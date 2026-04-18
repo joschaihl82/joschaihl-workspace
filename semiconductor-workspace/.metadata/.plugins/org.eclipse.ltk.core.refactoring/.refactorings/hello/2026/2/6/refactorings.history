@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;winpaint3/paint.c&apos; to &apos;hello.c&apos;" description="Rename resource &apos;paint.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="paint.c" name="hello.c" stamp="1770156161667" updateReferences="true"/>
+</session>

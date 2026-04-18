@@ -1,0 +1,2 @@
+#define qterm1_VERSION_MAJOR @qterm1_VERSION_MAJOR@
+#define qterm1_VERSION_MINOR @qterm1_VERSION_MINOR@

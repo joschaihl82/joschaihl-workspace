@@ -1,0 +1,212 @@
+// notepad_clone.c
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <commdlg.h>
+#include <stdio.h>
+
+#define IDM_FILE_NEW  101
+#define IDM_FILE_OPEN 102
+#define IDM_FILE_SAVE 103
+#define IDM_FILE_EXIT 104
+#define IDM_EDIT_CUT  201
+#define IDM_EDIT_COPY 202
+#define IDM_EDIT_PASTE 203
+#define IDM_HELP_ABOUT 301
+
+static HWND hEdit;
+static HWND hMainWnd;
+static const wchar_t gClassName[] = L"MiniNotepadClass";
+
+void DoFileOpen(HWND hwnd) {
+    OPENFILENAME ofn;
+    wchar_t szFile[MAX_PATH] = L"";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Text Files\0*.txt\0All Files\0*.*\0";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    ofn.lpstrDefExt = L"txt";
+
+    if (GetOpenFileName(&ofn)) {
+        HANDLE hFile = CreateFile(szFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            MessageBox(hwnd, L"Datei konnte nicht geöffnet werden.", L"Fehler", MB_ICONERROR);
+            return;
+        }
+        DWORD size = GetFileSize(hFile, NULL);
+        wchar_t *buf = (wchar_t*)GlobalAlloc(GPTR, size + sizeof(wchar_t));
+        if (!buf) { CloseHandle(hFile); return; }
+        DWORD read = 0;
+        // Try to read as UTF-16 if possible, otherwise read as ANSI and convert
+        ReadFile(hFile, buf, size, &read, NULL);
+        CloseHandle(hFile);
+
+        // Heuristic: if file starts with BOM 0xFEFF treat as UTF-16LE
+        if (size >= 2 && ((unsigned char*)buf)[0] == 0xFF && ((unsigned char*)buf)[1] == 0xFE) {
+            // already UTF-16LE with BOM; set text skipping BOM
+            SetWindowTextW(hEdit, (wchar_t*)((BYTE*)buf + 2));
+        } else {
+            // treat as ANSI: convert to wide char
+            int needed = MultiByteToWideChar(CP_ACP, 0, (char*)buf, read, NULL, 0);
+            wchar_t *wbuf = (wchar_t*)GlobalAlloc(GPTR, (needed + 1) * sizeof(wchar_t));
+            MultiByteToWideChar(CP_ACP, 0, (char*)buf, read, wbuf, needed);
+            wbuf[needed] = 0;
+            SetWindowTextW(hEdit, wbuf);
+            GlobalFree(wbuf);
+        }
+        GlobalFree(buf);
+    }
+}
+
+void DoFileSave(HWND hwnd) {
+    OPENFILENAME ofn;
+    wchar_t szFile[MAX_PATH] = L"";
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Text Files\0*.txt\0All Files\0*.*\0";
+    ofn.Flags = OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = L"txt";
+
+    if (GetSaveFileName(&ofn)) {
+        int len = GetWindowTextLengthW(hEdit);
+        wchar_t *buf = (wchar_t*)GlobalAlloc(GPTR, (len + 1) * sizeof(wchar_t));
+        GetWindowTextW(hEdit, buf, len + 1);
+
+        // Save as UTF-16LE with BOM
+        HANDLE hFile = CreateFile(szFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            MessageBox(hwnd, L"Datei konnte nicht gespeichert werden.", L"Fehler", MB_ICONERROR);
+            GlobalFree(buf);
+            return;
+        }
+        DWORD written;
+        // Write BOM
+        WORD bom = 0xFEFF;
+        WriteFile(hFile, &bom, sizeof(bom), &written, NULL);
+        // Write UTF-16 data
+        WriteFile(hFile, buf, len * sizeof(wchar_t), &written, NULL);
+        CloseHandle(hFile);
+        GlobalFree(buf);
+    }
+}
+
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        // Create Edit control
+        hEdit = CreateWindowEx(0, L"EDIT", NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            0, 0, 0, 0, hwnd, (HMENU)1, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+        // Create menu
+        HMENU hMenubar = CreateMenu();
+        HMENU hFile = CreatePopupMenu();
+        HMENU hEdit = CreatePopupMenu();
+        HMENU hHelp = CreatePopupMenu();
+
+        AppendMenu(hFile, MF_STRING, IDM_FILE_NEW, L"&Neu\tCtrl+N");
+        AppendMenu(hFile, MF_STRING, IDM_FILE_OPEN, L"&Öffnen...\tCtrl+O");
+        AppendMenu(hFile, MF_STRING, IDM_FILE_SAVE, L"&Speichern...\tCtrl+S");
+        AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
+        AppendMenu(hFile, MF_STRING, IDM_FILE_EXIT, L"&Beenden");
+
+        AppendMenu(hEdit, MF_STRING, IDM_EDIT_CUT, L"Ausschneiden\tCtrl+X");
+        AppendMenu(hEdit, MF_STRING, IDM_EDIT_COPY, L"Kopieren\tCtrl+C");
+        AppendMenu(hEdit, MF_STRING, IDM_EDIT_PASTE, L"Einfügen\tCtrl+V");
+
+        AppendMenu(hHelp, MF_STRING, IDM_HELP_ABOUT, L"&Über");
+
+        AppendMenu(hMenubar, MF_POPUP, (UINT_PTR)hFile, L"&Datei");
+        AppendMenu(hMenubar, MF_POPUP, (UINT_PTR)hEdit, L"&Bearbeiten");
+        AppendMenu(hMenubar, MF_POPUP, (UINT_PTR)hHelp, L"&Hilfe");
+
+        SetMenu(hwnd, hMenubar);
+        break;
+    }
+    case WM_SIZE:
+        if (hEdit) {
+            MoveWindow(hEdit, 0, 0, LOWORD(lParam), HIWORD(lParam), TRUE);
+        }
+        break;
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_FILE_NEW:
+            SetWindowTextW(hEdit, L"");
+            break;
+        case IDM_FILE_OPEN:
+            DoFileOpen(hwnd);
+            break;
+        case IDM_FILE_SAVE:
+            DoFileSave(hwnd);
+            break;
+        case IDM_FILE_EXIT:
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+            break;
+        case IDM_EDIT_CUT:
+            SendMessage(hEdit, WM_CUT, 0, 0);
+            break;
+        case IDM_EDIT_COPY:
+            SendMessage(hEdit, WM_COPY, 0, 0);
+            break;
+        case IDM_EDIT_PASTE:
+            SendMessage(hEdit, WM_PASTE, 0, 0);
+            break;
+        case IDM_HELP_ABOUT:
+            MessageBox(hwnd, L"Mini Notepad\nEinfacher Notepad Klon in C mit Win32 API", L"Über", MB_OK | MB_ICONINFORMATION);
+            break;
+        default:
+            break;
+        }
+        break;
+    case WM_CLOSE:
+        if (MessageBox(hwnd, L"Wirklich beenden?", L"Beenden", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            DestroyWindow(hwnd);
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow) {
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = gClassName;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    if (!RegisterClass(&wc)) {
+        MessageBox(NULL, L"Registrierung der Fensterklasse fehlgeschlagen.", L"Fehler", MB_ICONERROR);
+        return 0;
+    }
+
+    hMainWnd = CreateWindowEx(0, gClassName, L"Mini Notepad", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 800, 600, NULL, NULL, hInstance, NULL);
+
+    if (!hMainWnd) {
+        MessageBox(NULL, L"Fenster konnte nicht erstellt werden.", L"Fehler", MB_ICONERROR);
+        return 0;
+    }
+
+    ShowWindow(hMainWnd, nCmdShow);
+    UpdateWindow(hMainWnd);
+
+    // Basic accelerator table in code (Ctrl+N/O/S/X/C/V)
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return (int)msg.wParam;
+}

@@ -1,0 +1,2 @@
+#define xmpp_VERSION_MAJOR @xmpp_VERSION_MAJOR@
+#define xmpp_VERSION_MINOR @xmpp_VERSION_MINOR@

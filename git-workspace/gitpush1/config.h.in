@@ -1,0 +1,2 @@
+#define gitpush1_VERSION_MAJOR @gitpush1_VERSION_MAJOR@
+#define gitpush1_VERSION_MINOR @gitpush1_VERSION_MINOR@

@@ -1,0 +1,225 @@
+#ifndef UNICODE
+#define UNICODE
+#endif
+
+#include <windows.h>
+#include <commctrl.h>
+#include <commdlg.h>
+#include <stdio.h>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "comdlg32.lib")
+
+// --- Constants & IDs ---
+#define IDC_CANVAS   1001
+#define IDC_TOOLBAR  1002
+#define IDC_STATUS   1003
+#define IDC_PALETTE  1004
+
+#define IDM_NEW      2001
+#define IDM_OPEN     2002
+#define IDM_SAVE     2003
+#define IDM_EXIT     2004
+#define IDM_ABOUT    2005
+
+enum { TOOL_PEN=1, TOOL_LINE, TOOL_RECT, TOOL_RECT_FILL, TOOL_ELLIPSE, TOOL_ERASER, TOOL_TEXT, TOOL_FILL };
+
+// --- Global State ---
+HINSTANCE g_hInst;
+HWND g_hwndMain, g_hwndCanvas, g_hwndStatus;
+HDC g_hdcMem = NULL;
+HBITMAP g_hbmMem = NULL;
+COLORREF g_crFore = RGB(0, 0, 0);
+int g_nTool = TOOL_PEN;
+int g_nBrushSize = 2;
+BOOL g_bDrawing = FALSE;
+POINT g_ptStart, g_ptLast;
+
+// --- Function Prototypes ---
+LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK CanvasWndProc(HWND, UINT, WPARAM, LPARAM);
+void CreateAppUI(HWND);
+void DrawShape(HDC, POINT, POINT, int, COLORREF, int, BOOL);
+void SaveFile(HWND);
+
+// --- Drawing Implementation ---
+
+void DrawShape(HDC hdc, POINT start, POINT end, int tool, COLORREF color, int size, BOOL isPreview) {
+    HPEN hPen = CreatePen(isPreview ? PS_DOT : PS_SOLID, size, (tool == TOOL_ERASER ? RGB(255,255,255) : color));
+    HBRUSH hBrush = (tool == TOOL_RECT_FILL) ? CreateSolidBrush(color) : (HBRUSH)GetStockObject(NULL_BRUSH);
+
+    HGDIOBJ oldPen = SelectObject(hdc, hPen);
+    HGDIOBJ oldBrush = SelectObject(hdc, hBrush);
+
+    switch (tool) {
+        case TOOL_PEN:
+        case TOOL_ERASER:
+        case TOOL_LINE:
+            MoveToEx(hdc, start.x, start.y, NULL);
+            LineTo(hdc, end.x, end.y);
+            break;
+        case TOOL_RECT:
+        case TOOL_RECT_FILL:
+            Rectangle(hdc, start.x, start.y, end.x, end.y);
+            break;
+        case TOOL_ELLIPSE:
+            Ellipse(hdc, start.x, start.y, end.x, end.y);
+            break;
+    }
+
+    SelectObject(hdc, oldPen);
+    SelectObject(hdc, oldBrush);
+    DeleteObject(hPen);
+    if (tool == TOOL_RECT_FILL) DeleteObject(hBrush);
+}
+
+// --- Canvas Logic (The "Heart") ---
+
+LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            HDC hdc = GetDC(hwnd);
+            g_hdcMem = CreateCompatibleDC(hdc);
+            g_hbmMem = CreateCompatibleBitmap(hdc, 3000, 3000); // Massive canvas
+            SelectObject(g_hdcMem, g_hbmMem);
+            PatBlt(g_hdcMem, 0, 0, 3000, 3000, WHITENESS);
+            ReleaseDC(hwnd, hdc);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            POINT pt = { LOWORD(lp), HIWORD(lp) };
+            WCHAR buf[32];
+            swprintf(buf, 32, L" %d, %dpx", pt.x, pt.y);
+            SendMessage(g_hwndStatus, SB_SETTEXT, 1, (LPARAM)buf);
+
+            if (g_bDrawing) {
+                if (g_nTool == TOOL_PEN || g_nTool == TOOL_ERASER) {
+                    DrawShape(g_hdcMem, g_ptLast, pt, g_nTool, g_crFore, g_nBrushSize, FALSE);
+                    g_ptLast = pt;
+                }
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN:
+            g_bDrawing = TRUE;
+            g_ptStart = (POINT){ LOWORD(lp), HIWORD(lp) };
+            g_ptLast = g_ptStart;
+            SetCapture(hwnd);
+            if (g_nTool == TOOL_FILL) {
+                HBRUSH b = CreateSolidBrush(g_crFore);
+                HGDIOBJ old = SelectObject(g_hdcMem, b);
+                ExtFloodFill(g_hdcMem, g_ptStart.x, g_ptStart.y, GetPixel(g_hdcMem, g_ptStart.x, g_ptStart.y), FLOODFILLSURFACE);
+                SelectObject(g_hdcMem, old);
+                DeleteObject(b);
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+            if (g_bDrawing) {
+                POINT pt = { LOWORD(lp), HIWORD(lp) };
+                if (g_nTool != TOOL_PEN && g_nTool != TOOL_ERASER && g_nTool != TOOL_FILL) {
+                    DrawShape(g_hdcMem, g_ptStart, pt, g_nTool, g_crFore, g_nBrushSize, FALSE);
+                }
+                g_bDrawing = FALSE;
+                ReleaseCapture();
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            BitBlt(hdc, 0, 0, 3000, 3000, g_hdcMem, 0, 0, SRCCOPY);
+            if (g_bDrawing && g_nTool != TOOL_PEN && g_nTool != TOOL_ERASER && g_nTool != TOOL_FILL) {
+                POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+                DrawShape(hdc, g_ptStart, pt, g_nTool, g_crFore, g_nBrushSize, TRUE);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// --- UI Construction & Main Window ---
+
+void CreateAppUI(HWND hwnd) {
+    // Menu
+    HMENU hMenu = CreateMenu();
+    HMENU hFile = CreatePopupMenu();
+    AppendMenu(hFile, MF_STRING, IDM_NEW, L"&New\tCtrl+N");
+    AppendMenu(hFile, MF_STRING, IDM_SAVE, L"&Save as BMP...");
+    AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hFile, MF_STRING, IDM_EXIT, L"E&xit");
+    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hFile, L"&File");
+    SetMenu(hwnd, hMenu);
+
+    // Toolbar (Standard Buttons)
+    HWND hTool = CreateWindowEx(0, TOOLBARCLASSNAME, NULL, WS_CHILD | WS_VISIBLE | CCS_LEFT | CCS_NORESIZE | TBSTYLE_FLAT | TBSTYLE_WRAPABLE,
+                                0, 0, 56, 600, hwnd, (HMENU)IDC_TOOLBAR, g_hInst, NULL);
+    SendMessage(hTool, TB_BUTTONSTRUCTSIZE, sizeof(TBBUTTON), 0);
+    SendMessage(hTool, TB_SETBUTTONSIZE, 0, MAKELPARAM(48, 48));
+
+    TBBUTTON btns[] = {
+        {0, TOOL_PEN, TBSTATE_ENABLED | TBSTATE_CHECKED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Pen"},
+        {1, TOOL_LINE, TBSTATE_ENABLED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Line"},
+        {2, TOOL_RECT, TBSTATE_ENABLED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Box"},
+        {3, TOOL_RECT_FILL, TBSTATE_ENABLED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Full"},
+        {4, TOOL_ERASER, TBSTATE_ENABLED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Eraser"},
+        {5, TOOL_FILL, TBSTATE_ENABLED, BTNS_CHECKGROUP, {0}, 0, (INT_PTR)L"Fill"}
+    };
+    SendMessage(hTool, TB_ADDBUTTONS, 6, (LPARAM)&btns);
+
+    // Status Bar
+    g_hwndStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, (HMENU)IDC_STATUS, g_hInst, NULL);
+    int parts[] = { 200, -1 };
+    SendMessage(g_hwndStatus, SB_SETPARTS, 2, (LPARAM)parts);
+
+    // Canvas
+    g_hwndCanvas = CreateWindowEx(WS_EX_CLIENTEDGE, L"CanvasClass", NULL, WS_CHILD | WS_VISIBLE | WS_HSCROLL | WS_VSCROLL,
+                                  60, 10, 800, 600, hwnd, (HMENU)IDC_CANVAS, g_hInst, NULL);
+}
+
+LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: CreateAppUI(hwnd); return 0;
+        case WM_SIZE: {
+            // Reposition canvas to fill space
+            RECT rc; GetClientRect(hwnd, &rc);
+            MoveWindow(g_hwndCanvas, 60, 5, rc.right - 70, rc.bottom - 40, TRUE);
+            SendMessage(g_hwndStatus, WM_SIZE, 0, 0);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) >= 1 && LOWORD(wp) <= 8) g_nTool = LOWORD(wp);
+            if (LOWORD(wp) == IDM_EXIT) DestroyWindow(hwnd);
+            if (LOWORD(wp) == IDM_NEW) { PatBlt(g_hdcMem, 0, 0, 3000, 3000, WHITENESS); InvalidateRect(g_hwndCanvas, NULL, FALSE); }
+            return 0;
+        case WM_DESTROY: PostQuitMessage(0); return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+// --- Entry Point ---
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+    g_hInst = hInst;
+    InitCommonControls();
+
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = MainWndProc; wc.hInstance = hInst; wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE+1); wc.lpszClassName = L"PaintMain";
+    RegisterClass(&wc);
+    wc.lpfnWndProc = CanvasWndProc; wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH); wc.lpszClassName = L"CanvasClass";
+    RegisterClass(&wc);
+
+    g_hwndMain = CreateWindowEx(0, L"PaintMain", L"Win32 Professional Paint", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 1100, 850, NULL, NULL, hInst, NULL);
+
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return 0;
+}

@@ -1,0 +1,160 @@
+/* loopback_probe.c
+   Probe ALSA Loopback capture subdevices for audio signal.
+   For each Loopback card found, test devices 0 and 1 and subdevices 0..15.
+   For each candidate: record for 2 seconds (44100 Hz, stereo, S16_LE),
+   compute peak sample absolute value; if peak > THRESHOLD -> print device and exit.
+*/
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <alsa/asoundlib.h>
+#include <stdint.h>
+#include <math.h>
+
+#define SAMPLE_RATE 44100u
+#define CHANNELS 2
+#define FORMAT SND_PCM_FORMAT_S16_LE
+#define RECORD_SECONDS 2
+/* Threshold for 16-bit PCM absolute sample value to consider "signal present".
+   32767 is max; choose a conservative threshold (adjust if needed). */
+#define THRESHOLD 2000
+
+/* Try to open and record from device string like "hw:1,1,3".
+   Returns 1 if signal found, 0 if no signal, -1 on fatal error.
+   On signal found, peak_out is set to peak and optionally card/longname printed by caller. */
+static int test_device(const char *devstr, int *peak_out) {
+    snd_pcm_t *handle = NULL;
+    int err;
+    unsigned int rate = SAMPLE_RATE;
+    int channels = CHANNELS;
+    snd_pcm_uframes_t period_size = 1024;
+    if ((err = snd_pcm_open(&handle, devstr, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        /* cannot open device */
+        return -1;
+    }
+
+    snd_pcm_hw_params_t *hw = NULL;
+    snd_pcm_hw_params_malloc(&hw);
+    snd_pcm_hw_params_any(handle, hw);
+    snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(handle, hw, FORMAT);
+    snd_pcm_hw_params_set_rate_near(handle, hw, &rate, 0);
+    snd_pcm_hw_params_set_channels(handle, hw, channels);
+    snd_pcm_hw_params_set_period_size_near(handle, hw, &period_size, 0);
+    if ((err = snd_pcm_hw_params(handle, hw)) < 0) {
+        snd_pcm_hw_params_free(hw);
+        snd_pcm_close(handle);
+        return -1;
+    }
+    snd_pcm_hw_params_free(hw);
+
+    /* prepare buffer */
+    int bytes_per_sample = 2; /* S16_LE */
+    int bytes_per_frame = channels * bytes_per_sample;
+    snd_pcm_uframes_t total_frames = SAMPLE_RATE * RECORD_SECONDS;
+    snd_pcm_uframes_t frames_left = total_frames;
+    size_t buf_frames = period_size;
+    size_t bufbytes = buf_frames * bytes_per_frame;
+    int16_t *buffer = malloc(bufbytes);
+    if (!buffer) {
+        snd_pcm_close(handle);
+        return -1;
+    }
+
+    int peak = 0;
+    while (frames_left > 0) {
+        snd_pcm_uframes_t to_read = (frames_left > buf_frames) ? buf_frames : frames_left;
+        int r = snd_pcm_readi(handle, buffer, to_read);
+        if (r == -EPIPE) {
+            /* overrun */
+            snd_pcm_prepare(handle);
+            frames_left -= to_read; /* still count time even if overrun */
+            continue;
+        } else if (r < 0) {
+            /* read error */
+            free(buffer);
+            snd_pcm_close(handle);
+            return -1;
+        } else if (r == 0) {
+            frames_left -= to_read;
+            continue;
+        } else {
+            /* process r frames */
+            int samples = r * channels;
+            for (int i = 0; i < samples; ++i) {
+                int val = abs((int)buffer[i]);
+                if (val > peak) peak = val;
+            }
+            frames_left -= r;
+        }
+    }
+
+    free(buffer);
+    snd_pcm_close(handle);
+    if (peak_out) *peak_out = peak;
+    return (peak > THRESHOLD) ? 1 : 0;
+}
+
+int main(void) {
+    int card = -1;
+    if (snd_card_next(&card) < 0) {
+        fprintf(stderr, "Fehler: snd_card_next failed\n");
+        return 2;
+    }
+    if (card < 0) {
+        fprintf(stderr, "Keine ALSA-Karten gefunden\n");
+        return 2;
+    }
+
+    snd_ctl_card_info_t *info;
+    snd_ctl_card_info_malloc(&info);
+
+    while (card >= 0) {
+        char ctlname[32];
+        snprintf(ctlname, sizeof(ctlname), "hw:%d", card);
+        snd_ctl_t *ctl = NULL;
+        if (snd_ctl_open(&ctl, ctlname, 0) >= 0) {
+            if (snd_ctl_card_info(ctl, info) >= 0) {
+                const char *name = snd_ctl_card_info_get_name(info);
+                const char *longname = snd_ctl_card_info_get_longname(info);
+                /* look for Loopback in name or longname (case sensitive as typical) */
+                if ((name && strstr(name, "Loopback")) || (longname && strstr(longname, "Loopback"))) {
+                    fprintf(stderr, "Gefundene Loopback Karte: %s (%s) -> teste Subdevices\n",
+                            name ? name : "(unknown)", longname ? longname : "(no longname)");
+                    /* test devices 0 and 1 (typisch bei snd-aloop) and subdevices 0..15 */
+                    for (int dev = 0; dev <= 1; ++dev) {
+                        for (int sub = 0; sub <= 15; ++sub) {
+                            char devstr[64];
+                            snprintf(devstr, sizeof(devstr), "hw:%d,%d,%d", card, dev, sub);
+                            fprintf(stderr, "Teste %s ...\n", devstr);
+                            int peak = 0;
+                            int res = test_device(devstr, &peak);
+                            if (res == 1) {
+                                printf("Found signal on %s\n", devstr);
+                                printf("Card name: %s\n", name ? name : "(unknown)");
+                                printf("Card longname: %s\n", longname ? longname : "(unknown)");
+                                printf("Peak sample value: %d\n", peak);
+                                snd_ctl_close(ctl);
+                                snd_ctl_card_info_free(info);
+                                return 0;
+                            } else if (res == 0) {
+                                fprintf(stderr, "Kein Signal (peak=%d)\n", peak);
+                            } else {
+                                fprintf(stderr, "Fehler beim Testen von %s (device evtl. nicht vorhanden)\n", devstr);
+                            }
+                        }
+                    }
+                }
+            }
+            snd_ctl_close(ctl);
+        }
+        if (snd_card_next(&card) < 0) break;
+    }
+
+    snd_ctl_card_info_free(info);
+    fprintf(stderr, "Kein Signal auf Loopback Subdevices gefunden.\n");
+    fprintf(stderr, "Stelle sicher, dass Wiedergabe in Loopback-Playback geroutet ist (z.B. hw:Loopback,0,<sub>)\n");
+    return 1;
+}

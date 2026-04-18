@@ -1,0 +1,159 @@
+cmake_minimum_required(VERSION 3.15)
+
+# -------------------------
+# Projekt- und Optionen
+# -------------------------
+project(MiniNotepad LANGUAGES C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+option(TARGET_WINDOWS "Build for Windows (mingw-w64) even on Linux" OFF)
+set(MINGW_ARCH "x86_64" CACHE STRING "mingw-w64 architecture: x86_64 or i686")
+set(MINGW_PREFIX "" CACHE PATH "Optional prefix/path for mingw-w64 toolchain (e.g. /usr/bin or /usr/local/bin)")
+option(USE_ICON "Embed icon/resource.rc into Windows executable (only for TARGET_WINDOWS)" OFF)
+set(ICON_RC "resource.rc" CACHE FILEPATH "Path to resource .rc file to embed (used when USE_ICON=ON)")
+option(ENABLE_STRICT_WARNINGS "Enable extra compiler warnings" ON)
+
+# -------------------------
+# Generator check (informativ)
+# -------------------------
+if (NOT CMAKE_GENERATOR STREQUAL "Unix Makefiles")
+  message(WARNING "Empfohlener Generator ist \"Unix Makefiles\".\n"
+                  "Du kannst CMake mit -G \"Unix Makefiles\" aufrufen.\n"
+                  "Aktueller Generator: ${CMAKE_GENERATOR}")
+else()
+  message(STATUS "Generator: Unix Makefiles (empfohlen)")
+endif()
+
+# -------------------------
+# Cross-compile: mingw-w64 detection (vor project() Compiler-Setzung)
+# -------------------------
+if (TARGET_WINDOWS)
+  # Versuche Compiler nur zu setzen, wenn noch keiner gesetzt wurde
+  if (NOT CMAKE_C_COMPILER)
+    # mögliche Compiler-Namen
+    if (MINGW_ARCH STREQUAL "x86_64")
+      set(_try_gcc_names x86_64-w64-mingw32-gcc x86_64-w64-mingw32-gcc-posix)
+      set(_try_windres_names x86_64-w64-mingw32-windres windres)
+    else()
+      set(_try_gcc_names i686-w64-mingw32-gcc i686-w64-mingw32-gcc-posix)
+      set(_try_windres_names i686-w64-mingw32-windres windres)
+    endif()
+
+    # optionally use MINGW_PREFIX to search
+    if (MINGW_PREFIX)
+      list(TRANSFORM _try_gcc_names PREPEND "${MINGW_PREFIX}/")
+      list(TRANSFORM _try_windres_names PREPEND "${MINGW_PREFIX}/")
+    endif()
+
+    find_program(_found_mingw_gcc NAMES ${_try_gcc_names})
+    find_program(_found_windres NAMES ${_try_windres_names})
+
+    if (_found_mingw_gcc)
+      message(STATUS "Found mingw-w64 gcc: ${_found_mingw_gcc}")
+      set(CMAKE_C_COMPILER ${_found_mingw_gcc} CACHE FILEPATH "mingw-w64 gcc" FORCE)
+    else()
+      message(WARNING "TARGET_WINDOWS=ON but no mingw-w64 gcc found automatically.\n"
+                      "Set -DCMAKE_C_COMPILER=/path/to/x86_64-w64-mingw32-gcc")
+    endif()
+
+    if (_found_windres)
+      message(STATUS "Found windres: ${_found_windres}")
+      set(CMAKE_RC_COMPILER ${_found_windres} CACHE FILEPATH "windres" FORCE)
+    endif()
+  endif()
+
+  # Tell CMake we are targeting Windows
+  set(CMAKE_SYSTEM_NAME Windows CACHE STRING "Target system name" FORCE)
+  set(CMAKE_SYSTEM_PROCESSOR ${MINGW_ARCH} CACHE STRING "Target processor" FORCE)
+
+  # Adjust find root path for cross toolchains (optional)
+  if (MINGW_PREFIX)
+    set(CMAKE_FIND_ROOT_PATH ${MINGW_PREFIX} CACHE PATH "Find root path for cross compile" FORCE)
+    set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+    set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+    set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+  endif()
+endif()
+
+# -------------------------
+# Quellen, Executable, Ressourcen
+# -------------------------
+set(SRC_FILES
+  notepad1.c
+)
+
+# Wenn Icon/Resource gewünscht und vorhanden, binde es ein (nur Windows)
+if (TARGET_WINDOWS AND USE_ICON)
+  if (EXISTS "${CMAKE_SOURCE_DIR}/${ICON_RC}")
+    list(APPEND SRC_FILES ${ICON_RC})
+    message(STATUS "Resource file will be embedded: ${ICON_RC}")
+  else()
+    message(WARNING "USE_ICON=ON aber ${ICON_RC} nicht gefunden. Ignoriere Resource.")
+  endif()
+endif()
+
+# WIN32 flag unter Windows, damit kein Konsolenfenster erscheint
+if (TARGET_WINDOWS OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  add_executable(notepad_clone WIN32 ${SRC_FILES})
+else()
+  add_executable(notepad_clone ${SRC_FILES})
+endif()
+
+# -------------------------
+# Compiler- und Linker-Optionen
+# -------------------------
+target_compile_definitions(notepad_clone PRIVATE UNICODE _UNICODE)
+
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+  if (ENABLE_STRICT_WARNINGS)
+    target_compile_options(notepad_clone PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+  else()
+    target_compile_options(notepad_clone PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  endif()
+  if (TARGET_WINDOWS)
+    # -municode kann bei einigen mingw-Setups helfen
+    target_compile_options(notepad_clone PRIVATE -municode)
+  endif()
+elseif (MSVC)
+  target_compile_options(notepad_clone PRIVATE /W4)
+endif()
+
+# Linke Windows-spezifische libs nur für Windows-Ziel
+if (TARGET_WINDOWS OR CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  target_link_libraries(notepad_clone PRIVATE user32 gdi32 comdlg32 kernel32)
+endif()
+
+# -------------------------
+# Ausgabepfade, Build-Typen, Install
+# -------------------------
+# Saubere Ausgabeordner
+set_target_properties(notepad_clone PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+if (NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+# Install-Regel
+install(TARGETS notepad_clone RUNTIME DESTINATION bin)
+
+# Optional: export compile commands for tools (nützlich für clangd)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# -------------------------
+# Hilfreiche Statusausgaben
+# -------------------------
+message(STATUS "Project: ${PROJECT_NAME}")
+message(STATUS "Source dir: ${CMAKE_SOURCE_DIR}")
+message(STATUS "Build dir: ${CMAKE_BINARY_DIR}")
+message(STATUS "Target Windows: ${TARGET_WINDOWS}")
+if (TARGET_WINDOWS)
+  message(STATUS "Mingw arch: ${MINGW_ARCH}")
+  message(STATUS "C compiler: ${CMAKE_C_COMPILER}")
+  message(STATUS "RC compiler: ${CMAKE_RC_COMPILER}")
+endif()

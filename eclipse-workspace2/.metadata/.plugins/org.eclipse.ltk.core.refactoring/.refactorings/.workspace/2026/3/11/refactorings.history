@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Copy Project &apos;webserv1&apos;" description="Copy Project &apos;webserv1&apos;" destination="/wrk/eclipse-workspace2" element="/webserv1" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="webserv2" stamp="1773491928629"/>
+</session>

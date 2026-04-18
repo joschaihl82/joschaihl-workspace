@@ -1,0 +1,36 @@
+# 3.5 rule: mod prefix, obj/nam/dir postfix
+mod_obj := exectrace1.o
+mod_nam := exectrace1
+mod_dir := /lib/modules/$(shell uname -r)/extra
+obj-m := $(mod_obj)
+
+# 3.5 rule: mak prefix, bin/knd/cur/flg/ins postfix
+mak_bin := make
+mak_knd := /lib/modules/$(shell uname -r)/build
+mak_cur := $(shell pwd)
+mak_flg := v=1
+mak_ins := install
+
+.phony: all clean cln_all load unload
+
+all:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) modules $(mak_flg)
+
+clean:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) clean
+
+cln_all: clean
+	rm -f .*.cmd *.o *.mod *.mod.c modules.order Module.symvers
+
+# install to system path and update dependencies, then modprobe
+load: all
+	sudo mkdir -p $(mod_dir)
+	sudo cp $(mod_nam).ko $(mod_dir)
+	sudo depmod -a
+	sudo modprobe $(mod_nam)
+
+# remove module and cleanup system files
+unload:
+	sudo modprobe -r $(mod_nam)
+	sudo rm -f $(mod_dir)/$(mod_nam).ko
+	sudo depmod -a

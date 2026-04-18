@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/notepad_clone.dir/link.d CMakeFiles/notepad_clone.dir/notepad1.c.o -o bin/notepad_clone

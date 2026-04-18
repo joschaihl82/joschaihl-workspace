@@ -1,0 +1,310 @@
+/* loopback_auto_probe.c
+   Probe ALSA Loopback capture subdevices for audio signal.
+   For each Loopback card found, test devices 0 and 1 and subdevices 0..7.
+   For each candidate: try to configure a working HW params combination
+   (formats/rates/channels), record for 2 seconds, compute peak sample absolute value;
+   if peak > THRESHOLD -> print device, chosen params and exit.
+*/
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <alsa/asoundlib.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <math.h>
+
+#define RECORD_SECONDS 2
+#define DEFAULT_RATE 44100u
+#define DEFAULT_CHANNELS 2
+#define THRESHOLD_16BIT 2000   /* threshold for 16-bit samples; scaled for other widths */
+
+static const snd_pcm_format_t candidate_formats[] = {
+    SND_PCM_FORMAT_S16_LE,
+    SND_PCM_FORMAT_S32_LE,
+    SND_PCM_FORMAT_S24_LE,
+    SND_PCM_FORMAT_UNKNOWN
+};
+
+static const unsigned int candidate_rates[] = {
+    44100u,
+    48000u,
+    96000u,
+    32000u,
+    0u
+};
+
+volatile sig_atomic_t stop_requested = 0;
+#include <signal.h>
+static void sigint_handler(int sig){ (void)sig; stop_requested = 1; }
+
+/* Try to open and configure device. On success returns 0 and fills out chosen params.
+   On failure returns negative. */
+static int open_and_configure(const char *devstr,
+                              snd_pcm_t **out_handle,
+                              snd_pcm_format_t *out_format,
+                              unsigned int *out_rate,
+                              int *out_channels,
+                              snd_pcm_uframes_t *out_period)
+{
+    snd_pcm_t *handle = NULL;
+    int err;
+
+    if ((err = snd_pcm_open(&handle, devstr, SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        return -1;
+    }
+
+    snd_pcm_hw_params_t *hw = NULL;
+    snd_pcm_hw_params_malloc(&hw);
+    snd_pcm_hw_params_any(handle, hw);
+
+    /* We'll try combinations: for each format in candidate_formats, for each rate in candidate_rates,
+       try to set access, format, rate_near, channels, period_size_near and commit. */
+    snd_pcm_uframes_t period_size = 1024;
+    int channels_try = DEFAULT_CHANNELS;
+    unsigned int rate_try;
+    snd_pcm_format_t fmt_try;
+
+    int success = 0;
+    for (const snd_pcm_format_t *pf = candidate_formats; *pf != SND_PCM_FORMAT_UNKNOWN && !success; ++pf) {
+        fmt_try = *pf;
+        for (const unsigned int *pr = candidate_rates; *pr != 0 && !success; ++pr) {
+            rate_try = *pr;
+
+            /* reset hw params template */
+            snd_pcm_hw_params_any(handle, hw);
+            if ((err = snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+                continue;
+            }
+            if ((err = snd_pcm_hw_params_set_format(handle, hw, fmt_try)) < 0) {
+                /* format not supported, try next */
+                continue;
+            }
+            unsigned int rr = rate_try;
+            if ((err = snd_pcm_hw_params_set_rate_near(handle, hw, &rr, 0)) < 0) {
+                continue;
+            }
+            /* ensure rate matches reasonably */
+            if (abs((int)rr - (int)rate_try) > 1000) {
+                /* too far off, skip */
+                continue;
+            }
+            if ((err = snd_pcm_hw_params_set_channels(handle, hw, channels_try)) < 0) {
+                continue;
+            }
+            if ((err = snd_pcm_hw_params_set_period_size_near(handle, hw, &period_size, 0)) < 0) {
+                continue;
+            }
+            /* try to apply */
+            if ((err = snd_pcm_hw_params(handle, hw)) < 0) {
+                continue;
+            }
+            /* success */
+            success = 1;
+            break;
+        }
+    }
+
+    if (!success) {
+        snd_pcm_hw_params_free(hw);
+        snd_pcm_close(handle);
+        return -2;
+    }
+
+    /* retrieve actual params */
+    snd_pcm_hw_params_get_period_size(hw, out_period, 0);
+    unsigned int actual_rate = 0;
+    snd_pcm_hw_params_get_rate(hw, &actual_rate, 0);
+    int actual_channels = 0;
+    snd_pcm_hw_params_get_channels(hw, &actual_channels);
+    snd_pcm_format_t actual_format = SND_PCM_FORMAT_UNKNOWN;
+    /* There's no direct getter for format; but we can assume the last successful fmt_try is set.
+       For safety, try to detect common formats by testing read size assumptions. We'll set actual_format to fmt_try. */
+    /* For simplicity, set actual_format to the last tried format (fmt_try) */
+    actual_format = fmt_try;
+
+    snd_pcm_hw_params_free(hw);
+
+    *out_handle = handle;
+    *out_format = actual_format;
+    *out_rate = actual_rate;
+    *out_channels = actual_channels;
+
+    return 0;
+}
+
+/* Read RECORD_SECONDS from handle and compute peak. Returns 1 if peak > threshold, 0 otherwise, -1 on error.
+   Threshold is scaled according to sample width. */
+static int record_and_check_peak(snd_pcm_t *handle, snd_pcm_format_t format, unsigned int rate, int channels, snd_pcm_uframes_t period_size, int *out_peak)
+{
+    int bytes_per_sample;
+    if (format == SND_PCM_FORMAT_S16_LE) bytes_per_sample = 2;
+    else if (format == SND_PCM_FORMAT_S32_LE) bytes_per_sample = 4;
+    else if (format == SND_PCM_FORMAT_S24_LE) {
+        /* treat S24_LE as 4 bytes container if possible; but many drivers use 3-byte S24_3LE.
+           For simplicity, treat as 4 bytes (S32 container) and hope driver provides 32-bit aligned data.
+           If not, reads may be odd; in practice S24_LE often works as 4-byte container. */
+        bytes_per_sample = 4;
+    } else {
+        return -1;
+    }
+
+    size_t frame_bytes = (size_t)channels * bytes_per_sample;
+    snd_pcm_uframes_t total_frames = rate * RECORD_SECONDS;
+    snd_pcm_uframes_t frames_left = total_frames;
+    size_t buf_frames = period_size;
+    size_t bufbytes = buf_frames * frame_bytes;
+    uint8_t *buffer = malloc(bufbytes);
+    if (!buffer) return -1;
+
+    int peak = 0;
+
+    while (frames_left > 0 && !stop_requested) {
+        snd_pcm_uframes_t to_read = (frames_left > buf_frames) ? buf_frames : frames_left;
+        int r = snd_pcm_readi(handle, buffer, to_read);
+        if (r == -EPIPE) {
+            snd_pcm_prepare(handle);
+            frames_left -= to_read;
+            continue;
+        } else if (r < 0) {
+            free(buffer);
+            return -1;
+        } else if (r == 0) {
+            frames_left -= to_read;
+            continue;
+        } else {
+            /* process r frames */
+            if (format == SND_PCM_FORMAT_S16_LE) {
+                int16_t *p = (int16_t*)buffer;
+                int samples = r * channels;
+                for (int i = 0; i < samples; ++i) {
+                    int v = abs((int)p[i]);
+                    if (v > peak) peak = v;
+                }
+            } else if (format == SND_PCM_FORMAT_S32_LE || format == SND_PCM_FORMAT_S24_LE) {
+                /* treat as 32-bit signed */
+                int32_t *p = (int32_t*)buffer;
+                int samples = r * channels;
+                for (int i = 0; i < samples; ++i) {
+                    int v = abs((int)(p[i] >> (format == SND_PCM_FORMAT_S24_LE ? 8 : 0))); /* if S24 in 32-bit container, shift */
+                    if (v > peak) peak = v;
+                }
+            }
+            frames_left -= r;
+        }
+    }
+
+    free(buffer);
+
+    /* scale threshold: base threshold is for 16-bit; scale for 32-bit */
+    int threshold = THRESHOLD_16BIT;
+    if (format == SND_PCM_FORMAT_S32_LE || format == SND_PCM_FORMAT_S24_LE) {
+        /* 32-bit full scale is 2^31-1, scale threshold accordingly */
+        threshold = THRESHOLD_16BIT * 32768; /* 2000 * 32768 ~ 65M */
+    }
+
+    if (out_peak) *out_peak = peak;
+    return (peak > threshold) ? 1 : 0;
+}
+
+int main(void)
+{
+    signal(SIGINT, sigint_handler);
+
+    int card = -1;
+    if (snd_card_next(&card) < 0) {
+        fprintf(stderr, "Fehler: snd_card_next failed\n");
+        return 2;
+    }
+    if (card < 0) {
+        fprintf(stderr, "Keine ALSA-Karten gefunden\n");
+        return 2;
+    }
+
+    snd_ctl_card_info_t *info;
+    snd_ctl_card_info_malloc(&info);
+
+    while (card >= 0) {
+        char ctlname[32];
+        snprintf(ctlname, sizeof(ctlname), "hw:%d", card);
+        snd_ctl_t *ctl = NULL;
+        if (snd_ctl_open(&ctl, ctlname, 0) >= 0) {
+            if (snd_ctl_card_info(ctl, info) >= 0) {
+                const char *name = snd_ctl_card_info_get_name(info);
+                const char *longname = snd_ctl_card_info_get_longname(info);
+                if ((name && strstr(name, "Loopback")) || (longname && strstr(longname, "Loopback"))) {
+                    fprintf(stderr, "Gefundene Loopback Karte: %s (%s) -> teste Subdevices\n",
+                            name ? name : "(unknown)", longname ? longname : "(no longname)");
+                    /* test devices 0 and 1 and subdevices 0..7 (adjust if you have more) */
+                    for (int dev = 0; dev <= 1 && !stop_requested; ++dev) {
+                        for (int sub = 0; sub <= 7 && !stop_requested; ++sub) {
+                            char devstr[64];
+                            snprintf(devstr, sizeof(devstr), "hw:%d,%d,%d", card, dev, sub);
+                            fprintf(stderr, "Teste %s ...\n", devstr);
+
+                            /* Try to open and configure with auto-detection */
+                            snd_pcm_t *handle = NULL;
+                            snd_pcm_format_t chosen_format = SND_PCM_FORMAT_UNKNOWN;
+                            unsigned int chosen_rate = 0;
+                            int chosen_channels = 0;
+                            snd_pcm_uframes_t period_size = 0;
+                            int rc = open_and_configure(devstr, &handle, &chosen_format, &chosen_rate, &chosen_channels, &period_size);
+                            if (rc < 0) {
+                                /* try plughw fallback (automatic conversion) */
+                                char plugdev[64];
+                                snprintf(plugdev, sizeof(plugdev), "plughw:%d,%d", card, dev);
+                                fprintf(stderr, " hw open/config failed for %s, trying %s ...\n", devstr, plugdev);
+                                rc = open_and_configure(plugdev, &handle, &chosen_format, &chosen_rate, &chosen_channels, &period_size);
+                                if (rc < 0) {
+                                    fprintf(stderr, "Fehler beim Testen von %s (device evtl. nicht vorhanden oder nicht konfigurierbar)\n", devstr);
+                                    continue;
+                                } else {
+                                    /* note: device string is plughw */
+                                    snprintf(devstr, sizeof(devstr), "%s", plugdev);
+                                }
+                            }
+
+                            fprintf(stderr, "  Geöffneter Device: %s  Format: %s  Rate: %u  Channels: %d  Period: %lu\n",
+                                    devstr,
+                                    (chosen_format==SND_PCM_FORMAT_S16_LE) ? "S16_LE" :
+                                    (chosen_format==SND_PCM_FORMAT_S32_LE) ? "S32_LE" :
+                                    (chosen_format==SND_PCM_FORMAT_S24_LE) ? "S24_LE" : "UNKNOWN",
+                                    chosen_rate, chosen_channels, (unsigned long)period_size);
+
+                            int peak = 0;
+                            int found = record_and_check_peak(handle, chosen_format, chosen_rate, chosen_channels, period_size, &peak);
+                            snd_pcm_close(handle);
+
+                            if (found == 1) {
+                                printf("Found signal on %s\n", devstr);
+                                printf("Card name: %s\n", name ? name : "(unknown)");
+                                printf("Card longname: %s\n", longname ? longname : "(unknown)");
+                                printf("Used format: %s\n",
+                                       (chosen_format==SND_PCM_FORMAT_S16_LE) ? "S16_LE" :
+                                       (chosen_format==SND_PCM_FORMAT_S32_LE) ? "S32_LE" :
+                                       (chosen_format==SND_PCM_FORMAT_S24_LE) ? "S24_LE" : "UNKNOWN");
+                                printf("Used rate: %u\n", chosen_rate);
+                                printf("Channels: %d\n", chosen_channels);
+                                printf("Peak sample value: %d\n", peak);
+                                snd_ctl_close(ctl);
+                                snd_ctl_card_info_free(info);
+                                return 0;
+                            } else if (found == 0) {
+                                fprintf(stderr, "  Kein Signal (peak=%d)\n", peak);
+                            } else {
+                                fprintf(stderr, "  Fehler beim Aufnehmen von %s\n", devstr);
+                            }
+                        }
+                    }
+                }
+            }
+            snd_ctl_close(ctl);
+        }
+        if (snd_card_next(&card) < 0) break;
+    }
+
+    snd_ctl_card_info_free(info);
+    fprintf(stderr, "Kein Signal auf Loopback Subdevices gefunden.\n");
+    fprintf(stderr, "Stelle sicher, dass Wiedergabe in Loopback-Playback geroutet ist (z.B. hw:Loopback,0,<sub>)\n");
+    return 1;
+}

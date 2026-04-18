@@ -1,0 +1,607 @@
+// File: winpaint.c
+// Minimaler Paint-Klon in reinem C mit Win32 API, GDI und ComCtl32
+// Features: Pencil, Brush, Eraser, Line, Rect, FillRect, ColorDialog, Trackbar, Statusbar, Save/Load BMP
+// Compile: see instructions above
+
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <commctrl.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <windowsx.h> // Erforderlich für GET_X_LPARAM und GET_Y_LPARAM
+
+#pragma comment(lib, "comctl32.lib")
+
+// IDs
+enum {
+    ID_TOOL_PENCIL = 1001,
+    ID_TOOL_BRUSH,
+    ID_TOOL_ERASER,
+    ID_TOOL_LINE,
+    ID_TOOL_RECT,
+    ID_TOOL_FILLRECT,
+    ID_COLOR_BUTTON,
+    ID_TRACKBAR,
+    ID_STATUS,
+    ID_MENU_FILE_NEW = 2001,
+    ID_MENU_FILE_OPEN,
+    ID_MENU_FILE_SAVE,
+    ID_MENU_FILE_EXIT
+};
+
+// Tools
+typedef enum {
+    TOOL_PENCIL = 0,
+    TOOL_BRUSH,
+    TOOL_ERASER,
+    TOOL_LINE,
+    TOOL_RECT,
+    TOOL_FILLRECT
+} TOOL;
+
+// Globals
+static HWND g_hMain = NULL;
+static HWND g_hCanvas = NULL;
+static HWND g_hToolbar = NULL;
+static HWND g_hColorBtn = NULL;
+static HWND g_hTrack = NULL;
+static HWND g_hStatus = NULL;
+
+static HBITMAP g_hBitmap = NULL;      // offscreen bitmap
+static int g_canvasW = 1024;
+static int g_canvasH = 768;
+
+static COLORREF g_color = RGB(0,0,0);
+static COLORREF g_bgcolor = RGB(255,255,255);
+static int g_brushSize = 4;
+static TOOL g_tool = TOOL_PENCIL;
+
+static bool g_drawing = false;
+static POINT g_lastPt;
+static POINT g_startPt;
+static POINT g_currPt;
+static bool g_preview = false;
+
+// Forward
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+LRESULT CALLBACK CanvasProc(HWND, UINT, WPARAM, LPARAM);
+void CreateUI(HWND);
+void EnsureBitmap();
+void DrawBitmapToDC(HDC, RECT*);
+void DrawPreview(HDC);
+void CommitLineOrRect(bool filled);
+void SaveBitmapToFile(HWND, const wchar_t*);
+void LoadBitmapFromFile(HWND, const wchar_t*);
+void UpdateStatusBar();
+
+// Helpers
+static void SafeDeleteBitmap() {
+    if (g_hBitmap) { DeleteObject(g_hBitmap); g_hBitmap = NULL; }
+}
+
+static void InitCommon() {
+    INITCOMMONCONTROLSEX ic;
+    ic.dwSize = sizeof(ic);
+    ic.dwICC = ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&ic);
+}
+
+// Create an empty DIB section bitmap for canvas
+void EnsureBitmap() {
+    if (g_hBitmap) return;
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = g_canvasW;
+    bmi.bmiHeader.biHeight = -g_canvasH; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    HDC hdc = GetDC(NULL);
+    void* bits = NULL;
+    g_hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, hdc);
+    if (g_hBitmap && bits) {
+        // fill with background color
+        DWORD* p = (DWORD*)bits;
+        DWORD bg = (DWORD)( (GetBValue(g_bgcolor) << 16) | (GetGValue(g_bgcolor) << 8) | GetRValue(g_bgcolor) );
+        for (int i = 0; i < g_canvasW * g_canvasH; ++i) p[i] = bg;
+    }
+}
+
+// Draw the offscreen bitmap to given DC
+void DrawBitmapToDC(HDC hdc, RECT* rc) {
+    EnsureBitmap();
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP old = (HBITMAP)SelectObject(mem, g_hBitmap);
+    BitBlt(hdc, 0, 0, g_canvasW, g_canvasH, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+}
+
+// Draw preview shape on top of canvas (called during WM_PAINT)
+void DrawPreview(HDC hdc) {
+    if (!g_preview) return;
+    HPEN hPen = CreatePen(PS_SOLID, g_brushSize, g_color);
+    HBRUSH hBrush = NULL;
+    if (g_tool == TOOL_FILLRECT) {
+        COLORREF semi = g_color;
+        // create semi-transparent brush by blending with white (GDI doesn't support alpha for brushes easily)
+        // We'll use a hatch brush as visual hint
+        hBrush = CreateHatchBrush(HS_DIAGCROSS, g_color);
+        SelectObject(hdc, hBrush);
+    } else {
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    }
+    HPEN oldPen = (HPEN)SelectObject(hdc, hPen);
+
+    if (g_tool == TOOL_LINE) {
+        MoveToEx(hdc, g_startPt.x, g_startPt.y, NULL);
+        LineTo(hdc, g_currPt.x, g_currPt.y);
+    } else if (g_tool == TOOL_RECT || g_tool == TOOL_FILLRECT) {
+        RECT r = { g_startPt.x, g_startPt.y, g_currPt.x, g_currPt.y };
+        NormalizeRect(&r);
+        if (g_tool == TOOL_FILLRECT) {
+            // filled
+            FillRect(hdc, &r, hBrush);
+            FrameRect(hdc, &r, CreateSolidBrush(g_color));
+        } else {
+            Rectangle(hdc, r.left, r.top, r.right, r.bottom);
+        }
+    }
+
+    SelectObject(hdc, oldPen);
+    DeleteObject(hPen);
+    if (hBrush) DeleteObject(hBrush);
+}
+
+// Commit line or rectangle into the offscreen bitmap
+void CommitLineOrRect(bool filled) {
+    EnsureBitmap();
+    HDC mem = CreateCompatibleDC(NULL);
+    HBITMAP old = (HBITMAP)SelectObject(mem, g_hBitmap);
+
+    HPEN hPen = CreatePen(PS_SOLID, g_brushSize, g_color);
+    HBRUSH hBrush = filled ? CreateSolidBrush(g_color) : (HBRUSH)GetStockObject(NULL_BRUSH);
+    HPEN oldPen = (HPEN)SelectObject(mem, hPen);
+    HBRUSH oldBrush = (HBRUSH)SelectObject(mem, hBrush);
+
+    if (g_tool == TOOL_LINE) {
+        MoveToEx(mem, g_startPt.x, g_startPt.y, NULL);
+        LineTo(mem, g_currPt.x, g_currPt.y);
+    } else if (g_tool == TOOL_RECT || g_tool == TOOL_FILLRECT) {
+        RECT r = { g_startPt.x, g_startPt.y, g_currPt.x, g_currPt.y };
+        NormalizeRect(&r);
+        if (filled) {
+            FillRect(mem, &r, hBrush);
+        } else {
+            Rectangle(mem, r.left, r.top, r.right, r.bottom);
+        }
+    }
+
+    SelectObject(mem, oldPen);
+    SelectObject(mem, oldBrush);
+    DeleteObject(hPen);
+    if (hBrush && filled) DeleteObject(hBrush);
+
+    SelectObject(mem, old);
+    DeleteDC(mem);
+}
+
+// Save HBITMAP (32bit) to BMP file (simple)
+void SaveBitmapToFile(HWND hwnd, const wchar_t* path) {
+    EnsureBitmap();
+    BITMAP bm;
+    HDC hdc = GetDC(hwnd);
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP old = (HBITMAP)SelectObject(mem, g_hBitmap);
+    GetObject(g_hBitmap, sizeof(bm), &bm);
+
+    BITMAPFILEHEADER bfh;
+    BITMAPINFOHEADER bih;
+    ZeroMemory(&bfh, sizeof(bfh));
+    ZeroMemory(&bih, sizeof(bih));
+
+    bih.biSize = sizeof(BITMAPINFOHEADER);
+    bih.biWidth = bm.bmWidth;
+    bih.biHeight = bm.bmHeight;
+    bih.biPlanes = 1;
+    bih.biBitCount = 32;
+    bih.biCompression = BI_RGB;
+    bih.biSizeImage = bm.bmWidth * bm.bmHeight * 4;
+
+    bfh.bfType = 0x4D42; // 'BM'
+    bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+    bfh.bfSize = bfh.bfOffBits + bih.biSizeImage;
+
+    FILE* f = _wfopen(path, L"wb");
+    if (!f) { MessageBox(hwnd, L"Datei konnte nicht geöffnet werden.", L"Fehler", MB_ICONERROR); goto end; }
+
+    fwrite(&bfh, sizeof(bfh), 1, f);
+    fwrite(&bih, sizeof(bih), 1, f);
+
+    // read pixels
+    BYTE* pixels = (BYTE*)malloc(bih.biSizeImage);
+    if (!pixels) { fclose(f); goto end; }
+    GetDIBits(mem, g_hBitmap, 0, bm.bmHeight, pixels, (BITMAPINFO*)&bih, DIB_RGB_COLORS);
+    fwrite(pixels, 1, bih.biSizeImage, f);
+    free(pixels);
+    fclose(f);
+
+end:
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    ReleaseDC(hwnd, hdc);
+}
+
+// Load BMP into HBITMAP (simple)
+void LoadBitmapFromFile(HWND hwnd, const wchar_t* path) {
+    FILE* f = _wfopen(path, L"rb");
+    if (!f) { MessageBox(hwnd, L"Datei konnte nicht geöffnet werden.", L"Fehler", MB_ICONERROR); return; }
+    BITMAPFILEHEADER bfh;
+    BITMAPINFOHEADER bih;
+    fread(&bfh, sizeof(bfh), 1, f);
+    fread(&bih, sizeof(bih), 1, f);
+    if (bfh.bfType != 0x4D42) { fclose(f); MessageBox(hwnd, L"Keine BMP Datei.", L"Fehler", MB_ICONERROR); return; }
+
+    int w = bih.biWidth;
+    int h = bih.biHeight;
+    int bpp = bih.biBitCount;
+    if (bpp != 24 && bpp != 32) {
+        fclose(f);
+        MessageBox(hwnd, L"Nur 24/32-bit BMP unterstützt.", L"Fehler", MB_ICONERROR);
+        return;
+    }
+
+    // allocate buffer
+    int rowBytes = ((w * bpp + 31) / 32) * 4;
+    BYTE* data = (BYTE*)malloc(rowBytes * h);
+    fseek(f, bfh.bfOffBits, SEEK_SET);
+    fread(data, 1, rowBytes * h, f);
+    fclose(f);
+
+    // create DIB section 32bit and copy pixels
+    SafeDeleteBitmap();
+    g_canvasW = w;
+    g_canvasH = h;
+    BITMAPINFO bmi;
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = g_canvasW;
+    bmi.bmiHeader.biHeight = -g_canvasH;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = NULL;
+    HDC hdc = GetDC(NULL);
+    g_hBitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(NULL, hdc);
+    if (!g_hBitmap || !bits) { free(data); MessageBox(hwnd, L"Fehler beim Erstellen des Bildes.", L"Fehler", MB_ICONERROR); return; }
+
+    // copy rows (BMP bottom-up if bih.biHeight positive)
+    for (int y = 0; y < h; ++y) {
+        BYTE* srcRow;
+        if (bih.biHeight > 0) srcRow = data + (h - 1 - y) * rowBytes;
+        else srcRow = data + y * rowBytes;
+        DWORD* dst = (DWORD*)bits + y * w;
+        for (int x = 0; x < w; ++x) {
+            BYTE b = srcRow[x * (bpp/8) + 0];
+            BYTE g = srcRow[x * (bpp/8) + 1];
+            BYTE r = srcRow[x * (bpp/8) + 2];
+            dst[x] = (r) | (g << 8) | (b << 16);
+        }
+    }
+    free(data);
+    // resize main window canvas area if needed
+    RECT rc;
+    GetClientRect(g_hMain, &rc);
+    InvalidateRect(g_hCanvas, NULL, TRUE);
+    UpdateWindow(g_hCanvas);
+}
+
+// Normalize rect helper
+void NormalizeRect(RECT* r) {
+    if (r->left > r->right) { int t = r->left; r->left = r->right; r->right = t; }
+    if (r->top > r->bottom) { int t = r->top; r->top = r->bottom; r->bottom = t; }
+}
+
+// Update statusbar text
+void UpdateStatusBar() {
+    wchar_t buf[256];
+    const wchar_t* toolname = L"";
+    switch (g_tool) {
+        case TOOL_PENCIL: toolname = L"Pencil"; break;
+        case TOOL_BRUSH: toolname = L"Brush"; break;
+        case TOOL_ERASER: toolname = L"Eraser"; break;
+        case TOOL_LINE: toolname = L"Line"; break;
+        case TOOL_RECT: toolname = L"Rect"; break;
+        case TOOL_FILLRECT: toolname = L"FillRect"; break;
+    }
+    swprintf(buf, 256, L"Tool: %s    Brush: %d    Color: #%02X%02X%02X", toolname, g_brushSize, GetRValue(g_color), GetGValue(g_color), GetBValue(g_color));
+    SendMessage(g_hStatus, SB_SETTEXT, 0, (LPARAM)buf);
+}
+
+// Create UI controls (toolbar as simple buttons, color button, trackbar, statusbar)
+void CreateUI(HWND hwnd) {
+    // Toolbar area: create simple buttons for tools
+    int x = 10, y = 10, w = 80, h = 28, gap = 6;
+    g_hToolbar = CreateWindowEx(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, NULL, NULL, NULL);
+
+    HWND b;
+    b = CreateWindowEx(0, L"BUTTON", L"Pencil", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_PENCIL, NULL, NULL);
+    x += w + gap;
+    b = CreateWindowEx(0, L"BUTTON", L"Brush", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_BRUSH, NULL, NULL);
+    x = 10; y += h + gap;
+    b = CreateWindowEx(0, L"BUTTON", L"Eraser", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_ERASER, NULL, NULL);
+    x += w + gap;
+    b = CreateWindowEx(0, L"BUTTON", L"Line", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_LINE, NULL, NULL);
+    x = 10; y += h + gap;
+    b = CreateWindowEx(0, L"BUTTON", L"Rect", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_RECT, NULL, NULL);
+    x += w + gap;
+    b = CreateWindowEx(0, L"BUTTON", L"FillRect", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, x, y, w, h, hwnd, (HMENU)ID_TOOL_FILLRECT, NULL, NULL);
+
+    // Color button
+    g_hColorBtn = CreateWindowEx(0, L"BUTTON", L"Color...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 10, y + h + 12, 120, 28, hwnd, (HMENU)ID_COLOR_BUTTON, NULL, NULL);
+
+    // Trackbar for brush size
+    g_hTrack = CreateWindowEx(0, TRACKBAR_CLASS, NULL, WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS, 10, y + h + 48, 200, 40, hwnd, (HMENU)ID_TRACKBAR, NULL, NULL);
+    SendMessage(g_hTrack, TBM_SETRANGE, TRUE, MAKELONG(1, 50));
+    SendMessage(g_hTrack, TBM_SETPOS, TRUE, g_brushSize);
+
+    // Status bar
+    g_hStatus = CreateWindowEx(0, STATUSCLASSNAME, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, (HMENU)ID_STATUS, NULL, NULL);
+    UpdateStatusBar();
+}
+
+// Canvas window procedure
+LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        DrawBitmapToDC(hdc, &rc);
+        // draw preview on top
+        DrawPreview(hdc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+        g_drawing = true;
+        g_lastPt.x = x; g_lastPt.y = y;
+        g_startPt = g_lastPt;
+        g_currPt = g_lastPt;
+        if (g_tool == TOOL_PENCIL || g_tool == TOOL_BRUSH || g_tool == TOOL_ERASER) {
+            // draw initial point into bitmap
+            EnsureBitmap();
+            HDC mem = CreateCompatibleDC(NULL);
+            HBITMAP old = (HBITMAP)SelectObject(mem, g_hBitmap);
+            HPEN pen;
+            if (g_tool == TOOL_ERASER) pen = CreatePen(PS_SOLID, g_brushSize, g_bgcolor);
+            else pen = CreatePen(PS_SOLID, g_brushSize, g_color);
+            HPEN oldPen = (HPEN)SelectObject(mem, pen);
+            MoveToEx(mem, g_lastPt.x, g_lastPt.y, NULL);
+            LineTo(mem, g_lastPt.x+1, g_lastPt.y+1);
+            SelectObject(mem, oldPen);
+            DeleteObject(pen);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            // shape tools: enable preview
+            g_preview = true;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        SetCapture(hwnd);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+        if (!g_drawing) return 0;
+        if (g_tool == TOOL_PENCIL || g_tool == TOOL_BRUSH || g_tool == TOOL_ERASER) {
+            EnsureBitmap();
+            HDC mem = CreateCompatibleDC(NULL);
+            HBITMAP old = (HBITMAP)SelectObject(mem, g_hBitmap);
+            HPEN pen;
+            if (g_tool == TOOL_ERASER) pen = CreatePen(PS_SOLID, g_brushSize, g_bgcolor);
+            else pen = CreatePen(PS_SOLID, g_brushSize, g_color);
+            HPEN oldPen = (HPEN)SelectObject(mem, pen);
+            MoveToEx(mem, g_lastPt.x, g_lastPt.y, NULL);
+            LineTo(mem, x, y);
+            SelectObject(mem, oldPen);
+            DeleteObject(pen);
+            SelectObject(mem, old);
+            DeleteDC(mem);
+            g_lastPt.x = x; g_lastPt.y = y;
+            InvalidateRect(hwnd, NULL, FALSE);
+        } else {
+            // update preview end point
+            g_currPt.x = x; g_currPt.y = y;
+            // if shift pressed, constrain
+            if (GetKeyState(VK_SHIFT) & 0x8000) {
+                int dx = g_currPt.x - g_startPt.x;
+                int dy = g_currPt.y - g_startPt.y;
+                if (abs(dx) > abs(dy)) g_currPt.y = g_startPt.y;
+                else if (abs(dy) > abs(dx)) g_currPt.x = g_startPt.x;
+                else {
+                    // diagonal
+                    int s = (dx >= 0) ? 1 : -1;
+                    g_currPt.x = g_startPt.x + s * abs(dy);
+                }
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (!g_drawing) return 0;
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+        g_drawing = false;
+        ReleaseCapture();
+        if (g_tool == TOOL_PENCIL || g_tool == TOOL_BRUSH || g_tool == TOOL_ERASER) {
+            // already drawn
+        } else {
+            g_currPt.x = x; g_currPt.y = y;
+            // commit shape
+            if (g_tool == TOOL_LINE) CommitLineOrRect(false);
+            else if (g_tool == TOOL_RECT) CommitLineOrRect(false);
+            else if (g_tool == TOOL_FILLRECT) CommitLineOrRect(true);
+            g_preview = false;
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+    case WM_SIZE:
+        InvalidateRect(hwnd, NULL, TRUE);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// Main window proc
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        InitCommon();
+        CreateUI(hwnd);
+        // create canvas child
+        g_hCanvas = CreateWindowEx(0, L"STATIC", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER, 0, 0, g_canvasW, g_canvasH, hwnd, NULL, NULL, NULL);
+        SetWindowLongPtr(g_hCanvas, GWLP_WNDPROC, (LONG_PTR)CanvasProc);
+        EnsureBitmap();
+        UpdateStatusBar();
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        switch (id) {
+        case ID_TOOL_PENCIL: g_tool = TOOL_PENCIL; UpdateStatusBar(); break;
+        case ID_TOOL_BRUSH: g_tool = TOOL_BRUSH; UpdateStatusBar(); break;
+        case ID_TOOL_ERASER: g_tool = TOOL_ERASER; UpdateStatusBar(); break;
+        case ID_TOOL_LINE: g_tool = TOOL_LINE; UpdateStatusBar(); break;
+        case ID_TOOL_RECT: g_tool = TOOL_RECT; UpdateStatusBar(); break;
+        case ID_TOOL_FILLRECT: g_tool = TOOL_FILLRECT; UpdateStatusBar(); break;
+        case ID_COLOR_BUTTON: {
+            CHOOSECOLOR cc;
+            static COLORREF cust[16];
+            ZeroMemory(&cc, sizeof(cc));
+            cc.lStructSize = sizeof(cc);
+            cc.hwndOwner = hwnd;
+            cc.lpCustColors = cust;
+            cc.rgbResult = g_color;
+            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+            if (ChooseColor(&cc)) {
+                g_color = cc.rgbResult;
+                UpdateStatusBar();
+            }
+            break;
+        }
+        case ID_TRACKBAR: {
+            if (HIWORD(wParam) == TB_THUMBPOSITION || HIWORD(wParam) == TB_THUMBTRACK || HIWORD(wParam) == TB_ENDTRACK) {
+                g_brushSize = (int)SendMessage(g_hTrack, TBM_GETPOS, 0, 0);
+                UpdateStatusBar();
+            }
+            break;
+        }
+        case ID_MENU_FILE_NEW: {
+            SafeDeleteBitmap();
+            EnsureBitmap();
+            InvalidateRect(g_hCanvas, NULL, TRUE);
+            break;
+        }
+        case ID_MENU_FILE_SAVE: {
+            wchar_t path[MAX_PATH] = L"";
+            OPENFILENAME ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"BMP Files\0*.bmp\0All Files\0*.*\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_OVERWRITEPROMPT;
+            if (GetSaveFileName(&ofn)) {
+                SaveBitmapToFile(hwnd, path);
+            }
+            break;
+        }
+        case ID_MENU_FILE_OPEN: {
+            wchar_t path[MAX_PATH] = L"";
+            OPENFILENAME ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = L"BMP Files\0*.bmp\0All Files\0*.*\0";
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = MAX_PATH;
+            if (GetOpenFileName(&ofn)) {
+                LoadBitmapFromFile(hwnd, path);
+            }
+            break;
+        }
+        case ID_MENU_FILE_EXIT:
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+            break;
+        }
+        return 0;
+    }
+    case WM_CREATE: break;
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        // position canvas to left, toolbar controls remain absolute
+        MoveWindow(g_hCanvas, 0, 0, rc.right - 220, rc.bottom - 20, TRUE);
+        // status bar
+        SendMessage(g_hStatus, WM_SIZE, 0, 0);
+        return 0;
+    }
+    case WM_DESTROY:
+        SafeDeleteBitmap();
+        PostQuitMessage(0);
+        return 0;
+    case WM_INITMENUPOPUP:
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+// WinMain
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR pCmdLine, int nCmdShow) {
+    WNDCLASS wc = {0};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"WinPaintClass";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
+    RegisterClass(&wc);
+
+    // create main window
+    g_hMain = CreateWindowEx(0, wc.lpszClassName, L"WinPaint (GDI, ComCtl32) - C", WS_OVERLAPPEDWINDOW,
+                             CW_USEDEFAULT, CW_USEDEFAULT, 1200, 800, NULL, NULL, hInstance, NULL);
+
+    // create menu
+    HMENU hMenu = CreateMenu();
+    HMENU hFile = CreatePopupMenu();
+    AppendMenu(hFile, MF_STRING, ID_MENU_FILE_NEW, L"&New");
+    AppendMenu(hFile, MF_STRING, ID_MENU_FILE_OPEN, L"&Open...");
+    AppendMenu(hFile, MF_STRING, ID_MENU_FILE_SAVE, L"&Save...");
+    AppendMenu(hFile, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hFile, MF_STRING, ID_MENU_FILE_EXIT, L"E&xit");
+    AppendMenu(hMenu, MF_POPUP, (UINT_PTR)hFile, L"&File");
+    SetMenu(g_hMain, hMenu);
+
+    ShowWindow(g_hMain, nCmdShow);
+    UpdateWindow(g_hMain);
+
+    // message loop
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    return 0;
+}

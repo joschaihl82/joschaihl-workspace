@@ -1,0 +1,521 @@
+/*
+ * auto_mount_ext4_deleted_scan.c
+ *
+ * Behavior:
+ *  - Given a block device or image path, determine if it is already mounted by
+ *    scanning /proc/mounts. If mounted, use that mountpoint.
+ *  - If not mounted, create a temporary mountpoint under /tmp and mount the
+ *    device read-only using mount(2) with safe flags.
+ *  - Run an ext4 raw scanner (direct blocks only) to collect directory entries,
+ *    reconstruct paths and print only those paths for which lstat(mountroot+path)
+ *    returns ENOENT (i.e., the file is missing from the mounted tree).
+ *  - If the program mounted the device, it will unmount and remove the temp dir.
+ *
+ * Limitations:
+ *  - ext4 parsing handles direct data blocks only (no extents/indirect/indexed dirs).
+ *  - The program must be run as root to mount block devices and read raw devices.
+ *
+ * Build:
+ *   gcc -O2 -o auto_mount_ext4_deleted_scan auto_mount_ext4_deleted_scan.c
+ *
+ * Usage:
+ *   sudo ./auto_mount_ext4_deleted_scan /dev/sdXN
+ *
+ * Note: Always operate on a copy of a device when performing recovery work.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/wait.h>
+#include <limits.h>
+#include <dirent.h>
+
+#define EXT4_SUPER_OFFSET 1024
+#define EXT4_NAME_LEN 255
+
+/* Minimal ext4 on-disk structures (packed) */
+struct ext4_super {
+    uint32_t s_inodes_count;
+    uint32_t s_blocks_count_lo;
+    uint32_t s_r_blocks_count_lo;
+    uint32_t s_free_blocks_count_lo;
+    uint32_t s_free_inodes_count;
+    uint32_t s_first_data_block;
+    uint32_t s_log_block_size;
+    uint32_t s_log_cluster_size;
+    uint32_t s_blocks_per_group;
+    uint32_t s_clusters_per_group;
+    uint32_t s_inodes_per_group;
+    uint32_t s_mtime;
+    uint32_t s_wtime;
+    uint16_t s_mnt_count;
+    uint16_t s_max_mnt_count;
+    uint16_t s_magic;
+    uint16_t s_state;
+    uint16_t s_errors;
+    uint16_t s_minor_rev_level;
+    uint32_t s_lastcheck;
+    uint32_t s_checkinterval;
+    uint32_t s_creator_os;
+    uint32_t s_rev_level;
+    uint16_t s_def_resuid;
+    uint16_t s_def_resgid;
+    uint32_t s_first_ino;
+    uint16_t s_inode_size;
+    uint16_t s_block_group_nr;
+    uint32_t s_feature_compat;
+    uint32_t s_feature_incompat;
+    uint32_t s_feature_ro_compat;
+    uint8_t  s_uuid[16];
+    char     s_volume_name[16];
+    char     s_last_mounted[64];
+} __attribute__((packed));
+
+struct ext4_group_desc {
+    uint32_t bg_block_bitmap_lo;
+    uint32_t bg_inode_bitmap_lo;
+    uint32_t bg_inode_table_lo;
+    uint16_t bg_free_blocks_count_lo;
+    uint16_t bg_free_inodes_count_lo;
+    uint16_t bg_used_dirs_count_lo;
+    uint16_t bg_flags;
+    uint32_t bg_exclude_bitmap_lo;
+    uint16_t bg_block_bitmap_csum_lo;
+    uint16_t bg_inode_bitmap_csum_lo;
+    uint16_t bg_itable_unused;
+    uint16_t bg_checksum;
+} __attribute__((packed));
+
+struct ext4_inode {
+    uint16_t i_mode;
+    uint16_t i_uid;
+    uint32_t i_size_lo;
+    uint32_t i_atime;
+    uint32_t i_ctime;
+    uint32_t i_mtime;
+    uint32_t i_dtime;
+    uint16_t i_gid;
+    uint16_t i_links_count;
+    uint32_t i_blocks_lo;
+    uint32_t i_flags;
+    uint32_t i_osd1;
+    uint32_t i_block[15];
+    uint32_t i_generation;
+    uint32_t i_file_acl_lo;
+    uint32_t i_size_high;
+    uint32_t i_obso_faddr;
+    uint8_t  i_osd2[12];
+} __attribute__((packed));
+
+struct ext2_dir_entry {
+    uint32_t inode;
+    uint16_t rec_len;
+    uint8_t  name_len;
+    uint8_t  file_type;
+    char     name[]; /* not NUL-terminated */
+} __attribute__((packed));
+
+/* helpers */
+static ssize_t pread_all(int fd, void *buf, size_t count, off_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pread(fd, (char*)buf + done, count - done, offset + done);
+        if (r < 0) return -1;
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+static uint16_t le16(const void *p) {
+    const uint8_t *b = p;
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static uint32_t le32(const void *p) {
+    const uint8_t *b = p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+/* Data structures to hold directory entries and parent links */
+struct dir_entry {
+    uint32_t parent_inode;
+    uint32_t child_inode;
+    char name[EXT4_NAME_LEN + 1];
+};
+
+struct dir_entry_list {
+    struct dir_entry *items;
+    size_t used;
+    size_t cap;
+};
+
+static void de_list_init(struct dir_entry_list *l) {
+    l->items = NULL; l->used = 0; l->cap = 0;
+}
+static void de_list_free(struct dir_entry_list *l) {
+    free(l->items); l->items = NULL; l->used = l->cap = 0;
+}
+static int de_list_add(struct dir_entry_list *l, uint32_t parent, uint32_t child, const char *name) {
+    if (l->used == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 4096;
+        struct dir_entry *n = realloc(l->items, ncap * sizeof(*n));
+        if (!n) return -1;
+        l->items = n; l->cap = ncap;
+    }
+    l->items[l->used].parent_inode = parent;
+    l->items[l->used].child_inode = child;
+    strncpy(l->items[l->used].name, name, EXT4_NAME_LEN);
+    l->items[l->used].name[EXT4_NAME_LEN] = '\0';
+    l->used++;
+    return 0;
+}
+
+/* Find name for child inode under given parent (linear search) */
+static const char *find_name_under_parent(struct dir_entry_list *l, uint32_t parent, uint32_t child) {
+    for (size_t i = 0; i < l->used; ++i) {
+        if (l->items[i].parent_inode == parent && l->items[i].child_inode == child) {
+            return l->items[i].name;
+        }
+    }
+    return NULL;
+}
+
+/* Reconstruct full path for an entry (parent_inode, child_inode, name) */
+static char *reconstruct_path(struct dir_entry_list *l, uint32_t parent, uint32_t child, const char *name) {
+    size_t comps_cap = 16;
+    size_t comps_len = 0;
+    char **comps = malloc(comps_cap * sizeof(char*));
+    if (!comps) return NULL;
+
+    comps[comps_len++] = strdup(name);
+    uint32_t cur_dir = parent;
+    const uint32_t ROOT_INO = 2;
+
+    while (cur_dir != 0 && cur_dir != ROOT_INO) {
+        uint32_t parent_of_cur = 0;
+        for (size_t i = 0; i < l->used; ++i) {
+            if (l->items[i].parent_inode == cur_dir && strcmp(l->items[i].name, "..") == 0) {
+                parent_of_cur = l->items[i].child_inode;
+                break;
+            }
+        }
+        if (parent_of_cur == 0) break;
+
+        const char *dir_name = find_name_under_parent(l, parent_of_cur, cur_dir);
+        char *tofree = NULL;
+        if (!dir_name) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "[inode:%u]", cur_dir);
+            tofree = strdup(tmp);
+            if (!tofree) break;
+            dir_name = tofree;
+        }
+
+        if (comps_len == comps_cap) {
+            comps_cap *= 2;
+            char **n = realloc(comps, comps_cap * sizeof(char*));
+            if (!n) { free(tofree); break; }
+            comps = n;
+        }
+        comps[comps_len++] = strdup(dir_name);
+        if (tofree) free(tofree);
+        cur_dir = parent_of_cur;
+    }
+
+    /* join components in reverse */
+    size_t total_len = 1;
+    for (size_t i = 0; i < comps_len; ++i) total_len += strlen(comps[i]) + 1;
+    char *path = malloc(total_len + 1);
+    if (!path) {
+        for (size_t i = 0; i < comps_len; ++i) free(comps[i]);
+        free(comps);
+        return NULL;
+    }
+    char *p = path;
+    *p++ = '/';
+    *p = '\0';
+    for (size_t i = 0; i < comps_len; ++i) {
+        const char *comp = comps[comps_len - 1 - i];
+        size_t l = strlen(comp);
+        memcpy(p, comp, l);
+        p += l;
+        if (i + 1 < comps_len) *p++ = '/';
+        *p = '\0';
+    }
+
+    for (size_t i = 0; i < comps_len; ++i) free(comps[i]);
+    free(comps);
+    return path;
+}
+
+/* ext4 scanner that fills dir_entry_list */
+static void scan_ext4_collect(int fd, struct dir_entry_list *list) {
+    struct ext4_super sb;
+    if (pread_all(fd, &sb, sizeof(sb), EXT4_SUPER_OFFSET) != sizeof(sb)) {
+        fprintf(stderr, "Failed to read ext4 superblock: %s\n", strerror(errno));
+        return;
+    }
+    if (le16(&sb.s_magic) != 0xEF53) {
+        fprintf(stderr, "No ext filesystem magic found\n");
+        return;
+    }
+
+    uint32_t inodes_count = le32(&sb.s_inodes_count);
+    uint32_t inodes_per_group = le32(&sb.s_inodes_per_group);
+    uint16_t inode_size = le16(&sb.s_inode_size);
+    if (inode_size == 0) inode_size = 128;
+    uint32_t log_block = le32(&sb.s_log_block_size);
+    uint32_t block_size = 1024U << log_block;
+
+    fprintf(stderr, "EXT4 detected: inodes=%u inodes_per_group=%u inode_size=%u block_size=%u\n",
+           inodes_count, inodes_per_group, inode_size, block_size);
+
+    off_t gd_table_off = (block_size == 1024) ? (2 * block_size) : block_size;
+
+    uint32_t blocks_count = le32(&sb.s_blocks_count_lo);
+    uint32_t blocks_per_group = le32(&sb.s_blocks_per_group);
+    uint32_t groups_count = (blocks_count + blocks_per_group - 1) / blocks_per_group;
+    if (groups_count == 0) groups_count = (inodes_count + inodes_per_group - 1) / inodes_per_group;
+
+    size_t gd_size = sizeof(struct ext4_group_desc);
+    size_t gdt_bytes = groups_count * gd_size;
+    uint8_t *gdt = malloc(gdt_bytes);
+    if (!gdt) {
+        fprintf(stderr, "OOM reading group descriptors\n");
+        return;
+    }
+    if (pread_all(fd, gdt, gdt_bytes, gd_table_off) < 0) {
+        if (pread_all(fd, gdt, gd_size, gd_table_off) < 0) {
+            free(gdt);
+            fprintf(stderr, "Failed to read group descriptor(s)\n");
+            return;
+        }
+        groups_count = 1;
+    }
+
+    for (uint32_t g = 0; g < groups_count; ++g) {
+        struct ext4_group_desc *gd = (struct ext4_group_desc *)(gdt + g * gd_size);
+        uint32_t itable_lo = le32(&gd->bg_inode_table_lo);
+        if (itable_lo == 0) continue;
+        off_t inode_table_off = (off_t)itable_lo * block_size;
+
+        uint32_t start_inode = g * inodes_per_group + 1;
+        uint32_t inodes_in_group = inodes_per_group;
+        if (start_inode + inodes_in_group - 1 > inodes_count)
+            inodes_in_group = inodes_count - (start_inode - 1);
+
+        for (uint32_t i = 0; i < inodes_in_group; ++i) {
+            off_t inode_off = inode_table_off + (off_t)i * inode_size;
+            uint8_t *inode_buf = malloc(inode_size);
+            if (!inode_buf) continue;
+            if (pread_all(fd, inode_buf, inode_size, inode_off) != (ssize_t)inode_size) {
+                free(inode_buf);
+                continue;
+            }
+            struct ext4_inode inode;
+            memcpy(&inode, inode_buf, sizeof(struct ext4_inode) < inode_size ? sizeof(struct ext4_inode) : inode_size);
+            free(inode_buf);
+
+            uint16_t mode = le16(&inode.i_mode);
+            uint32_t this_inode_no = start_inode + i;
+            if ((mode & 0xF000) == 0x4000) { /* directory */
+                for (int bi = 0; bi < 12; ++bi) {
+                    uint32_t blk = le32(&inode.i_block[bi]);
+                    if (blk == 0) continue;
+                    off_t block_off = (off_t)blk * block_size;
+                    uint8_t *block = malloc(block_size);
+                    if (!block) continue;
+                    if (pread_all(fd, block, block_size, block_off) != (ssize_t)block_size) {
+                        free(block);
+                        continue;
+                    }
+                    uint32_t pos = 0;
+                    while (pos + sizeof(struct ext2_dir_entry) < block_size) {
+                        struct ext2_dir_entry *de = (struct ext2_dir_entry *)(block + pos);
+                        uint32_t inode_no = le32(&de->inode);
+                        uint16_t rec_len = le16(&de->rec_len);
+                        uint8_t name_len = de->name_len;
+                        if (rec_len == 0) break;
+                        if (inode_no != 0 && name_len > 0 && name_len <= EXT4_NAME_LEN && pos + rec_len <= block_size) {
+                            char name[EXT4_NAME_LEN + 1];
+                            if (name_len > EXT4_NAME_LEN) name_len = EXT4_NAME_LEN;
+                            memcpy(name, de->name, name_len);
+                            name[name_len] = '\0';
+                            if (de_list_add(list, this_inode_no, inode_no, name) != 0) {
+                                /* ignore on OOM */
+                            }
+                        }
+                        pos += rec_len;
+                    }
+                    free(block);
+                }
+            }
+        }
+    }
+
+    free(gdt);
+}
+
+/* Build full path and check lstat against mounted root; print only if lstat fails with ENOENT */
+static void print_deleted_only(struct dir_entry_list *list, const char *mountroot) {
+    if (!mountroot) return;
+    size_t mountroot_len = strlen(mountroot);
+    int need_slash = (mountroot_len == 0 || mountroot[mountroot_len - 1] != '/');
+
+    for (size_t i = 0; i < list->used; ++i) {
+        const char *name = list->items[i].name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+        uint32_t parent = list->items[i].parent_inode;
+        uint32_t child = list->items[i].child_inode;
+        char *relpath = reconstruct_path(list, parent, child, name);
+        if (!relpath) continue;
+
+        /* build full path: mountroot + relpath */
+        size_t full_len = mountroot_len + (need_slash ? 1 : 0) + strlen(relpath) + 1;
+        char *full = malloc(full_len);
+        if (!full) { free(relpath); continue; }
+        strcpy(full, mountroot);
+        if (need_slash) strcat(full, "/");
+        if (relpath[0] == '/') strcat(full, relpath + 1); else strcat(full, relpath);
+
+        struct stat st;
+        if (lstat(full, &st) == -1) {
+            if (errno == ENOENT) {
+                printf("%s\n", relpath);
+            }
+        }
+        free(full);
+        free(relpath);
+    }
+}
+
+/* Check /proc/mounts for an existing mountpoint for 'device' */
+static int find_existing_mountpoint(const char *device, char *out_mount, size_t out_len) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return -1;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        /* format: device mountpoint fstype options ... */
+        char dev[PATH_MAX], mnt[PATH_MAX], fstype[64], opts[256];
+        if (sscanf(line, "%4095s %4095s %63s %255s", dev, mnt, fstype, opts) >= 2) {
+            if (strcmp(dev, device) == 0) {
+                strncpy(out_mount, mnt, out_len - 1);
+                out_mount[out_len - 1] = '\0';
+                fclose(f);
+                return 0;
+            }
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
+/* Create a temporary mountpoint under /tmp and mount the device read-only.
+ * Returns 0 on success, mountpoint is written to out_mount.
+ * If already_mounted is non-NULL and set to 1, caller must not unmount.
+ */
+static int mount_device_ro(const char *device, char *out_mount, size_t out_len, int *mounted_by_us) {
+    /* First check if device is already mounted */
+    if (find_existing_mountpoint(device, out_mount, out_len) == 0) {
+        if (mounted_by_us) *mounted_by_us = 0;
+        return 0;
+    }
+
+    /* Create temporary directory */
+    char tmpl[] = "/tmp/scanmnt.XXXXXX";
+    char *tmp = mkdtemp(tmpl);
+    if (!tmp) {
+        fprintf(stderr, "mkdtemp failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    /* Try mounting with generic "auto" type first; many kernels accept NULL fs type but mount(2) requires a string */
+    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_DIRSYNC;
+    int rc = mount(device, tmp, "auto", flags, NULL);
+    if (rc != 0) {
+        /* fallback to ext4 explicitly */
+        rc = mount(device, tmp, "ext4", flags, NULL);
+        if (rc != 0) {
+            /* cleanup and return error */
+            int saved = errno;
+            rmdir(tmp);
+            fprintf(stderr, "mount failed: %s\n", strerror(saved));
+            return -1;
+        }
+    }
+
+    strncpy(out_mount, tmp, out_len - 1);
+    out_mount[out_len - 1] = '\0';
+    if (mounted_by_us) *mounted_by_us = 1;
+    return 0;
+}
+
+/* Unmount and remove mountpoint if we mounted it */
+static void unmount_and_cleanup(const char *mountpoint) {
+    if (!mountpoint || mountpoint[0] == '\0') return;
+    /* Try lazy unmount first */
+    if (umount2(mountpoint, MNT_DETACH) != 0) {
+        /* fallback to regular unmount */
+        umount2(mountpoint, 0);
+    }
+    /* remove directory if empty */
+    rmdir(mountpoint);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <device-or-image>\n", argv[0]);
+        return 1;
+    }
+    const char *device = argv[1];
+
+    if (geteuid() != 0) {
+        fprintf(stderr, "This program requires root privileges to mount devices and read raw images.\n");
+        return 1;
+    }
+
+    char mountpoint[PATH_MAX] = {0};
+    int mounted_by_us = 0;
+    if (mount_device_ro(device, mountpoint, sizeof(mountpoint), &mounted_by_us) != 0) {
+        fprintf(stderr, "Failed to find or create a mountpoint for %s\n", device);
+        return 2;
+    }
+
+    fprintf(stderr, "Using mountpoint: %s (mounted_by_us=%d)\n", mountpoint, mounted_by_us);
+
+    /* Open raw device for ext4 scanning */
+    int fd = open(device, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to open %s: %s\n", device, strerror(errno));
+        if (mounted_by_us) unmount_and_cleanup(mountpoint);
+        return 3;
+    }
+
+    struct dir_entry_list list;
+    de_list_init(&list);
+    scan_ext4_collect(fd, &list);
+
+    if (list.used == 0) {
+        fprintf(stderr, "No ext4 directory entries collected (or unsupported layout).\n");
+    } else {
+        print_deleted_only(&list, mountpoint);
+    }
+
+    de_list_free(&list);
+    close(fd);
+
+    if (mounted_by_us) {
+        unmount_and_cleanup(mountpoint);
+    }
+
+    return 0;
+}

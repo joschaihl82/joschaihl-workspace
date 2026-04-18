@@ -1,0 +1,108 @@
+// exectrace1.c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Josh + Copilot");
+MODULE_DESCRIPTION("Trace executed binaries and print resolved full path using sched_process_exec tracepoint");
+MODULE_VERSION("0.5");
+
+/*
+ * This module registers a probe for the sched_process_exec tracepoint.
+ * Some kernels export register_trace_sched_process_exec/unregister_trace_sched_process_exec,
+ * but others do not. To be portable, use tracepoint_probe_register/unregister
+ * which register a probe by tracepoint name.
+ */
+
+/* Define a ratelimit state in a portable way */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+/* Tracepoint probe */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+    char *buf = NULL;
+    char *path = NULL;
+
+    if (!p || !bprm)
+        return;
+
+    /* Rate-limit logging to avoid flooding the kernel log */
+    if (!__ratelimit(&exectrace_rl))
+        return;
+
+    /* If the kernel has opened the file for the new executable, try to resolve its full path */
+    if (bprm->file) {
+        struct path fpath;
+
+        /* copy the path structure to avoid races and take a reference */
+        fpath = bprm->file->f_path;
+        path_get(&fpath);
+
+        buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!buf) {
+            path_put(&fpath);
+            pr_info("exectrace: pid=%d comm=%s filename=%s (no mem for path)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+            return;
+        }
+
+        path = d_path(&fpath, buf, PATH_MAX);
+        if (IS_ERR(path)) {
+            pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+        } else {
+            pr_info("exectrace: pid=%d comm=%s path=%s\n",
+                p->pid, p->comm, path);
+        }
+
+        kfree(buf);
+        path_put(&fpath);
+    } else {
+        /* Fall back to bprm->filename when file pointer is not available */
+        pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+            p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+    }
+}
+
+/* Use tracepoint_probe_register/unregister for portability */
+static int tp_ret;
+
+static int __init exectrace_init(void)
+{
+    /* Register probe by tracepoint name */
+    tp_ret = tracepoint_probe_register("sched_process_exec",
+                                       (void *)probe_sched_process_exec,
+                                       NULL);
+    if (tp_ret) {
+        pr_err("exectrace: failed to register tracepoint probe (ret=%d)\n", tp_ret);
+        return tp_ret;
+    }
+
+    pr_info("exectrace: module loaded, tracing exec paths\n");
+    return 0;
+}
+
+static void __exit exectrace_exit(void)
+{
+    if (tp_ret == 0)
+        tracepoint_probe_unregister("sched_process_exec",
+                                    (void *)probe_sched_process_exec,
+                                    NULL);
+    pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);

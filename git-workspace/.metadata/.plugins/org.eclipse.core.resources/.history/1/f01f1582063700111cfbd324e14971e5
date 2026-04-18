@@ -1,0 +1,337 @@
+// gitpush.cpp
+// Qt6 + libgit2 single-file tool "gitpush"
+// Build: see CMakeLists.txt above
+// Usage:
+//   ./gitpush /pfad/zum/verzeichnis --user GitHubUser --token DeinToken [--private]
+
+#include <QCoreApplication>
+#include <QCommandLineParser>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QEventLoop>
+#include <QTimer>
+#include <QDirIterator>
+#include <QFileInfo>
+#include <QDebug>
+
+#include <git2.h>
+#include <cstring>
+
+// --- Hilfsfunktionen für HTTP POST (synchron) ---
+static bool postJsonSync(QNetworkAccessManager &mgr, const QUrl &url, const QByteArray &json,
+                         const QByteArray &authHeader, int timeoutMs, int &httpStatus, QByteArray &responseBody)
+{
+    QNetworkRequest req(url);
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    if (!authHeader.isEmpty()) req.setRawHeader("Authorization", authHeader);
+    QNetworkReply *reply = mgr.post(req, json);
+    QEventLoop loop;
+    QTimer timer;
+    timer.setSingleShot(true);
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(&timer, &QTimer::timeout, &loop, &QEventLoop::quit);
+    timer.start(timeoutMs);
+    loop.exec();
+    if (!timer.isActive()) {
+        // timeout
+        reply->abort();
+        responseBody = reply->readAll();
+        httpStatus = 0;
+        reply->deleteLater();
+        return false;
+    }
+    responseBody = reply->readAll();
+    QVariant status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+    httpStatus = status.isValid() ? status.toInt() : 0;
+    reply->deleteLater();
+    return (httpStatus >= 200 && httpStatus < 300);
+}
+
+// --- libgit2 Credentials Callback ---
+// Für HTTPS: wir liefern username "x-access-token" und das PAT als Passwort.
+// libgit2 ruft diese Callback auf, wenn Authentifizierung benötigt wird.
+struct CredContext {
+    QByteArray token;
+};
+
+static int credentials_cb(git_cred **out,
+                          const char *url,
+                          const char *username_from_url,
+                          unsigned int allowed_types,
+                          void *payload)
+{
+    Q_UNUSED(url);
+    Q_UNUSED(username_from_url);
+    CredContext *ctx = static_cast<CredContext*>(payload);
+
+    // Wenn der Server USERPASS_PLAINTEXT erlaubt, geben wir token als Passwort zurück.
+    if (allowed_types & GIT_CREDTYPE_USERPASS_PLAINTEXT) {
+        // GitHub akzeptiert "x-access-token" als username mit PAT als password.
+        const char *user = "x-access-token";
+        const char *pass = ctx->token.constData();
+        return git_cred_userpass_plaintext_new(out, user, pass);
+    }
+
+    // Fallback: keine passenden Credentials
+    return GIT_PASSTHROUGH;
+}
+
+// --- Hilfsfunktion: rekursiv Dateien zum Index hinzufügen ---
+static int addDirectoryToIndex(git_repository *repo, const QString &dirPath)
+{
+    git_index *index = nullptr;
+    int error = git_repository_index(&index, repo);
+    if (error) return error;
+
+    QDirIterator it(dirPath, QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                   QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        QString filePath = it.next();
+        // Pfad relativ zum Repo-Root
+        QString rel = QDir(dirPath).relativeFilePath(filePath);
+        QByteArray relUtf8 = rel.toUtf8();
+        error = git_index_add_bypath(index, relUtf8.constData());
+        if (error) {
+            git_index_free(index);
+            return error;
+        }
+    }
+
+    error = git_index_write(index);
+    git_index_free(index);
+    return error;
+}
+
+// --- Commit erstellen aus Index ---
+static int createCommitIfNeeded(git_repository *repo, const char *message, git_oid *out_commit_oid)
+{
+    int error = 0;
+    git_index *index = nullptr;
+    error = git_repository_index(&index, repo);
+    if (error) return error;
+
+    // Wenn Index leer ist, nichts zu tun
+    if (git_index_entrycount(index) == 0) {
+        git_index_free(index);
+        return 0;
+    }
+
+    git_oid tree_oid;
+    error = git_index_write_tree(&tree_oid, index);
+    if (error) { git_index_free(index); return error; }
+
+    git_tree *tree = nullptr;
+    error = git_tree_lookup(&tree, repo, &tree_oid);
+    if (error) { git_index_free(index); return error; }
+
+    // Parent commit falls vorhanden
+    git_reference *head_ref = nullptr;
+    git_commit *parent = nullptr;
+    if (git_reference_lookup(&head_ref, repo, "HEAD") == 0) {
+        git_oid parent_oid;
+        if (git_reference_name_to_id(&parent_oid, repo, "HEAD") == 0) {
+            if (git_commit_lookup(&parent, repo, &parent_oid) != 0) {
+                parent = nullptr;
+            }
+        }
+    }
+
+    // Signature
+    git_signature *sig = nullptr;
+    error = git_signature_now(&sig, "gitpush", "gitpush@example.com");
+    if (error) { git_tree_free(tree); git_index_free(index); return error; }
+
+    const git_commit *parents[1];
+    size_t parent_count = 0;
+    if (parent) {
+        parents[0] = parent;
+        parent_count = 1;
+    }
+
+    error = git_commit_create_v(out_commit_oid,
+                                repo,
+                                "HEAD",
+                                sig,
+                                sig,
+                                nullptr,
+                                message,
+                                tree,
+                                (int)parent_count,
+                                parent_count ? parents : nullptr);
+
+    git_signature_free(sig);
+    if (parent) git_commit_free(parent);
+    if (head_ref) git_reference_free(head_ref);
+    git_tree_free(tree);
+    git_index_free(index);
+    return error;
+}
+
+// --- Push durchführen mit libgit2 ---
+static int pushToRemote(git_repository *repo, const char *remote_name, const char *refspec, CredContext *credCtx)
+{
+    int error = 0;
+    git_remote *remote = nullptr;
+    error = git_remote_lookup(&remote, repo, remote_name);
+    if (error) return error;
+
+    git_remote_callbacks callbacks = GIT_REMOTE_CALLBACKS_INIT;
+    callbacks.credentials = credentials_cb;
+    callbacks.payload = credCtx;
+
+    git_push_options push_opts;
+    error = git_push_init_options(&push_opts, GIT_PUSH_OPTIONS_VERSION);
+    if (error) { git_remote_free(remote); return error; }
+    push_opts.callbacks = callbacks;
+
+    const char *refs[] = { refspec };
+    error = git_remote_push(remote, refs, 1, &push_opts);
+    git_remote_free(remote);
+    return error;
+}
+
+// --- Main ---
+int main(int argc, char *argv[])
+{
+    QCoreApplication app(argc, argv);
+    QCoreApplication::setApplicationName("gitpush");
+    QCommandLineParser parser;
+    parser.setApplicationDescription("gitpush - create GitHub repo and push directory using libgit2");
+    parser.addHelpOption();
+    parser.addVersionOption();
+    parser.addPositionalArgument("directory", "Lokales Verzeichnis, das gepusht werden soll");
+    parser.addOption({{"u","user"}, "GitHub Benutzername (erforderlich)", "user"});
+    parser.addOption({{"t","token"}, "GitHub Personal Access Token (oder setze GITHUB_TOKEN)", "token"});
+    parser.addOption({{"p","private"}, "Repository privat erstellen", ""});
+    parser.process(app);
+
+    const QStringList posArgs = parser.positionalArguments();
+    if (posArgs.isEmpty() || !parser.isSet("user")) {
+        parser.showHelp(1);
+    }
+
+    QString dirPath = posArgs.first();
+    QString githubUser = parser.value("user");
+    QString token = parser.value("token");
+    if (token.isEmpty()) token = qgetenv("GITHUB_TOKEN");
+    if (token.isEmpty()) {
+        qCritical() << "Kein Token angegeben. Nutze --token oder setze die Umgebungsvariable GITHUB_TOKEN.";
+        return 2;
+    }
+
+    QFileInfo fi(dirPath);
+    if (!fi.exists() || !fi.isDir()) {
+        qCritical() << "Verzeichnis existiert nicht:" << dirPath;
+        return 3;
+    }
+    QString repoName = fi.fileName();
+    bool isPrivate = parser.isSet("private");
+
+    // 1) GitHub Repo via REST API erstellen
+    QNetworkAccessManager mgr;
+    QUrl url("https://api.github.com/user/repos");
+    QJsonObject body;
+    body["name"] = repoName;
+    body["private"] = isPrivate;
+    body["auto_init"] = false;
+    QByteArray json = QJsonDocument(body).toJson();
+    QByteArray authHeader = QString("token %1").arg(QString::fromUtf8(token)).toUtf8();
+
+    int httpStatus = 0;
+    QByteArray resp;
+    qDebug() << "Erstelle Repository auf GitHub:" << repoName;
+    if (!postJsonSync(mgr, url, json, authHeader, 30000, httpStatus, resp)) {
+        qCritical() << "Repository-Erstellung fehlgeschlagen. HTTP Status:" << httpStatus << "Antwort:" << resp;
+        return 4;
+    }
+    qDebug() << "Repository erfolgreich erstellt auf GitHub:" << repoName;
+
+    // 2) libgit2 initialisieren
+    git_libgit2_init();
+
+    // 3) Repository öffnen oder initialisieren
+    git_repository *repo = nullptr;
+    int error = git_repository_open(&repo, dirPath.toUtf8().constData());
+    if (error == GIT_ENOTFOUND) {
+        // nicht vorhanden -> init
+        git_repository_init(&repo, dirPath.toUtf8().constData(), 0);
+    } else if (error) {
+        qCritical() << "Fehler beim Öffnen des Repositories:" << error;
+        git_libgit2_shutdown();
+        return 5;
+    }
+
+    // 4) Dateien zum Index hinzufügen
+    error = addDirectoryToIndex(repo, dirPath);
+    if (error) {
+        qCritical() << "Fehler beim Hinzufügen der Dateien zum Index:" << error;
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        return 6;
+    }
+
+    // 5) Commit erstellen (falls nötig)
+    git_oid commit_oid;
+    error = createCommitIfNeeded(repo, "Initial commit", &commit_oid);
+    if (error) {
+        qCritical() << "Fehler beim Erstellen des Commits:" << error;
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        return 7;
+    } else {
+        if (!git_oid_iszero(&commit_oid)) {
+            char oid_str[GIT_OID_HEXSZ+1];
+            git_oid_tostr(oid_str, sizeof(oid_str), &commit_oid);
+            qDebug() << "Commit erstellt:" << oid_str;
+        } else {
+            qDebug() << "Kein neuer Commit nötig (Index leer oder keine Änderungen).";
+        }
+    }
+
+    // 6) Remote hinzufügen (ohne Token in URL)
+    QString remoteUrl = QString("https://github.com/%1/%2.git").arg(githubUser, repoName);
+    // Entferne vorhandene origin falls vorhanden
+    git_remote *existing = nullptr;
+    if (git_remote_lookup(&existing, repo, "origin") == 0) {
+        git_remote_delete(repo, "origin");
+        if (existing) git_remote_free(existing);
+    }
+    error = git_remote_create(&existing, repo, "origin", remoteUrl.toUtf8().constData());
+    if (error) {
+        qCritical() << "Fehler beim Anlegen des Remote origin:" << error;
+        git_repository_free(repo);
+        git_libgit2_shutdown();
+        return 8;
+    }
+    git_remote_free(existing);
+
+    // 7) Push mit Credentials-Callback
+    CredContext credCtx;
+    credCtx.token = token.toUtf8();
+
+    // Refspec: push HEAD to refs/heads/main (oder master). Wir versuchen main, dann master.
+    // Zuerst push HEAD:refs/heads/main
+    const char *refspecMain = "HEAD:refs/heads/main";
+    error = pushToRemote(repo, "origin", refspecMain, &credCtx);
+    if (error) {
+        qDebug() << "Push nach main fehlgeschlagen, versuche master. Fehlercode:" << error;
+        const char *refspecMaster = "HEAD:refs/heads/master";
+        error = pushToRemote(repo, "origin", refspecMaster, &credCtx);
+        if (error) {
+            qCritical() << "Push fehlgeschlagen. Fehlercode:" << error;
+            git_repository_free(repo);
+            git_libgit2_shutdown();
+            return 9;
+        }
+    }
+
+    qDebug() << "Push erfolgreich abgeschlossen.";
+
+    // Cleanup
+    git_repository_free(repo);
+    git_libgit2_shutdown();
+    return 0;
+}

@@ -1,0 +1,2 @@
+#define paintbrush_VERSION_MAJOR @paintbrush_VERSION_MAJOR@
+#define paintbrush_VERSION_MINOR @paintbrush_VERSION_MINOR@

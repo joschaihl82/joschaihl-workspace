@@ -1,0 +1,39 @@
+cmake_minimum_required(VERSION 3.16)
+project(QtZipperGui LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Enable Qt automatic handling of moc, uic and rcc
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTORCC ON)
+
+# Find Qt6 components
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets)
+
+# Find libzip via pkg-config
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBZIP REQUIRED libzip)
+
+# Add executable
+add_executable(QtZipperGui
+    zipbak1.cpp
+)
+
+# Include directories from libzip
+target_include_directories(QtZipperGui PRIVATE ${LIBZIP_INCLUDE_DIRS})
+
+# Link libraries: Qt and libzip
+target_link_libraries(QtZipperGui PRIVATE Qt6::Core Qt6::Widgets ${LIBZIP_LIBRARIES})
+
+# Ensure proper compile definitions (optional)
+target_compile_definitions(QtZipperGui PRIVATE QT_DISABLE_DEPRECATED_BEFORE=0)
+
+# If pkg-config provided library dirs, add them (keeps linker happy on some systems)
+if (LIBZIP_LIBRARY_DIRS)
+    link_directories(${LIBZIP_LIBRARY_DIRS})
+endif()
+
+# Install target (optional)
+install(TARGETS QtZipperGui RUNTIME DESTINATION bin)

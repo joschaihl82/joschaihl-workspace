@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Copy Project &apos;spotifyproxy&apos;" description="Copy Project &apos;spotifyproxy&apos;" destination="/home/joscha/proxy-workspace" element="/spotifyproxy" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="spotifyproxy2" stamp="1775322496168"/>&#x0A;<refactoring comment="Copy Project &apos;spotifyproxy2&apos;" description="Copy Project &apos;spotifyproxy2&apos;" destination="/home/joscha/proxy-workspace" element="/spotifyproxy2" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="spotifyproxy3" stamp="1775324070499"/>
+</session>

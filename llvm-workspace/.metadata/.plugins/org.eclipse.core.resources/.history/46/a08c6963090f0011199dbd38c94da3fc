@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.13)
+project(remove_unused_static_funcs_to_c)
+
+find_package(LLVM REQUIRED CONFIG)
+find_package(Clang REQUIRED CONFIG)
+
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+
+add_executable(remove_unused_static_funcs_to_c remove_unused_static_funcs_to_c.cpp)
+
+target_include_directories(remove_unused_static_funcs_to_c PRIVATE ${CLANG_INCLUDE_DIRS})
+target_link_libraries(remove_unused_static_funcs_to_c
+  PRIVATE
+    clangTooling
+    clangBasic
+    clangAST
+    clangFrontend
+    clangLex
+)

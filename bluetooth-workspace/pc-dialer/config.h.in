@@ -1,0 +1,2 @@
+#define pc-dialer_VERSION_MAJOR @pc-dialer_VERSION_MAJOR@
+#define pc-dialer_VERSION_MINOR @pc-dialer_VERSION_MINOR@

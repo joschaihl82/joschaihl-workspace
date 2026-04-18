@@ -1,0 +1,182 @@
+ciator.c:330:8: error: unknown type name ‘ErrCode’
+  330 | static ErrCode sock_read_exact(int fd, unsigned char* buf, size_t len) {
+      |        ^~~~~~~
+ciator.c: In function ‘sock_read_exact’:
+ciator.c:337:14: error: ‘E_CONN_FAIL’ undeclared (first use in this function)
+  337 |       return E_CONN_FAIL;
+      |              ^~~~~~~~~~~
+ciator.c:337:14: note: each undeclared identifier is reported only once for each function it appears in
+ciator.c:341:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  341 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:365:8: error: unknown type name ‘ErrCode’
+  365 | static ErrCode directory_parse(const char* text, DirectoryList* dir) {
+      |        ^~~~~~~
+ciator.c: In function ‘directory_parse’:
+ciator.c:366:39: error: ‘E_DIR_PARSE’ undeclared (first use in this function)
+  366 |   if (!text || dir->count > 0) return E_DIR_PARSE;
+      |                                       ^~~~~~~~~~~
+ciator.c:394:31: error: ‘E_NO_RELAYS’ undeclared (first use in this function)
+  394 |   if (dir->count == 0) return E_NO_RELAYS;
+      |                               ^~~~~~~~~~~
+ciator.c:396:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  396 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:399:8: error: unknown type name ‘ErrCode’
+  399 | static ErrCode directory_fetch(DirectoryList* dir) {
+      |        ^~~~~~~
+ciator.c: In function ‘directory_fetch’:
+ciator.c:412:88: error: ‘E_HTTP_FAIL’ undeclared (first use in this function)
+  412 |   if (send(fd, req, req_len, 0) < 0) { perror("[HTTP] Send failed"); close(fd); return E_HTTP_FAIL; }
+      |                                                                                        ^~~~~~~~~~~
+ciator.c: At top level:
+ciator.c:460:8: error: unknown type name ‘ErrCode’
+  460 | static ErrCode populate_directory_by_latency(DirectoryList* dir, CandidateRelay* cand, int n) {
+      |        ^~~~~~~
+ciator.c: In function ‘populate_directory_by_latency’:
+ciator.c:461:37: error: ‘E_NO_RELAYS’ undeclared (first use in this function)
+  461 |   if (!dir || !cand || n<=0) return E_NO_RELAYS; dir->count=0;
+      |                                     ^~~~~~~~~~~
+ciator.c:483:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  483 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: In function ‘mock_or_run_once’:
+ciator.c:591:46: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  591 |   if (sock_read_exact(cfd, buf, CELL_LEN) != E_SUCCESS) {
+      |                                              ^~~~~~~~~
+      |                                              EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:662:3: error: conflicting types for ‘TTunnel’; have ‘struct <anonymous>’
+  662 | } TTunnel;
+      |   ^~~~~~~
+ciator.c:649:26: note: previous declaration of ‘TTunnel’ with type ‘TTunnel’ {aka ‘struct TTunnel_s’}
+  649 | typedef struct TTunnel_s TTunnel;
+      |                          ^~~~~~~
+ciator.c:671:8: error: unknown type name ‘ErrCode’
+  671 | static ErrCode tunnel_select_next_node(TTunnel* t) {
+      |        ^~~~~~~
+ciator.c: In function ‘tunnel_select_next_node’:
+ciator.c:672:80: error: ‘E_NO_RELAYS’ undeclared (first use in this function)
+  672 |   if (t->dir->count == 0) { LOGE("TUNNEL","No relays in directory.\n"); return E_NO_RELAYS; }
+      |                                                                                ^~~~~~~~~~~
+ciator.c:675:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  675 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:678:8: error: unknown type name ‘ErrCode’
+  678 | static ErrCode tunnel_handle_circuit_created(TTunnel* t) {
+      |        ^~~~~~~
+ciator.c: In function ‘tunnel_handle_circuit_created’:
+ciator.c:681:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  681 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:684:8: error: unknown type name ‘ErrCode’
+  684 | static ErrCode tunnel_handle_connect_complete(TTunnel* t) {
+      |        ^~~~~~~
+ciator.c: In function ‘tunnel_handle_connect_complete’:
+ciator.c:690:125: error: ‘E_TOR_PROTO’ undeclared (first use in this function)
+  690 |   if (send(t->circ->fd, create_cell, CELL_LEN, 0) != CELL_LEN) { perror("[TUNNEL] send CREATE"); close(t->circ->fd); return E_TOR_PROTO; }
+      |                                                                                                                             ^~~~~~~~~~~
+ciator.c:692:58: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  692 |   if (sock_read_exact(t->circ->fd, created, CELL_LEN) != E_SUCCESS) {
+      |                                                          ^~~~~~~~~
+      |                                                          EXIT_SUCCESS
+ciator.c: At top level:
+ciator.c:707:8: error: unknown type name ‘ErrCode’
+  707 | static ErrCode tunnel_start_connect(TTunnel* t) {
+      |        ^~~~~~~
+ciator.c: In function ‘tunnel_start_connect’:
+ciator.c:709:90: error: ‘E_RETRY_LIMIT’ undeclared (first use in this function)
+  709 |   if (t->retryCount > MAX_RETRY_COUNT) { LOGE("TUNNEL","Max retries reached.\n"); return E_RETRY_LIMIT; }
+      |                                                                                          ^~~~~~~~~~~~~
+ciator.c:711:37: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  711 |   if (tunnel_select_next_node(t) != E_SUCCESS) return E_NO_RELAYS;
+      |                                     ^~~~~~~~~
+      |                                     EXIT_SUCCESS
+ciator.c:711:55: error: ‘E_NO_RELAYS’ undeclared (first use in this function)
+  711 |   if (tunnel_select_next_node(t) != E_SUCCESS) return E_NO_RELAYS;
+      |                                                       ^~~~~~~~~~~
+ciator.c:718:83: error: ‘E_CONN_FAIL’ undeclared (first use in this function)
+  718 |   if (fd < 0) { LOGE("TUNNEL","Connect to mock OR failed, retrying...\n"); return E_CONN_FAIL; }
+      |                                                                                   ^~~~~~~~~~~
+ciator.c:722:19: warning: assignment to ‘TTunnel *’ {aka ‘struct TTunnel_s *’} from incompatible pointer type ‘TTunnel *’ [-Wincompatible-pointer-types]
+  722 |   t->circ->tunnel = t; t->circ->fd = fd; t->circ->circId = util_rand_id();
+      |                   ^
+ciator.c: At top level:
+ciator.c:727:8: error: unknown type name ‘ErrCode’
+  727 | static ErrCode tunnel_connect_robust(TTunnel* t) {
+      |        ^~~~~~~
+ciator.c: In function ‘tunnel_connect_robust’:
+ciator.c:728:3: error: unknown type name ‘ErrCode’
+  728 |   ErrCode r = E_CONN_FAIL;
+      |   ^~~~~~~
+ciator.c:728:15: error: ‘E_CONN_FAIL’ undeclared (first use in this function)
+  728 |   ErrCode r = E_CONN_FAIL;
+      |               ^~~~~~~~~~~
+ciator.c:729:24: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  729 |   while (G_RUN && r != E_SUCCESS) {
+      |                        ^~~~~~~~~
+      |                        EXIT_SUCCESS
+ciator.c:731:14: error: ‘E_RETRY_LIMIT’ undeclared (first use in this function)
+  731 |     if (r == E_RETRY_LIMIT) { LOGE("TUNNEL","Failed after retries.\n"); return r; }
+      |              ^~~~~~~~~~~~~
+ciator.c:732:14: error: ‘E_NO_RELAYS’ undeclared (first use in this function)
+  732 |     if (r == E_NO_RELAYS)   { LOGE("TUNNEL","No relays to try.\n");  return r; }
+      |              ^~~~~~~~~~~
+ciator.c: At top level:
+ciator.c:758:8: error: unknown type name ‘ErrCode’
+  758 | static ErrCode sconn_get_request(SConn* s) {
+      |        ^~~~~~~
+ciator.c: In function ‘sconn_get_request’:
+ciator.c:760:39: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  760 |   if (sock_read_exact(s->fd, b, 3) != E_SUCCESS || b[0] != SOCKS_VER) return E_SOCKS_PROTO;
+      |                                       ^~~~~~~~~
+      |                                       EXIT_SUCCESS
+ciator.c:760:78: error: ‘E_SOCKS_PROTO’ undeclared (first use in this function)
+  760 |   if (sock_read_exact(s->fd, b, 3) != E_SUCCESS || b[0] != SOCKS_VER) return E_SOCKS_PROTO;
+      |                                                                              ^~~~~~~~~~~~~
+ciator.c: At top level:
+ciator.c:791:8: error: unknown type name ‘ErrCode’
+  791 | static ErrCode stream_open_and_tunnel_data(TTunnel* t, SConn* s) {
+      |        ^~~~~~~
+ciator.c: In function ‘stream_open_and_tunnel_data’:
+ciator.c:793:65: error: ‘E_CONN_FAIL’ undeclared (first use in this function)
+  793 |   if (!t->circ) { LOGE("STREAM","No active circuit.\n"); return E_CONN_FAIL; }
+      |                                                                 ^~~~~~~~~~~
+ciator.c:797:26: error: ‘E_TOR_PROTO’ undeclared (first use in this function)
+  797 |   if (hp_len < 0) return E_TOR_PROTO;
+      |                          ^~~~~~~~~~~
+ciator.c:810:10: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  810 |   return E_SUCCESS;
+      |          ^~~~~~~~~
+      |          EXIT_SUCCESS
+ciator.c: In function ‘handle_client_connection’:
+ciator.c:921:3: error: unknown type name ‘ErrCode’
+  921 |   ErrCode e = sconn_get_request(s);
+      |   ^~~~~~~
+ciator.c:922:12: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+  922 |   if (e != E_SUCCESS) {
+      |            ^~~~~~~~~
+      |            EXIT_SUCCESS
+ciator.c:928:3: error: unknown type name ‘ErrCode’
+  928 |   ErrCode se = stream_open_and_tunnel_data(t, s);
+      |   ^~~~~~~
+ciator.c: In function ‘main’:
+ciator.c:1012:3: error: unknown type name ‘ErrCode’
+ 1012 |   ErrCode sel = populate_directory_by_latency(&dir, CFG_CANDIDATES, CFG_CAND_COUNT);
+      |   ^~~~~~~
+ciator.c:1013:14: error: ‘E_SUCCESS’ undeclared (first use in this function); did you mean ‘EXIT_SUCCESS’?
+ 1013 |   if (sel != E_SUCCESS) {
+      |              ^~~~~~~~~
+      |              EXIT_SUCCESS
+ciator.c:1032:3: error: unknown type name ‘ErrCode’
+ 1032 |   ErrCode cr = tunnel_connect_robust(t);
+      |   ^~~~~~~

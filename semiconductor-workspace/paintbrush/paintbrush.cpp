@@ -1,0 +1,206 @@
+#include <QApplication>
+#include <QMainWindow>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QImage>
+#include <QToolBar>
+#include <QColorDialog>
+#include <QSpinBox>
+#include <QPushButton>
+#include <QFileDialog>
+#include <QStatusBar>
+#include <QLabel>
+#include <QActionGroup>
+#include <QMessageBox>
+#include <QMenu>
+#include <QMenuBar>
+
+enum Tool { Pen, Eraser, Line, Rect, Ellipse };
+
+class PaintCanvas : public QWidget {
+    Q_OBJECT
+public:
+    PaintCanvas(QWidget *parent = nullptr) : QWidget(parent),
+        drawing(false), currentTool(Pen), brushColor(Qt::black), brushWidth(5) {
+        setAttribute(Qt::WA_StaticContents);
+        image = QImage(2000, 2000, QImage::Format_RGB32);
+        image.fill(Qt::white);
+    }
+
+    void setTool(Tool tool) { currentTool = tool; }
+    void setBrushColor(QColor color) { brushColor = color; }
+    void setBrushWidth(int width) { brushWidth = width; }
+
+    bool saveImage(const QString &fileName, const char *fileFormat) {
+        return image.save(fileName, fileFormat);
+    }
+
+    void clearImage() {
+        image.fill(Qt::white);
+        update();
+    }
+
+protected:
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton) {
+            lastPoint = event->position().toPoint();
+            startPoint = lastPoint; // Für Formen wichtig
+            drawing = true;
+            tempImage = image; // Backup für Vorschau beim Ziehen
+        }
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override {
+        if ((event->buttons() & Qt::LeftButton) && drawing) {
+            QPoint currentPoint = event->position().toPoint();
+            if (currentTool == Pen || currentTool == Eraser) {
+                draw(currentPoint);
+            } else {
+                // Vorschau-Effekt für Formen
+                image = tempImage;
+                draw(currentPoint);
+            }
+            emit mousePosChanged(currentPoint);
+        }
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        if (event->button() == Qt::LeftButton && drawing) {
+            draw(event->position().toPoint());
+            drawing = false;
+        }
+    }
+
+    void paintEvent(QPaintEvent *event) override {
+        QPainter canvasPainter(this);
+        canvasPainter.drawImage(event->rect(), image, event->rect());
+    }
+
+signals:
+    void mousePosChanged(QPoint p);
+
+private:
+    void draw(const QPoint &endPoint) {
+        QPainter painter(&image);
+        QPen pen(brushColor, brushWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+
+        if (currentTool == Eraser) {
+            pen.setColor(Qt::white);
+        }
+        painter.setPen(pen);
+
+        switch (currentTool) {
+            case Pen:
+            case Eraser:
+                painter.drawLine(lastPoint, endPoint);
+                lastPoint = endPoint;
+                break;
+            case Line:
+                painter.drawLine(startPoint, endPoint);
+                break;
+            case Rect:
+                painter.drawRect(QRect(startPoint, endPoint));
+                break;
+            case Ellipse:
+                painter.drawEllipse(QRect(startPoint, endPoint));
+                break;
+        }
+        update();
+    }
+
+    bool drawing;
+    Tool currentTool;
+    QColor brushColor;
+    int brushWidth;
+    QPoint lastPoint;
+    QPoint startPoint;
+    QImage image;
+    QImage tempImage; // Für die Vorschau von Rechtecken/Linien
+};
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        canvas = new PaintCanvas();
+        setCentralWidget(canvas);
+        setWindowTitle("Pro-Paint Qt6");
+
+        createActions();
+        createMenus();
+
+        statusBarLabel = new QLabel("Position: 0, 0");
+        statusBar()->addPermanentWidget(statusBarLabel);
+        connect(canvas, &PaintCanvas::mousePosChanged, [this](QPoint p){
+            statusBarLabel->setText(QString("Position: %1, %2").arg(p.x()).arg(p.y()));
+        });
+    }
+
+private:
+    void createActions() {
+        // Tool Toolbar
+        QToolBar *tools = addToolBar("Werkzeuge");
+        QActionGroup *group = new QActionGroup(this);
+
+        auto addTool = [&](const QString &name, Tool tool, bool checked = false) {
+            QAction *act = tools->addAction(name);
+            act->setCheckable(true);
+            act->setChecked(checked);
+            act->setActionGroup(group);
+            connect(act, &QAction::triggered, [this, tool](){ canvas->setTool(tool); });
+        };
+
+        addTool("Stift", Pen, true);
+        addTool("Radierer", Eraser);
+        addTool("Linie", Line);
+        addTool("Rechteck", Rect);
+        addTool("Ellipse", Ellipse);
+
+        tools->addSeparator();
+
+        // Farbe & Dicke
+        QSpinBox *spin = new QSpinBox();
+        spin->setRange(1, 50);
+        spin->setValue(5);
+        connect(spin, &QSpinBox::valueChanged, canvas, &PaintCanvas::setBrushWidth);
+        tools->addWidget(new QLabel(" Dicke: "));
+        tools->addWidget(spin);
+
+        QPushButton *colorBtn = new QPushButton("Farbe");
+        connect(colorBtn, &QPushButton::clicked, [this](){
+            QColor c = QColorDialog::getColor(Qt::black, this);
+            if(c.isValid()) canvas->setBrushColor(c);
+        });
+        tools->addWidget(colorBtn);
+    }
+
+    void createMenus() {
+        QMenu *fileMenu = menuBar()->addMenu("&Datei");
+
+        QAction *saveAct = fileMenu->addAction("&Speichern");
+        connect(saveAct, &QAction::triggered, [this](){
+            QString path = QFileDialog::getSaveFileName(this, "Bild speichern", "", "PNG (*.png);;JPG (*.jpg)");
+            if(!path.isEmpty()) canvas->saveImage(path, nullptr);
+        });
+
+        QAction *clearAct = fileMenu->addAction("&Neu / Löschen");
+        connect(clearAct, &QAction::triggered, canvas, &PaintCanvas::clearImage);
+
+        fileMenu->addSeparator();
+        QAction *exitAct = fileMenu->addAction("&Beenden");
+        connect(exitAct, &QAction::triggered, this, &QWidget::close);
+    }
+
+    PaintCanvas *canvas;
+    QLabel *statusBarLabel;
+};
+
+#include "paintbrush.moc" // Wichtig bei Q_OBJECT in main.cpp
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+    MainWindow window;
+    window.resize(1200, 800);
+    window.show();
+    return app.exec();
+}

@@ -1,0 +1,107 @@
+# Makefile for exectrace1 kernel module (auto-detect exports and proceed)
+MODULE := exectrace1
+obj-m := $(MODULE).o
+CC := x86_64-linux-gnu-gcc
+SRCDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+ifeq ($(origin CC), command line)
+  KBUILD_CC := CC=$(CC)
+else
+  KBUILD_CC :=
+endif
+
+OUTDIR ?= $(SRCDIR)/out
+MAKEPROG ?= $(shell command -v gmake 2>/dev/null || command -v make)
+BUILDLOG := $(SRCDIR)/build_kernel.log
+
+.PHONY: all default kbuild clean install check_exports in_tree_prepare in_tree_build
+
+default: all
+all: kbuild
+
+check_kdir:
+	@if [ ! -d "$(KDIR)" ]; then \
+	  echo "ERROR: kernel build directory '$(KDIR)' not found."; \
+	  echo "Set KDIR to your kernel build dir, e.g. /lib/modules/$(shell uname -r)/build"; \
+	  exit 1; \
+	fi
+
+# Check for exported symbols (accept either kallsyms_lookup_name or kallsyms_lookup_names)
+check_exports:
+	@echo "Checking kernel exports in /proc/kallsyms..."
+	@echo -n "  kallsyms_lookup_name(s): "; \
+	if grep -Eq " kallsyms_lookup_name(s)?$$" /proc/kallsyms 2>/dev/null; then \
+	  grep -E "kallsyms_lookup_name(s)?" /proc/kallsyms | head -n1; \
+	else \
+	  echo "(not found)"; \
+	fi
+	@echo -n "  __tracepoint_sched_process_exec: "; grep -F "__tracepoint_sched_process_exec" /proc/kallsyms 2>/dev/null || echo "(not found)"
+	@echo -n "  __start___tracepoints / __stop___tracepoints: "; \
+	(grep -F "__start___tracepoints" /proc/kallsyms 2>/dev/null || true) && (grep -F "__stop___tracepoints" /proc/kallsyms 2>/dev/null || true) || echo "(not found)"
+
+# Build: proceed automatically if required symbols are exported
+kbuild: check_kdir
+	@echo "=== Checking for required kernel exports ==="
+	@HAS_KALLSYMS=0; \
+	if grep -Eq " kallsyms_lookup_name(s)?$$" /proc/kallsyms 2>/dev/null; then HAS_KALLSYMS=1; fi; \
+	if [ $$HAS_KALLSYMS -eq 1 ]; then \
+	  echo "kallsyms_lookup_name(s) exported: proceeding with out-of-tree build."; \
+	else \
+	  echo "kallsyms_lookup_name not exported."; \
+	  if [ "$(IN_TREE)" = "1" ]; then \
+		echo "IN_TREE=1 requested: attempting in-tree build."; \
+		$(MAKE) IN_TREE=1 all; exit $$?; \
+	  else \
+		echo "To attempt in-tree build, run: make IN_TREE=1"; \
+		exit 1; \
+	  fi; \
+	fi
+	@echo "Invoking kernel build: $(MAKEPROG) -C '$(KDIR)' M='$(SRCDIR)' modules"
+	@$(MAKEPROG) -C "$(KDIR)" M="$(SRCDIR)" $(KBUILD_CC) modules V=$(V) 2>&1 | tee "$(BUILDLOG)"
+	@if [ -f "$(SRCDIR)/$(MODULE).ko" ]; then \
+	  mkdir -p "$(OUTDIR)"; \
+	  cp -u "$(SRCDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"; \
+	  echo "Built: $(OUTDIR)/$(MODULE).ko"; \
+	else \
+	  echo "ERROR: $(MODULE).ko not found after build."; \
+	  echo "Inspect $(BUILDLOG) for modpost/compile errors."; \
+	  exit 1; \
+	fi
+
+# In-tree build (requires sudo)
+in_tree_prepare:
+	@echo "Preparing in-tree build area under $(KDIR)..."
+	@if [ ! -d "$(KDIR)" ]; then echo "ERROR: kernel build dir $(KDIR) not found"; exit 1; fi
+	@IN_TREE_DIR="$(KDIR)/drivers/misc/$(MODULE)"; \
+	if [ ! -d "$$IN_TREE_DIR" ]; then sudo mkdir -p "$$IN_TREE_DIR"; fi; \
+	sudo cp -f "$(SRCDIR)/$(MODULE).c" "$$IN_TREE_DIR/"; \
+	printf "obj-$(CONFIG_EXECTRACE1) += $(MODULE).o\n" | sudo tee "$$IN_TREE_DIR/Makefile" > /dev/null; \
+	echo "Copied sources to $$IN_TREE_DIR"
+
+in_tree_build: in_tree_prepare
+	@echo "Building in-tree module (may require sudo)..."; \
+	IN_TREE_DIR="$(KDIR)/drivers/misc/$(MODULE)"; \
+	sudo sh -c "cd $(KDIR) && $(MAKEPROG) M=drivers/misc/$(MODULE) modules V=$(V)" 2>&1 | tee "$(BUILDLOG)"; \
+	if [ -f "$(KDIR)/drivers/misc/$(MODULE)/$(MODULE).ko" ]; then \
+	  mkdir -p "$(OUTDIR)"; \
+	  sudo cp -u "$(KDIR)/drivers/misc/$(MODULE)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"; \
+	  sudo chown $(shell id -u):$(shell id -g) "$(OUTDIR)/$(MODULE).ko" || true; \
+	  echo "In-tree build succeeded; copied to $(OUTDIR)/$(MODULE).ko"; \
+	else \
+	  echo "In-tree build failed; inspect $(BUILDLOG)"; exit 1; \
+	fi
+
+ifeq ($(IN_TREE),1)
+all: in_tree_build
+endif
+
+clean: check_kdir
+	@$(MAKEPROG) -C "$(KDIR)" M="$(SRCDIR)" clean || true
+	@rm -rf "$(OUTDIR)" "$(BUILDLOG)"
+	@echo "Cleaned."
+
+install: kbuild
+	@mkdir -p "$(OUTDIR)"
+	@cp -u "$(SRCDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"
+	@echo "Installed: $(OUTDIR)/$(MODULE).ko"

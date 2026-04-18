@@ -1,0 +1,65 @@
+cmake_minimum_required(VERSION 3.10)
+project(exectrace1_module NONE)
+
+# --- Configuration variables (override on the command line)
+# Example:
+#   cmake -DKERNEL_DIR=/lib/modules/$(uname -r)/build -DMODULE_NAME=exectrace1 -S . -B build
+set(KERNEL_DIR "/lib/modules/${CMAKE_SYSTEM_PROCESSOR}/build" CACHE PATH "Path to kernel build directory")
+set(MODULE_NAME "exectrace1" CACHE STRING "Kernel module base name (without .ko)")
+set(MODULE_SRC "exectrace1.c" CACHE STRING "Module source file")
+
+# Try a sensible default for the kernel build directory if user didn't override
+if(NOT DEFINED KERNEL_DIR OR NOT EXISTS "${KERNEL_DIR}")
+  execute_process(COMMAND uname -r
+                  OUTPUT_VARIABLE UNAME_R
+                  OUTPUT_STRIP_TRAILING_WHITESPACE)
+  set(KERNEL_DIR "/lib/modules/${UNAME_R}/build" CACHE PATH "Path to kernel build directory" FORCE)
+endif()
+
+# Output directory for built module
+set(MODULE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/out" CACHE PATH "Directory to place built .ko")
+
+# Ensure a generator make program is available
+if(NOT CMAKE_MAKE_PROGRAM)
+  find_program(CMAKE_MAKE_PROGRAM make)
+endif()
+
+# --- Build target: invoke kernel build system
+add_custom_target(kbuild
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULE_OUTPUT_DIR}"
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${KERNEL_DIR}" M="${CMAKE_SOURCE_DIR}" modules
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Building kernel module ${MODULE_NAME} using kernel build system at ${KERNEL_DIR}"
+  VERBATIM
+)
+
+# --- Clean target (avoid reserved name 'clean')
+add_custom_target(kclean
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${KERNEL_DIR}" M="${CMAKE_SOURCE_DIR}" clean
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${MODULE_OUTPUT_DIR}"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Cleaning kernel module build artifacts (kclean)"
+  VERBATIM
+)
+
+# --- Install target (avoid reserved name 'install')
+add_custom_target(kinstall
+  DEPENDS kbuild
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULE_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/${MODULE_NAME}.ko"
+          "${MODULE_OUTPUT_DIR}/${MODULE_NAME}.ko"
+  COMMENT "Copying ${MODULE_NAME}.ko to ${MODULE_OUTPUT_DIR} (kinstall)"
+  VERBATIM
+)
+
+# --- Convenience target to show configuration
+add_custom_target(show
+  COMMAND ${CMAKE_COMMAND} -E echo "Kernel dir: ${KERNEL_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E echo "Module source: ${MODULE_SRC}"
+  COMMAND ${CMAKE_COMMAND} -E echo "Built module (after kinstall): ${MODULE_OUTPUT_DIR}/${MODULE_NAME}.ko"
+  VERBATIM
+)
+
+message(STATUS "CMake configured for kernel module build")
+message(STATUS "Use -DKERNEL_DIR=... -DMODULE_NAME=... to override defaults")

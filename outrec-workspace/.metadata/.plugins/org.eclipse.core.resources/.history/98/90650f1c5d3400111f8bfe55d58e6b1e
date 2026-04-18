@@ -1,0 +1,192 @@
+// record_pulse_mp3.c
+// Compile: gcc -o record_pulse_mp3 record_pulse_mp3.c -lpulse-simple -lpulse -lmp3lame
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <signal.h>
+#include <pulse/simple.h>
+#include <pulse/error.h>
+#include <lame/lame.h>
+#include <unistd.h>
+
+static volatile int running = 1;
+static void int_handler(int sig) { (void)sig; running = 0; }
+
+#define BUFSIZE 8192
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: %s [--device <pulse_source>] [--mp3] [--bitrate <kbps>]\n"
+        "Defaults: device=default.monitor, mp3=false, bitrate=192\n", prog);
+}
+
+int main(int argc, char *argv[]) {
+    const char *device = "default.monitor";
+    int to_mp3 = 0;
+    int bitrate = 192;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--device") == 0 && i+1 < argc) {
+            device = argv[++i];
+        } else if (strcmp(argv[i], "--mp3") == 0) {
+            to_mp3 = 1;
+        } else if (strcmp(argv[i], "--bitrate") == 0 && i+1 < argc) {
+            bitrate = atoi(argv[++i]);
+            if (bitrate <= 0) bitrate = 192;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
+
+    signal(SIGINT, int_handler);
+    signal(SIGTERM, int_handler);
+
+    // Timestamped filename
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    char outname[256];
+    if (to_mp3)
+        strftime(outname, sizeof(outname), "%Y-%m-%d-%H-%M-%S.mp3", t);
+    else
+        strftime(outname, sizeof(outname), "%Y-%m-%d-%H-%M-%S.wav", t);
+
+    printf("Aufnahme von PulseAudio Quelle: %s\n", device);
+    printf("Ausgabe: %s\n", outname);
+    printf("Stop mit Ctrl+C\n");
+
+    // PulseAudio simple API params
+    static const pa_sample_spec ss = {
+        .format = PA_SAMPLE_S16LE,
+        .rate = 44100,
+        .channels = 2
+    };
+
+    int error;
+    pa_simple *s = pa_simple_new(NULL,               // server
+                                 "record_pulse_mp3", // client name
+                                 PA_STREAM_RECORD,
+                                 device,             // source name
+                                 "record",           // stream description
+                                 &ss,                // sample format
+                                 NULL, NULL, &error);
+    if (!s) {
+        fprintf(stderr, "PulseAudio Fehler: %s\n", pa_strerror(error));
+        return 1;
+    }
+
+    FILE *out = fopen(outname, "wb");
+    if (!out) {
+        perror("fopen");
+        pa_simple_free(s);
+        return 1;
+    }
+
+    // If WAV requested, write simple WAV header placeholder (will patch sizes on exit)
+    int64_t data_bytes_written = 0;
+    if (!to_mp3) {
+        // WAV header (44 bytes) placeholder
+        unsigned char header[44] = {0};
+        fwrite(header, 1, sizeof(header), out);
+    }
+
+    // Setup LAME if mp3 requested
+    lame_t lame = NULL;
+    unsigned char mp3buf[BUFSIZE];
+    if (to_mp3) {
+        lame = lame_init();
+        lame_set_in_samplerate(lame, ss.rate);
+        lame_set_num_channels(lame, ss.channels);
+        lame_set_brate(lame, bitrate);
+        lame_set_quality(lame, 5); // 0 best, 9 worst
+        if (lame_init_params(lame) < 0) {
+            fprintf(stderr, "LAME init failed\n");
+            fclose(out);
+            pa_simple_free(s);
+            return 1;
+        }
+    }
+
+    // Buffer for raw PCM
+    int16_t buffer[BUFSIZE/2];
+    while (running) {
+        if (pa_simple_read(s, buffer, sizeof(buffer), &error) < 0) {
+            fprintf(stderr, "PulseAudio read error: %s\n", pa_strerror(error));
+            break;
+        }
+
+        if (to_mp3) {
+            // lame expects interleaved PCM 16-bit signed
+            int samples = sizeof(buffer) / (sizeof(int16_t) * ss.channels) * ss.channels;
+            // encode: input is int16_t interleaved, use lame_encode_buffer_interleaved
+            int mp3bytes = lame_encode_buffer_interleaved(lame, buffer, (int)(sizeof(buffer)/(2*ss.channels)), mp3buf, sizeof(mp3buf));
+            if (mp3bytes < 0) {
+                fprintf(stderr, "LAME encode error: %d\n", mp3bytes);
+                break;
+            }
+            if (mp3bytes > 0) {
+                if (fwrite(mp3buf, 1, mp3bytes, out) != (size_t)mp3bytes) {
+                    perror("fwrite");
+                    break;
+                }
+            }
+        } else {
+            size_t wrote = fwrite(buffer, 1, sizeof(buffer), out);
+            data_bytes_written += wrote;
+            if (wrote != sizeof(buffer)) {
+                perror("fwrite");
+                break;
+            }
+        }
+    }
+
+    // finalize mp3
+    if (to_mp3 && lame) {
+        int flush_bytes = lame_encode_flush(lame, mp3buf, sizeof(mp3buf));
+        if (flush_bytes > 0) fwrite(mp3buf, 1, flush_bytes, out);
+        lame_close(lame);
+    }
+
+    // finalize wav header if needed
+    if (!to_mp3) {
+        // Prepare WAV header fields
+        int32_t subchunk2_size = (int32_t)data_bytes_written;
+        int32_t chunk_size = 36 + subchunk2_size;
+        int16_t audio_format = 1; // PCM
+        int16_t num_channels = ss.channels;
+        int32_t sample_rate = ss.rate;
+        int16_t bits_per_sample = 16;
+        int32_t byte_rate = sample_rate * num_channels * bits_per_sample/8;
+        int16_t block_align = num_channels * bits_per_sample/8;
+
+        fseek(out, 0, SEEK_SET);
+        // RIFF header
+        fwrite("RIFF",1,4,out);
+        fwrite(&chunk_size,4,1,out);
+        fwrite("WAVE",1,4,out);
+        // fmt subchunk
+        fwrite("fmt ",1,4,out);
+        int32_t subchunk1_size = 16;
+        fwrite(&subchunk1_size,4,1,out);
+        fwrite(&audio_format,2,1,out);
+        fwrite(&num_channels,2,1,out);
+        fwrite(&sample_rate,4,1,out);
+        fwrite(&byte_rate,4,1,out);
+        fwrite(&block_align,2,1,out);
+        fwrite(&bits_per_sample,2,1,out);
+        // data subchunk
+        fwrite("data",1,4,out);
+        fwrite(&subchunk2_size,4,1,out);
+    }
+
+    fclose(out);
+    pa_simple_free(s);
+
+    printf("Aufnahme beendet. Datei: %s\n", outname);
+    return 0;
+}

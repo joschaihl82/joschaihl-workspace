@@ -1,0 +1,585 @@
+// ext4recover.cpp
+//
+// Single-file Qt6 application (Widgets + WebEngine) that scans a device/image
+// linearly for ext4 directory entries and emits only reconstructed paths that
+// contain the placeholder "[ino:...]" (per user request).
+//
+// UI:
+//  - Top bar: filesystem selector (combo), Refresh FS button, Filter edit, Search button
+//  - Left pane: QTableView with columns Percent, Path, Notes
+//  - Right pane: QWebEngineView preview
+//  - Bottom: QProgressBar showing scan progress (0..100)
+//
+// Scanner runs in a worker thread and emits signals to update the UI.
+// The scanner performs a best-effort linear raw scan reading inode-sized chunks,
+// parsing directory direct blocks (i_block[0..11]) and reconstructing simple
+// placeholder-containing paths of the form "/[ino:<pseudo>]/<name>" and emits
+// only those paths. The percent printed is monotonic scan progress based on
+// the current processed bytes (outer loop offset).
+//
+// Build with CMake (Qt6 Widgets + WebEngine). Example CMakeLists.txt:
+//
+// cmake_minimum_required(VERSION 3.16)
+// project(ext4recover LANGUAGES CXX)
+// set(CMAKE_CXX_STANDARD 17)
+// find_package(Qt6 REQUIRED COMPONENTS Widgets WebEngineWidgets)
+// add_executable(ext4recover ext4recover.cpp)
+// target_link_libraries(ext4recover PRIVATE Qt6::Widgets Qt6::WebEngineWidgets)
+//
+// Run: ./ext4recover
+//
+// Note: scanning raw block devices usually requires root. Use a disk image file
+// for testing as a normal user.
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QComboBox>
+#include <QPushButton>
+#include <QLineEdit>
+#include <QTableView>
+#include <QStandardItemModel>
+#include <QSortFilterProxyModel>
+#include <QProgressBar>
+#include <QSplitter>
+#include <QWebEngineView>
+#include <QFileDialog>
+#include <QHeaderView>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QLabel>
+#include <QMessageBox>
+#include <QFile>
+#include <QTextStream>
+#include <QThread>
+#include <QFileInfo>
+#include <QUrl>
+#include <QTimer>
+
+#include <atomic>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <memory>
+#include <algorithm>
+
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
+//
+// Low-level helpers (portable-ish POSIX)
+//
+static ssize_t pread_all(int fd, void *buf, size_t count, off_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pread(fd, (char*)buf + done, count - done, offset + done);
+        if (r < 0) return -1;
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+static inline uint16_t le16(const void *p) {
+    const uint8_t *b = (const uint8_t*)p;
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static inline uint32_t le32(const void *p) {
+    const uint8_t *b = (const uint8_t*)p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+#pragma pack(push,1)
+struct ext4_super {
+    uint32_t s_inodes_count;
+    uint32_t s_blocks_count_lo;
+    uint32_t s_r_blocks_count_lo;
+    uint32_t s_free_blocks_count_lo;
+    uint32_t s_free_inodes_count;
+    uint32_t s_first_data_block;
+    uint32_t s_log_block_size;
+    uint32_t s_log_cluster_size;
+    uint32_t s_blocks_per_group;
+    uint32_t s_clusters_per_group;
+    uint32_t s_inodes_per_group;
+    uint32_t s_mtime;
+    uint32_t s_wtime;
+    uint16_t s_mnt_count;
+    uint16_t s_max_mnt_count;
+    uint16_t s_magic;
+    uint16_t s_state;
+    uint16_t s_errors;
+    uint16_t s_minor_rev_level;
+    uint32_t s_lastcheck;
+    uint32_t s_checkinterval;
+    uint32_t s_creator_os;
+    uint32_t s_rev_level;
+    uint16_t s_def_resuid;
+    uint16_t s_def_resgid;
+    uint32_t s_first_ino;
+    uint16_t s_inode_size;
+    uint16_t s_block_group_nr;
+    uint32_t s_feature_compat;
+    uint32_t s_feature_incompat;
+    uint32_t s_feature_ro_compat;
+    uint8_t  s_uuid[16];
+    char     s_volume_name[16];
+    char     s_last_mounted[64];
+};
+struct ext4_inode {
+    uint16_t i_mode;
+    uint16_t i_uid;
+    uint32_t i_size_lo;
+    uint32_t i_atime;
+    uint32_t i_ctime;
+    uint32_t i_mtime;
+    uint32_t i_dtime;
+    uint16_t i_gid;
+    uint16_t i_links_count;
+    uint32_t i_blocks_lo;
+    uint32_t i_flags;
+    uint32_t i_osd1;
+    uint32_t i_block[15];
+    uint32_t i_generation;
+    uint32_t i_file_acl_lo;
+    uint32_t i_size_high;
+    uint32_t i_obso_faddr;
+    uint8_t  i_osd2[12];
+};
+struct ext2_dir_entry {
+    uint32_t inode;
+    uint16_t rec_len;
+    uint8_t  name_len;
+    uint8_t  file_type;
+    // name follows
+};
+#pragma pack(pop)
+
+//
+// Scanner class: runs in worker thread
+//
+class Scanner : public QObject {
+    Q_OBJECT
+public:
+    explicit Scanner(QObject *parent = nullptr) : QObject(parent), m_stop(false) {}
+    ~Scanner() override { requestStop(); }
+
+    void requestStop() { m_stop.store(true); }
+
+public slots:
+    // startScan runs in the worker thread context
+    void startScan(const QString &devicePath) {
+        m_stop.store(false);
+        scanDevice(devicePath);
+    }
+
+signals:
+    void entryFound(const QString &path, double percent); // path contains "[ino:...]"
+    void progress(double percent); // 0..100
+    void finished();
+
+private:
+    std::atomic<bool> m_stop;
+
+    bool readSuperblock(int fd, uint16_t &inodeSize, uint32_t &blockSize) {
+        ext4_super sb;
+        if (pread_all(fd, &sb, sizeof(sb), 1024) != (ssize_t)sizeof(sb)) return false;
+        if (le16(&sb.s_magic) != 0xEF53) return false;
+        uint16_t isz = le16(&sb.s_inode_size);
+        if (isz == 0) isz = 128;
+        uint32_t log_block = le32(&sb.s_log_block_size);
+        uint32_t bsz = 1024U << log_block;
+        inodeSize = isz;
+        blockSize = bsz;
+        return true;
+    }
+
+    bool validateDirEntry(const uint8_t *block, size_t blockSize, size_t offset) {
+        if (offset + 8 > blockSize) return false;
+        const uint8_t *p = block + offset;
+        uint32_t inode = le32(p);
+        uint16_t rec_len = le16(p + 4);
+        uint8_t name_len = p[6];
+        uint8_t file_type = p[7];
+        if (rec_len < 8) return false;
+        if (offset + rec_len > blockSize) return false;
+        if (name_len == 0 || name_len > rec_len - 8) return false;
+        if (name_len > 255) return false;
+        if (inode == 0) return false;
+        if (file_type > 7) return false;
+        const uint8_t *namep = p + 8;
+        int printable = 0;
+        for (size_t i = 0; i < name_len; ++i) {
+            uint8_t c = namep[i];
+            if (c == 0 || c == '/') return false;
+            if (c >= 0x20 && c < 0x7f) printable++;
+        }
+        if (printable == 0) return false;
+        return true;
+    }
+
+    void scanDevice(const QString &devicePath) {
+        // open device/image read-only
+        int fd = open(devicePath.toLocal8Bit().constData(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            emit finished();
+            return;
+        }
+
+        uint16_t inodeSize = 128;
+        uint32_t blockSize = 4096;
+        readSuperblock(fd, inodeSize, blockSize); // best-effort; fall back to defaults if fails
+
+        off_t end = lseek(fd, 0, SEEK_END);
+        if (end == (off_t)-1) {
+            close(fd);
+            emit finished();
+            return;
+        }
+        off_t totalBytes = end;
+
+        std::unique_ptr<uint8_t[]> inodeBuf(new (std::nothrow) uint8_t[inodeSize ? inodeSize : 128]);
+        if (!inodeBuf) { close(fd); emit finished(); return; }
+
+        // We'll store minimal dir entries to help reconstruct names if needed.
+        // For this version we will emit placeholder paths of the form "/[ino:<pseudo>]/<name>"
+        // immediately when we find a directory entry; that satisfies the user's requirement.
+
+        off_t processedBytes = 0;
+        for (off_t off = 0; off + inodeSize <= end; off += inodeSize) {
+            if (m_stop.load()) break;
+
+            ssize_t r = pread_all(fd, inodeBuf.get(), inodeSize, off);
+            if (r != (ssize_t)inodeSize) {
+                processedBytes = off + inodeSize;
+                double pct = totalBytes > 0 ? (double)processedBytes / (double)totalBytes * 100.0 : 0.0;
+                emit progress(pct);
+                continue;
+            }
+
+            // update monotonic processedBytes
+            processedBytes = off;
+            double pct = totalBytes > 0 ? (double)processedBytes / (double)totalBytes * 100.0 : 0.0;
+            emit progress(pct);
+
+            ext4_inode inode;
+            memset(&inode, 0, sizeof(inode));
+            memcpy(&inode, inodeBuf.get(), std::min((size_t)sizeof(inode), (size_t)inodeSize));
+            uint16_t mode = le16(&inode.i_mode);
+            uint16_t type = mode & 0xF000;
+            if (type != 0x4000) continue; // not a directory
+
+            uint64_t pseudoIno = (uint64_t)(off / inodeSize) + 1;
+
+            // parse direct blocks only
+            for (int bi = 0; bi < 12; ++bi) {
+                uint32_t blk = le32(&inode.i_block[bi]);
+                if (blk == 0) continue;
+                off_t blockOff = (off_t)blk * (off_t)blockSize;
+                if (blockOff + blockSize > end) continue;
+                std::unique_ptr<uint8_t[]> blockBuf(new (std::nothrow) uint8_t[blockSize]);
+                if (!blockBuf) continue;
+                if (pread_all(fd, blockBuf.get(), blockSize, blockOff) != (ssize_t)blockSize) continue;
+                uint32_t pos = 0;
+                while (pos + 8 < blockSize) {
+                    if (!validateDirEntry(blockBuf.get(), blockSize, pos)) { pos += 4; continue; }
+                    const uint8_t *p = blockBuf.get() + pos;
+                    uint32_t inode_no = le32(p);
+                    uint16_t rec_len = le16(p + 4);
+                    uint8_t name_len = p[6];
+                    if (rec_len < 8) break;
+                    if (pos + rec_len > blockSize) break;
+                    if (inode_no != 0 && name_len > 0 && name_len <= 255) {
+                        std::string name((const char*)(p + 8), name_len);
+                        // Build placeholder path: "/[ino:<pseudo>]/<name>"
+                        char bufPath[1024];
+                        snprintf(bufPath, sizeof(bufPath), "/[ino:%llu]/%s", (unsigned long long)pseudoIno, name.c_str());
+                        QString qpath = QString::fromUtf8(bufPath);
+                        // Emit only placeholder-containing paths (they do contain "[ino:...]")
+                        emit entryFound(qpath, pct);
+                    }
+                    pos += rec_len;
+                }
+            }
+        }
+
+        emit progress(100.0);
+        close(fd);
+        emit finished();
+    }
+};
+
+//
+// MainWindow: UI and wiring
+//
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr) : QMainWindow(parent),
+        m_model(new QStandardItemModel(this)),
+        m_proxy(new QSortFilterProxyModel(this)),
+        m_scanner(nullptr),
+        m_scanThread(nullptr)
+    {
+        setupUi();
+        setupConnections();
+        populateFsCombo();
+    }
+
+    ~MainWindow() override {
+        if (m_scanner) {
+            m_scanner->requestStop();
+        }
+        if (m_scanThread) {
+            m_scanThread->quit();
+            m_scanThread->wait();
+        }
+    }
+
+private slots:
+    void refreshFsList() {
+        populateFsCombo();
+    }
+
+    void onFsActivated(int index) {
+        QVariant data = m_fsCombo->itemData(index);
+        if (!data.isValid()) return;
+        QString v = data.toString();
+        if (v == "__choose_file__") {
+            QString device = QFileDialog::getOpenFileName(this, "Select device or image to scan", QString(), "All files (*)");
+            if (device.isEmpty()) return;
+            // insert and select
+            m_fsCombo->insertItem(1, device, device);
+            m_fsCombo->setCurrentIndex(1);
+            startScanForCurrentSelection();
+        } else {
+            startScanForCurrentSelection();
+        }
+    }
+
+    void onSearchClicked() {
+        QString pattern = m_searchEdit->text();
+        if (pattern.isEmpty()) {
+            m_proxy->setFilterRegularExpression(QRegularExpression());
+        } else {
+            QRegularExpression re(pattern, QRegularExpression::CaseInsensitiveOption);
+            if (re.isValid()) m_proxy->setFilterRegularExpression(re);
+            else m_proxy->setFilterFixedString(pattern);
+        }
+    }
+
+    void onEntryFound(const QString &path, double percent) {
+        // deduplicate
+        for (int r = 0; r < m_model->rowCount(); ++r) {
+            QString existing = m_model->item(r, 1)->text();
+            if (existing == path) return;
+        }
+        QList<QStandardItem*> row;
+        QStandardItem *percentItem = new QStandardItem(QString::asprintf("%.2f%%", percent));
+        QStandardItem *pathItem = new QStandardItem(path);
+        QStandardItem *noteItem = new QStandardItem(QString());
+        percentItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        row << percentItem << pathItem << noteItem;
+        m_model->appendRow(row);
+    }
+
+    void onProgress(double percent) {
+        int p = qBound(0, int(percent + 0.5), 100);
+        m_progressBar->setValue(p);
+    }
+
+    void onScanFinished() {
+        QMessageBox::information(this, "Scan finished", "Device scan finished.");
+        // cleanup thread objects are handled in startScanForCurrentSelection connections
+    }
+
+    void onTableSelectionChanged(const QModelIndex &current, const QModelIndex &previous) {
+        Q_UNUSED(previous);
+        if (!current.isValid()) return;
+        QModelIndex src = m_proxy->mapToSource(current);
+        QString path = m_model->item(src.row(), 1)->text();
+
+        // If path is a real file path, preview; otherwise show as text
+        QFileInfo fi(path);
+        if (fi.exists() && fi.isFile()) {
+            QUrl url = QUrl::fromLocalFile(fi.absoluteFilePath());
+            m_preview->load(url);
+        } else {
+            QString html = QString("<html><body><pre>%1</pre></body></html>").arg(path.toHtmlEscaped());
+            m_preview->setHtml(html);
+        }
+    }
+
+private:
+    // UI widgets
+    QComboBox *m_fsCombo = nullptr;
+    QPushButton *m_refreshFsBtn = nullptr;
+    QLineEdit *m_searchEdit = nullptr;
+    QPushButton *m_searchButton = nullptr;
+    QTableView *m_tableView = nullptr;
+    QStandardItemModel *m_model = nullptr;
+    QSortFilterProxyModel *m_proxy = nullptr;
+    QWebEngineView *m_preview = nullptr;
+    QProgressBar *m_progressBar = nullptr;
+    QSplitter *m_splitter = nullptr;
+
+    // scanner
+    Scanner *m_scanner;
+    QThread *m_scanThread;
+
+    void setupUi() {
+        QWidget *central = new QWidget(this);
+        setCentralWidget(central);
+
+        m_fsCombo = new QComboBox(this);
+        m_fsCombo->setMinimumWidth(360);
+        m_refreshFsBtn = new QPushButton("Refresh FS", this);
+
+        m_searchEdit = new QLineEdit(this);
+        m_searchEdit->setPlaceholderText("Filter filenames (regex or substring)");
+        m_searchButton = new QPushButton("Search", this);
+
+        QHBoxLayout *topLayout = new QHBoxLayout;
+        topLayout->addWidget(new QLabel("Filesystem:"));
+        topLayout->addWidget(m_fsCombo);
+        topLayout->addWidget(m_refreshFsBtn);
+        topLayout->addSpacing(12);
+        topLayout->addWidget(new QLabel("Filter:"));
+        topLayout->addWidget(m_searchEdit);
+        topLayout->addWidget(m_searchButton);
+
+        // table model
+        m_model->setColumnCount(3);
+        m_model->setHeaderData(0, Qt::Horizontal, "Percent");
+        m_model->setHeaderData(1, Qt::Horizontal, "Path");
+        m_model->setHeaderData(2, Qt::Horizontal, "Notes");
+
+        m_proxy->setSourceModel(m_model);
+        m_proxy->setFilterCaseSensitivity(Qt::CaseInsensitive);
+        m_proxy->setFilterKeyColumn(1);
+
+        m_tableView = new QTableView(this);
+        m_tableView->setModel(m_proxy);
+        m_tableView->setSelectionBehavior(QAbstractItemView::SelectRows);
+        m_tableView->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_tableView->horizontalHeader()->setStretchLastSection(true);
+        m_tableView->verticalHeader()->setVisible(false);
+        m_tableView->setEditTriggers(QAbstractItemView::NoEditTriggers);
+
+        m_preview = new QWebEngineView(this);
+        m_preview->setHtml("<html><body><h3>No preview</h3></body></html>");
+
+        m_splitter = new QSplitter(this);
+        m_splitter->addWidget(m_tableView);
+        m_splitter->addWidget(m_preview);
+        m_splitter->setStretchFactor(0, 1);
+        m_splitter->setStretchFactor(1, 1);
+
+        m_progressBar = new QProgressBar(this);
+        m_progressBar->setRange(0, 100);
+        m_progressBar->setValue(0);
+
+        QVBoxLayout *mainLayout = new QVBoxLayout;
+        mainLayout->addLayout(topLayout);
+        mainLayout->addWidget(m_splitter);
+        mainLayout->addWidget(m_progressBar);
+
+        central->setLayout(mainLayout);
+
+        setWindowTitle("ext4recover");
+        resize(1200, 800);
+    }
+
+    void setupConnections() {
+        connect(m_refreshFsBtn, &QPushButton::clicked, this, &MainWindow::refreshFsList);
+        connect(m_fsCombo, QOverload<int>::of(&QComboBox::activated), this, &MainWindow::onFsActivated);
+        connect(m_searchButton, &QPushButton::clicked, this, &MainWindow::onSearchClicked);
+        connect(m_searchEdit, &QLineEdit::returnPressed, this, &MainWindow::onSearchClicked);
+        connect(m_tableView->selectionModel(), &QItemSelectionModel::currentChanged,
+                this, &MainWindow::onTableSelectionChanged);
+    }
+
+    void populateFsCombo() {
+        m_fsCombo->clear();
+        m_fsCombo->addItem("Choose device or image...", QString());
+        // parse /proc/mounts for ext4 entries
+        QFile f("/proc/mounts");
+        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QTextStream in(&f);
+            while (!in.atEnd()) {
+                QString line = in.readLine();
+                QStringList parts = line.split(' ', Qt::SkipEmptyParts);
+                if (parts.size() < 3) continue;
+                QString dev = parts.at(0);
+                QString mnt = parts.at(1);
+                QString fstype = parts.at(2);
+                if (fstype == "ext4") {
+                    QString label = QString("%1  (%2)").arg(mnt, dev);
+                    m_fsCombo->addItem(label, dev + "|" + mnt);
+                }
+            }
+            f.close();
+        }
+        m_fsCombo->addItem("Select device/image file...", QString("__choose_file__"));
+    }
+
+    void startScanForCurrentSelection() {
+        int idx = m_fsCombo->currentIndex();
+        if (idx < 0) return;
+        QVariant data = m_fsCombo->itemData(idx);
+        QString device;
+        if (data.isValid()) {
+            QString v = data.toString();
+            if (v == "__choose_file__") {
+                device = QFileDialog::getOpenFileName(this, "Select device or image to scan", QString(), "All files (*)");
+                if (device.isEmpty()) return;
+            } else if (v.contains("|")) {
+                device = v.section('|', 0, 0);
+            } else {
+                device = v;
+            }
+        } else {
+            device = m_fsCombo->currentText();
+        }
+        if (device.isEmpty()) {
+            QMessageBox::warning(this, "No device", "Please select a device or image to scan.");
+            return;
+        }
+
+        // clear previous results
+        m_model->removeRows(0, m_model->rowCount());
+        m_progressBar->setValue(0);
+
+        // create scanner and thread
+        m_scanner = new Scanner;
+        m_scanThread = new QThread(this);
+        m_scanner->moveToThread(m_scanThread);
+
+        connect(m_scanThread, &QThread::started, [this, device]() {
+            m_scanner->startScan(device);
+        });
+        connect(m_scanner, &Scanner::entryFound, this, &MainWindow::onEntryFound);
+        connect(m_scanner, &Scanner::progress, this, &MainWindow::onProgress);
+        connect(m_scanner, &Scanner::finished, this, &MainWindow::onScanFinished);
+        connect(m_scanner, &Scanner::finished, m_scanThread, &QThread::quit);
+        connect(m_scanThread, &QThread::finished, m_scanner, &QObject::deleteLater);
+        connect(m_scanThread, &QThread::finished, m_scanThread, &QObject::deleteLater);
+
+        m_scanThread->start();
+    }
+};
+
+#include "ext4recover.moc"
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+
+    // Ensure Qt WebEngine is initialized (Qt handles this internally when QWebEngineView is used)
+    MainWindow w;
+    w.show();
+
+    return app.exec();
+}
+
+#include <QObject>
+#include "ext4recover.moc"

@@ -1,0 +1,11 @@
+config/gspotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/gspotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/gspotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/gspotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/gspotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/spotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/spotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/spotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/spotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/spotify/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+eclipse.preferences.version=1

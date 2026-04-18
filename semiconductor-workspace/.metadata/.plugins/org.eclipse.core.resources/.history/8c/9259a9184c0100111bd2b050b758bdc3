@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/dat/semiconductor-workspace/winpaint3/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/x86_64-w64-mingw32-gcc -DUNICODE -D_UNICODE  -static-libgcc -static -O2 -O3 -DNDEBUG -o CMakeFiles/winpaint.dir/paint.c.obj -c /dat/semiconductor-workspace/winpaint3/paint.c",
+  "file": "/dat/semiconductor-workspace/winpaint3/paint.c",
+  "output": "CMakeFiles/winpaint.dir/paint.c.obj"
+}
+]

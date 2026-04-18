@@ -1,0 +1,10 @@
+# ninja log v6
+3	764	1772389220495663976	cia-antivirus_autogen/timestamp	b2675d4441c9e514
+3	764	1772389220495663976	cia-antivirus_autogen/mocs_compilation.cpp	b2675d4441c9e514
+3	764	1772389220495663976	/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/timestamp	b2675d4441c9e514
+3	764	1772389220495663976	/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/mocs_compilation.cpp	b2675d4441c9e514
+765	783	1772389220514144762	CMakeFiles/cia-antivirus.dir/cia-antivirus_autogen/mocs_compilation.cpp.o	2011ad0a17fce824
+766	5423	1772389220514664079	CMakeFiles/cia-antivirus.dir/cia-antivirus4.cpp.o	6d413574f4629bb2
+5423	6017	1772389225171689283	cia-antivirus	6c2c274876d60438
+2	13	1772389519688646868	CMakeFiles/clean.additional	b7f779938bef587c
+13	16	1772389519699646987	clean	a31eedcededa8236

@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORKAUTH_LIB -DQT_NETWORK_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetworkAuth -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic -o CMakeFiles/DriveSyncQt6.dir/DriveSyncQt6_autogen/mocs_compilation.cpp.o -c /home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/mocs_compilation.cpp",
+  "file": "/home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/mocs_compilation.cpp",
+  "output": "CMakeFiles/DriveSyncQt6.dir/DriveSyncQt6_autogen/mocs_compilation.cpp.o"
+},
+{
+  "directory": "/home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORKAUTH_LIB -DQT_NETWORK_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/joscha/gdrive-workspace/gdrive7/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetworkAuth -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -O3 -DNDEBUG -std=c++17 -Wall -Wextra -Wpedantic -o CMakeFiles/DriveSyncQt6.dir/main.cpp.o -c /home/joscha/gdrive-workspace/gdrive7/main.cpp",
+  "file": "/home/joscha/gdrive-workspace/gdrive7/main.cpp",
+  "output": "CMakeFiles/DriveSyncQt6.dir/main.cpp.o"
+}
+]

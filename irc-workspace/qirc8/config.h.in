@@ -1,0 +1,2 @@
+#define qirc1_VERSION_MAJOR @qirc1_VERSION_MAJOR@
+#define qirc1_VERSION_MINOR @qirc1_VERSION_MINOR@

@@ -1,0 +1,141 @@
+xghost.c:52:3: error: conflicting types for ‘Region’; have ‘struct <anonymous>’
+   52 | } Region;
+      |   ^~~~~~
+In file included from xghost.c:29:
+/usr/include/X11/Xutil.h:273:26: note: previous declaration of ‘Region’ with type ‘Region’ {aka ‘struct _XRegion *’}
+  273 | typedef struct _XRegion *Region;
+      |                          ^~~~~~
+xghost.c: In function ‘main’:
+xghost.c:382:39: error: request for member ‘x’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                       ^
+xghost.c:382:53: error: request for member ‘y’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                                     ^
+xghost.c:382:67: error: request for member ‘x’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                                                   ^
+xghost.c:382:82: error: request for member ‘w’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                                                                  ^
+xghost.c:382:100: error: request for member ‘y’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                                                                                    ^
+xghost.c:382:115: error: request for member ‘h’ in something not a structure or union
+  382 |             BBox regbox = { regions[r].x, regions[r].y, regions[r].x + regions[r].w - 1, regions[r].y + regions[r].h - 1, 0 };
+      |                                                                                                                   ^
+xghost.c:402:15: error: request for member ‘x’ in something not a structure or union
+  402 |             nr->x = x0; nr->y = y0; nr->w = w; nr->h = h;
+      |               ^~
+xghost.c:402:27: error: request for member ‘y’ in something not a structure or union
+  402 |             nr->x = x0; nr->y = y0; nr->w = w; nr->h = h;
+      |                           ^~
+xghost.c:402:39: error: request for member ‘w’ in something not a structure or union
+  402 |             nr->x = x0; nr->y = y0; nr->w = w; nr->h = h;
+      |                                       ^~
+xghost.c:402:50: error: request for member ‘h’ in something not a structure or union
+  402 |             nr->x = x0; nr->y = y0; nr->w = w; nr->h = h;
+      |                                                  ^~
+xghost.c:403:15: error: request for member ‘hist_pos’ in something not a structure or union
+  403 |             nr->hist_pos = 0; nr->hist_count = 0;
+      |               ^~
+xghost.c:403:33: error: request for member ‘hist_count’ in something not a structure or union
+  403 |             nr->hist_pos = 0; nr->hist_count = 0;
+      |                                 ^~
+xghost.c:404:15: error: request for member ‘id’ in something not a structure or union
+  404 |             nr->id = next_id++;
+      |               ^~
+xghost.c:405:15: error: request for member ‘last_seen_frame’ in something not a structure or union
+  405 |             nr->last_seen_frame = frame_idx;
+      |               ^~
+xghost.c:435:16: error: request for member ‘hist’ in something not a structure or union
+  435 |             reg->hist[reg->hist_pos] = mean;
+      |                ^~
+xghost.c:435:26: error: request for member ‘hist_pos’ in something not a structure or union
+  435 |             reg->hist[reg->hist_pos] = mean;
+      |                          ^~
+xghost.c:436:16: error: request for member ‘hist_pos’ in something not a structure or union
+  436 |             reg->hist_pos = (reg->hist_pos + 1) % MAX_HISTORY;
+      |                ^~
+xghost.c:436:33: error: request for member ‘hist_pos’ in something not a structure or union
+  436 |             reg->hist_pos = (reg->hist_pos + 1) % MAX_HISTORY;
+      |                                 ^~
+xghost.c:437:20: error: request for member ‘hist_count’ in something not a structure or union
+  437 |             if (reg->hist_count < MAX_HISTORY) reg->hist_count++;
+      |                    ^~
+xghost.c:437:51: error: request for member ‘hist_count’ in something not a structure or union
+  437 |             if (reg->hist_count < MAX_HISTORY) reg->hist_count++;
+      |                                                   ^~
+xghost.c:438:16: error: request for member ‘last_seen_frame’ in something not a structure or union
+  438 |             reg->last_seen_frame = frame_idx;
+      |                ^~
+xghost.c:440:16: error: request for member ‘x’ in something not a structure or union
+  440 |             reg->x = boxes[b].x0; reg->y = boxes[b].y0; reg->w = boxes[b].x1 - boxes[b].x0 + 1; reg->h = boxes[b].y1 - boxes[b].y0 + 1;
+      |                ^~
+xghost.c:440:38: error: request for member ‘y’ in something not a structure or union
+  440 |             reg->x = boxes[b].x0; reg->y = boxes[b].y0; reg->w = boxes[b].x1 - boxes[b].x0 + 1; reg->h = boxes[b].y1 - boxes[b].y0 + 1;
+      |                                      ^~
+xghost.c:440:60: error: request for member ‘w’ in something not a structure or union
+  440 |             reg->x = boxes[b].x0; reg->y = boxes[b].y0; reg->w = boxes[b].x1 - boxes[b].x0 + 1; reg->h = boxes[b].y1 - boxes[b].y0 + 1;
+      |                                                            ^~
+xghost.c:440:100: error: request for member ‘h’ in something not a structure or union
+  440 |             reg->x = boxes[b].x0; reg->y = boxes[b].y0; reg->w = boxes[b].x1 - boxes[b].x0 + 1; reg->h = boxes[b].y1 - boxes[b].y0 + 1;
+      |                                                                                                    ^~
+xghost.c:446:39: error: request for member ‘last_seen_frame’ in something not a structure or union
+  446 |             if (frame_idx - regions[r].last_seen_frame > STALE_FRAMES) {
+      |                                       ^
+xghost.c:462:28: error: request for member ‘hist_count’ in something not a structure or union
+  462 |                 int n = reg->hist_count;
+      |                            ^~
+xghost.c:463:66: error: request for member ‘id’ in something not a structure or union
+  463 |                 if (n == 0) { printf("  ID %d: no history\n", reg->id); continue; }
+      |                                                                  ^~
+xghost.c:464:33: error: request for member ‘hist_pos’ in something not a structure or union
+  464 |                 int start = (reg->hist_pos + MAX_HISTORY - reg->hist_count) % MAX_HISTORY;
+      |                                 ^~
+xghost.c:464:63: error: request for member ‘hist_count’ in something not a structure or union
+  464 |                 int start = (reg->hist_pos + MAX_HISTORY - reg->hist_count) % MAX_HISTORY;
+      |                                                               ^~
+xghost.c:465:51: error: request for member ‘hist’ in something not a structure or union
+  465 |                 for (int i=0;i<n;i++) tmp[i] = reg->hist[(start + i) % MAX_HISTORY];
+      |                                                   ^~
+xghost.c:469:27: error: request for member ‘id’ in something not a structure or union
+  469 |                        reg->id, reg->x, reg->y, reg->w, reg->h, n, freq, power);
+      |                           ^~
+xghost.c:469:36: error: request for member ‘x’ in something not a structure or union
+  469 |                        reg->id, reg->x, reg->y, reg->w, reg->h, n, freq, power);
+      |                                    ^~
+xghost.c:469:44: error: request for member ‘y’ in something not a structure or union
+  469 |                        reg->id, reg->x, reg->y, reg->w, reg->h, n, freq, power);
+      |                                            ^~
+xghost.c:469:52: error: request for member ‘w’ in something not a structure or union
+  469 |                        reg->id, reg->x, reg->y, reg->w, reg->h, n, freq, power);
+      |                                                    ^~
+xghost.c:469:60: error: request for member ‘h’ in something not a structure or union
+  469 |                        reg->id, reg->x, reg->y, reg->w, reg->h, n, freq, power);
+      |                                                            ^~
+xghost.c:490:25: error: request for member ‘x’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                         ^~
+xghost.c:490:38: error: request for member ‘y’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                                      ^~
+xghost.c:490:51: error: request for member ‘x’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                                                   ^~
+xghost.c:490:60: error: request for member ‘w’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                                                            ^~
+xghost.c:490:77: error: request for member ‘y’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                                                                             ^~
+xghost.c:490:86: error: request for member ‘h’ in something not a structure or union
+  490 |             int x0 = reg->x, y0 = reg->y, x1 = reg->x + reg->w - 1, y1 = reg->y + reg->h - 1;
+      |                                                                                      ^~
+xghost.c:491:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  491 |             if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 >= WIDTH) x1 = WIDTH - 1; if (y1 >= HEIGHT) y1 = HEIGHT - 1;
+      |             ^~
+xghost.c:491:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  491 |             if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0; if (x1 >= WIDTH) x1 = WIDTH - 1; if (y1 >= HEIGHT) y1 = HEIGHT - 1;
+      |                                 ^~
+make: *** [Makefile:23: ghost_filter] Error 1

@@ -1,0 +1,438 @@
+// cia-antivirus.cpp
+// Qt6 GUI + libclamav + ALSA, Scan läuft in Hintergrundthread (std::thread innerhalb QObject Worker)
+// Fenster ist vergrößerbar und startet maximiert
+// cl_load wird mit nicht-NULL-Pfad aufgerufen, cl_scanfile verwendet nicht-NULL scanoptions
+// Keine Hash-Berechnung
+// Prozentanzeige zeigt dynamisch Nachkommastellen abhängig von Gesamtanzahl
+// Gesamtanzahl wird mit get_cnt_dir("/") ermittelt (rekursives Zählen) — Zählung läuft in Hintergrund, UI bleibt responsiv
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QProgressBar>
+#include <QTextEdit>
+#include <QVBoxLayout>
+#include <QScreen>
+#include <QDirIterator>
+#include <QMutex>
+#include <QDateTime>
+#include <QSizePolicy>
+#include <QTimer>
+#include <QMetaObject>
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstring>
+#include <cmath>
+#include <thread>
+#include <atomic>
+#include <vector>
+
+#include <alsa/asoundlib.h>
+
+extern "C" {
+#include <clamav.h>
+}
+
+// --- get_cnt_dir: vom Benutzer gewünschte Version (rekursives Zählen) ---
+unsigned long get_cnt_dir(const char *ptr_path) {
+    unsigned long cnt_tot = 0;
+    struct dirent *str_ent;
+    DIR *ptr_dir = opendir(ptr_path);
+
+    // falls verzeichnis nicht geöffnet werden kann (z.b. keine rechte)
+    if (!ptr_dir) {
+        return 0;
+    }
+
+    while ((str_ent = readdir(ptr_dir)) != NULL) {
+        // filter: "." und ".." ignorieren
+        if (strcmp(str_ent->d_name, ".") == 0 || strcmp(str_ent->d_name, "..") == 0) {
+            continue;
+        }
+
+        // pfad für den nächsten schritt zusammenbauen
+        char chr_sub[1024];
+        snprintf(chr_sub, sizeof(chr_sub), "%s/%s", ptr_path, str_ent->d_name);
+
+        if (str_ent->d_type == DT_DIR) {
+            // rekursiver aufruf für unterverzeichnisse
+            cnt_tot += get_cnt_dir(chr_sub);
+        } else if (str_ent->d_type == DT_REG) {
+            // reguläre datei zählen
+            cnt_tot++;
+        }
+    }
+
+    closedir(ptr_dir);
+    return cnt_tot;
+}
+
+// --- libclamav callbacks (nicht-NULL) ---
+static cl_error_t sigload_progress_cb(size_t total_items, size_t now_completed, void *context) {
+    Q_UNUSED(total_items);
+    Q_UNUSED(now_completed);
+    Q_UNUSED(context);
+    return CL_SUCCESS;
+}
+
+static void clamav_msg_cb(enum cl_msg severity, const char *fullmsg, const char *msg, void *context) {
+    Q_UNUSED(severity);
+    Q_UNUSED(context);
+    if (fullmsg) {
+        fprintf(stderr, "clamav: %s\n", fullmsg);
+    } else if (msg) {
+        fprintf(stderr, "clamav: %s\n", msg);
+    }
+}
+
+// --- Worker (QObject) der den Scan in einem std::thread ausführt ---
+class ScannerWorker : public QObject {
+    Q_OBJECT
+public:
+    explicit ScannerWorker(const QStringList &roots, QObject *parent = nullptr)
+        : QObject(parent), m_roots(roots), m_running(false) {}
+
+    ~ScannerWorker() override {
+        stop();
+    }
+
+    void start() {
+        if (m_running.load()) return;
+        m_running.store(true);
+        m_thread = std::thread(&ScannerWorker::scanLoop, this);
+    }
+
+    void stop() {
+        if (!m_running.load()) return;
+        m_running.store(false);
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+signals:
+    void fileScanned(const QString &path, bool infected);
+    void virusFound(const QString &path, const QString &virusName);
+    void logMessage(const QString &msg, bool important);
+    void finishedScanning();
+
+private:
+    void scanLoop() {
+        if (!m_running.load()) {
+            emit finishedScanning();
+            return;
+        }
+
+        if (cl_init(CL_INIT_DEFAULT) != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_init failed"), true);
+            emit finishedScanning();
+            return;
+        }
+
+        struct cl_engine *engine = cl_engine_new();
+        if (!engine) {
+            emit logMessage(QStringLiteral("cl_engine_new failed"), true);
+            emit finishedScanning();
+            return;
+        }
+
+        // DB-Pfad nicht-NULL: cl_retdbdir() oder Fallback
+        const char *dbdir = cl_retdbdir();
+        const char *usepath = (dbdir && dbdir[0]) ? dbdir : "/var/lib/clamav";
+
+        unsigned int sigs = 0;
+        cl_error_t loadrc = cl_load(usepath, engine, &sigs, 0);
+        if (loadrc != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_load failed: %1").arg(cl_strerror(loadrc)), true);
+            cl_engine_free(engine);
+            emit finishedScanning();
+            return;
+        }
+
+        // set non-NULL callbacks
+        cl_engine_set_clcb_sigload_progress(engine, sigload_progress_cb, nullptr);
+        cl_set_clcb_msg(clamav_msg_cb);
+
+        if (cl_engine_compile(engine) != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_engine_compile failed"), true);
+            cl_engine_free(engine);
+            emit finishedScanning();
+            return;
+        }
+
+        // prepare non-NULL scan options (zero-initialisiert)
+        struct cl_scan_options scanopts;
+        memset(&scanopts, 0, sizeof(scanopts));
+        // Optional: falls Felder in cl_scan_options vorhanden sind, hier setzen
+
+        for (const QString &root : m_roots) {
+            if (!m_running.load()) break;
+            QDirIterator it(root, QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext() && m_running.load()) {
+                QString path = it.next();
+                if (path.startsWith("/proc") || path.startsWith("/sys") || path.startsWith("/dev"))
+                    continue;
+
+                const char *cpath = path.toUtf8().constData();
+                const char *virname = nullptr;
+                unsigned long int scanned = 0;
+
+                cl_error_t rc = cl_scanfile(cpath, &virname, &scanned, engine, &scanopts);
+
+                if (rc == CL_VIRUS) {
+                    QString v = virname ? QString::fromUtf8(virname) : QStringLiteral("(unknown)");
+                    emit virusFound(path, v);
+                } else if (rc != CL_CLEAN && rc != CL_SUCCESS) {
+                    emit logMessage(QStringLiteral("Scan error %1 for %2").arg(cl_strerror(rc)).arg(path), true);
+                }
+
+                emit fileScanned(path, rc == CL_VIRUS);
+
+                // kurze Pause, damit UI-Events verarbeitet werden können
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        cl_engine_free(engine);
+        emit finishedScanning();
+        m_running.store(false);
+    }
+
+    QStringList m_roots;
+    std::thread m_thread;
+    std::atomic<bool> m_running;
+};
+
+// --- MainWindow mit ALSA-Alarm (zwei Töne nacheinander) ---
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        QWidget *central = new QWidget;
+        QVBoxLayout *lay = new QVBoxLayout;
+        central->setLayout(lay);
+        setCentralWidget(central);
+
+        m_progress = new QProgressBar;
+        m_progress->setTextVisible(true);
+        m_progress->setMinimum(0);
+        m_progress->setValue(0);
+        m_progress->setFixedHeight(30);
+        m_progress->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        lay->addWidget(m_progress);
+
+        m_log = new QTextEdit;
+        m_log->setReadOnly(true);
+        m_log->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        lay->addWidget(m_log);
+
+        lay->setStretchFactor(m_progress, 0);
+        lay->setStretchFactor(m_log, 1);
+
+        // Gesamtanzahl per get_cnt_dir("/") ermitteln — Zählung in Hintergrund, UI bleibt responsiv
+        m_progress->setMaximum(1000000); // temporärer Fallback-Wert bis Zählung fertig
+        std::thread([this]() {
+            unsigned long total = get_cnt_dir("/");
+            if (total == 0) {
+                // falls Zählung 0 ergibt, belasse Fallback
+                return;
+            }
+            // setze Maximum im GUI-Thread
+            QMetaObject::invokeMethod(this, "setTotalCount", Qt::QueuedConnection,
+                                      Q_ARG(unsigned long, total));
+        }).detach();
+
+        // initiales Format
+        updateProgressFormat(0, m_progress->maximum());
+
+        QStringList roots;
+        roots << "/";
+
+        m_worker = new ScannerWorker(roots, this);
+
+        connect(m_worker, &ScannerWorker::fileScanned, this, &MainWindow::onFileScanned);
+        connect(m_worker, &ScannerWorker::virusFound, this, &MainWindow::onVirusFound);
+        connect(m_worker, &ScannerWorker::logMessage, this, &MainWindow::appendLog);
+        connect(m_worker, &ScannerWorker::finishedScanning, this, &MainWindow::onFinished);
+
+        // Startet Scan in Hintergrund (std::thread innerhalb Worker)
+        m_worker->start();
+    }
+
+    ~MainWindow() override {
+        if (m_worker) {
+            m_worker->stop();
+            m_worker->deleteLater();
+        }
+    }
+
+public slots:
+    void setTotalCount(unsigned long total) {
+        if (total == 0) return;
+        if (total < (1ULL<<31)) {
+            m_progress->setMaximum(static_cast<int>(total));
+        } else {
+            m_progress->setMaximum(1000000);
+        }
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+    }
+
+    void onFileScanned(const QString &path, bool infected) {
+        QMutexLocker locker(&m_mutex);
+        int nextVal = m_progress->value() + 1;
+        if (nextVal > m_progress->maximum()) nextVal = m_progress->maximum();
+        m_progress->setValue(nextVal);
+
+        // Update Format mit dynamischer Nachkommastellen-Anzeige
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+
+        if (infected) {
+            m_log->setTextColor(Qt::red);
+            QFont f = m_log->currentFont();
+            f.setBold(true);
+            m_log->setCurrentFont(f);
+            m_log->append(QString("[%1] INFECTED: %2").arg(QDateTime::currentDateTime().toString(), path));
+            m_log->setTextColor(Qt::black);
+            f.setBold(false);
+            m_log->setCurrentFont(f);
+        } else {
+            m_log->setTextColor(Qt::black);
+            QFont f = m_log->currentFont();
+            f.setBold(false);
+            m_log->setCurrentFont(f);
+            m_log->append(QString("[%1] OK: %2").arg(QDateTime::currentDateTime().toString(), path));
+        }
+    }
+
+    void onVirusFound(const QString &path, const QString &virusName) {
+        Q_UNUSED(path);
+        Q_UNUSED(virusName);
+        playAlertToneALSA(440.0, 1.0, 880.0, 1.0);
+    }
+
+    void appendLog(const QString &msg, bool important) {
+        Q_UNUSED(important);
+        m_log->append(msg);
+    }
+
+    void onFinished() {
+        m_log->append("Scan finished.");
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+    }
+
+private:
+    // Berechnet Anzahl Nachkommastellen abhängig von total und setzt das Format der ProgressBar
+    void updateProgressFormat(int current, int total) {
+        QString percentStr = formatPercent(current, total);
+        QString fmt = QString("%1  %2/%3").arg(percentStr, QString::number(current), QString::number(total));
+        m_progress->setFormat(fmt);
+    }
+
+    // Formatierung: dynamische Nachkommastellen basierend auf Größe von total
+    QString formatPercent(int current, int total) {
+        if (total <= 0) return QStringLiteral("0%");
+        double pct = (static_cast<double>(current) * 100.0) / static_cast<double>(total);
+
+        // Anzahl Ziffern in total
+        int digits = 1;
+        if (total > 0) {
+            digits = static_cast<int>(std::floor(std::log10(static_cast<double>(total)))) + 1;
+        }
+
+        // Ziel: bei großen Totals weniger Nachkommastellen
+        int decimals = 3 - digits;
+        if (decimals < 0) decimals = 0;
+        if (decimals > 6) decimals = 6;
+
+        return QString::number(pct, 'f', decimals) + QStringLiteral("%");
+    }
+
+    // Play first freq1 for dur1 seconds, then freq2 for dur2 seconds using ALSA (detached thread)
+    void playAlertToneALSA(double freq1, double dur1, double freq2, double dur2) {
+        std::thread([freq1, dur1, freq2, dur2]() {
+            const unsigned int sampleRate = 44100;
+            const unsigned int channels = 1;
+            const snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+            const double amplitude = 0.6 * 32767.0;
+
+            auto playTone = [&](double freq, double duration) -> void {
+                int rc;
+                snd_pcm_t *pcmHandle = nullptr;
+                snd_pcm_hw_params_t *params = nullptr;
+
+                rc = snd_pcm_open(&pcmHandle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+                if (rc < 0) return;
+
+                snd_pcm_hw_params_malloc(&params);
+                snd_pcm_hw_params_any(pcmHandle, params);
+                snd_pcm_hw_params_set_access(pcmHandle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+                snd_pcm_hw_params_set_format(pcmHandle, params, format);
+                snd_pcm_hw_params_set_channels(pcmHandle, params, channels);
+                unsigned int rate = sampleRate;
+                snd_pcm_hw_params_set_rate_near(pcmHandle, params, &rate, 0);
+
+                snd_pcm_uframes_t frames = 1024;
+                snd_pcm_hw_params_set_period_size_near(pcmHandle, params, &frames, 0);
+
+                rc = snd_pcm_hw_params(pcmHandle, params);
+                if (rc < 0) {
+                    snd_pcm_hw_params_free(params);
+                    snd_pcm_close(pcmHandle);
+                    return;
+                }
+
+                snd_pcm_hw_params_free(params);
+
+                const size_t totalSamples = static_cast<size_t>(std::ceil(duration * sampleRate));
+                std::vector<int16_t> buffer(totalSamples * channels);
+
+                constexpr double PI = 3.14159265358979323846;
+                for (size_t i = 0; i < totalSamples; ++i) {
+                    double t = static_cast<double>(i) / static_cast<double>(sampleRate);
+                    double v = amplitude * std::sin(2.0 * PI * freq * t);
+                    buffer[i] = static_cast<int16_t>(v);
+                }
+
+                size_t offset = 0;
+                while (offset < totalSamples) {
+                    snd_pcm_sframes_t framesToWrite = std::min<size_t>(frames, totalSamples - offset);
+                    rc = snd_pcm_writei(pcmHandle, buffer.data() + offset * channels, framesToWrite);
+                    if (rc == -EPIPE) {
+                        snd_pcm_prepare(pcmHandle);
+                    } else if (rc < 0) {
+                        break;
+                    } else {
+                        offset += static_cast<size_t>(rc);
+                    }
+                }
+
+                snd_pcm_drain(pcmHandle);
+                snd_pcm_close(pcmHandle);
+            };
+
+            playTone(freq1, dur1);
+            playTone(freq2, dur2);
+        }).detach();
+    }
+
+    QProgressBar *m_progress;
+    QTextEdit *m_log;
+    ScannerWorker *m_worker;
+    QMutex m_mutex;
+};
+
+#include "cia-antivirus4.moc"
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.setWindowState(w.windowState() | Qt::WindowMaximized);
+    w.show();
+    return app.exec();
+}
+
+#include <QObject>
+#include <QStringList>
+#include <QMutexLocker>
+#include <QMetaType>

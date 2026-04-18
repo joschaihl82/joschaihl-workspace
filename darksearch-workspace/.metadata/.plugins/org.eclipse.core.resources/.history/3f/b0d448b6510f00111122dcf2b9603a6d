@@ -1,0 +1,154 @@
+cmake_minimum_required(VERSION 3.13)
+project(wt_crawler LANGUAGES CXX)
+
+# -------------------------
+# User options
+# -------------------------
+option(BUILD_STATIC_LIBS "Prefer static libraries (.a) when finding dependencies" OFF)
+option(CMAKE_BUILD_TYPE "Build type" RELEASE)
+if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+  set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Install prefix" FORCE)
+endif()
+
+# -------------------------
+# C++ standard
+# -------------------------
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# -------------------------
+# Prefer static libs if requested
+# -------------------------
+if(BUILD_STATIC_LIBS)
+  # Prepend .a so find_library and pkg-config prefer static libs
+  if(NOT CMAKE_FIND_LIBRARY_SUFFIXES)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a" ".so")
+  else()
+    list(REMOVE_ITEM CMAKE_FIND_LIBRARY_SUFFIXES ".so" ".dylib")
+    list(INSERT CMAKE_FIND_LIBRARY_SUFFIXES 0 ".a")
+  endif()
+  add_definitions(-DBUILD_STATIC_LIBS)
+endif()
+
+# -------------------------
+# pkg-config for Wt and libxml2
+# -------------------------
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(WT REQUIRED wt)
+pkg_check_modules(LIBXML2 REQUIRED libxml-2.0)
+
+# Include and link dirs from pkg-config
+include_directories(${WT_INCLUDE_DIRS} ${LIBXML2_INCLUDE_DIRS})
+link_directories(${WT_LIBRARY_DIRS} ${LIBXML2_LIBRARY_DIRS})
+add_definitions(${WT_CFLAGS_OTHER} ${LIBXML2_CFLAGS_OTHER})
+
+# -------------------------
+# Find other dependencies
+# -------------------------
+find_package(CURL REQUIRED)
+find_package(SQLite3 REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
+
+# Add include dirs for found packages
+if(CURL_FOUND)
+  include_directories(${CURL_INCLUDE_DIRS})
+endif()
+if(SQLite3_FOUND)
+  include_directories(${SQLite3_INCLUDE_DIRS})
+endif()
+if(OpenSSL_FOUND)
+  include_directories(${OPENSSL_INCLUDE_DIR})
+endif()
+
+# -------------------------
+# Source and target
+# -------------------------
+set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/wt_crawler.cpp)
+add_executable(wt_crawler ${SRC})
+
+# Ensure position independent code for static linking where needed
+set_target_properties(wt_crawler PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# -------------------------
+# Link libraries
+# -------------------------
+# Use pkg-config WT libs first (this will include wt, wt_http, wtfcgi etc. as provided by pkg-config)
+if(WT_LIBRARIES)
+  target_link_libraries(wt_crawler ${WT_LIBRARIES})
+else()
+  # Fallback: try to find common Wt components by name
+  find_library(WT_LIB wt HINTS /usr/local/lib /usr/lib)
+  find_library(WT_HTTP_LIB wt_http HINTS /usr/local/lib /usr/lib)
+  if(WT_LIB) target_link_libraries(wt_crawler ${WT_LIB}) endif()
+  if(WT_HTTP_LIB) target_link_libraries(wt_crawler ${WT_HTTP_LIB}) endif()
+endif()
+
+# Link libxml2 from pkg-config
+if(LIBXML2_LIBRARIES)
+  target_link_libraries(wt_crawler ${LIBXML2_LIBRARIES})
+endif()
+
+# Link other required libs
+if(CURL_LIBRARIES)
+  target_link_libraries(wt_crawler ${CURL_LIBRARIES})
+else()
+  target_link_libraries(wt_crawler CURL::libcurl)
+endif()
+
+if(SQLite3_LIBRARIES)
+  target_link_libraries(wt_crawler ${SQLite3_LIBRARIES})
+else()
+  target_link_libraries(wt_crawler SQLite::SQLite3)
+endif()
+
+if(OPENSSL_FOUND)
+  target_link_libraries(wt_crawler OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+# Threads
+target_link_libraries(wt_crawler Threads::Threads)
+
+# Some systems require dl and rt
+find_library(DL_LIB dl)
+if(DL_LIB) target_link_libraries(wt_crawler ${DL_LIB}) endif()
+find_library(RT_LIB rt)
+if(RT_LIB) target_link_libraries(wt_crawler ${RT_LIB}) endif()
+
+# -------------------------
+# Compile definitions and warnings
+# -------------------------
+target_compile_definitions(wt_crawler PRIVATE _GNU_SOURCE)
+if(MSVC)
+  target_compile_options(wt_crawler PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(wt_crawler PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
+# -------------------------
+# RPATH and install
+# -------------------------
+# Ensure runtime linker can find libraries installed to CMAKE_INSTALL_PREFIX/lib
+set_target_properties(wt_crawler PROPERTIES
+  BUILD_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
+  INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
+)
+
+install(TARGETS wt_crawler RUNTIME DESTINATION bin)
+
+# Install helper: copy config or docs if present
+install(FILES README.md DESTINATION share/wt_crawler OPTIONAL)
+
+# -------------------------
+# Helpful messages
+# -------------------------
+message(STATUS "Project: ${PROJECT_NAME}")
+message(STATUS "CMake build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "Using pkg-config Wt include dirs: ${WT_INCLUDE_DIRS}")
+message(STATUS "Using pkg-config Wt libraries: ${WT_LIBRARIES}")
+if(BUILD_STATIC_LIBS)
+  message(STATUS "BUILD_STATIC_LIBS=ON: preferring static libraries (.a)")
+endif()

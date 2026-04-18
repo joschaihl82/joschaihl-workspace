@@ -1,0 +1,40 @@
+var data = {
+  "name": "Josh",
+  "age": 34,
+  "active": true,
+  "tags": ["dev", "c", "sparrow"]
+};
+
+// The compiler will create globals:
+//   data_name   -> pointer to "Josh" (.rodata)
+//   data_age    -> integer 34
+//   data_active -> integer 1 (true)
+//   data_tags   -> pointer to JSON text for the array (or separate rodata)
+
+function show_fields() {
+  // Print string globals with printf (use %s)
+  printf("Name: %s\n", data_name);
+
+  // Print numeric globals with print (uses %g)
+  print("Age:", data_age);
+
+  // Boolean printed via printf or print
+  if (data_active) {
+    printf("Active: true\n");
+  } else {
+    printf("Active: false\n");
+  }
+
+  // Print the tags JSON text (pointer to rodata)
+  printf("Tags JSON: %s\n", data_tags);
+}
+
+function show_whole() {
+  // 'data' itself is a pointer to the full JSON text emitted in .rodata
+  printf("Full JSON: %s\n", data);
+}
+
+	print("Demo start");
+	//show_fields();
+	show_whole();
+	print("Demo end");	

@@ -1,0 +1,78 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+
+/* this is the magic fix for modpost undefined errors */
+#define CREATE_TRACE_POINTS
+#include <trace/events/sched.h>
+
+/* lowercase compatibility layer */
+#define hz HZ
+#define path_max PATH_MAX
+#define gfp_atomic GFP_ATOMIC
+#define is_err IS_ERR
+#define define_ratelimit_state DEFINE_RATELIMIT_STATE
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("josh");
+MODULE_DESCRIPTION("trace exec paths");
+MODULE_VERSION("1.0");
+
+define_ratelimit_state(sys_rlstat, 5 * hz, 10);
+
+static void prb_execcbk(void *data, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+{
+	char *buf;
+	char *path;
+
+	if (!p || !bprm || !bprm->file)
+		return;
+
+	if (!__ratelimit(&sys_rlstat))
+		return;
+
+	struct path fpath = bprm->file->f_path;
+	path_get(&fpath);
+
+	buf = kmalloc(path_max, gfp_atomic);
+	if (!buf) {
+		path_put(&fpath);
+		return;
+	}
+
+	path = d_path(&fpath, buf, path_max);
+	if (!is_err(path)) {
+		pr_info("exectrace: pid=%d comm=%s path=%s\n", p->pid, p->comm, path);
+	}
+
+	kfree(buf);
+	path_put(&fpath);
+}
+
+static int __init mod_initfn(void)
+{
+	int ret = register_trace_sched_process_exec(prb_execcbk, NULL);
+	if (ret) return ret;
+
+	pr_info("exectrace: loaded\n");
+	return 0;
+}
+
+static void __exit mod_exitfn(void)
+{
+	unregister_trace_sched_process_exec(prb_execcbk, NULL);
+	tracepoint_synchronize_unregister();
+	pr_info("exectrace: unloaded\n");
+}
+
+module_init(mod_initfn);
+module_exit(mod_exitfn);

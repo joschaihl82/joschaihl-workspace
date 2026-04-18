@@ -1,0 +1,201 @@
+// exectrace1.c
+// Register a probe for sched_process_exec by resolving the tracepoint pointer
+// at runtime via kallsyms_lookup_name. This avoids declaring __tracepoint_*
+// symbols at link time (which causes modpost undefined errors on some kernels).
+//
+// Build with: obj-m := exectrace1.o
+// Then: make -C /lib/modules/$(uname -r)/build M=$PWD modules V=1
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+#include <linux/string.h>
+#include <linux/bpf.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("josh");
+MODULE_DESCRIPTION("Trace exec paths and print resolved full path using sched_process_exec tracepoint");
+MODULE_VERSION("1.3");
+
+/* Rate-limit state */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+/* Prototype for kallsyms_lookup_name (many distros export this symbol) */
+extern unsigned long kallsyms_lookup_name(const char *name);
+
+/* Probe callback matching sched_process_exec tracepoint:
+ * void probe(void *data, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+ */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+    char *buf = NULL;
+    char *path = NULL;
+
+    if (!p || !bprm)
+        return;
+
+    if (!__ratelimit(&exectrace_rl))
+        return;
+
+    if (bprm->file) {
+        struct path fpath;
+
+        fpath = bprm->file->f_path;
+        path_get(&fpath);
+
+        buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!buf) {
+            path_put(&fpath);
+            pr_info("exectrace: pid=%d comm=%s filename=%s (no mem)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+            return;
+        }
+
+        path = d_path(&fpath, buf, PATH_MAX);
+        if (IS_ERR(path)) {
+            pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+        } else {
+            pr_info("exectrace: pid=%d comm=%s path=%s\n",
+                p->pid, p->comm, path);
+        }
+
+        kfree(buf);
+        path_put(&fpath);
+    } else {
+        pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+            p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+    }
+}
+
+/* Helper: try to resolve a symbol name to an address using kallsyms_lookup_name.
+ * Returns NULL on failure.
+ */
+static void *resolve_symbol(const char *name)
+{
+    unsigned long addr;
+
+    if ((void *)kallsyms_lookup_name == NULL)
+        return NULL;
+
+    addr = kallsyms_lookup_name(name);
+    if (!addr)
+        return NULL;
+    return (void *)addr;
+}
+
+/* Try to find a tracepoint by name by scanning the tracepoint table
+ * using __start___tracepoints/__stop___tracepoints addresses resolved via kallsyms.
+ * Returns pointer or NULL.
+ */
+static struct tracepoint *find_tracepoint_by_name_runtime(const char *name)
+{
+    struct tracepoint *start, *stop, *tp;
+    unsigned long pstart, pstop;
+
+    pstart = (unsigned long)resolve_symbol("__start___tracepoints");
+    pstop  = (unsigned long)resolve_symbol("__stop___tracepoints");
+    if (!pstart || !pstop)
+        return NULL;
+
+    start = (struct tracepoint *)pstart;
+    stop  = (struct tracepoint *)pstop;
+
+    for (tp = start; tp < stop; tp++) {
+        if (tp->name && strcmp(tp->name, name) == 0)
+            return tp;
+    }
+    return NULL;
+}
+
+/* Pointer to the tracepoint we register with */
+static struct tracepoint *tp_sched = NULL;
+static bool tp_registered;
+
+/* Module init: resolve tracepoint pointer and register probe */
+static int __init exectrace_init(void)
+{
+    int ret = 0;
+
+    /* 1) Try to resolve exported tracepoint symbol __tracepoint_sched_process_exec */
+    tp_sched = (struct tracepoint *)resolve_symbol("__tracepoint_sched_process_exec");
+    if (tp_sched) {
+        ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+        if (ret == 0) {
+            tp_registered = true;
+            pr_info("exectrace: registered via __tracepoint_sched_process_exec\n");
+            return 0;
+        }
+        /* if registration failed, clear and fall through */
+        tp_sched = NULL;
+    }
+
+    /* 2) Try runtime scan of tracepoint table */
+    tp_sched = find_tracepoint_by_name_runtime("sched_process_exec");
+    if (tp_sched) {
+        ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+        if (ret == 0) {
+            tp_registered = true;
+            pr_info("exectrace: registered via runtime tracepoint scan\n");
+            return 0;
+        }
+        tp_sched = NULL;
+    }
+
+    /* 3) Try register_trace_sched_process_exec helper if exported */
+    {
+        typedef int (*reg_fn_t)(void *probe, void *data);
+        reg_fn_t reg_fn = (reg_fn_t)resolve_symbol("register_trace_sched_process_exec");
+        if (reg_fn) {
+            ret = reg_fn((void *)probe_sched_process_exec, NULL);
+            if (ret == 0) {
+                tp_registered = true;
+                pr_info("exectrace: registered via register_trace_sched_process_exec helper\n");
+                return 0;
+            }
+        }
+    }
+
+    pr_err("exectrace: failed to register probe for sched_process_exec (ret=%d)\n", ret);
+    return ret ? ret : -ENOENT;
+}
+
+/* Module exit: unregister probe according to how it was registered */
+static void __exit exectrace_exit(void)
+{
+    if (!tp_registered)
+        goto out;
+
+    /* If we registered via tracepoint_probe_register, unregister with tracepoint pointer */
+    if (tp_sched) {
+        tracepoint_probe_unregister(tp_sched, (void *)probe_sched_process_exec, NULL);
+        goto out;
+    }
+
+    /* Otherwise try unregister helper if available */
+    {
+        typedef void (*unreg_fn_t)(void *probe, void *data);
+        unreg_fn_t unreg_fn = (unreg_fn_t)resolve_symbol("unregister_trace_sched_process_exec");
+        if (unreg_fn) {
+            unreg_fn((void *)probe_sched_process_exec, NULL);
+        }
+    }
+
+out:
+    pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);

@@ -1,0 +1,602 @@
+// packer_lz4.cpp
+// Qt6 single-file LZ4 packer with improved UI and directory support
+// Save as packer_lz4.cpp
+// Build with Qt6 Widgets and optional liblz4 (CMakeLists provided earlier)
+
+#include <QtWidgets>
+#include <QThreadPool>
+#include <QFileInfo>
+#include <QDirIterator>
+#include <atomic>
+
+#ifdef __has_include
+#  if __has_include(<lz4frame.h>)
+#    include <lz4frame.h>
+#    define HAVE_LZ4_FRAME 1
+#  endif
+#endif
+
+#ifndef HAVE_LZ4_FRAME
+#  undef HAVE_LZ4_FRAME
+#endif
+
+static QString humanSize(qint64 bytes) {
+    if (bytes < 0) return QString();
+    const char* units[] = {"B","KB","MB","GB","TB"};
+    double b = double(bytes);
+    int i = 0;
+    while (b >= 1024.0 && i < 4) { b /= 1024.0; ++i; }
+    return QString::asprintf("%.2f %s", b, units[i]);
+}
+
+static void appendLog(QTextEdit* log, const QString& line) {
+    QString ts = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+    log->append(QString("[%1] %2").arg(ts, line));
+}
+
+// Simple container format:
+// For each entry:
+// 1 byte: type (0=file, 1=dir)
+// u16: path length (bytes)
+// path bytes (UTF-8, relative path)
+// u64: file size (0 for dir)
+// file bytes (only for file, exactly file size)
+// Entries concatenated.
+
+class PackWorker : public QObject, public QRunnable {
+    Q_OBJECT
+public:
+    struct Entry { QString absPath; QString relPath; bool isDir; qint64 size; };
+    enum Mode { Pack, Unpack };
+
+    PackWorker(const QList<Entry>& entries, const QString& archivePath, Mode mode,
+               int compressionLevel, bool checksum)
+        : m_entries(entries), m_archivePath(archivePath), m_mode(mode),
+          m_compressionLevel(compressionLevel), m_checksum(checksum)
+    {
+        setAutoDelete(true);
+    }
+
+signals:
+    void progress(int percent, const QString& message);
+    void finished(bool success, const QString& message);
+
+protected:
+    void run() override {
+        if (m_mode == Pack) pack();
+        else unpack();
+    }
+
+private:
+    QList<Entry> m_entries;
+    QString m_archivePath;
+    Mode m_mode;
+    int m_compressionLevel;
+    bool m_checksum;
+
+    void emitProgress(int p, const QString& msg) { emit progress(p, msg); }
+
+    // portable checksum flag assignment
+    template<typename T>
+    static T checksumFlag(bool enabled) {
+#if defined(LZ4F_contentChecksumEnabled) && defined(LZ4F_contentChecksumNotEnabled)
+        return enabled ? LZ4F_contentChecksumEnabled : LZ4F_contentChecksumNotEnabled;
+#elif defined(LZ4F_contentChecksumEnabled)
+        return enabled ? LZ4F_contentChecksumEnabled : (T)0;
+#else
+        return (T)(enabled ? 1 : 0);
+#endif
+    }
+
+    void pack() {
+        if (m_entries.isEmpty()) { emit finished(false, "No entries to pack."); return; }
+        QString outFile = m_archivePath;
+        if (outFile.isEmpty()) {
+            QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+            outFile = QDir::current().filePath(QString("archive_%1.lz4").arg(stamp));
+        }
+
+#ifdef HAVE_LZ4_FRAME
+        emitProgress(0, "Packing with LZ4 Frame API");
+        FILE* fout = fopen(outFile.toLocal8Bit().constData(), "wb");
+        if (!fout) { emit finished(false, "Cannot open output file for writing."); return; }
+
+        LZ4F_preferences_t prefs;
+        memset(&prefs, 0, sizeof(prefs));
+        prefs.frameInfo.contentChecksumFlag = checksumFlag<decltype(prefs.frameInfo.contentChecksumFlag)>(m_checksum);
+        prefs.compressionLevel = m_compressionLevel;
+
+        LZ4F_cctx* cctx = nullptr;
+        if (LZ4F_createCompressionContext(&cctx, LZ4F_VERSION) != 0) { fclose(fout); emit finished(false, "LZ4F_createCompressionContext failed"); return; }
+
+        // Build container in streaming fashion: write headers and compressed frames per entry
+        qint64 totalBytes = 0;
+        for (const Entry& e : m_entries) totalBytes += qMax<qint64>(1, e.size);
+        qint64 processed = 0;
+        int idx = 0;
+
+        for (const Entry& e : m_entries) {
+            ++idx;
+            // write metadata header (uncompressed): magic "PCK2", type(1), pathlen(u16), path bytes, filesize(u64)
+            QByteArray pathUtf8 = e.relPath.toUtf8();
+            fwrite("PCK2",1,4,fout);
+            unsigned char type = e.isDir ? 1 : 0;
+            fwrite(&type,1,1,fout);
+            quint16 plen = quint16(pathUtf8.size());
+            fwrite(&plen, sizeof(plen), 1, fout);
+            fwrite(pathUtf8.constData(), 1, plen, fout);
+            quint64 fsize = (quint64)e.size;
+            fwrite(&fsize, sizeof(fsize), 1, fout);
+
+            if (e.isDir) {
+                emitProgress(int((processed*100)/totalBytes), QString("Added dir: %1").arg(e.relPath));
+                continue;
+            }
+
+            QFile in(e.absPath);
+            if (!in.open(QIODevice::ReadOnly)) { LZ4F_freeCompressionContext(cctx); fclose(fout); emit finished(false, QString("Cannot open input: %1").arg(e.absPath)); return; }
+
+            // Start a new LZ4 frame for this file
+            char outBuf[1<<16];
+            size_t headerSize = LZ4F_compressBegin(cctx, outBuf, sizeof(outBuf), &prefs);
+            if (LZ4F_isError(headerSize)) { in.close(); LZ4F_freeCompressionContext(cctx); fclose(fout); emit finished(false, "LZ4F_compressBegin failed"); return; }
+            fwrite(outBuf,1,headerSize,fout);
+
+            while (!in.atEnd()) {
+                QByteArray chunk = in.read(1<<16);
+                size_t cSize = LZ4F_compressUpdate(cctx, outBuf, sizeof(outBuf), chunk.constData(), chunk.size(), nullptr);
+                if (LZ4F_isError(cSize)) { in.close(); LZ4F_freeCompressionContext(cctx); fclose(fout); emit finished(false, "LZ4F_compressUpdate failed"); return; }
+                fwrite(outBuf,1,cSize,fout);
+                processed += chunk.size();
+                int percent = int((processed * 100) / qMax<qint64>(1, totalBytes));
+                emitProgress(percent, QString("Packing %1 (%2/%3)").arg(e.relPath).arg(idx).arg(m_entries.size()));
+            }
+
+            size_t endSize = LZ4F_compressEnd(cctx, outBuf, sizeof(outBuf), nullptr);
+            if (LZ4F_isError(endSize)) { in.close(); LZ4F_freeCompressionContext(cctx); fclose(fout); emit finished(false, "LZ4F_compressEnd failed"); return; }
+            fwrite(outBuf,1,endSize,fout);
+            in.close();
+        }
+
+        LZ4F_freeCompressionContext(cctx);
+        fclose(fout);
+        emit finished(true, QString("Packed %1 entries to %2").arg(m_entries.size()).arg(outFile));
+#else
+        // Fallback: create temporary container file then call lz4 CLI
+        emitProgress(0, "Packing with lz4 CLI fallback");
+        QString tmp = QDir::temp().filePath(QString("packer_container_%1.bin").arg(QDateTime::currentMSecsSinceEpoch()));
+        QFile out(tmp);
+        if (!out.open(QIODevice::WriteOnly)) { emit finished(false, "Cannot create temporary file."); return; }
+
+        for (const Entry& e : m_entries) {
+            QByteArray pathUtf8 = e.relPath.toUtf8();
+            out.write("PCK2",4);
+            unsigned char type = e.isDir ? 1 : 0;
+            out.write(reinterpret_cast<const char*>(&type),1);
+            quint16 plen = quint16(pathUtf8.size());
+            out.write(reinterpret_cast<const char*>(&plen), sizeof(plen));
+            out.write(pathUtf8);
+            quint64 fsize = (quint64)e.size;
+            out.write(reinterpret_cast<const char*>(&fsize), sizeof(fsize));
+            if (!e.isDir) {
+                QFile in(e.absPath);
+                if (!in.open(QIODevice::ReadOnly)) { out.close(); QFile::remove(tmp); emit finished(false, QString("Cannot open input: %1").arg(e.absPath)); return; }
+                while (!in.atEnd()) {
+                    QByteArray chunk = in.read(1<<16);
+                    out.write(chunk);
+                }
+                in.close();
+            }
+        }
+        out.close();
+
+        QStringList args;
+        if (m_compressionLevel >= 1 && m_compressionLevel <= 12) args << QString("-%1").arg(m_compressionLevel);
+        args << tmp << outFile;
+        QProcess proc;
+        proc.start("lz4", args);
+        if (!proc.waitForStarted()) { QFile::remove(tmp); emit finished(false, "Failed to start lz4 process."); return; }
+        while (proc.state() == QProcess::Running) {
+            QThread::msleep(200);
+            emitProgress(50, "Compressing (external lz4)");
+            QCoreApplication::processEvents();
+        }
+        proc.waitForFinished();
+        int exitCode = proc.exitCode();
+        QFile::remove(tmp);
+        if (exitCode != 0) { emit finished(false, QString("lz4 failed: %1").arg(proc.readAllStandardError())); return; }
+        emitProgress(100, "Compression finished");
+        emit finished(true, QString("Packed %1 entries to %2").arg(m_entries.size()).arg(outFile));
+#endif
+    }
+
+    void unpack() {
+        if (m_archivePath.isEmpty()) { emit finished(false, "No archive selected."); return; }
+#ifdef HAVE_LZ4_FRAME
+        emitProgress(0, "Unpacking with LZ4 Frame API");
+        QFile in(m_archivePath);
+        if (!in.open(QIODevice::ReadOnly)) { emit finished(false, "Cannot open archive."); return; }
+        QByteArray all = in.readAll();
+        const char* ptr = all.constData();
+        qint64 remaining = all.size();
+        int extracted = 0;
+        while (remaining > 0) {
+            if (remaining < 4) { emit finished(false, "Corrupt archive (short magic)"); return; }
+            if (memcmp(ptr, "PCK2", 4) != 0) { emit finished(false, "Invalid archive magic"); return; }
+            ptr += 4; remaining -= 4;
+            unsigned char type = (unsigned char)*ptr; ptr += 1; remaining -= 1;
+            quint16 plen;
+            if (remaining < (int)sizeof(plen)) { emit finished(false, "Corrupt archive (short plen)"); return; }
+            memcpy(&plen, ptr, sizeof(plen)); ptr += sizeof(plen); remaining -= sizeof(plen);
+            if (remaining < plen) { emit finished(false, "Corrupt archive (short path)"); return; }
+            QString relPath = QString::fromUtf8(ptr, plen); ptr += plen; remaining -= plen;
+            if (remaining < (int)sizeof(quint64)) { emit finished(false, "Corrupt archive (short fsize)"); return; }
+            quint64 fsize;
+            memcpy(&fsize, ptr, sizeof(fsize)); ptr += sizeof(fsize); remaining -= sizeof(fsize);
+
+            if (type == 1) { // directory
+                QDir().mkpath(relPath);
+                ++extracted;
+                emitProgress(int((extracted*100)/qMax(1,m_entries.size())), QString("Created dir: %1").arg(relPath));
+                continue;
+            }
+
+            // For files: next bytes are an LZ4 frame; we need to decompress frame-by-frame.
+            // For simplicity: write remaining bytes to temp and use LZ4F to decompress until we produce fsize bytes.
+            // Note: This is a pragmatic approach; production code should stream properly.
+            QByteArray frameData(ptr, remaining);
+            LZ4F_dctx* dctx = nullptr;
+            if (LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION) != 0) { emit finished(false, "LZ4F_createDecompressionContext failed"); return; }
+            const char* src = frameData.constData();
+            size_t srcSize = frameData.size();
+            size_t srcPos = 0;
+            QByteArray outBuf;
+            outBuf.resize((qint64)fsize);
+            size_t outPos = 0;
+            while (outPos < fsize && srcPos < srcSize) {
+                size_t dstSize = fsize - outPos;
+                size_t dstSizeCopy = dstSize;
+                size_t ret = LZ4F_decompress(dctx, outBuf.data()+outPos, &dstSizeCopy, src+srcPos, &srcSize, nullptr);
+                if (LZ4F_isError(ret)) { LZ4F_freeDecompressionContext(dctx); emit finished(false, "Decompression error"); return; }
+                outPos += dstSizeCopy;
+                srcPos = srcSize;
+                if (ret == 0) break;
+            }
+            LZ4F_freeDecompressionContext(dctx);
+
+            // write file
+            QFile outFile(relPath);
+            QDir().mkpath(QFileInfo(relPath).absolutePath());
+            if (!outFile.open(QIODevice::WriteOnly)) { emit finished(false, QString("Cannot write: %1").arg(relPath)); return; }
+            outFile.write(outBuf);
+            outFile.close();
+
+            // advance ptr by consumed bytes (srcPos)
+            ptr += srcPos;
+            remaining -= srcPos;
+            ++extracted;
+            emitProgress(int((extracted*100)/qMax(1,m_entries.size())), QString("Extracted: %1").arg(relPath));
+        }
+        emit finished(true, QString("Unpacked %1 entries").arg(extracted));
+#else
+        // Fallback: use lz4 -d to decompress to temp, then parse container
+        emitProgress(0, "Unpacking with lz4 CLI fallback");
+        QString tmp = QDir::temp().filePath(QString("packer_unpacked_%1.bin").arg(QDateTime::currentMSecsSinceEpoch()));
+        QProcess proc;
+        proc.start("lz4", QStringList() << "-d" << m_archivePath << tmp);
+        if (!proc.waitForStarted()) { emit finished(false, "Failed to start lz4 process."); return; }
+        while (proc.state() == QProcess::Running) {
+            QThread::msleep(100);
+            emitProgress(10, "Decompressing (external lz4)");
+            QCoreApplication::processEvents();
+        }
+        proc.waitForFinished();
+        if (proc.exitCode() != 0) { emit finished(false, QString("lz4 failed: %1").arg(proc.readAllStandardError())); return; }
+
+        QFile in(tmp);
+        if (!in.open(QIODevice::ReadOnly)) { QFile::remove(tmp); emit finished(false, "Cannot open temporary file."); return; }
+        while (!in.atEnd()) {
+            char magic[4];
+            if (in.read(magic,4) != 4) break;
+            if (memcmp(magic,"PCK2",4) != 0) { in.close(); QFile::remove(tmp); emit finished(false, "Invalid archive format"); return; }
+            unsigned char type;
+            in.read(reinterpret_cast<char*>(&type),1);
+            quint16 plen;
+            in.read(reinterpret_cast<char*>(&plen), sizeof(plen));
+            QByteArray path = in.read(plen);
+            quint64 fsize;
+            in.read(reinterpret_cast<char*>(&fsize), sizeof(fsize));
+            QString relPath = QString::fromUtf8(path);
+            if (type == 1) { QDir().mkpath(relPath); continue; }
+            QByteArray data = in.read((qint64)fsize);
+            QDir().mkpath(QFileInfo(relPath).absolutePath());
+            QFile outFile(relPath);
+            if (!outFile.open(QIODevice::WriteOnly)) { in.close(); QFile::remove(tmp); emit finished(false, QString("Cannot write: %1").arg(relPath)); return; }
+            outFile.write(data);
+            outFile.close();
+        }
+        in.close();
+        QFile::remove(tmp);
+        emit finished(true, "Unpacked archive");
+#endif
+    }
+};
+
+// ---------- MainWindow with improved UI ----------
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        setWindowTitle("LZ4 Packer");
+        resize(1000, 700);
+        QWidget* central = new QWidget;
+        setCentralWidget(central);
+
+        // Toolbar
+        QToolBar* tb = addToolBar("main");
+        tb->setIconSize(QSize(20,20));
+        QAction* actAddFiles = tb->addAction(QIcon::fromTheme("document-open"), "Add Files");
+        QAction* actAddDir = tb->addAction(QIcon::fromTheme("folder-new"), "Add Directory");
+        QAction* actRemove = tb->addAction(QIcon::fromTheme("edit-delete"), "Remove");
+        tb->addSeparator();
+        QAction* actPack = tb->addAction(QIcon::fromTheme("document-save"), "Pack");
+        QAction* actUnpack = tb->addAction(QIcon::fromTheme("document-open"), "Unpack");
+
+        // Left: tree of entries
+        QGroupBox* gbEntries = new QGroupBox("Entries");
+        QVBoxLayout* vEntries = new QVBoxLayout;
+        m_tree = new QTreeWidget;
+        m_tree->setHeaderLabels(QStringList() << "Name" << "Size" << "Type" << "Path");
+        m_tree->setColumnHidden(3, true); // store absolute path in hidden column
+        m_tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+        vEntries->addWidget(m_tree);
+        QHBoxLayout* hEntryBtns = new QHBoxLayout;
+        QPushButton* btnAddFiles = new QPushButton("Add Files");
+        QPushButton* btnAddDir = new QPushButton("Add Directory");
+        QPushButton* btnRemoveSel = new QPushButton("Remove");
+        hEntryBtns->addWidget(btnAddFiles);
+        hEntryBtns->addWidget(btnAddDir);
+        hEntryBtns->addWidget(btnRemoveSel);
+        vEntries->addLayout(hEntryBtns);
+        gbEntries->setLayout(vEntries);
+
+        // Right: options
+        QGroupBox* gbOptions = new QGroupBox("Archive Options");
+        QFormLayout* fOpt = new QFormLayout;
+        m_cbLevel = new QComboBox;
+        for (int i=1;i<=12;++i) m_cbLevel->addItem(QString::number(i));
+        m_cbLevel->setCurrentIndex(3);
+        m_chkChecksum = new QCheckBox("Enable checksum");
+        m_chkPreserve = new QCheckBox("Preserve absolute paths (store relative by default)");
+        m_chkIncludeEmptyDirs = new QCheckBox("Include empty directories");
+        m_leOutput = new QLineEdit;
+        QPushButton* btnBrowse = new QPushButton("Browse");
+        fOpt->addRow("Compression level", m_cbLevel);
+        fOpt->addRow("", m_chkChecksum);
+        fOpt->addRow("", m_chkPreserve);
+        fOpt->addRow("", m_chkIncludeEmptyDirs);
+        fOpt->addRow("Output archive", m_leOutput);
+        fOpt->addRow("", btnBrowse);
+        gbOptions->setLayout(fOpt);
+
+        // Bottom: progress + log
+        m_progress = new QProgressBar;
+        m_progress->setRange(0,100);
+        m_log = new QTextEdit;
+        m_log->setReadOnly(true);
+        QSplitter* bottomSplit = new QSplitter(Qt::Vertical);
+        bottomSplit->addWidget(m_progress);
+        bottomSplit->addWidget(m_log);
+        bottomSplit->setStretchFactor(1, 1);
+
+        // Layout
+        QHBoxLayout* topLayout = new QHBoxLayout;
+        topLayout->addWidget(gbEntries, 3);
+        topLayout->addWidget(gbOptions, 1);
+
+        QVBoxLayout* mainLayout = new QVBoxLayout;
+        mainLayout->addLayout(topLayout);
+        mainLayout->addWidget(bottomSplit, 1);
+        central->setLayout(mainLayout);
+
+        statusBar()->showMessage("Ready");
+
+        // Connections
+        connect(btnAddFiles, &QPushButton::clicked, this, &MainWindow::onAddFiles);
+        connect(actAddFiles, &QAction::triggered, this, &MainWindow::onAddFiles);
+        connect(btnAddDir, &QPushButton::clicked, this, &MainWindow::onAddDirectory);
+        connect(actAddDir, &QAction::triggered, this, &MainWindow::onAddDirectory);
+        connect(btnRemoveSel, &QPushButton::clicked, this, &MainWindow::onRemoveSelected);
+        connect(actRemove, &QAction::triggered, this, &MainWindow::onRemoveSelected);
+        connect(btnBrowse, &QPushButton::clicked, this, &MainWindow::onBrowseOutput);
+        connect(actPack, &QAction::triggered, this, &MainWindow::onPack);
+        connect(actUnpack, &QAction::triggered, this, &MainWindow::onUnpack);
+        connect(m_tree, &QTreeWidget::customContextMenuRequested, this, &MainWindow::onTreeContextMenu);
+
+        // Drag & drop
+        setAcceptDrops(true);
+    }
+
+protected:
+    void dragEnterEvent(QDragEnterEvent* e) override {
+        if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+    }
+    void dropEvent(QDropEvent* e) override {
+        const QList<QUrl> urls = e->mimeData()->urls();
+        for (const QUrl& u : urls) {
+            QString path = u.toLocalFile();
+            if (QFileInfo(path).isDir()) addDirectory(path);
+            else addFile(path);
+        }
+    }
+
+private slots:
+    void onAddFiles() {
+        QStringList files = QFileDialog::getOpenFileNames(this, "Add files");
+        for (const QString& f : files) addFile(f);
+    }
+    void onAddDirectory() {
+        QString dir = QFileDialog::getExistingDirectory(this, "Select directory to add");
+        if (!dir.isEmpty()) addDirectory(dir);
+    }
+    void onRemoveSelected() {
+        auto items = m_tree->selectedItems();
+        for (QTreeWidgetItem* it : items) delete it;
+    }
+    void onBrowseOutput() {
+        QString file = QFileDialog::getSaveFileName(this, "Choose output archive", QDir::currentPath(), "LZ4 Archive (*.lz4)");
+        if (!file.isEmpty()) m_leOutput->setText(file);
+    }
+    void onPack() {
+        QList<PackWorker::Entry> entries = collectEntries();
+        if (entries.isEmpty()) { appendLog(m_log, "No entries to pack."); return; }
+        QString out = m_leOutput->text();
+        if (out.isEmpty()) {
+            QString base = QFileInfo(entries.first().absPath).absolutePath();
+            out = QFileDialog::getSaveFileName(this, "Select output archive", base, "LZ4 Archive (*.lz4)");
+            if (out.isEmpty()) return;
+            m_leOutput->setText(out);
+        }
+        appendLog(m_log, QString("Starting pack: %1 entries -> %2").arg(entries.size()).arg(out));
+        PackWorker* w = new PackWorker(entries, out, PackWorker::Pack, m_cbLevel->currentText().toInt(), m_chkChecksum->isChecked());
+        connect(w, &PackWorker::progress, this, &MainWindow::onWorkerProgress);
+        connect(w, &PackWorker::finished, this, &MainWindow::onWorkerFinished);
+        QThreadPool::globalInstance()->start(w);
+    }
+    void onUnpack() {
+        QString archive = QFileDialog::getOpenFileName(this, "Open archive to unpack", QDir::currentPath(), "LZ4 Archive (*.lz4)");
+        if (archive.isEmpty()) return;
+        appendLog(m_log, QString("Starting unpack: %1").arg(archive));
+        PackWorker* w = new PackWorker(QList<PackWorker::Entry>(), archive, PackWorker::Unpack, m_cbLevel->currentText().toInt(), m_chkChecksum->isChecked());
+        connect(w, &PackWorker::progress, this, &MainWindow::onWorkerProgress);
+        connect(w, &PackWorker::finished, this, &MainWindow::onWorkerFinished);
+        QThreadPool::globalInstance()->start(w);
+    }
+
+    void onWorkerProgress(int percent, const QString& message) {
+        m_progress->setValue(percent);
+        statusBar()->showMessage(message);
+    }
+    void onWorkerFinished(bool success, const QString& message) {
+        appendLog(m_log, message);
+        m_progress->setValue(success ? 100 : 0);
+        statusBar()->showMessage(success ? "Done" : "Error");
+    }
+
+    void onTreeContextMenu(const QPoint& pt) {
+        QTreeWidgetItem* it = m_tree->itemAt(pt);
+        if (!it) return;
+        QMenu m;
+        QAction* open = m.addAction("Open location");
+        QAction* remove = m.addAction("Remove");
+        QAction* act = m.exec(m_tree->viewport()->mapToGlobal(pt));
+        if (act == open) {
+            QString abs = it->data(0, Qt::UserRole+1).toString();
+            QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(abs).absolutePath()));
+        } else if (act == remove) {
+            delete it;
+        }
+    }
+
+private:
+    QTreeWidget* m_tree = nullptr;
+    QComboBox* m_cbLevel = nullptr;
+    QCheckBox* m_chkChecksum = nullptr;
+    QCheckBox* m_chkPreserve = nullptr;
+    QCheckBox* m_chkIncludeEmptyDirs = nullptr;
+    QLineEdit* m_leOutput = nullptr;
+    QProgressBar* m_progress = nullptr;
+    QTextEdit* m_log = nullptr;
+
+    void addFile(const QString& path) {
+        QFileInfo fi(path);
+        if (!fi.exists() || !fi.isFile()) return;
+        QString rel = computeRelative(path);
+        QTreeWidgetItem* it = new QTreeWidgetItem(QStringList() << fi.fileName() << humanSize(fi.size()) << "File" << path);
+        it->setData(0, Qt::UserRole+1, path);
+        it->setData(0, Qt::UserRole+2, rel);
+        it->setIcon(0, QApplication::style()->standardIcon(QStyle::SP_FileIcon));
+        m_tree->addTopLevelItem(it);
+        appendLog(m_log, QString("Added file: %1").arg(path));
+    }
+
+    void addDirectory(const QString& dirPath) {
+        QFileInfo fi(dirPath);
+        if (!fi.exists() || !fi.isDir()) return;
+        QString base = computeRelative(dirPath);
+        // Add directory node and all children recursively
+        QDirIterator it(dirPath, QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot, QDirIterator::Subdirectories);
+        // Add the root directory entry
+        QTreeWidgetItem* root = new QTreeWidgetItem(QStringList() << fi.fileName() << "" << "Directory" << dirPath);
+        root->setData(0, Qt::UserRole+1, dirPath);
+        root->setData(0, Qt::UserRole+2, base);
+        root->setIcon(0, QApplication::style()->standardIcon(QStyle::SP_DirIcon));
+        m_tree->addTopLevelItem(root);
+        appendLog(m_log, QString("Added directory: %1").arg(dirPath));
+
+        while (it.hasNext()) {
+            it.next();
+            QString p = it.filePath();
+            QFileInfo cfi(p);
+            QString rel = QDir(dirPath).relativeFilePath(p);
+            QString relFull = QDir::cleanPath(QDir(dirPath).dirName() + QDir::separator() + rel);
+            if (cfi.isDir()) {
+                QTreeWidgetItem* dit = new QTreeWidgetItem(QStringList() << cfi.fileName() << "" << "Directory" << p);
+                dit->setData(0, Qt::UserRole+1, p);
+                dit->setData(0, Qt::UserRole+2, relFull);
+                dit->setIcon(0, QApplication::style()->standardIcon(QStyle::SP_DirIcon));
+                m_tree->addTopLevelItem(dit);
+            } else {
+                QTreeWidgetItem* fit = new QTreeWidgetItem(QStringList() << cfi.fileName() << humanSize(cfi.size()) << "File" << p);
+                fit->setData(0, Qt::UserRole+1, p);
+                fit->setData(0, Qt::UserRole+2, relFull);
+                fit->setIcon(0, QApplication::style()->standardIcon(QStyle::SP_FileIcon));
+                m_tree->addTopLevelItem(fit);
+            }
+        }
+    }
+
+    QString computeRelative(const QString& absPath) const {
+        // If preserve absolute paths is checked, store absolute; otherwise store relative to current dir
+        if (m_chkPreserve && m_chkPreserve->isChecked()) return absPath;
+        QString cwd = QDir::currentPath();
+        QString rel = QDir(cwd).relativeFilePath(absPath);
+        return rel;
+    }
+
+    QList<PackWorker::Entry> collectEntries() const {
+        QList<PackWorker::Entry> list;
+        for (int i=0;i<m_tree->topLevelItemCount();++i) {
+            QTreeWidgetItem* it = m_tree->topLevelItem(i);
+            QString abs = it->data(0, Qt::UserRole+1).toString();
+            QString rel = it->data(0, Qt::UserRole+2).toString();
+            QString type = it->text(2);
+            if (type == "Directory") {
+                // If include empty dirs unchecked, skip directories that are not explicitly added as empty
+                if (!m_chkIncludeEmptyDirs->isChecked()) {
+                    // check if directory is empty relative to entries: we still include directories explicitly added
+                }
+                PackWorker::Entry e; e.absPath = abs; e.relPath = rel; e.isDir = true; e.size = 0;
+                list << e;
+            } else {
+                QFileInfo fi(abs);
+                PackWorker::Entry e; e.absPath = abs; e.relPath = rel; e.isDir = false; e.size = fi.size();
+                list << e;
+            }
+        }
+        return list;
+    }
+};
+
+// ---------- main ----------
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    QCoreApplication::setApplicationName("lz4_packer");
+    QCoreApplication::setOrganizationName("ExampleOrg");
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include "lz4packer1.moc"

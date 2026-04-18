@@ -1,0 +1,9 @@
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/shader_ide.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/edit_cache.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/rebuild_cache.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/list_install_components.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/install.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/install/local.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/install/strip.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/shader_ide_autogen_timestamp_deps.dir
+/home/joscha/vj-workspace/shadertoy/CMakeFiles/shader_ide_autogen.dir

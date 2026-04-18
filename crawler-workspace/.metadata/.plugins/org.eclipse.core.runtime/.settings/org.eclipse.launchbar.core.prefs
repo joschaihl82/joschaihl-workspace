@@ -1,0 +1,14 @@
+LaunchTargetManager/configs/crawler1\ (1)=org.eclipse.launchbar.core.launchTargetType.local\:Local
+LaunchTargetManager/configs/crawler4\ Debug=org.eclipse.launchbar.core.launchTargetType.local\:Local
+LaunchTargetManager/configs/jcrawler1\ Debug=org.eclipse.launchbar.core.launchTargetType.local\:Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:textgen,org.eclipse.launchbar.core.descriptorType.default\:textgen (1),org.eclipse.launchbar.core.descriptorType.default\:crawler1,org.eclipse.launchbar.core.descriptorType.default\:crawler1 (1),org.eclipse.launchbar.core.descriptorType.default\:crawler3 Debug,org.eclipse.launchbar.core.descriptorType.default\:jcrawler1 Debug,org.eclipse.launchbar.core.descriptorType.default\:crawler4 Debug,org.eclipse.launchbar.core.descriptorType.default\:textgen2 Debug
+eclipse.preferences.version=1
+org.eclipse.launchbar.core.descriptorType.default\:crawler1/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:crawler1/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:crawler4\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:crawler4\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:textgen/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:textgen/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

@@ -1,0 +1,8 @@
+# ninja log v6
+2	296	1776066267202358578	gitpush_autogen/timestamp	e3e94112fac223b0
+2	296	1776066267202358578	gitpush_autogen/mocs_compilation.cpp	e3e94112fac223b0
+2	296	1776066267202358578	/home/joscha/git-workspace/gitpush4/build/cmake.run.linux.x86_64.Local/gitpush_autogen/timestamp	e3e94112fac223b0
+2	296	1776066267202358578	/home/joscha/git-workspace/gitpush4/build/cmake.run.linux.x86_64.Local/gitpush_autogen/mocs_compilation.cpp	e3e94112fac223b0
+296	307	1776066267213399922	CMakeFiles/gitpush.dir/gitpush_autogen/mocs_compilation.cpp.o	84ae197b566ca46c
+297	4390	1776066267214385084	CMakeFiles/gitpush.dir/gitpush1.cpp.o	c4ef2ee731df4fa5
+4391	4922	1776066271307362066	gitpush	348f4d51f7c82915

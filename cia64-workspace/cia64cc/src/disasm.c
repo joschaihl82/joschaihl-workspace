@@ -1,0 +1,270 @@
+// cia64disasm.c -- CIA64 disassembler
+// Build: gcc -O2 -std=c11 -o cia64disasm cia64disasm.c
+// Usage: ./cia64disasm [-h|--header] [-a base_addr] file.bin
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <inttypes.h>
+#include <errno.h>
+
+static inline uint32_t rd_of(uint32_t insn){ return (insn>>7)&0x1F; }
+static inline uint32_t rs1_of(uint32_t insn){ return (insn>>15)&0x1F; }
+static inline uint32_t rs2_of(uint32_t insn){ return (insn>>20)&0x1F; }
+static inline uint32_t opcode_of(uint32_t insn){ return insn & 0x7F; }
+static inline uint32_t funct3_of(uint32_t insn){ return (insn>>12)&0x7; }
+static inline uint32_t funct7_of(uint32_t insn){ return (insn>>25)&0x7F; }
+
+static int32_t sign_extend(uint32_t v, int bits) {
+    uint32_t m = 1u << (bits - 1);
+    return (int32_t)((v ^ m) - m);
+}
+
+static void regname(char *buf, size_t n, const char *prefix, unsigned idx) {
+    snprintf(buf, n, "%s%u", prefix, idx);
+}
+
+static void print_reg(char *out, size_t n, unsigned idx) {
+    snprintf(out, n, "x%u", idx);
+}
+static void print_freg(char *out, size_t n, unsigned idx) {
+    snprintf(out, n, "f%u", idx);
+}
+static void print_vreg(char *out, size_t n, unsigned idx) {
+    snprintf(out, n, "v%u", idx);
+}
+
+/* decode immediates for B-type and J-type */
+static int32_t imm_b(uint32_t insn) {
+    uint32_t imm12 = (insn >> 31) & 0x1;
+    uint32_t imm11 = (insn >> 7) & 0x1;
+    uint32_t imm10_5 = (insn >> 25) & 0x3F;
+    uint32_t imm4_1 = (insn >> 8) & 0xF;
+    uint32_t imm = (imm12 << 12) | (imm11 << 11) | (imm10_5 << 5) | (imm4_1 << 1);
+    return sign_extend(imm, 13);
+}
+static int32_t imm_j(uint32_t insn) {
+    uint32_t imm20 = (insn >> 31) & 0x1;
+    uint32_t imm10_1 = (insn >> 21) & 0x3FF;
+    uint32_t imm11 = (insn >> 20) & 0x1;
+    uint32_t imm19_12 = (insn >> 12) & 0xFF;
+    uint32_t imm = (imm20 << 20) | (imm19_12 << 12) | (imm11 << 11) | (imm10_1 << 1);
+    return sign_extend(imm, 21);
+}
+static int32_t imm_i(uint32_t insn) {
+    uint32_t imm = (insn >> 20) & 0xFFF;
+    return sign_extend(imm, 12);
+}
+static int32_t imm_s(uint32_t insn) {
+    uint32_t imm4_0 = (insn >> 7) & 0x1F;
+    uint32_t imm11_5 = (insn >> 25) & 0x7F;
+    uint32_t imm = (imm11_5 << 5) | imm4_0;
+    return sign_extend(imm, 12);
+}
+
+/* Disassemble one 32-bit instruction into buf (bufsize). pc is virtual address. */
+static void disasm_insn(uint32_t insn, uint64_t pc, char *buf, size_t bufsize) {
+    uint32_t opc = opcode_of(insn);
+    uint32_t rd = rd_of(insn), rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+    uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+    char rdst[8], r1[8], r2[8], vf[8];
+    print_reg(rdst, sizeof(rdst), rd);
+    print_reg(r1, sizeof(r1), rs1);
+    print_reg(r2, sizeof(r2), rs2);
+
+    switch (opc) {
+    case 0x33: { // R-type
+        if (f3==0 && f7==0x00) snprintf(buf, bufsize, "ADD %s, %s, %s", rdst, r1, r2);
+        else if (f3==0 && f7==0x20) snprintf(buf, bufsize, "SUB %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x1) snprintf(buf, bufsize, "SLL %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x2) snprintf(buf, bufsize, "SLT %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x3) snprintf(buf, bufsize, "SLTU %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x4) snprintf(buf, bufsize, "XOR %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x5 && f7==0x00) snprintf(buf, bufsize, "SRL %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x5 && f7==0x20) snprintf(buf, bufsize, "SRA %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x6) snprintf(buf, bufsize, "OR %s, %s, %s", rdst, r1, r2);
+        else if (f3==0x7) snprintf(buf, bufsize, "AND %s, %s, %s", rdst, r1, r2);
+        else snprintf(buf, bufsize, "UNIMPL_R f3=0x%x f7=0x%x", f3, f7);
+        break;
+    }
+    case 0x13: { // I-type ALU
+        int32_t imm = imm_i(insn);
+        if (f3==0x0) snprintf(buf, bufsize, "ADDI %s, %s, %d", rdst, r1, imm);
+        else if (f3==0x1) {
+            uint32_t sh = (insn>>20)&0x3F;
+            snprintf(buf, bufsize, "SLLI %s, %s, %u", rdst, r1, sh);
+        } else if (f3==0x5) {
+            uint32_t sh = (insn>>20)&0x3F;
+            if (f7==0x00) snprintf(buf, bufsize, "SRLI %s, %s, %u", rdst, r1, sh);
+            else snprintf(buf, bufsize, "SRAI %s, %s, %u", rdst, r1, sh);
+        } else snprintf(buf, bufsize, "UNIMPL_I f3=0x%x", f3);
+        break;
+    }
+    case 0x03: { // LOAD
+        int32_t imm = imm_i(insn);
+        const char *mn = "??";
+        if (f3==0x0) mn = "LB";
+        else if (f3==0x1) mn = "LH";
+        else if (f3==0x2) mn = "LW";
+        else if (f3==0x3) mn = "LD";
+        else if (f3==0x4) mn = "LBU";
+        else if (f3==0x5) mn = "LHU";
+        else if (f3==0x6) mn = "LWU";
+        snprintf(buf, bufsize, "%s %s, %d(%s)", mn, rdst, imm, r1);
+        break;
+    }
+    case 0x23: { // STORE
+        int32_t imm = imm_s(insn);
+        const char *mn = "??";
+        if (f3==0x0) mn = "SB";
+        else if (f3==0x1) mn = "SH";
+        else if (f3==0x2) mn = "SW";
+        else if (f3==0x3) mn = "SD";
+        snprintf(buf, bufsize, "%s %s, %d(%s)", mn, r2, imm, r1);
+        break;
+    }
+    case 0x63: { // BRANCH
+        int32_t off = imm_b(insn);
+        const char *mn = "??";
+        if (f3==0x0) mn = "BEQ";
+        else if (f3==0x1) mn = "BNE";
+        else if (f3==0x4) mn = "BLT";
+        else if (f3==0x5) mn = "BGE";
+        else if (f3==0x6) mn = "BLTU";
+        else if (f3==0x7) mn = "BGEU";
+        snprintf(buf, bufsize, "%s %s, %s, 0x%llx", mn, r1, r2, (unsigned long long)(pc + off));
+        break;
+    }
+    case 0x6F: { // JAL
+        int32_t off = imm_j(insn);
+        snprintf(buf, bufsize, "JAL %s, 0x%llx", rdst, (unsigned long long)(pc + off));
+        break;
+    }
+    case 0x67: { // JALR
+        int32_t imm = imm_i(insn);
+        snprintf(buf, bufsize, "JALR %s, %s, %d", rdst, r1, imm);
+        break;
+    }
+    case 0x73: { // SYSTEM
+        uint32_t funct = (insn >> 20);
+        if (funct == 0) snprintf(buf, bufsize, "ECALL");
+        else snprintf(buf, bufsize, "SYSTEM 0x%x", funct);
+        break;
+    }
+    case 0x53: { // FP scalar
+        // Use f7 and f3 mapping from earlier
+        uint32_t rd_f = rd, rs1_f = rs1, rs2_f = rs2;
+        char rd_s[8], rs1_s[8], rs2_s[8];
+        print_freg(rd_s, sizeof(rd_s), rd_f);
+        print_freg(rs1_s, sizeof(rs1_s), rs1_f);
+        print_freg(rs2_s, sizeof(rs2_s), rs2_f);
+        if (f7==0x00 && f3==0x0) snprintf(buf, bufsize, "FADD.D %s, %s, %s", rd_s, rs1_s, rs2_s);
+        else if (f7==0x00 && f3==0x1) snprintf(buf, bufsize, "FSUB.D %s, %s, %s", rd_s, rs1_s, rs2_s);
+        else if (f7==0x00 && f3==0x2) snprintf(buf, bufsize, "FMUL.D %s, %s, %s", rd_s, rs1_s, rs2_s);
+        else if (f7==0x00 && f3==0x3) snprintf(buf, bufsize, "FDIV.D %s, %s, %s", rd_s, rs1_s, rs2_s);
+        else if (f7==0x20 && f3==0x0) snprintf(buf, bufsize, "FCVT.D.SI %s, %s", rd_s, r1); // int->double
+        else if (f7==0x20 && f3==0x1) snprintf(buf, bufsize, "FCVT.SI.D %s, %s", rdst, rs1_s); // double->int
+        else snprintf(buf, bufsize, "UNIMPL_FP f7=0x%x f3=0x%x", f7, f3);
+        break;
+    }
+    case 0x5B: { // Vector class (custom)
+        uint32_t vd = rd, vs1 = rs1, vs2 = rs2;
+        char vd_s[8], vs1_s[8], vs2_s[8];
+        print_vreg(vd_s, sizeof(vd_s), vd);
+        print_vreg(vs1_s, sizeof(vs1_s), vs1);
+        print_vreg(vs2_s, sizeof(vs2_s), vs2);
+        if (f7==0x00 && f3==0x0) snprintf(buf, bufsize, "VADD.64 %s, %s, %s", vd_s, vs1_s, vs2_s);
+        else if (f7==0x00 && f3==0x1) snprintf(buf, bufsize, "VMUL.64 %s, %s, %s", vd_s, vs1_s, vs2_s);
+        else if (f7==0x10 && f3==0x0) snprintf(buf, bufsize, "VADD.32 %s, %s, %s", vd_s, vs1_s, vs2_s);
+        else if (f7==0x20 && f3==0x0) {
+            // VLD vd, [rs1 + imm] (imm encoded in rs2 field)
+            uint32_t imm12 = rs2_of(insn);
+            snprintf(buf, bufsize, "VLD %s, %u(%s)", vd_s, imm12, vs1_s);
+        } else if (f7==0x20 && f3==0x1) {
+            uint32_t imm12 = rs2_of(insn);
+            snprintf(buf, bufsize, "VST %s, %u(%s)", vd_s, imm12, vs1_s);
+        } else snprintf(buf, bufsize, "UNIMPL_VEC f7=0x%x f3=0x%x", f7, f3);
+        break;
+    }
+    default:
+        snprintf(buf, bufsize, "ILLEGAL_OPCODE 0x%x", opc);
+        break;
+    }
+}
+
+/* Read file into buffer. Returns size or -1 on error. */
+static ssize_t read_file(const char *path, uint8_t **out) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    rewind(f);
+    uint8_t *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return -1; }
+    fclose(f);
+    *out = buf;
+    return sz;
+}
+
+static void usage(const char *p) {
+    fprintf(stderr, "CIA64 disassembler\n");
+    fprintf(stderr, "Usage: %s [-h|--header] [-a base_addr] file.bin\n", p);
+    fprintf(stderr, "  -h, --header    file has 8-byte header: 4-byte load addr, 4-byte payload size\n");
+    fprintf(stderr, "  -a base_addr    override base virtual address (hex or decimal)\n");
+}
+
+int disasm(int argc, char **argv) {
+    int expect_header = 0;
+    uint64_t base_addr = 0;
+    const char *path = NULL;
+
+    for (int i=1;i<argc;i++) {
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--header")) expect_header = 1;
+        else if (!strcmp(argv[i], "-a")) {
+            if (i+1 >= argc) { usage(argv[0]); return 1; }
+            i++;
+            char *end = NULL;
+            base_addr = strtoull(argv[i], &end, 0);
+            if (end == argv[i]) { fprintf(stderr,"bad base addr\n"); return 1; }
+        } else if (!path) path = argv[i];
+        else { usage(argv[0]); return 1; }
+    }
+    if (!path) { usage(argv[0]); return 1; }
+
+    uint8_t *buf = NULL;
+    ssize_t sz = read_file(path, &buf);
+    if (sz < 0) { fprintf(stderr,"failed to read %s: %s\n", path, strerror(errno)); return 1; }
+
+    uint64_t addr = base_addr;
+    uint8_t *p = buf;
+    size_t remaining = (size_t)sz;
+
+    if (expect_header) {
+        if (remaining < 8) { fprintf(stderr,"file too small for header\n"); free(buf); return 1; }
+        uint32_t load = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+        uint32_t payload = (uint32_t)p[4] | ((uint32_t)p[5]<<8) | ((uint32_t)p[6]<<16) | ((uint32_t)p[7]<<24);
+        addr = load;
+        p += 8; remaining -= 8;
+        if (payload && payload < remaining) remaining = payload;
+    }
+
+    // If no header and base_addr==0, start at 0
+    size_t off = 0;
+    while (remaining >= 4) {
+        uint32_t w = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+        char out[256];
+        disasm_insn(w, addr + off, out, sizeof(out));
+        printf("%08" PRIx64 ": %08x    %s\n", (uint64_t)(addr + off), w, out);
+        p += 4; remaining -= 4; off += 4;
+    }
+
+    if (remaining) {
+        printf("trailing %zu bytes\n", remaining);
+    }
+
+    free(buf);
+    return 0;
+}

@@ -1,0 +1,271 @@
+cmake_minimum_required(VERSION 3.13)
+project(wt_crawler LANGUAGES CXX)
+
+# -------------------------
+# Options and basic config
+# -------------------------
+option(BUILD_STATIC_LIBS "Prefer static libraries (.a) when finding dependencies" OFF)
+
+if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+  set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Install prefix" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(BUILD_STATIC_LIBS)
+  if(NOT CMAKE_FIND_LIBRARY_SUFFIXES)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".a" ".so")
+  else()
+    list(REMOVE_ITEM CMAKE_FIND_LIBRARY_SUFFIXES ".so" ".dylib")
+    list(INSERT CMAKE_FIND_LIBRARY_SUFFIXES 0 ".a")
+  endif()
+  add_definitions(-DBUILD_STATIC_LIBS)
+endif()
+
+# -------------------------
+# Search prefixes (can be overridden)
+# -------------------------
+set(USER_PREFIXES "/usr/local" "/usr")
+list(REMOVE_DUPLICATES USER_PREFIXES)
+
+# -------------------------
+# Allow user overrides from command line
+# Example:
+#   cmake .. -DWT_INCLUDE_DIR=/usr/local/include/Wt -DWT_LIB=/usr/local/lib/libwt.so
+# -------------------------
+
+# -------------------------
+# Find Wt headers (no pkg-config)
+# -------------------------
+if(NOT DEFINED WT_INCLUDE_DIR)
+  find_path(WT_INCLUDE_DIR
+    NAMES Wt/WApplication.h
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES include include/wt include/wt-4 include/wt-3.3
+  )
+endif()
+
+# If not found, try a few explicit common locations
+if(NOT WT_INCLUDE_DIR)
+  if(EXISTS "/usr/local/include/wt/WApplication.h")
+    set(WT_INCLUDE_DIR "/usr/local/include")
+  elseif(EXISTS "/usr/include/wt/WApplication.h")
+    set(WT_INCLUDE_DIR "/usr/include")
+  endif()
+endif()
+
+# -------------------------
+# Find Wt libraries (no pkg-config)
+# -------------------------
+if(NOT DEFINED WT_LIB)
+  find_library(WT_LIB
+    NAMES wt libwt wt-4 libwt-4
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+if(NOT DEFINED WT_HTTP_LIB)
+  find_library(WT_HTTP_LIB
+    NAMES wt_http libwt_http wt-http libwt-http wt_http-4 libwt_http-4
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+if(NOT DEFINED WT_DBO_LIB)
+  find_library(WT_DBO_LIB
+    NAMES wtdbo libwtdbo wt_dbo libwt_dbo
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+# -------------------------
+# Find other dependencies
+# -------------------------
+if(NOT DEFINED LIBXML2_INCLUDE_DIR)
+  find_path(LIBXML2_INCLUDE_DIR
+    NAMES libxml/parser.h
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES include include/libxml2
+  )
+endif()
+
+if(NOT DEFINED LIBXML2_LIB)
+  find_library(LIBXML2_LIB
+    NAMES xml2 libxml2
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+if(NOT DEFINED CURL_LIB)
+  find_library(CURL_LIB
+    NAMES curl libcurl
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+# Prefer find_package for SQLite3, fallback to find_library
+find_package(SQLite3 QUIET)
+if(SQLite3_FOUND)
+  set(SQLITE3_LIB ${SQLite3_LIBRARIES})
+else()
+  if(NOT DEFINED SQLITE3_LIB)
+    find_library(SQLITE3_LIB
+      NAMES sqlite3 libsqlite3
+      HINTS ${USER_PREFIXES}
+      PATH_SUFFIXES lib lib64
+    )
+  endif()
+endif()
+
+if(NOT DEFINED OPENSSL_SSL_LIB)
+  find_library(OPENSSL_SSL_LIB
+    NAMES ssl libssl
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+if(NOT DEFINED OPENSSL_CRYPTO_LIB)
+  find_library(OPENSSL_CRYPTO_LIB
+    NAMES crypto libcrypto
+    HINTS ${USER_PREFIXES}
+    PATH_SUFFIXES lib lib64
+  )
+endif()
+
+# Optional system libs
+find_library(PTHREAD_LIB pthread)
+find_library(DL_LIB dl)
+find_library(RT_LIB rt)
+
+# -------------------------
+# Diagnostics
+# -------------------------
+message(STATUS "Searching for Wt in: ${USER_PREFIXES}")
+message(STATUS "WT_INCLUDE_DIR = ${WT_INCLUDE_DIR}")
+message(STATUS "WT_LIB = ${WT_LIB}")
+message(STATUS "WT_HTTP_LIB = ${WT_HTTP_LIB}")
+message(STATUS "WT_DBO_LIB = ${WT_DBO_LIB}")
+message(STATUS "LIBXML2_INCLUDE_DIR = ${LIBXML2_INCLUDE_DIR}")
+message(STATUS "LIBXML2_LIB = ${LIBXML2_LIB}")
+message(STATUS "CURL_LIB = ${CURL_LIB}")
+message(STATUS "SQLITE3_LIB = ${SQLITE3_LIB}")
+message(STATUS "OPENSSL_SSL_LIB = ${OPENSSL_SSL_LIB}")
+message(STATUS "OPENSSL_CRYPTO_LIB = ${OPENSSL_CRYPTO_LIB}")
+
+# -------------------------
+# Fail early with actionable messages
+# -------------------------
+if(NOT WT_INCLUDE_DIR)
+  message(FATAL_ERROR "Could not find Wt headers (wt/WApplication.h). Set -DWT_INCLUDE_DIR=/path/to/wt/includes or install Wt headers under /usr/local/include.")
+endif()
+
+if(NOT (WT_LIB OR WT_HTTP_LIB))
+  message(FATAL_ERROR "Could not find Wt libraries (libwt or wt_http). Ensure Wt is installed under /usr/local/lib and adjust USER_PREFIXES or pass -DWT_LIB=/path/to/libwt.a.")
+endif()
+
+if(NOT SQLITE3_LIB)
+  message(WARNING "SQLite3 library not found. Install libsqlite3-dev or pass -DSQLITE3_LIB=/path/to/libsqlite3.so")
+endif()
+
+# -------------------------
+# Target
+# -------------------------
+set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/wt_crawler.cpp)
+add_executable(wt_crawler ${SRC})
+
+# Include directories
+target_include_directories(wt_crawler PRIVATE ${WT_INCLUDE_DIR})
+if(LIBXML2_INCLUDE_DIR)
+  target_include_directories(wt_crawler PRIVATE ${LIBXML2_INCLUDE_DIR})
+endif()
+
+# -------------------------
+# Link libraries (explicit, only those found)
+# -------------------------
+set(LINK_LIBS "")
+
+if(WT_LIB)
+  list(APPEND LINK_LIBS ${WT_LIB})
+endif()
+
+if(WT_HTTP_LIB)
+  list(APPEND LINK_LIBS ${WT_HTTP_LIB})
+endif()
+
+if(WT_DBO_LIB)
+  list(APPEND LINK_LIBS ${WT_DBO_LIB})
+endif()
+
+if(LIBXML2_LIB)
+  list(APPEND LINK_LIBS ${LIBXML2_LIB})
+endif()
+
+if(CURL_LIB)
+  list(APPEND LINK_LIBS ${CURL_LIB})
+endif()
+
+if(SQLITE3_LIB)
+  list(APPEND LINK_LIBS ${SQLITE3_LIB})
+endif()
+
+if(OPENSSL_SSL_LIB)
+  list(APPEND LINK_LIBS ${OPENSSL_SSL_LIB})
+endif()
+
+if(OPENSSL_CRYPTO_LIB)
+  list(APPEND LINK_LIBS ${OPENSSL_CRYPTO_LIB})
+endif()
+
+if(PTHREAD_LIB)
+  list(APPEND LINK_LIBS ${PTHREAD_LIB})
+endif()
+
+if(DL_LIB)
+  list(APPEND LINK_LIBS ${DL_LIB})
+endif()
+
+if(RT_LIB)
+  list(APPEND LINK_LIBS ${RT_LIB})
+endif()
+
+if(LINK_LIBS)
+  target_link_libraries(wt_crawler PRIVATE ${LINK_LIBS})
+else()
+  message(FATAL_ERROR "No libraries found to link against. Check installation under /usr/local/lib.")
+endif()
+
+# -------------------------
+# Compile options and defs
+# -------------------------
+target_compile_definitions(wt_crawler PRIVATE _GNU_SOURCE)
+if(MSVC)
+  target_compile_options(wt_crawler PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(wt_crawler PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
+# -------------------------
+# RPATH and install
+# -------------------------
+set_target_properties(wt_crawler PROPERTIES
+  BUILD_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
+  INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib"
+)
+
+install(TARGETS wt_crawler RUNTIME DESTINATION bin)
+
+# -------------------------
+# Build hints
+# -------------------------
+message(STATUS "CMake configuration complete. To build:")
+message(STATUS "  mkdir build && cd build")
+message(STATUS "  cmake .. -DBUILD_STATIC_LIBS=ON -DWT_INCLUDE_DIR=/usr/local/include -DWT_LIB=/usr/local/lib/libwt.so")
+message(STATUS "  cmake --build . -- -j")

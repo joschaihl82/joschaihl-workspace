@@ -1,0 +1,87 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+#include <trace/events/sched.h>
+
+/* --- compatibility layer for lowercase rule --- */
+#define hz HZ
+#define path_max PATH_MAX
+#define gfp_atomic GFP_ATOMIC
+#define is_err IS_ERR
+#define define_ratelimit_state DEFINE_RATELIMIT_STATE
+
+/* these must stay uppercase for the kernel build tool (modpost) to work */
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("josh");
+MODULE_DESCRIPTION("trace exec paths");
+MODULE_VERSION("0.9");
+
+/* 3.5 rule: sys prefix, rl state */
+define_ratelimit_state(sys_rlstat, 5 * hz, 10);
+
+/* 3.5 rule: prb prefix, exec callback */
+static void prb_execcbk(void *data, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+{
+	char *buf = NULL;
+	char *path = NULL;
+
+	if (!p || !bprm || !bprm->file)
+		return;
+
+	if (!__ratelimit(&sys_rlstat))
+		return;
+
+	struct path fpath;
+	fpath = bprm->file->f_path;
+	path_get(&fpath);
+
+	buf = kmalloc(path_max, gfp_atomic);
+	if (!buf) {
+		path_put(&fpath);
+		return;
+	}
+
+	path = d_path(&fpath, buf, path_max);
+	if (!is_err(path)) {
+		pr_info("exectrace: pid=%d comm=%s path=%s\n", p->pid, p->comm, path);
+	}
+
+	kfree(buf);
+	path_put(&fpath);
+}
+
+/* 3.5 rule: mod prefix, init logic */
+static int __init mod_initfn(void)
+{
+	int ret;
+
+	/* using the tracepoint registration helper */
+	ret = register_trace_sched_process_exec(prb_execcbk, NULL);
+	if (ret) {
+		pr_err("exectrace: register failed %d\n", ret);
+		return ret;
+	}
+
+	pr_info("exectrace: loaded\n");
+	return 0;
+}
+
+/* 3.5 rule: mod prefix, exit logic */
+static void __exit mod_exitfn(void)
+{
+	unregister_trace_sched_process_exec(prb_execcbk, NULL);
+	tracepoint_synchronize_unregister();
+	pr_info("exectrace: unloaded\n");
+}
+
+module_init(mod_initfn);
+module_exit(mod_exitfn);

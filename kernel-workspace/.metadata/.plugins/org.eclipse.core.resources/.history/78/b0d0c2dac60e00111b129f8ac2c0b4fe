@@ -1,0 +1,30 @@
+# makefile for exectrace1 kernel module
+# usage:
+#   make                # build module
+#   make clean          # remove build files
+
+modobj := exectrace1.o
+obj-m := $(modobj)
+
+# directory for kernel headers
+knddir ?= /lib/modules/$(shell uname -r)/build
+
+# current working directory
+curdir := $(shell pwd)
+
+# default target
+.phony: all clean load unld
+
+all:
+	$(make) -c $(knddir) m=$(curdir) modules
+
+clean:
+	$(make) -c $(knddir) m=$(curdir) clean
+
+# helper to load the module
+load: all
+	sudo insmod ./exectrace1.ko
+
+# helper to unload the module
+unld:
+	sudo rmmod exectrace1

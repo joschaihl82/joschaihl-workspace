@@ -1,0 +1,21 @@
+.section .text
+.globl main
+main:
+    push %rbp
+    mov %rsp, %rbp
+    mov $42, %rax
+    push %rax
+    lea Lstr_0(%rip), %rax
+    push %rax
+    pop %rdi
+    pop %rsi
+    call printf
+    mov $0, %edi
+    call exit
+    pop %rbp
+    ret
+.section .rodata
+Lfmt_int: .asciz "%ld\n"
+Lstr_0: .asciz "%ld\n"
+.section .data
+.section .text

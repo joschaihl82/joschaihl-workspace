@@ -1,0 +1,1333 @@
+#include <qcoreapplication>
+#include <qmainwindow>
+#include <qthread>
+#include <qdebug>
+#include <qmutex>
+#include <qwaitcondition>
+#include <qsettings>
+#include <qsqlitedatabase>
+#include <qsqlquery>
+#include <qsqlerror>
+#include <qsqltablemodel>
+#include <qwidget>
+#include <qlineedit>
+#include <qspinbox>
+#include <qpushbutton>
+#include <qtextedit>
+#include <qtableview>
+#include <qvboxlayout>
+#include <qhboxlayout>
+#include <qgroupbox>
+#include <qtabwidget>
+#include <qlabel>
+#include <qprogressbar>
+
+// C and external library includes
+extern "C" {
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <regex.h>
+#include <curl/curl.h>
+#include <sqlite3.h>
+#include <openssl/sha.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <libxml/HTMLparser.h>
+#include <libxml/xpath.h>
+}
+
+// Global C-structs/Definitions retained for C-logic linkage
+#define DEFAULT_MAX_PAGES 200
+#define DEFAULT_MAX_DEPTH 3
+#define USER_AGENT "addresscrawlercli/1.0"
+#define DB_FILENAME "crawler.db"
+#define POLITE_DELAY_MS 150
+#define DEFAULT_WORKERS 6
+
+// Global C variables encapsulated by QObject members but needed for C-logic
+static sqlite3 *gloDb = nullptr;
+static pthread_mutex_t gloMtxDb = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t gloMtxFrontier = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gloCndFrontier = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t gloMtxLog = PTHREAD_MUTEX_INITIALIZER;
+static volatile int gloStop = 0;
+static int gloMaxDepth = DEFAULT_MAX_DEPTH;
+static int gloWorkers = DEFAULT_WORKERS;
+
+// Dynamic buffer for curl (C-struct, kept for efficiency)
+typedef struct dynbuf {
+    char *data;
+    size_t len;
+} dynbuf_t;
+
+// Fetch metadata (C-struct, kept for efficiency)
+typedef struct fetch_meta {
+    char contentType[128];
+    long responseCode;
+} fetch_meta_t;
+
+// Crawl Item structure (C++ struct)
+struct crawlitem {
+    QString url;
+    QString norm;
+    int depth = 0;
+    double score = 0.0;
+    int inbound = 0;
+
+    // Custom memory management (Qt handles string memory)
+    crawlitem() {}
+    crawlitem(const crawlitem& other) : url(other.url), norm(other.norm), depth(other.depth), score(other.score), inbound(other.inbound) {}
+    crawlitem& operator=(const crawlitem& other) {
+        if (this != &other) {
+            url = other.url;
+            norm = other.norm;
+            depth = other.depth;
+            score = other.score;
+            inbound = other.inbound;
+        }
+        return *this;
+    }
+};
+
+// Heap (max-heap) for frontier (C++ class wrapping the C-logic)
+class heap
+{
+private:
+    QVector<crawlitem> items;
+
+    void heapSwap(int a, int b) {
+        if (a < items.size() && b < items.size()) {
+            items.swapItemsAt(a, b);
+        }
+    }
+
+    void heapifyDown(int i) {
+        while (true) {
+            int l = 2 * i + 1;
+            int r = 2 * i + 2;
+            int largest = i;
+            if (l < items.size() && items[l].score > items[largest].score)
+                largest = l;
+            if (r < items.size() && items[r].score > items[largest].score)
+                largest = r;
+            if (largest == i)
+                break;
+            heapSwap(i, largest);
+            i = largest;
+        }
+    }
+
+    void heapifyUp(int i) {
+        while (i > 0) {
+            int p = (i - 1) / 2;
+            if (items[p].score >= items[i].score)
+                break;
+            heapSwap(p, i);
+            i = p;
+        }
+    }
+
+public:
+    heap() {}
+    ~heap() {}
+
+    void push(const crawlitem& it) {
+        items.append(it);
+        heapifyUp(items.size() - 1);
+    }
+
+    bool isEmpty() const {
+        return items.isEmpty();
+    }
+
+    int size() const {
+        return items.size();
+    }
+
+    crawlitem popMax() {
+        if (items.isEmpty()) {
+            qCritical() << "heap_pop_max: empty";
+            exit(EXIT_FAILURE);
+        }
+        crawlitem out = items[0];
+        items[0] = items.last();
+        items.removeLast();
+        heapifyDown(0);
+        return out;
+    }
+    
+    // used for random extraction in the original C code, not used for max-heap strategy
+    /*crawlitem popRandom() {
+        if (items.isEmpty()) {
+            qCritical() << "heap_pop_random: empty";
+            exit(EXIT_FAILURE);
+        }
+        qsizetype idx = QRandomGenerator::global()->bounded(items.size());
+        crawlitem out = items[idx];
+        items[idx] = items.last();
+        items.removeLast();
+        // Since we removed an item, we might need to restore heap property at the new index 'idx'
+        heapifyDown(idx); // first check down
+        heapifyUp(idx);   // then check up
+        return out;
+    }*/
+
+    void clear() {
+        items.clear();
+    }
+};
+
+// =====================================================================================
+// Crawler Backend (QObject wrapping C-logic)
+// =====================================================================================
+
+class crawlerbackend : public QObject
+{
+    Q_OBJECT
+
+public:
+    explicit crawlerbackend(QObject *parent = nullptr) : QObject(parent) {
+        // Init C-libraries globally (libxml2, curl)
+        xmlInitParser();
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+            qCritical() << "curl_global_init failed";
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    ~crawlerbackend() override {
+        // Cleanup C-libraries globally
+        curl_global_cleanup();
+        xmlCleanupParser();
+        dbClose();
+        frontier.clear();
+    }
+
+signals:
+    void logInfo(const QString &message);
+    void newEmail(const QString &email, const QString &source);
+    void newPhone(const QString &phone, const QString &source);
+    void progressUpdate(int crawled, int queued, int emails, int phones);
+    void crawlFinished();
+
+public slots:
+    void startCrawl(const QString &seedUrl, int maxPages, int maxDepth, int workers) {
+        gloMaxDepth = maxDepth;
+        gloWorkers = workers;
+        gloStop = 0; // Reset stop flag
+        gloDb = nullptr; // Ensure DB is reopened if previously closed
+
+        // 1. Init/Load DB and Frontier
+        dbOpen(DB_FILENAME);
+        enqueueSeed(seedUrl);
+        loadFrontierFromDb(); // Re-load any uncrawled URLs from the last session
+
+        // 2. Start workers
+        runCrawlLoopParallel(maxPages);
+    }
+
+    void stopCrawl() {
+        // Signal stop and wake workers
+        pthread_mutex_lock(&gloMtxFrontier);
+        gloStop = 1;
+        pthread_cond_broadcast(&gloCndFrontier);
+        pthread_mutex_unlock(&gloMtxFrontier);
+
+        // Wait for threads to join (will be done in runCrawlLoopParallel)
+        emit logInfo("stopping crawl...");
+    }
+
+private:
+    heap frontier;
+
+    // --- Original C-code implementation integrated as private methods ---
+
+    // Original C-code: strdup_safe
+    char *strdupSafe(const char *s) {
+        if (s == nullptr)
+            return nullptr;
+        char *r = strdup(s);
+        if (r == nullptr) {
+            perror("strdup");
+            exit(EXIT_FAILURE);
+        }
+        return r;
+    }
+
+    // Original C-code: sleep_polite
+    void sleepPolite() {
+        usleep(POLITE_DELAY_MS * 1000);
+    }
+
+    // Original C-code: log_info (rewritten to use Qt signal)
+    void logInfoC(const char *fmt, ...) {
+        va_list ap;
+        time_t t = time(nullptr);
+        struct tm tm;
+        char timestr[64];
+        localtime_r(&t, &tm);
+        strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm);
+
+        // Log lock is now purely for console output, not relevant for Qt signals
+        pthread_mutex_lock(&gloMtxLog);
+        
+        char msgbuf[1024];
+        int offset = snprintf(msgbuf, sizeof(msgbuf), "[%s] ", timestr);
+
+        va_start(ap, fmt);
+        vsnprintf(msgbuf + offset, sizeof(msgbuf) - offset, fmt, ap);
+        va_end(ap);
+
+        printf("%s\n", msgbuf); // Keep console logging
+        fflush(stdout);
+
+        pthread_mutex_unlock(&gloMtxLog);
+        
+        // Emit signal for the Qt UI
+        emit logInfo(QString::fromUtf8(msgbuf));
+    }
+
+    // Original C-code: dbuf_init
+    void dbufInit(dynbuf_t *b) {
+        b->data = nullptr;
+        b->len = 0;
+    }
+
+    // Original C-code: dbuf_free
+    void dbufFree(dynbuf_t *b) {
+        free(b->data);
+        b->data = nullptr;
+        b->len = 0;
+    }
+
+    // Original C-code: dbuf_write
+    static size_t dbufWrite(void *ptr, size_t size, size_t nmemb, void *userdata) {
+        size_t add = size * nmemb;
+        dynbuf_t *b = (dynbuf_t *)userdata;
+        char *n = (char*)realloc(b->data, b->len + add + 1);
+        if (n == nullptr)
+            return 0;
+        memcpy(n + b->len, ptr, add);
+        b->data = n;
+        b->len += add;
+        b->data[b->len] = '\0';
+        return add;
+    }
+
+    // Original C-code: sha256_hex
+    char *sha256Hex(const unsigned char *data, size_t len) {
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        SHA256_CTX ctx;
+        if (SHA256_Init(&ctx) != 1) return nullptr;
+        if (SHA256_Update(&ctx, data, len) != 1) return nullptr;
+        if (SHA256_Final(hash, &ctx) != 1) return nullptr;
+
+        char *hex = (char*)malloc(SHA256_DIGEST_LENGTH * 2 + 1);
+        if (hex == nullptr) return nullptr;
+        for (size_t i = 0; i < SHA256_DIGEST_LENGTH; ++i)
+            sprintf(hex + (i * 2), "%02x", hash[i]);
+        hex[SHA256_DIGEST_LENGTH * 2] = '\0';
+        return hex;
+    }
+
+    // Original C-code: normalize_url (rewritten to use QString)
+    QString normalizeUrl(const QString &url) {
+        if (url.isEmpty()) return QString();
+        QString copy = url;
+        int hashIdx = copy.indexOf('#');
+        if (hashIdx != -1)
+            copy.truncate(hashIdx);
+        while (copy.length() > 1 && copy.endsWith('/')) {
+            copy.chop(1);
+        }
+        return copy;
+    }
+
+    // Original C-code: url_host (rewritten to use QString)
+    QString urlHost(const QString &url) {
+        if (url.isEmpty()) return QString();
+        int p = url.indexOf("://");
+        int start = (p != -1) ? p + 3 : 0;
+        int end = url.indexOf('/', start);
+        QString host = (end != -1) ? url.mid(start, end - start) : url.mid(start);
+        int colon = host.indexOf(':');
+        if (colon != -1)
+            host.truncate(colon);
+        return host.toLower();
+    }
+
+    // Original C-code: domain_trust (rewritten to use QString)
+    double domainTrust(const QString &url) {
+        QString host = urlHost(url);
+        double score = 0.5;
+        if (host.isEmpty()) return score;
+        if (host.endsWith(".gov"))
+            score = 5.0;
+        else if (host.endsWith(".edu"))
+            score = 4.0;
+        else if (host.endsWith(".org"))
+            score = 2.0;
+        else if (host.endsWith(".com"))
+            score = 1.5;
+        return score;
+    }
+
+    // Original C-code: resolve_url (rewritten to use QString)
+    QString resolveUrl(const QString &base, const QString &href) {
+        if (href.isEmpty()) return QString();
+        if (href.startsWith("http://", Qt::CaseInsensitive) || href.startsWith("https://", Qt::CaseInsensitive))
+            return href;
+
+        int p = base.indexOf("://");
+        if (p == -1) return href;
+
+        int hostStart = p + 3;
+        int pathStart = base.indexOf('/', hostStart);
+        QString root = (pathStart != -1) ? base.left(pathStart) : base;
+
+        if (href.startsWith('/')) {
+            return root + href;
+        } else {
+            int lastSlash = base.lastIndexOf('/');
+            if (lastSlash != -1) {
+                QString prefix = base.left(lastSlash + 1);
+                return prefix + href;
+            } else {
+                return root + "/" + href;
+            }
+        }
+    }
+    
+    // Original C-code: ts_heap_pop_max (rewritten for Qt signal-slot)
+    bool tsHeapPopMax(crawlitem *out) {
+        pthread_mutex_lock(&gloMtxFrontier);
+        while (frontier.isEmpty() && !gloStop) {
+            pthread_cond_wait(&gloCndFrontier, &gloMtxFrontier);
+        }
+        if (gloStop && frontier.isEmpty()) {
+            pthread_mutex_unlock(&gloMtxFrontier);
+            return false;
+        }
+        if (frontier.isEmpty()) {
+            pthread_mutex_unlock(&gloMtxFrontier);
+            return false;
+        }
+        *out = frontier.popMax();
+        pthread_mutex_unlock(&gloMtxFrontier);
+        return true;
+    }
+
+    // Original C-code: ts_heap_push (rewritten for Qt signal-slot)
+    void tsHeapPush(const crawlitem& it) {
+        pthread_mutex_lock(&gloMtxFrontier);
+        frontier.push(it);
+        pthread_cond_signal(&gloCndFrontier);
+        pthread_mutex_unlock(&gloMtxFrontier);
+    }
+
+    // Original C-code: db_open
+    void dbOpen(const char *filename) {
+        if (gloDb) return; // Already open
+        if (sqlite3_open(filename, &gloDb) != SQLITE_OK) {
+            qCritical() << QString("cannot open db %1: %2").arg(filename).arg(sqlite3_errmsg(gloDb));
+            exit(EXIT_FAILURE);
+        }
+        const char *sql =
+            "PRAGMA journal_mode=WAL;"
+            "CREATE TABLE IF NOT EXISTS urls ("
+            " url TEXT UNIQUE,"
+            " normalized TEXT UNIQUE,"
+            " depth INTEGER,"
+            " score REAL,"
+            " crawled INTEGER DEFAULT 0,"
+            " content_hash TEXT"
+            ");"
+            "CREATE TABLE IF NOT EXISTS emails (email TEXT UNIQUE, source_url TEXT);"
+            "CREATE TABLE IF NOT EXISTS phones (phone TEXT UNIQUE, source_url TEXT);";
+        char *err = nullptr;
+        if (sqlite3_exec(gloDb, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+            qCritical() << "db init error:" << err;
+            sqlite3_free(err);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // Original C-code: db_close
+    void dbClose() {
+        if (gloDb)
+            sqlite3_close(gloDb);
+        gloDb = nullptr;
+    }
+
+    // Original C-code: db_insert_url
+    int dbInsertUrl(const QString &url, const QString &norm, int depth, double score) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "INSERT OR IGNORE INTO urls (url, normalized, depth, score) VALUES (?, ?, ?, ?);";
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+        QByteArray urlBytes = url.toUtf8();
+        QByteArray normBytes = norm.toUtf8();
+        sqlite3_bind_text(stmt, 1, urlBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, normBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, depth);
+        sqlite3_bind_double(stmt, 4, score);
+        int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE && sqlite3_changes(gloDb) > 0) return 1;
+        return 0;
+    }
+
+    // Original C-code: db_mark_crawled_with_hash
+    void dbMarkCrawledWithHash(const QString &norm, const QString &hashHex) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "UPDATE urls SET crawled = 1, content_hash = ? WHERE normalized = ?;";
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
+        QByteArray hashBytes = hashHex.toUtf8();
+        QByteArray normBytes = norm.toUtf8();
+        sqlite3_bind_text(stmt, 1, hashBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, normBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+
+    // Original C-code: db_has_norm
+    int dbHasNorm(const QString &norm) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "SELECT 1 FROM urls WHERE normalized = ? LIMIT 1;";
+        int found = 0;
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            QByteArray normBytes = norm.toUtf8();
+            sqlite3_bind_text(stmt, 1, normBytes.constData(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) found = 1;
+        }
+        sqlite3_finalize(stmt);
+        return found;
+    }
+
+    // Original C-code: db_has_content_hash
+    int dbHasContentHash(const QString &hashHex) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "SELECT 1 FROM urls WHERE content_hash = ? LIMIT 1;";
+        int found = 0;
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            QByteArray hashBytes = hashHex.toUtf8();
+            sqlite3_bind_text(stmt, 1, hashBytes.constData(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt) == SQLITE_ROW) found = 1;
+        }
+        sqlite3_finalize(stmt);
+        return found;
+    }
+
+    // Original C-code: db_insert_email
+    int dbInsertEmail(const QString &email, const QString &source) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "INSERT OR IGNORE INTO emails (email, source_url) VALUES (?, ?);";
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+        QByteArray emailBytes = email.toUtf8();
+        QByteArray sourceBytes = source.toUtf8();
+        sqlite3_bind_text(stmt, 1, emailBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, sourceBytes.constData(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE && sqlite3_changes(gloDb) > 0) return 1;
+        return 0;
+    }
+
+    // Original C-code: db_insert_phone
+    int dbInsertPhone(const QString &phone, const QString &source) {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "INSERT OR IGNORE INTO phones (phone, source_url) VALUES (?, ?);";
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) != SQLITE_OK) return 0;
+        QByteArray phoneBytes = phone.toUtf8();
+        QByteArray sourceBytes = source.toUtf8();
+        sqlite3_bind_text(stmt, 1, phoneBytes.constData(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, sourceBytes.constData(), -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE && sqlite3_changes(gloDb) > 0) return 1;
+        return 0;
+    }
+
+    // Original C-code: db_count_crawled
+    int dbCountCrawled() {
+        sqlite3_stmt *stmt = nullptr;
+        const char *sql = "SELECT COUNT(*) FROM urls WHERE crawled = 1;";
+        int count = 0;
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            if (sqlite3_step(stmt) == SQLITE_ROW) count = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        return count;
+    }
+
+    // Original C-code: db_insert_url_threadsafe
+    void dbInsertUrlThreadsafe(const QString &url, const QString &norm, int depth, double score) {
+        pthread_mutex_lock(&gloMtxDb);
+        int inserted = dbInsertUrl(url, norm, depth, score);
+        pthread_mutex_unlock(&gloMtxDb);
+        if (inserted) {
+            logInfoC("[NEW URL] queued score=%.3f url=%s", score, url.toUtf8().constData());
+        }
+    }
+
+    // Original C-code: db_insert_email_threadsafe
+    void dbInsertEmailThreadsafe(const QString &email, const QString &source) {
+        pthread_mutex_lock(&gloMtxDb);
+        int inserted = dbInsertEmail(email, source);
+        pthread_mutex_unlock(&gloMtxDb);
+        if (inserted) {
+            logInfoC("[NEW EMAIL] %s  (source: %s)", email.toUtf8().constData(), source.toUtf8().constData());
+            emit newEmail(email, source);
+        }
+    }
+
+    // Original C-code: db_insert_phone_threadsafe
+    void dbInsertPhoneThreadsafe(const QString &phone, const QString &source) {
+        pthread_mutex_lock(&gloMtxDb);
+        int inserted = dbInsertPhone(phone, source);
+        pthread_mutex_unlock(&gloMtxDb);
+        if (inserted) {
+            logInfoC("[NEW PHONE] %s  (source: %s)", phone.toUtf8().constData(), source.toUtf8().constData());
+            emit newPhone(phone, source);
+        }
+    }
+
+    // Original C-code: normalize_phone (rewritten to use QString)
+    QString normalizePhone(const QString &raw) {
+        if (raw.isEmpty()) return QString();
+        QString out;
+        for (const QChar &c : raw) {
+            if (c == '+' && out.isEmpty())
+                out += c;
+            else if (c.isDigit())
+                out += c;
+        }
+        return out.isEmpty() ? QString() : out;
+    }
+
+    // Original C-code: extract_emails (rewritten to use QString and QRegExp/QRegularExpression)
+    void extractEmails(const QString &text, const QString &source) {
+        // kept C regex for consistency with original file, but use QRegularExpression in Qt normally
+        regex_t re;
+        const char *pattern = "([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,})";
+        QByteArray textBytes = text.toUtf8();
+        if (regcomp(&re, pattern, REG_EXTENDED | REG_ICASE) != 0)
+            return;
+        const char *p = textBytes.constData();
+        regmatch_t m[2];
+        while (regexec(&re, p, 2, m, 0) == 0) {
+            int start = m[1].rm_so;
+            int end = m[1].rm_eo;
+            size_t len = (size_t)(end - start);
+            QString email = QString::fromUtf8(p + start, len).toLower();
+            dbInsertEmailThreadsafe(email, source);
+            p += end;
+        }
+        regfree(&re);
+    }
+
+    // Original C-code: extract_phones (rewritten to use QString and QRegExp/QRegularExpression)
+    void extractPhones(const QString &text, const QString &source) {
+        regex_t re;
+        const char *pattern = "(\\+?[0-9][0-9\\-\\.\\s\\(\\)]{6,}[0-9])";
+        QByteArray textBytes = text.toUtf8();
+        if (regcomp(&re, pattern, REG_EXTENDED | REG_ICASE) != 0)
+            return;
+        const char *p = textBytes.constData();
+        regmatch_t m[2];
+        while (regexec(&re, p, 2, m, 0) == 0) {
+            int start = m[1].rm_so;
+            int end = m[1].rm_eo;
+            size_t len = (size_t)(end - start);
+            QString raw = QString::fromUtf8(p + start, len);
+            QString norm = normalizePhone(raw);
+            if (!norm.isEmpty()) {
+                dbInsertPhoneThreadsafe(norm, source);
+            }
+            p += end;
+        }
+        regfree(&re);
+    }
+
+    // Original C-code: process_href (rewritten to use QString and the class methods)
+    void processHref(const QString &href, const QString &base, int baseDepth) {
+        if (href.isEmpty()) return;
+
+        if (href.startsWith("mailto:", Qt::CaseInsensitive)) {
+            QString emailStr = href.mid(7);
+            int q = emailStr.indexOf('?');
+            if (q != -1) emailStr.truncate(q);
+            QStringList emails = emailStr.split(',');
+            for (const QString &email : emails) {
+                dbInsertEmailThreadsafe(email.toLower().trimmed(), base);
+            }
+            return;
+        }
+
+        if (href.startsWith("tel:", Qt::CaseInsensitive)) {
+            QString phoneStr = href.mid(4);
+            int q = phoneStr.indexOf('?');
+            if (q != -1) phoneStr.truncate(q);
+            QString norm = normalizePhone(phoneStr);
+            if (!norm.isEmpty()) {
+                dbInsertPhoneThreadsafe(norm, base);
+            }
+            return;
+        }
+
+        QString resolved = resolveUrl(base, href);
+        if (resolved.isEmpty()) return;
+
+        QString norm = normalizeUrl(resolved);
+        if (norm.isEmpty()) return;
+
+        pthread_mutex_lock(&gloMtxDb);
+        bool alreadyExists = dbHasNorm(norm);
+        pthread_mutex_unlock(&gloMtxDb);
+
+        if (!alreadyExists && baseDepth + 1 <= gloMaxDepth) {
+            double dt = domainTrust(resolved);
+            int inbound = 0;
+            double score = 2.0 * dt + (-1.0) * (baseDepth + 1) + 1.0 * inbound + (-0.5) * (resolved.length() / 10.0);
+
+            crawlitem it;
+            it.url = resolved;
+            it.norm = norm;
+            it.depth = baseDepth + 1;
+            it.score = score;
+            it.inbound = inbound;
+            
+            tsHeapPush(it);
+            dbInsertUrlThreadsafe(resolved, norm, it.depth, it.score);
+        }
+    }
+
+    // Original C-code: header_cb
+    static size_t headerCb(char *buffer, size_t size, size_t nitems, void *userdata) {
+        size_t len = size * nitems;
+        fetch_meta_t *m = (fetch_meta_t *)userdata;
+        if (len > 13 && strncasecmp(buffer, "Content-Type:", 13) == 0) {
+            const char *p = buffer + 13;
+            while (*p && isspace((unsigned char)*p))
+                p++;
+            size_t copylen = len - (p - buffer);
+            if (copylen >= sizeof(m->contentType))
+                copylen = sizeof(m->contentType) - 1;
+            memcpy(m->contentType, p, copylen);
+            m->contentType[copylen] = '\0';
+        }
+        return len;
+    }
+
+    // Original C-code: fetch_url
+    int fetchUrl(CURL *curl, const QString &url, dynbuf_t *out, fetch_meta_t *meta) {
+        dbufInit(out);
+        meta->contentType[0] = '\0';
+        meta->responseCode = 0;
+        QByteArray urlBytes = url.toUtf8();
+
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, urlBytes.constData());
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dbufWrite);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, headerCb);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, meta);
+        
+        CURLcode rc = curl_easy_perform(curl);
+        if (rc != CURLE_OK) {
+            dbufFree(out);
+            return 0;
+        }
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &meta->responseCode);
+        
+        if (meta->contentType[0] && strstr(meta->contentType, "text/html") == nullptr) {
+            dbufFree(out);
+            return 0;
+        }
+        return 1;
+    }
+
+    // Original C-code: parse_html_and_extract
+    void parseHtmlAndExtract(const char *html, size_t htmlLen, const QString &base, int baseDepth) {
+        if (html == nullptr || htmlLen == 0) return;
+        QByteArray baseBytes = base.toUtf8();
+
+        htmlDocPtr doc = htmlReadMemory(html, (int)htmlLen, baseBytes.constData(), nullptr, HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_RECOVER);
+        if (doc == nullptr) return;
+
+        xmlXPathContextPtr xpathCtx = xmlXPathNewContext(doc);
+        if (xpathCtx == nullptr) {
+            xmlFreeDoc(doc);
+            return;
+        }
+
+        // 1) Collect all text nodes
+        xmlXPathObjectPtr textObj = xmlXPathEvalExpression((xmlChar *)"//text()", xpathCtx);
+        if (textObj && textObj->nodesetval) {
+            xmlNodeSetPtr nodes = textObj->nodesetval;
+            QString textContent;
+            for (int i = 0; i < nodes->nodeNr; ++i) {
+                xmlNodePtr node = nodes->nodeTab[i];
+                if (node && node->content) {
+                    textContent += QString::fromUtf8((const char *)node->content) + " ";
+                }
+            }
+
+            // deobfuscate common patterns (using QString replace for simplicity)
+            textContent.replace(QRegularExpression("\\[at\\]|\\(at\\)|\\s+at\\s+", QRegularExpression::CaseInsensitive), "@");
+            textContent.replace(QRegularExpression("\\[dot\\]|\\(dot\\)|\\s+dot\\s+", QRegularExpression::CaseInsensitive), ".");
+
+            // run extractors on text
+            extractEmails(textContent, base);
+            extractPhones(textContent, base);
+        }
+        if (textObj) xmlXPathFreeObject(textObj);
+
+        // 2) Collect all href attributes and enqueue
+        xmlXPathObjectPtr hrefObj = xmlXPathEvalExpression((xmlChar *)"//@href", xpathCtx);
+        if (hrefObj && hrefObj->nodesetval) {
+            xmlNodeSetPtr nodes = hrefObj->nodesetval;
+            for (int i = 0; i < nodes->nodeNr; ++i) {
+                xmlAttrPtr attr = (xmlAttrPtr)nodes->nodeTab[i];
+                if (attr && attr->children && attr->children->content) {
+                    QString href = QString::fromUtf8((const char *)attr->children->content);
+                    processHref(href, base, baseDepth);
+                }
+            }
+        }
+        if (hrefObj) xmlXPathFreeObject(hrefObj);
+
+        xmlXPathFreeContext(xpathCtx);
+        xmlFreeDoc(doc);
+    }
+    
+    // Original C-code: enqueue_seed
+    void enqueueSeed(const QString &seed) {
+        QString seedNorm = normalizeUrl(seed);
+        double seedScore = 10.0 * domainTrust(seed);
+
+        pthread_mutex_lock(&gloMtxDb);
+        bool alreadyExists = dbHasNorm(seedNorm);
+        pthread_mutex_unlock(&gloMtxDb);
+
+        if (!alreadyExists) {
+            crawlitem seedItem;
+            seedItem.url = seed;
+            seedItem.norm = seedNorm;
+            seedItem.depth = 0;
+            seedItem.score = seedScore;
+            seedItem.inbound = 0;
+            tsHeapPush(seedItem);
+            dbInsertUrlThreadsafe(seed, seedNorm, 0, seedScore);
+        }
+    }
+
+    // New: load frontier from DB (for persistence)
+    void loadFrontierFromDb() {
+        sqlite3_stmt *stmt = nullptr;
+        // Select all URLs that have been inserted but not yet crawled
+        const char *sql = "SELECT url, normalized, depth, score FROM urls WHERE crawled = 0;";
+        if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            qCritical() << "db load frontier error:" << sqlite3_errmsg(gloDb);
+            return;
+        }
+
+        int count = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            crawlitem it;
+            it.url = QString::fromUtf8((const char*)sqlite3_column_text(stmt, 0));
+            it.norm = QString::fromUtf8((const char*)sqlite3_column_text(stmt, 1));
+            it.depth = sqlite3_column_int(stmt, 2);
+            it.score = sqlite3_column_double(stmt, 3);
+            it.inbound = 0; // Inbound cannot be reliably restored without link analysis
+
+            tsHeapPush(it);
+            count++;
+        }
+        sqlite3_finalize(stmt);
+        if (count > 0) {
+            logInfoC("[RESUMING] loaded %d URLs into frontier from database.", count);
+        }
+    }
+    
+    // Original C-code: worker_thread (wrapped in C++ static function for pthread)
+    static void *workerThread(void *arg) {
+        crawlerbackend *self = (crawlerbackend *)arg;
+        CURL *curl = curl_easy_init();
+        if (curl == nullptr) {
+            self->logInfoC("curl init failed in worker thread");
+            return nullptr;
+        }
+
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 120L);
+        curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+
+        while (!gloStop) {
+            crawlitem it;
+            if (!self->tsHeapPopMax(&it)) break;
+
+            // Check crawled flag (threadsafe)
+            int already = 0;
+            pthread_mutex_lock(&gloMtxDb);
+            {
+                sqlite3_stmt *stmt = nullptr;
+                const char *sql = "SELECT crawled FROM urls WHERE normalized = ? LIMIT 1;";
+                if (sqlite3_prepare_v2(gloDb, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+                    QByteArray normBytes = it.norm.toUtf8();
+                    sqlite3_bind_text(stmt, 1, normBytes.constData(), -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(stmt) == SQLITE_ROW) already = sqlite3_column_int(stmt, 0);
+                }
+                sqlite3_finalize(stmt);
+            }
+            pthread_mutex_unlock(&gloMtxDb);
+            if (already) {
+                continue;
+            }
+
+            dynbuf_t body;
+            fetch_meta_t meta;
+            int ok = self->fetchUrl(curl, it.url, &body, &meta);
+            
+            if (!ok || meta.responseCode >= 400 || body.len == 0) {
+                pthread_mutex_lock(&gloMtxDb);
+                self->dbMarkCrawledWithHash(it.norm, "");
+                pthread_mutex_unlock(&gloMtxDb);
+                self->dbufFree(&body);
+                self->sleepPolite();
+                continue;
+            }
+
+            char *hashHex = self->sha256Hex((unsigned char *)body.data, body.len);
+            if (hashHex == nullptr) {
+                pthread_mutex_lock(&gloMtxDb);
+                self->dbMarkCrawledWithHash(it.norm, "");
+                pthread_mutex_unlock(&gloMtxDb);
+                self->dbufFree(&body);
+                self->sleepPolite();
+                continue;
+            }
+
+            int dup;
+            pthread_mutex_lock(&gloMtxDb);
+            dup = self->dbHasContentHash(QString::fromUtf8(hashHex));
+            pthread_mutex_unlock(&gloMtxDb);
+            
+            if (dup) {
+                pthread_mutex_lock(&gloMtxDb);
+                self->dbMarkCrawledWithHash(it.norm, QString::fromUtf8(hashHex));
+                pthread_mutex_unlock(&gloMtxDb);
+                free(hashHex);
+                self->dbufFree(&body);
+                self->sleepPolite();
+                continue;
+            }
+
+            // Log newly crawled page with ranking (score)
+            self->logInfoC("[CRAWLED] score=%.3f url=%s", it.score, it.url.toUtf8().constData());
+
+            // parse and extract using libxml2
+            self->parseHtmlAndExtract(body.data, body.len, it.url, it.depth);
+
+            pthread_mutex_lock(&gloMtxDb);
+            self->dbMarkCrawledWithHash(it.norm, QString::fromUtf8(hashHex));
+            pthread_mutex_unlock(&gloMtxDb);
+
+            free(hashHex);
+            self->dbufFree(&body);
+            self->sleepPolite();
+        }
+
+        curl_easy_cleanup(curl);
+        self->logInfoC("[WORKER] thread finished.");
+        return nullptr;
+    }
+    
+    // Original C-code: crawl_loop_parallel
+    void runCrawlLoopParallel(int maxPages) {
+        pthread_t *workers = (pthread_t*)malloc(sizeof(pthread_t) * gloWorkers);
+        if (!workers) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+        
+        logInfoC("starting %d worker threads...", gloWorkers);
+        for (int i = 0; i < gloWorkers; ++i) {
+            if (pthread_create(&workers[i], nullptr, workerThread, this) != 0) {
+                qCritical() << "failed to create worker" << i;
+            }
+        }
+
+        // Monitor progress and emit signals
+        while (1) {
+            pthread_mutex_lock(&gloMtxDb);
+            int crawled = dbCountCrawled();
+            int emails = 0; // Not tracked efficiently
+            int phones = 0; // Not tracked efficiently
+            pthread_mutex_unlock(&gloMtxDb);
+            
+            pthread_mutex_lock(&gloMtxFrontier);
+            int queued = frontier.size();
+            pthread_mutex_unlock(&gloMtxFrontier);
+
+            emit progressUpdate(crawled, queued, emails, phones);
+            
+            if (gloStop || crawled >= maxPages) {
+                break;
+            }
+            QThread::sleep(1);
+        }
+
+        // Signal stop and wake workers (in case they are waiting)
+        pthread_mutex_lock(&gloMtxFrontier);
+        gloStop = 1;
+        pthread_cond_broadcast(&gloCndFrontier);
+        pthread_mutex_unlock(&gloMtxFrontier);
+
+        // Wait for workers to join
+        for (int i = 0; i < gloWorkers; ++i)
+            pthread_join(workers[i], nullptr);
+
+        free(workers);
+        emit crawlFinished();
+        logInfoC("crawl finished.");
+    }
+};
+
+// =====================================================================================
+// Main Window (Qt GUI)
+// =====================================================================================
+
+class mainwindow : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    explicit mainwindow(QWidget *parent = nullptr) : QMainWindow(parent) {
+        // Setup backend thread
+        backend = new crawlerbackend();
+        backendThread = new QThread(this);
+        backend->moveToThread(backendThread);
+        
+        // Connections
+        connect(backendThread, &QThread::finished, backend, &QObject::deleteLater);
+        connect(backend, &crawlerbackend::logInfo, this, &mainwindow::appendLog);
+        connect(backend, &crawlerbackend::progressUpdate, this, &mainwindow::updateProgress);
+        connect(backend, &crawlerbackend::crawlFinished, this, &mainwindow::crawlFinished);
+        connect(backend, &crawlerbackend::newEmail, this, &mainwindow::updateResults);
+        connect(backend, &crawlerbackend::newPhone, this, &mainwindow::updateResults);
+
+        // GUI Setup
+        setupUi();
+        loadSettings();
+        
+        // Finalize DB setup for QSqlTableModel
+        setupDbModels();
+
+        backendThread->start();
+    }
+
+    ~mainwindow() override {
+        saveSettings();
+        backend->stopCrawl();
+        backendThread->quit();
+        backendThread->wait();
+    }
+
+private slots:
+    void startResumeClicked() {
+        if (isCrawling) {
+            // Already crawling, this should not happen if button is disabled
+            return;
+        }
+        
+        QString seedUrl = leSeedUrl->text().trimmed();
+        int maxPages = sbMaxPages->value();
+        int maxDepth = sbMaxDepth->value();
+        int workers = sbWorkers->value();
+
+        if (seedUrl.isEmpty()) {
+            appendLog("[ERROR] seed url cannot be empty.");
+            return;
+        }
+        
+        // Emit signal to start crawl on the worker thread
+        QMetaObject::invokeMethod(backend, "startCrawl", Qt::QueuedConnection,
+                                  Q_ARG(QString, seedUrl), 
+                                  Q_ARG(int, maxPages),
+                                  Q_ARG(int, maxDepth),
+                                  Q_ARG(int, workers));
+
+        isCrawling = true;
+        updateUiState();
+    }
+
+    void stopClicked() {
+        if (!isCrawling) return;
+        
+        QMetaObject::invokeMethod(backend, "stopCrawl", Qt::QueuedConnection);
+        // The UI state will be updated in crawlFinished slot
+    }
+
+    void crawlFinished() {
+        isCrawling = false;
+        updateUiState();
+        appendLog("[STATUS] crawl worker thread stopped.");
+        updateResults(); // Final result refresh
+    }
+
+    void appendLog(const QString &message) {
+        teLog->append(message);
+    }
+    
+    void updateProgress(int crawled, int queued, int emails, int phones) {
+        pbProgress->setMaximum(sbMaxPages->value());
+        pbProgress->setValue(crawled);
+        
+        lblCrawledCount->setText(QString("crawled: %1 / %2").arg(crawled).arg(sbMaxPages->value()));
+        lblQueuedCount->setText(QString("queued: %1").arg(queued));
+        
+        // Note: emails and phones are not currently counted efficiently in the C logic 
+        // without another DB query, so we'll just refresh the model or use a quick query.
+        QSqlQuery emailQuery(QSqlDatabase::database(DB_FILENAME));
+        if (emailQuery.exec("SELECT COUNT(*) FROM emails;")) {
+            if (emailQuery.next()) lblEmailCount->setText(QString("emails: %1").arg(emailQuery.value(0).toInt()));
+        }
+        QSqlQuery phoneQuery(QSqlDatabase::database(DB_FILENAME));
+        if (phoneQuery.exec("SELECT COUNT(*) FROM phones;")) {
+            if (phoneQuery.next()) lblPhoneCount->setText(QString("phones: %1").arg(phoneQuery.value(0).toInt()));
+        }
+        
+        // Automatically refresh the current result view if it is not the urls view.
+        if (twResults->currentIndex() != 0) {
+             updateResults();
+        }
+    }
+    
+    void updateResults() {
+        // Refresh the currently visible result table
+        int index = twResults->currentIndex();
+        if (index == 0) urlModel->select();
+        else if (index == 1) emailModel->select();
+        else if (index == 2) phoneModel->select();
+    }
+    
+    void dbStatusChanged(bool status) {
+        if (status) {
+            appendLog("[STATUS] database connection established.");
+        } else {
+            appendLog("[ERROR] database connection lost: " + QSqlDatabase::database(DB_FILENAME).lastError().text());
+        }
+    }
+
+private:
+    crawlerbackend *backend;
+    QThread *backendThread;
+    bool isCrawling = false;
+
+    // UI elements
+    QLineEdit *leSeedUrl;
+    QSpinBox *sbMaxPages;
+    QSpinBox *sbMaxDepth;
+    QSpinBox *sbWorkers;
+    QPushButton *pbStartResume;
+    QPushButton *pbStop;
+    QTextEdit *teLog;
+    QTableWidget *twUrls;
+    QLabel *lblCrawledCount;
+    QLabel *lblQueuedCount;
+    QLabel *lblEmailCount;
+    QLabel *lblPhoneCount;
+    QProgressBar *pbProgress;
+    QTabWidget *twResults;
+    
+    // Database Models
+    QSqlTableModel *urlModel;
+    QSqlTableModel *emailModel;
+    QSqlTableModel *phoneModel;
+
+    void setupUi() {
+        setWindowTitle("addresscrawler qt5");
+        
+        // --- 1. Controls Pane ---
+        leSeedUrl = new QLineEdit("http://example.com");
+        sbMaxPages = new QSpinBox(); sbMaxPages->setRange(1, 10000); sbMaxPages->setValue(DEFAULT_MAX_PAGES);
+        sbMaxDepth = new QSpinBox(); sbMaxDepth->setRange(1, 10); sbMaxDepth->setValue(DEFAULT_MAX_DEPTH);
+        sbWorkers = new QSpinBox(); sbWorkers->setRange(1, 16); sbWorkers->setValue(DEFAULT_WORKERS);
+        pbStartResume = new QPushButton("start/resume");
+        pbStop = new QPushButton("stop");
+        pbStop->setEnabled(false);
+
+        connect(pbStartResume, &QPushButton::clicked, this, &mainwindow::startResumeClicked);
+        connect(pbStop, &QPushButton::clicked, this, &mainwindow::stopClicked);
+        
+        QGroupBox *gbControls = new QGroupBox("controls");
+        QFormLayout *flControls = new QFormLayout(gbControls);
+        flControls->addRow("seed url:", leSeedUrl);
+        flControls->addRow("max pages:", sbMaxPages);
+        flControls->addRow("max depth:", sbMaxDepth);
+        flControls->addRow("workers:", sbWorkers);
+        QHBoxLayout *hlButtons = new QHBoxLayout();
+        hlButtons->addWidget(pbStartResume);
+        hlButtons->addWidget(pbStop);
+        flControls->addRow(hlButtons);
+
+        // --- 2. Status and Logs Pane ---
+        lblCrawledCount = new QLabel("crawled: 0 / 0");
+        lblQueuedCount = new QLabel("queued: 0");
+        lblEmailCount = new QLabel("emails: 0");
+        lblPhoneCount = new QLabel("phones: 0");
+        pbProgress = new QProgressBar();
+        pbProgress->setTextVisible(false);
+
+        QHBoxLayout *hlProgress = new QHBoxLayout();
+        hlProgress->addWidget(lblCrawledCount);
+        hlProgress->addWidget(lblQueuedCount);
+        hlProgress->addWidget(lblEmailCount);
+        hlProgress->addWidget(lblPhoneCount);
+        
+        QGroupBox *gbStatus = new QGroupBox("status");
+        QVBoxLayout *vlStatus = new QVBoxLayout(gbStatus);
+        vlStatus->addLayout(hlProgress);
+        vlStatus->addWidget(pbProgress);
+        
+        teLog = new QTextEdit();
+        teLog->setReadOnly(true);
+        teLog->setMaximumHeight(200);
+
+        QTabWidget *twLogs = new QTabWidget();
+        twLogs->addTab(gbStatus, "progress");
+        twLogs->addTab(teLog, "log output");
+
+        // --- 3. Results Pane ---
+        twResults = new QTabWidget();
+        
+        // Placeholder for tables - actual tables will be QTableView connected to models
+        twResults->addTab(new QWidget(), "urls");
+        twResults->addTab(new QWidget(), "emails");
+        twResults->addTab(new QWidget(), "phones");
+        
+        // --- Main Layout ---
+        QWidget *centralWidget = new QWidget();
+        QVBoxLayout *mainLayout = new QVBoxLayout(centralWidget);
+        mainLayout->addWidget(gbControls);
+        mainLayout->addWidget(twLogs);
+        mainLayout->addWidget(twResults);
+        setCentralWidget(centralWidget);
+        resize(800, 600);
+    }
+    
+    void setupDbModels() {
+        // Note: The C logic uses sqlite3 directly for the worker. 
+        // We set up QSqlTableModel for the UI display.
+        QSqlDatabase db = QSqlDatabase::addDatabase("qsqlite", DB_FILENAME);
+        db.setDatabaseName(DB_FILENAME);
+
+        if (!db.open()) {
+            qCritical() << "failed to open database for qt ui:" << db.lastError().text();
+            return;
+        }
+        
+        // URLs Model
+        urlModel = new QSqlTableModel(this, db);
+        urlModel->setTable("urls");
+        urlModel->setEditStrategy(QSqlTableModel::OnManualSubmit);
+        urlModel->select();
+        
+        QTableView *tvUrls = new QTableView();
+        tvUrls->setModel(urlModel);
+        twResults->widget(0)->setLayout(new QVBoxLayout());
+        twResults->widget(0)->layout()->addWidget(tvUrls);
+        
+        // Emails Model
+        emailModel = new QSqlTableModel(this, db);
+        emailModel->setTable("emails");
+        emailModel->setEditStrategy(QSqlTableModel::OnManualSubmit);
+        emailModel->select();
+        
+        QTableView *tvEmails = new QTableView();
+        tvEmails->setModel(emailModel);
+        twResults->widget(1)->setLayout(new QVBoxLayout());
+        twResults->widget(1)->layout()->addWidget(tvEmails);
+        
+        // Phones Model
+        phoneModel = new QSqlTableModel(this, db);
+        phoneModel->setTable("phones");
+        phoneModel->setEditStrategy(QSqlTableModel::OnManualSubmit);
+        phoneModel->select();
+        
+        QTableView *tvPhones = new QTableView();
+        tvPhones->setModel(phoneModel);
+        twResults->widget(2)->setLayout(new QVBoxLayout());
+        twResults->widget(2)->layout()->addWidget(tvPhones);
+        
+        // Refresh counts immediately
+        updateProgress(0, 0, 0, 0);
+    }
+    
+    void updateUiState() {
+        bool enabled = !isCrawling;
+        leSeedUrl->setEnabled(enabled);
+        sbMaxPages->setEnabled(enabled);
+        sbMaxDepth->setEnabled(enabled);
+        sbWorkers->setEnabled(enabled);
+        pbStartResume->setEnabled(enabled);
+        pbStop->setEnabled(!enabled);
+        
+        pbStartResume->setText(enabled ? "start/resume" : "crawling...");
+    }
+
+    void loadSettings() {
+        QSettings settings("addresscrawler", "qtcli");
+        leSeedUrl->setText(settings.value("seedurl", "http://example.com").toString());
+        sbMaxPages->setValue(settings.value("maxpages", DEFAULT_MAX_PAGES).toInt());
+        sbMaxDepth->setValue(settings.value("maxdepth", DEFAULT_MAX_DEPTH).toInt());
+        sbWorkers->setValue(settings.value("workers", DEFAULT_WORKERS).toInt());
+        
+        // If it was crawling when quit, start resume logic is handled by backend.
+        if (settings.value("iscrawling", false).toBool()) {
+            appendLog("[STATUS] resuming from last session state.");
+        }
+    }
+
+    void saveSettings() {
+        QSettings settings("addresscrawler", "qtcli");
+        settings.setValue("seedurl", leSeedUrl->text());
+        settings.setValue("maxpages", sbMaxPages->value());
+        settings.setValue("maxdepth", sbMaxDepth->value());
+        settings.setValue("workers", sbWorkers->value());
+        settings.setValue("iscrawling", isCrawling); // Save current crawling state
+    }
+};
+
+// =====================================================================================
+// Main Entry
+// =====================================================================================
+
+int main(int argc, char *argv[])
+{
+    // C-level global inits are now handled in crawlerbackend constructor/destructor
+    QCoreApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+    QApplication app(argc, argv);
+    
+    // The DB persistence is handled by the sqlite file itself, 
+    // and the frontier persistence is handled by re-loading uncrawled URLs from the DB.
+
+    mainwindow w;
+    w.show();
+
+    return app.exec();
+}
+
+#include "addresscrawler.moc"

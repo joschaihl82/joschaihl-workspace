@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(DriveSyncQt6 LANGUAGES CXX)
+
+# Require C++17 or newer
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Enable automoc, autouic, rcc
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC OFF)
+set(CMAKE_AUTOUIC OFF)
+
+# Find Qt6 components
+find_package(Qt6 REQUIRED COMPONENTS Core Network NetworkAuth)
+
+# Source
+set(SRC
+    main.cpp
+)
+
+add_executable(${PROJECT_NAME} ${SRC})
+
+# Link Qt libraries
+target_link_libraries(${PROJECT_NAME}
+    PRIVATE
+        Qt6::Core
+        Qt6::Network
+        Qt6::NetworkAuth
+)
+
+# Optional: add compiler warnings and definitions
+if (MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Install rule (optional)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)

@@ -1,0 +1,12 @@
+# ninja log v6
+3	558	1776068874025599110	gitpush_autogen/timestamp	c0ef11bd1b775756
+3	558	1776068874025599110	gitpush_autogen/mocs_compilation.cpp	c0ef11bd1b775756
+3	558	1776068874025599110	/home/joscha/git-workspace/gitpush6/build/cmake.run.linux.x86_64.Local/gitpush_autogen/timestamp	c0ef11bd1b775756
+3	558	1776068874025599110	/home/joscha/git-workspace/gitpush6/build/cmake.run.linux.x86_64.Local/gitpush_autogen/mocs_compilation.cpp	c0ef11bd1b775756
+559	575	1776068874044759910	CMakeFiles/gitpush.dir/gitpush_autogen/mocs_compilation.cpp.o	1bb937b8615e2378
+6	459	1776069110828811819	gitpush_autogen/timestamp	c0ef11bd1b775756
+6	459	1776069110828811819	gitpush_autogen/mocs_compilation.cpp	c0ef11bd1b775756
+6	459	1776069110828811819	/home/joscha/git-workspace/gitpush6/build/cmake.run.linux.x86_64.Local/gitpush_autogen/timestamp	c0ef11bd1b775756
+6	459	1776069110828811819	/home/joscha/git-workspace/gitpush6/build/cmake.run.linux.x86_64.Local/gitpush_autogen/mocs_compilation.cpp	c0ef11bd1b775756
+459	7805	1776069111281812226	CMakeFiles/gitpush.dir/gitpush1.cpp.o	6201cfeaad1b6387
+7805	8480	1776069118627818825	gitpush	348f4d51f7c82915

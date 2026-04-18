@@ -1,0 +1,2 @@
+'gcc "Z:\home\joscha\ui-workspace\notepad1\a.c" -o "Z:\home\joscha\ui-workspace\notepad1\a.exe" ' konnte nicht als interner oder externer Befehl
+oder als Batch-Skript erkannt werden.

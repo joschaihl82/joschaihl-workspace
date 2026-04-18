@@ -1,0 +1,2 @@
+#define spotify_VERSION_MAJOR @spotify_VERSION_MAJOR@
+#define spotify_VERSION_MINOR @spotify_VERSION_MINOR@

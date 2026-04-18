@@ -1,0 +1,7 @@
+/home/joscha/ui-workspace/notepad1/CMakeFiles/notepad_clone.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/edit_cache.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/rebuild_cache.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/list_install_components.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/install.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/install/local.dir
+/home/joscha/ui-workspace/notepad1/CMakeFiles/install/strip.dir

@@ -1,0 +1,5 @@
+# ninja log v6
+1	20856	1771673212071090406	CMakeFiles/remove_unused_static_funcs_to_c.dir/unused-optimizer1.cpp.o	272f35375581bd86
+20857	23569	1771673232927158366	remove_unused_static_funcs_to_c	2cc37b3854ee2852
+3	16906	1771673558144218173	CMakeFiles/remove_unused_static_funcs_to_c.dir/unused-optimizer1.cpp.o	272f35375581bd86
+16906	19289	1771673575047273252	remove_unused_static_funcs_to_c	2cc37b3854ee2852

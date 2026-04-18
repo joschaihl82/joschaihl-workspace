@@ -1,0 +1,19 @@
+enum hello {
+	H1,
+	H2,
+	H3
+};
+
+struct TestStruct {
+	long tst;
+	char mem[1024];
+};
+
+static void bla() {
+
+}
+
+int main() {
+	bla();
+	return H1;
+}

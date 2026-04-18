@@ -1,0 +1,27 @@
+#ifndef APP_H
+#define APP_H
+
+/* Layout constants shared across modules */
+#define RULER_THICKNESS 56
+#define TOOLBAR_HEIGHT 40
+#define STATUS_HEIGHT 20
+
+/* Public API between modules (very small surface) */
+
+/* Render module */
+int render_init(int win_w, int win_h);
+void render_shutdown(void);
+void render_resize(int w, int h);
+void render_draw(void);
+
+/* Zoom / pan API */
+void render_zoom_to_centered(double new_zoom, int animate);
+void render_zoom_in_centered(void);
+void render_zoom_out_centered(void);
+
+/* Optional small helpers you may add later:
+   void render_pan_by(int dx, int dy);
+   void render_set_grid_visible(int on);
+*/
+
+#endif /* APP_H */

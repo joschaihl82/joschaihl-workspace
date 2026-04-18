@@ -1,0 +1,595 @@
+// unused-optimizer1.cpp
+// Preprocess (using Clang Preprocessor API) then run AST-based cleanup.
+// Writes modified files as filename.clean.c
+
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/Tooling.h>
+#include <clang/Frontend/FrontendActions.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/Frontend/TextDiagnosticPrinter.h>
+#include <clang/Frontend/CompilerInvocation.h>
+#include <clang/Basic/DiagnosticOptions.h>
+#include <clang/Basic/TargetOptions.h>
+#include <clang/Basic/TargetInfo.h>
+#include <clang/Lex/Preprocessor.h>
+#include <clang/Lex/Token.h>
+#include <clang/Lex/Lexer.h>
+#include <clang/Basic/FileManager.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Basic/Diagnostic.h>
+#include <clang/Basic/LangOptions.h>
+#include <clang/Basic/SourceLocation.h>
+#include <clang/Basic/Version.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/TypeLoc.h>
+#include <clang/Lex/PreprocessorOptions.h>
+#include <clang/Frontend/Utils.h>
+//#include <llvm/Support/Host.h>
+#include <llvm/Support/MemoryBuffer.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/FileSystem.h>
+
+#include <set>
+#include <map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cctype>
+#include <iostream>
+
+using namespace clang;
+using namespace clang::tooling;
+using namespace llvm;
+
+static cl::OptionCategory ToolCategory("remove-unused-in-file options");
+static cl::opt<std::string> OutputSuffix("suffix",
+    cl::desc("Suffix for cleaned files"),
+    cl::value_desc("suffix"),
+    cl::init(".clean.c"),
+    cl::cat(ToolCategory));
+
+// Range info for removal
+struct RangeInfo {
+  unsigned startOffset;
+  unsigned endOffset; // exclusive
+  std::string name;
+};
+
+// -------------------- Preprocessing using Clang Preprocessor API --------------------
+
+// Build a CompilerInvocation from command-line args (flags only, not the program name).
+static std::unique_ptr<CompilerInvocation> makeInvocationFromArgs(ArrayRef<std::string> Args, DiagnosticsEngine &Diags) {
+  std::vector<const char*> cargs;
+  cargs.reserve(Args.size());
+  for (auto &s : Args) cargs.push_back(s.c_str());
+  IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts(new DiagnosticOptions());
+  TextDiagnosticPrinter *DiagClient = new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts);
+  DiagnosticsEngine DiagsLocal(DiagID, &*DiagOpts, DiagClient);
+
+  std::unique_ptr<CompilerInvocation> CI(new CompilerInvocation());
+  CompilerInvocation::CreateFromArgs(*CI, cargs.data(), cargs.data() + cargs.size(), DiagsLocal);
+  return CI;
+}
+
+// Preprocess the file at 'path' using the provided compile args (flags).
+// Returns the preprocessed source as a string (includes expanded, macros handled).
+static bool preprocessFileToString(const std::string &path,
+                                   const std::vector<std::string> &args,
+                                   std::string &outPreprocessed,
+                                   std::string &diagMessage) {
+  // Prepare diagnostics
+  IntrusiveRefCntPtr<DiagnosticIDs> DiagID(new DiagnosticIDs());
+  IntrusiveRefCntPtr<DiagnosticOptions> DiagOpts(new DiagnosticOptions());
+  TextDiagnosticPrinter *DiagClient = new TextDiagnosticPrinter(llvm::errs(), &*DiagOpts);
+  DiagnosticsEngine Diags(DiagID, &*DiagOpts, DiagClient);
+
+  // Build CompilerInvocation from args
+  std::unique_ptr<CompilerInvocation> CI(new CompilerInvocation());
+  // Convert args vector to char* array for CreateFromArgs
+  std::vector<const char*> argv;
+  argv.reserve(args.size());
+  for (auto &s : args) argv.push_back(s.c_str());
+  if (!CompilerInvocation::CreateFromArgs(*CI, argv.data(), argv.data() + argv.size(), Diags)) {
+    diagMessage = "Failed to create CompilerInvocation from args";
+    return false;
+  }
+
+  // Ensure language options are set (C by default)
+  LangOptions &langOpts = CI->getLangOpts();
+  if (!langOpts.C99 && !langOpts.C11 && !langOpts.CPlusPlus) {
+    // default to C11 if nothing set
+    langOpts.C11 = 1;
+  }
+
+  // Create CompilerInstance
+  CompilerInstance Clang;
+  Clang.setInvocation(std::move(CI));
+  Clang.createDiagnostics(DiagClient, false);
+  if (!Clang.hasDiagnostics()) {
+    diagMessage = "Failed to create diagnostics";
+    return false;
+  }
+
+  // Target
+  std::shared_ptr<TargetOptions> PTO(new TargetOptions());
+  PTO->Triple = llvm::sys::getDefaultTargetTriple();
+  TargetInfo *TI = TargetInfo::CreateTargetInfo(Clang.getDiagnostics(), PTO);
+  Clang.setTarget(TI);
+
+  // File manager and source manager
+  Clang.createFileManager();
+  Clang.createSourceManager(Clang.getFileManager());
+
+  // Create preprocessor
+  PreprocessorOptions &PPOpts = Clang.getPreprocessorOpts();
+  // Keep macros and includes handled normally; no special options needed here.
+
+  Clang.createPreprocessor(TU_Complete);
+  Clang.getPreprocessor().getBuiltinInfo().initializeBuiltins(Clang.getPreprocessor().getIdentifierTable(),
+                                                              Clang.getPreprocessor().getLangOpts());
+
+  // Create and set main file buffer from the file path
+  ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> BufOrErr = llvm::MemoryBuffer::getFile(path);
+  if (!BufOrErr) {
+    diagMessage = "Cannot open file: " + path;
+    return false;
+  }
+  std::unique_ptr<llvm::MemoryBuffer> Buf = std::move(*BufOrErr);
+  FileID FID = Clang.getSourceManager().createFileID(std::move(Buf));
+  Clang.getSourceManager().setMainFileID(FID);
+
+  // Initialize preprocessor and enter main file
+  Clang.getPreprocessor().EnterMainSourceFile();
+  Clang.getPreprocessor().Initialize(*Clang.getPreprocessor().getBuiltinInfo().getLangOpts());
+
+  // Lex tokens and reconstruct preprocessed text
+  Preprocessor &PP = Clang.getPreprocessor();
+  Token Tok;
+  std::string result;
+  result.reserve(Clang.getSourceManager().getBufferData(FID).size() * 2);
+
+  // We'll use a small buffer to get token spellings
+  SmallString<256> SpellingBuf;
+
+  // Keep track of previous token end location to insert whitespace/newlines as needed
+  SourceLocation PrevLoc = Clang.getSourceManager().getLocForStartOfFile(FID);
+
+  while (true) {
+    PP.Lex(Tok);
+    if (Tok.is(tok::eof)) break;
+
+    // Get token spelling
+    SpellingBuf.clear();
+    PP.getSpelling(Tok, SpellingBuf);
+
+    // Insert a single space between tokens when necessary to avoid token concatenation.
+    // We use token kinds to decide when to insert spaces: if both previous and current token are identifiers or literals,
+    // insert a space. This is conservative but safe for parsing.
+    // For simplicity, always append a space between two identifiers or identifier+literal.
+    // We don't attempt to perfectly reconstruct original whitespace.
+    if (!result.empty()) {
+      // If previous char is alnum or '_' and first char of current spelling is alnum or '_', add space
+      char prevc = result.back();
+      char curc = SpellingBuf.empty() ? '\0' : SpellingBuf[0];
+      if ((isalnum((unsigned char)prevc) || prevc == '_') &&
+          (isalnum((unsigned char)curc) || curc == '_')) {
+        result.push_back(' ');
+      }
+    }
+
+    result.append(SpellingBuf.begin(), SpellingBuf.end());
+
+    // For tokens that represent statement terminators or braces, append a newline to keep output readable
+    if (Tok.isOneOf(tok::semi, tok::r_brace)) result.push_back('\n');
+    // For preprocessor directives emitted as tokens (rare here), keep them as-is.
+  }
+
+  outPreprocessed.swap(result);
+  return true;
+}
+
+// -------------------- AST collector and consumer (cleanup) --------------------
+
+struct CollectorState {
+  std::map<const FunctionDecl*, RangeInfo> funcDefs;
+  std::set<const FunctionDecl*> funcCalled;
+  std::set<const FunctionDecl*> funcAddrTaken;
+
+  std::map<const TagDecl*, RangeInfo> tagDefs;
+  std::map<const TypedefNameDecl*, RangeInfo> typedefDefs;
+  std::set<const TagDecl*> tagUsed;
+  std::set<const TypedefNameDecl*> typedefUsed;
+
+  std::map<const EnumDecl*, std::vector<std::string>> enumConstantsUsed;
+
+  std::string fileName;
+};
+
+class PerFileCollector : public RecursiveASTVisitor<PerFileCollector> {
+  ASTContext &Ctx;
+  SourceManager &SM;
+  LangOptions LO;
+  CollectorState &State;
+
+public:
+  PerFileCollector(ASTContext &Context, CollectorState &S)
+    : Ctx(Context), SM(Context.getSourceManager()), LO(Context.getLangOpts()), State(S) {}
+
+  bool recordRangeForDecl(SourceLocation B, SourceLocation E, RangeInfo &out) {
+    if (!B.isValid() || !E.isValid()) return false;
+    if (!SM.isWrittenInSameFile(B, E)) return false;
+    FileID fid = SM.getFileID(B);
+    if (fid.isInvalid()) return false;
+    SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+    if (!realEnd.isValid()) return false;
+    unsigned start = SM.getFileOffset(B);
+    unsigned end = SM.getFileOffset(realEnd);
+
+    // Try to include a trailing semicolon and following newline(s)
+    StringRef buf = SM.getBufferData(fid);
+    unsigned i = end;
+    while (i < buf.size() && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\f' || buf[i] == '\v')) ++i;
+    if (i < buf.size() && buf[i] == ';') {
+      unsigned j = i + 1;
+      while (j < buf.size() && (buf[j] == ' ' || buf[j] == '\t')) ++j;
+      if (j < buf.size() && (buf[j] == '\r' || buf[j] == '\n')) {
+        while (j < buf.size() && (buf[j] == '\r' || buf[j] == '\n')) ++j;
+      }
+      end = j;
+    }
+
+    out.startOffset = start;
+    out.endOffset = end;
+    return true;
+  }
+
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    if (FD->isThisDeclarationADefinition()) {
+      SourceLocation B = FD->getSourceRange().getBegin();
+      SourceLocation E = FD->getSourceRange().getEnd();
+      RangeInfo ri{0,0,FD->getNameAsString()};
+      if (recordRangeForDecl(B, E, ri)) {
+        State.funcDefs[FD] = ri;
+        State.fileName = SM.getFilename(B).str();
+      }
+    }
+    if (TypeSourceInfo *TSI = FD->getTypeSourceInfo()) VisitTypeLoc(TSI->getTypeLoc());
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) {
+    if (FunctionDecl *Callee = CE->getDirectCallee()) State.funcCalled.insert(Callee);
+    return true;
+  }
+
+  bool VisitUnaryOperator(UnaryOperator *UO) {
+    if (UO->getOpcode() == UO_AddrOf) {
+      Expr *sub = UO->getSubExpr()->IgnoreParenImpCasts();
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(sub)) {
+        if (FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) State.funcAddrTaken.insert(FD);
+      }
+    }
+    return true;
+  }
+
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    if (ValueDecl *VD = DRE->getDecl()) {
+      if (FunctionDecl *FD = dyn_cast<FunctionDecl>(VD)) {
+        QualType QT = DRE->getType();
+        if (!QT.isNull() && (QT->isPointerType() || QT->isFunctionPointerType())) State.funcAddrTaken.insert(FD);
+      }
+      if (EnumConstantDecl *ECD = dyn_cast<EnumConstantDecl>(VD)) {
+        if (DeclContext *DC = ECD->getDeclContext()) {
+          if (EnumDecl *ED = dyn_cast<EnumDecl>(DC)) {
+            const EnumDecl *def = ED->getDefinition() ? ED->getDefinition() : ED;
+            State.enumConstantsUsed[def].push_back(ECD->getNameAsString());
+            State.tagUsed.insert(def);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  bool VisitTagDecl(TagDecl *TD) {
+    if (!TD->isThisDeclarationADefinition()) return true;
+    SourceLocation B = TD->getBeginLoc();
+    SourceLocation E = TD->getEndLoc();
+    RangeInfo ri{0,0,TD->getNameAsString()};
+    if (!recordRangeForDecl(B, E, ri)) return true;
+    State.tagDefs[TD] = ri;
+    State.fileName = SM.getFilename(B).str();
+    return true;
+  }
+
+  bool VisitTypedefNameDecl(TypedefNameDecl *TD) {
+    SourceLocation B = TD->getBeginLoc();
+    SourceLocation E = TD->getEndLoc();
+    RangeInfo ri{0,0,TD->getNameAsString()};
+    if (!recordRangeForDecl(B, E, ri)) return true;
+    State.typedefDefs[TD] = ri;
+    State.fileName = SM.getFilename(B).str();
+    return true;
+  }
+
+  bool VisitTypeLoc(TypeLoc TL) {
+    if (TL.getType().isNull()) return true;
+    if (TagTypeLoc TTL = TL.getAs<TagTypeLoc>()) {
+      if (TagDecl *TD = TTL.getDecl()) {
+        const TagDecl *def = TD->getDefinition() ? TD->getDefinition() : TD;
+        State.tagUsed.insert(def);
+      }
+    }
+    if (TypedefTypeLoc TDL = TL.getAs<TypedefTypeLoc>()) {
+      if (TypedefNameDecl *TD = TDL.getTypedefNameDecl()) State.typedefUsed.insert(TD);
+    }
+    return true;
+  }
+
+  bool VisitCXXBaseSpecifier(CXXBaseSpecifier const &B) {
+    if (TypeSourceInfo *TSI = B.getTypeSourceInfo()) VisitTypeLoc(TSI->getTypeLoc());
+    return true;
+  }
+
+  bool VisitVarDecl(VarDecl *VD) {
+    if (TypeSourceInfo *TSI = VD->getTypeSourceInfo()) VisitTypeLoc(TSI->getTypeLoc());
+    return true;
+  }
+  bool VisitFieldDecl(FieldDecl *FD) {
+    if (TypeSourceInfo *TSI = FD->getTypeSourceInfo()) VisitTypeLoc(TSI->getTypeLoc());
+    return true;
+  }
+  bool VisitParmVarDecl(ParmVarDecl *PD) {
+    if (TypeSourceInfo *TSI = PD->getTypeSourceInfo()) VisitTypeLoc(TSI->getTypeLoc());
+    return true;
+  }
+};
+
+// ASTConsumer that uses PerFileCollector
+class PerFileConsumer : public ASTConsumer {
+  ASTContext *Ctx;
+public:
+  CollectorState State;
+  PerFileConsumer(ASTContext *C) : Ctx(C) {}
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    PerFileCollector V(Context, State);
+    V.TraverseDecl(Context.getTranslationUnitDecl());
+
+    if (State.fileName.empty()) {
+      llvm::outs() << "Skipping TU with no file backing\n";
+      return;
+    }
+
+    // Print enums that have enumerators used in this file
+    if (!State.enumConstantsUsed.empty()) {
+      SourceManager &SM = Context.getSourceManager();
+      LangOptions LO = Context.getLangOpts();
+      for (auto &entry : State.enumConstantsUsed) {
+        const EnumDecl *ED = entry.first;
+        const TagDecl *TD = ED;
+        SourceRange SR = TD->getSourceRange();
+        SourceLocation B = SR.getBegin();
+        SourceLocation E = TD->getEndLoc();
+        if (B.isValid() && E.isValid() && SM.isWrittenInSameFile(B, E)) {
+          SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+          if (realEnd.isValid()) {
+            CharSourceRange CR = CharSourceRange::getCharRange(B, realEnd);
+            StringRef src = Lexer::getSourceText(CR, SM, LO);
+            llvm::outs() << "Enum used in file " << State.fileName << " :\n";
+            llvm::outs() << src << "\n";
+            llvm::outs() << "Used enumerators: ";
+            bool first = true;
+            for (auto &ename : entry.second) {
+              if (!first) llvm::outs() << ", ";
+              llvm::outs() << ename;
+              first = false;
+            }
+            llvm::outs() << "\n\n";
+          }
+        }
+      }
+    }
+
+    // Decide removable functions (conservative)
+    std::vector<RangeInfo> funcRemovals;
+    for (auto &p : State.funcDefs) {
+      const FunctionDecl *FD = p.first;
+      const RangeInfo &ri = p.second;
+      if (FD->getStorageClass() != SC_Static) continue;
+      if (State.funcCalled.count(FD)) continue;
+      if (State.funcAddrTaken.count(FD)) continue;
+      if (FD->hasAttr<UsedAttr>() || FD->hasAttr<ConstructorAttr>() || FD->hasAttr<DestructorAttr>()) continue;
+      funcRemovals.push_back(ri);
+    }
+
+    // Decide removable types
+    std::vector<RangeInfo> typeRemovals;
+    for (auto &p : State.tagDefs) {
+      const TagDecl *TD = p.first;
+      const RangeInfo &ri = p.second;
+      const TagDecl *def = TD->getDefinition() ? TD->getDefinition() : TD;
+      if (State.tagUsed.count(def)) continue;
+      if (const EnumDecl *ED = dyn_cast<EnumDecl>(def)) {
+        if (State.enumConstantsUsed.count(ED)) continue;
+      }
+      if (TD->getName().empty()) continue;
+      if (TD->hasAttr<UsedAttr>()) continue;
+      typeRemovals.push_back(ri);
+    }
+    for (auto &p : State.typedefDefs) {
+      const TypedefNameDecl *TD = p.first;
+      const RangeInfo &ri = p.second;
+      if (State.typedefUsed.count(TD)) continue;
+      if (TD->hasAttr<UsedAttr>()) continue;
+      if (TD->getName().empty()) continue;
+      typeRemovals.push_back(ri);
+    }
+
+    if (funcRemovals.empty() && typeRemovals.empty()) {
+      llvm::outs() << "No removable functions or types in file: " << State.fileName << "\n";
+      return;
+    }
+
+    // Read the preprocessed buffer from SourceManager (main file)
+    SourceManager &SM = Context.getSourceManager();
+    FileID fid = SM.getMainFileID();
+    StringRef buf = SM.getBufferData(fid);
+    std::string content = buf.str();
+
+    // Collect ranges to remove and merge
+    std::vector<std::pair<unsigned,unsigned>> ranges;
+    auto addRange = [&](const RangeInfo &r) {
+      unsigned s = r.startOffset;
+      unsigned e = r.endOffset;
+      if (s >= content.size()) return;
+      e = std::min(e, (unsigned)content.size());
+      ranges.emplace_back(s, e);
+    };
+    for (auto &r : funcRemovals) addRange(r);
+    for (auto &r : typeRemovals) addRange(r);
+
+    if (ranges.empty()) {
+      llvm::outs() << "No valid ranges to remove in file: " << State.fileName << "\n";
+      return;
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<unsigned,unsigned>> merged;
+    auto cur = ranges[0];
+    for (size_t i = 1; i < ranges.size(); ++i) {
+      if (ranges[i].first <= cur.second) cur.second = std::max(cur.second, ranges[i].second);
+      else { merged.push_back(cur); cur = ranges[i]; }
+    }
+    merged.push_back(cur);
+
+    // Remove ranges from content (descending order)
+    std::sort(merged.begin(), merged.end(), [](auto &a, auto &b){ return a.first > b.first; });
+    std::string newContent = content;
+    for (auto &r : merged) {
+      unsigned s = r.first;
+      unsigned e = r.second;
+      if (s >= e || s >= newContent.size()) continue;
+      unsigned safeEnd = std::min(e, (unsigned)newContent.size());
+      newContent.erase(s, safeEnd - s);
+    }
+
+    // Remove lines that contain only semicolons and whitespace
+    auto is_semicolon_only_line = [](llvm::StringRef line) -> bool {
+      line = line.trim();
+      if (line.empty()) return false;
+      size_t commentPos = line.find("//");
+      if (commentPos != llvm::StringRef::npos) line = line.substr(0, commentPos).rtrim();
+      if (line.find("/*") != llvm::StringRef::npos || line.find("*/") != llvm::StringRef::npos) return false;
+      bool hasSemi = false;
+      for (char c : line) {
+        if (c == ';') hasSemi = true;
+        else if (!isspace((unsigned char)c)) return false;
+      }
+      return hasSemi;
+    };
+
+    // Split into lines and filter
+    std::vector<std::string> lines;
+    {
+      size_t pos = 0, len = newContent.size();
+      while (pos < len) {
+        size_t nl = newContent.find_first_of("\r\n", pos);
+        if (nl == std::string::npos) { lines.emplace_back(newContent.substr(pos)); break; }
+        lines.emplace_back(newContent.substr(pos, nl - pos));
+        if (newContent[nl] == '\r' && nl + 1 < len && newContent[nl+1] == '\n') pos = nl + 2;
+        else pos = nl + 1;
+      }
+    }
+    std::string filtered;
+    filtered.reserve(newContent.size());
+    for (size_t i = 0; i < lines.size(); ++i) {
+      llvm::StringRef lr(lines[i]);
+      if (is_semicolon_only_line(lr)) continue;
+      filtered.append(lines[i]);
+      if (i + 1 < lines.size()) filtered.push_back('\n');
+    }
+    // Collapse leading newlines to at most one
+    size_t p = 0;
+    while (p < filtered.size() && (filtered[p] == '\n' || filtered[p] == '\r')) ++p;
+    if (p > 1) filtered.erase(0, p - 1);
+    newContent.swap(filtered);
+
+    // Write cleaned file
+    std::string outFile = State.fileName + OutputSuffix;
+    std::ofstream fout(outFile, std::ios::binary);
+    if (!fout) {
+      llvm::errs() << "Cannot write output file: " << outFile << "\n";
+      return;
+    }
+    fout << newContent;
+    fout.close();
+
+    llvm::outs() << "Wrote cleaned file: " << outFile << " (removed " << merged.size() << " ranges)\n";
+  }
+};
+
+// FrontendAction that uses PerFileConsumer
+class PerFileAction : public ASTFrontendAction {
+public:
+  PerFileAction() {}
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef) override {
+    return std::make_unique<PerFileConsumer>(&CI.getASTContext());
+  }
+};
+
+// -------------------- Main: preprocess with Clang API, then parse preprocessed text --------------------
+
+int main(int argc, const char **argv) {
+  auto ExpectedParser = CommonOptionsParser::create(argc, argv, ToolCategory);
+  if (!ExpectedParser) {
+    llvm::errs() << "Error parsing command line: " << llvm::toString(ExpectedParser.takeError()) << "\n";
+    return 1;
+  }
+  CommonOptionsParser &OptionsParser = *ExpectedParser;
+  CompilationDatabase &Compilations = OptionsParser.getCompilations();
+
+  for (const std::string &srcPath : OptionsParser.getSourcePathList()) {
+    // Get compile commands for this file (if available)
+    std::vector<std::string> args;
+    auto cmds = Compilations.getCompileCommands(srcPath);
+    if (!cmds.empty()) {
+      // Use the command line from the first compile command (skip program name)
+      const std::vector<std::string> &cmdline = cmds[0].CommandLine;
+      if (cmdline.size() >= 2) {
+        args.assign(cmdline.begin() + 1, cmdline.end());
+      } else {
+        args = {"-std=c11"};
+      }
+    } else {
+      args = {"-std=c11"};
+    }
+
+    // Preprocess using Clang Preprocessor API
+    std::string preprocessed;
+    std::string diag;
+    if (!preprocessFileToString(srcPath, args, preprocessed, diag)) {
+      llvm::errs() << "Preprocessing failed for " << srcPath << ": " << diag << "\n";
+      continue;
+    }
+
+    // Now parse the preprocessed text with Clang so AST sees inlined headers.
+    // Use the same compile args when parsing.
+    bool ok = tooling::runToolOnCodeWithArgs(newFrontendActionFactory<PerFileAction>().get(),
+                                             preprocessed,
+                                             args,
+                                             srcPath);
+    if (!ok) {
+      llvm::errs() << "Parsing preprocessed content failed for: " << srcPath << "\n";
+      continue;
+    }
+  }
+
+  llvm::outs() << "Done. Review the .clean.c files before replacing originals.\n";
+  return 0;
+}

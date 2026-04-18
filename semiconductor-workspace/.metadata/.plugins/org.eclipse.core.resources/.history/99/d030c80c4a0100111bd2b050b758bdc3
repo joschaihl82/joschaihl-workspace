@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local/QtPaintClone_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -O3 -DNDEBUG -std=gnu++17 -o CMakeFiles/QtPaintClone.dir/QtPaintClone_autogen/mocs_compilation.cpp.o -c /dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local/QtPaintClone_autogen/mocs_compilation.cpp",
+  "file": "/dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local/QtPaintClone_autogen/mocs_compilation.cpp",
+  "output": "CMakeFiles/QtPaintClone.dir/QtPaintClone_autogen/mocs_compilation.cpp.o"
+},
+{
+  "directory": "/dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local/QtPaintClone_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -O3 -DNDEBUG -std=gnu++17 -o CMakeFiles/QtPaintClone.dir/paintbrush.cpp.o -c /dat/semiconductor-workspace/paintbrush/paintbrush.cpp",
+  "file": "/dat/semiconductor-workspace/paintbrush/paintbrush.cpp",
+  "output": "CMakeFiles/QtPaintClone.dir/paintbrush.cpp.o"
+}
+]

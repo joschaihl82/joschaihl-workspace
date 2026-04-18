@@ -1,0 +1,1040 @@
+// cc.c
+// Minimal single-file C compiler: lexer, parser (subset), codegen (x86-64), ELF object writer, linker invocation.
+// Produces relocatable object out.o and links with system linker to create dynamically linked executable out.
+//
+// Limitations:
+// - Supports a small subset of C: integer literals, string literals, simple arithmetic,
+//   function definitions with integer return, function calls, return statements.
+// - No full type system, no structs, no enums, limited error checking.
+// - Emits simple x86-64 machine code for expressions and function prologue/epilogue.
+// - Emits relocations for external function calls and global addresses, writes out.o, then runs `gcc out.o -o out`.
+//
+// Use: gcc cc.c -o cc
+//       ./cc test.c
+//
+// Example test.c:
+//   int puts(const char*);
+//   int main() {
+//     puts("hello");
+//     return 0;
+//   }
+
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------------------------
+   Tokenizer
+   --------------------------- */
+typedef enum {
+    TK_RESERVED,
+    TK_TYPE,
+    TK_ID,
+    TK_NUM,
+    TK_CHAR,
+    TK_STRING,
+    TK_EOF,
+} token_kind;
+
+typedef struct token token;
+struct token {
+    token_kind kind;
+    token *next;
+    char *str;
+    int len;
+    int val;
+};
+
+static char *p_input; // input pointer for tokenizer
+
+static bool is_alpha_char(char c){
+    return c == '_' || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+static bool is_alnum_char(char c){
+    return is_alpha_char(c) || isdigit((unsigned char)c);
+}
+
+token *tokenize(char *code){
+    p_input = code;
+    token *head = calloc(1, sizeof(token));
+    token *cur = head;
+
+    char *types[] = {"void","_Bool","char","short","int","long","unsigned","signed","const","volatile","static","extern"};
+    int num_types = sizeof(types)/sizeof(*types);
+
+    char *keywords[] = {"return","if","else","while","for","break","continue","sizeof","typedef","struct","union","enum","include"};
+    int num_keywords = sizeof(keywords)/sizeof(*keywords);
+
+    // punctuators list; order not critical here but longer tokens should be matched first
+    char *puncts[] = {
+        ">>=", "<<=", "++", "--", "->", "+=", "-=", "*=", "/=", "%=", "||", "&&", "==", "!=", "<=", ">=", "<<", ">>",
+        "#", "=", "?", ":", "|", "^", "&", "<", ">", "+", "-", "*", "/", "%", "!", ".", ",", ";", "(", ")", "{", "}", "[", "]"
+    };
+    int num_puncts = sizeof(puncts)/sizeof(*puncts);
+
+    while(*p_input){
+        // skip whitespace
+        if(isspace((unsigned char)*p_input)){ p_input++; continue; }
+
+        // preprocessor line (skip to newline)
+        if(*p_input == '#'){ while(*p_input && *p_input != '\n') p_input++; continue; }
+
+        // line comment
+        if(memcmp(p_input, "//", 2) == 0){ p_input += 2; while(*p_input && *p_input != '\n') p_input++; continue; }
+
+        // block comment
+        if(memcmp(p_input, "/*", 2) == 0){ p_input += 2; while(*p_input && memcmp(p_input, "*/", 2) != 0) p_input++; if(*p_input) p_input += 2; continue; }
+
+        // char literal
+        if(*p_input == '\''){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_CHAR;
+            t->str = p_input;
+            t->len = 0;
+            p_input++; // skip opening '
+            while(*p_input && *p_input != '\''){
+                if(*p_input == '\\'){ p_input++; if(*p_input) p_input++; t->len += 2; }
+                else { p_input++; t->len++; }
+            }
+            if(*p_input == '\''){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // string literal
+        if(*p_input == '\"'){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_STRING;
+            t->str = p_input;
+            t->len = 0;
+            p_input++; // skip opening "
+            while(*p_input && *p_input != '\"'){
+                if(*p_input == '\\'){ p_input++; if(*p_input) p_input++; t->len += 2; }
+                else { p_input++; t->len++; }
+            }
+            if(*p_input == '\"'){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // types
+        bool matched = false;
+        for(int i=0;i<num_types;i++){
+            char *s = types[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0 && !is_alnum_char(p_input[L])){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_TYPE;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // keywords
+        for(int i=0;i<num_keywords;i++){
+            char *s = keywords[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0 && !is_alnum_char(p_input[L])){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_RESERVED;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // punctuators (longest-first)
+        for(int i=0;i<num_puncts;i++){
+            char *s = puncts[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_RESERVED;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // number
+        if(isdigit((unsigned char)*p_input)){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_NUM;
+            t->str = p_input;
+            t->len = 0;
+            t->val = 0;
+            while(isdigit((unsigned char)*p_input)){ t->val = t->val*10 + (*p_input - '0'); p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // identifier
+        if(is_alpha_char(*p_input)){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_ID;
+            t->str = p_input;
+            t->len = 0;
+            while(is_alnum_char(*p_input)){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        fprintf(stderr, "tokenize: invalid token at: '%c'\n", *p_input);
+        exit(1);
+    }
+
+    token *t = calloc(1, sizeof(token));
+    t->kind = TK_EOF;
+    t->str = p_input;
+    t->len = 0;
+    cur->next = t;
+    return head->next;
+}
+
+/* ---------------------------
+   AST and symbol structures
+   --------------------------- */
+typedef enum {
+    ND_FUNC_DEF,
+    ND_GLOBAL_DEF,
+    ND_BLOCK,
+    ND_IF,
+    ND_WHILE,
+    ND_FOR,
+    ND_RET,
+    ND_COMMA,
+    ND_ASSIGN,
+    ND_COND,
+    ND_LOG_OR,
+    ND_LOG_AND,
+    ND_BIT_OR,
+    ND_BIT_XOR,
+    ND_BIT_AND,
+    ND_EQ,
+    ND_NEQ,
+    ND_LT,
+    ND_LEQ,
+    ND_LSHIFT,
+    ND_RSHIFT,
+    ND_ADD,
+    ND_SUB,
+    ND_MUL,
+    ND_DIV,
+    ND_MOD,
+    ND_NEG,
+    ND_LOG_NOT,
+    ND_ADR,
+    ND_DEREF,
+    ND_CAST,
+    ND_GLOBAL,
+    ND_LOCAL,
+    ND_NUM,
+    ND_STRING,
+    ND_FUNC_CALL,
+    ND_DOT,
+    ND_ARROW,
+} node_kind;
+
+typedef enum {
+    NOHEAD, VOID, BOOL, CHAR, SHORT, INT, LONG, PTR, ARRAY, FUNC, STRUCT, ENUM
+} type_kind;
+
+typedef enum {
+    SY_VAR, SY_ENUM, SY_TYPE, SY_TAG
+} symb_kind;
+
+typedef struct type type;
+typedef struct symb symb;
+typedef struct node node;
+
+struct type {
+    type_kind kind;
+    type *ptr_to;
+    symb *head;
+    int size;
+    int align;
+    char *name;
+    int len;
+};
+
+struct symb {
+    symb_kind kind;
+    symb *next;
+    type *ty;
+    char *name;
+    int len;
+    int offset;
+    int val;
+    bool is_func_def;
+};
+
+struct node {
+    node_kind kind;
+    node *op1, *op2, *op3, *op4;
+    node *head;
+    node *next;
+    type *ty;
+    char *name;
+    int len;
+    int offset;
+    int val;
+};
+
+/* Global lists */
+static node *node_head = NULL;
+static node *node_tail = NULL;
+static symb *global_head = NULL;
+static symb *local_head = NULL;
+static symb *tag_head = NULL;
+
+/* ---------------------------
+   Simple parser for subset
+   --------------------------- */
+/* For brevity this parser supports:
+   - function definitions: int foo() { ... }
+   - return expr;
+   - expression statements: expr;
+   - function calls: id(...);
+   - string literals and numeric literals
+*/
+
+static token *cur_tok; // parser current token
+
+static bool expect_tok(const char *op){
+    if((int)strlen(op) == cur_tok->len && memcmp(op, cur_tok->str, cur_tok->len) == 0){
+        cur_tok = cur_tok->next; return true;
+    }
+    return false;
+}
+static bool consume_id(char **out_name, int *out_len){
+    if(cur_tok->kind == TK_ID){
+        *out_name = cur_tok->str; *out_len = cur_tok->len;
+        cur_tok = cur_tok->next; return true;
+    }
+    return false;
+}
+static int get_number(){
+    if(cur_tok->kind != TK_NUM){ fprintf(stderr, "parse error: expected number\n"); exit(1); }
+    int v = cur_tok->val; cur_tok = cur_tok->next; return v;
+}
+
+static node *new_node(node_kind k){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = k;
+    return nd;
+}
+
+/* forward declarations */
+static node *parse_primary();
+static node *parse_postfix();
+static node *parse_unary();
+static node *parse_mul();
+static node *parse_add();
+static node *parse_rel();
+static node *parse_eq();
+static node *parse_assign();
+static node *parse_expr();
+static node *parse_stmt();
+static node *parse_block();
+
+static node *parse_primary(){
+    if(cur_tok->kind == TK_NUM){
+        node *nd = new_node(ND_NUM);
+        nd->val = cur_tok->val;
+        nd->ty = calloc(1,sizeof(type)); nd->ty->kind = INT;
+        cur_tok = cur_tok->next;
+        return nd;
+    }
+    if(cur_tok->kind == TK_STRING){
+        node *nd = new_node(ND_STRING);
+        nd->name = cur_tok->str;
+        nd->len = cur_tok->len;
+        cur_tok = cur_tok->next;
+        return nd;
+    }
+    if(cur_tok->kind == TK_ID){
+        // variable or function
+        char *name = cur_tok->str; int len = cur_tok->len;
+        cur_tok = cur_tok->next;
+        if(expect_tok("(")){
+            node *nd = new_node(ND_FUNC_CALL);
+            nd->name = name; nd->len = len;
+            nd->val = 0;
+            nd->head = NULL;
+            if(expect_tok(")")) return nd;
+            while(1){
+                node *arg = parse_assign();
+                arg->next = nd->head; nd->head = arg; nd->val++;
+                if(expect_tok(",")) continue;
+                if(expect_tok(")")) break;
+                fprintf(stderr, "parse error: expected ',' or ')' in call\n"); exit(1);
+            }
+            return nd;
+        } else {
+            node *nd = new_node(ND_LOCAL);
+            nd->name = name; nd->len = len;
+            return nd;
+        }
+    }
+    if(expect_tok("(")){
+        node *nd = parse_expr();
+        if(!expect_tok(")")) { fprintf(stderr, "parse error: expected ')'\n"); exit(1); }
+        return nd;
+    }
+    fprintf(stderr, "parse error: unexpected token in primary\n"); exit(1);
+}
+
+static node *parse_postfix(){ return parse_primary(); }
+static node *parse_unary(){
+    if(expect_tok("-")){
+        node *nd = new_node(ND_NEG);
+        nd->op1 = parse_unary();
+        return nd;
+    }
+    if(expect_tok("!")){
+        node *nd = new_node(ND_LOG_NOT);
+        nd->op1 = parse_unary();
+        return nd;
+    }
+    return parse_postfix();
+}
+static node *parse_mul(){
+    node *nd = parse_unary();
+    while(1){
+        if(expect_tok("*")){
+            node *r = new_node(ND_MUL); r->op1 = nd; r->op2 = parse_unary(); nd = r; continue;
+        }
+        if(expect_tok("/")){
+            node *r = new_node(ND_DIV); r->op1 = nd; r->op2 = parse_unary(); nd = r; continue;
+        }
+        break;
+    }
+    return nd;
+}
+static node *parse_add(){
+    node *nd = parse_mul();
+    while(1){
+        if(expect_tok("+")){
+            node *r = new_node(ND_ADD); r->op1 = nd; r->op2 = parse_mul(); nd = r; continue;
+        }
+        if(expect_tok("-")){
+            node *r = new_node(ND_SUB); r->op1 = nd; r->op2 = parse_mul(); nd = r; continue;
+        }
+        break;
+    }
+    return nd;
+}
+static node *parse_rel(){ return parse_add(); }
+static node *parse_eq(){ return parse_rel(); }
+static node *parse_assign(){
+    node *nd = parse_eq();
+    if(expect_tok("=")){
+        node *r = new_node(ND_ASSIGN); r->op1 = nd; r->op2 = parse_assign(); return r;
+    }
+    return nd;
+}
+static node *parse_expr(){ return parse_assign(); }
+
+static node *parse_stmt(){
+    if(expect_tok("{")) return parse_block();
+    if(expect_tok("return")){
+        node *nd = new_node(ND_RET);
+        if(!expect_tok(";")){
+            nd->op1 = parse_expr();
+            if(!expect_tok(";")) { fprintf(stderr, "parse error: expected ';' after return\n"); exit(1); }
+        }
+        return nd;
+    }
+    node *nd = parse_expr();
+    if(!expect_tok(";")) { fprintf(stderr, "parse error: expected ';' after expr\n"); exit(1); }
+    return nd;
+}
+
+static node *parse_block(){
+    node *nd = new_node(ND_BLOCK);
+    node *head = NULL, *tail = NULL;
+    while(!expect_tok("}")){
+        node *s = parse_stmt();
+        if(!head) head = tail = s; else { tail->next = s; tail = s; }
+    }
+    nd->head = head;
+    return nd;
+}
+
+/* Top-level parsing: only function definitions and extern declarations */
+static void program_parse(token *toks){
+    cur_tok = toks;
+    node_head = NULL; node_tail = NULL;
+    while(cur_tok->kind != TK_EOF){
+        // skip optional type token
+        if(cur_tok->kind == TK_TYPE) cur_tok = cur_tok->next;
+        // allow implicit int if not specified
+        if(cur_tok->kind != TK_ID){ fprintf(stderr, "parse error: expected identifier at top-level\n"); exit(1); }
+        char *name = cur_tok->str; int len = cur_tok->len; cur_tok = cur_tok->next;
+        if(expect_tok("(")){
+            // function decl/def: skip params until ')'
+            while(!expect_tok(")")){
+                // skip tokens inside parameter list (we don't parse params)
+                cur_tok = cur_tok->next;
+                if(cur_tok->kind == TK_EOF){ fprintf(stderr, "parse error: unexpected EOF in parameter list\n"); exit(1); }
+            }
+            if(expect_tok("{")){
+                node *fn = new_node(ND_FUNC_DEF);
+                fn->name = name; fn->len = len;
+                fn->op1 = parse_block();
+                // append to node list
+                if(!node_head) node_head = node_tail = fn; else { node_tail->next = fn; node_tail = fn; }
+                continue;
+            } else {
+                // prototype; skip until ;
+                while(!expect_tok(";")) cur_tok = cur_tok->next;
+                continue;
+            }
+        } else {
+            // global var or prototype; skip until ;
+            while(!expect_tok(";")) cur_tok = cur_tok->next;
+            continue;
+        }
+    }
+}
+
+/* ---------------------------
+   Simple code emitter (x86-64) with relocations
+   --------------------------- */
+
+/* dynamic code buffer */
+static uint8_t *code_buf = NULL;
+static size_t code_cap = 0;
+static size_t code_len = 0;
+static void ensure_capacity(size_t n){ if(code_len + n <= code_cap) return; size_t nc = code_cap?code_cap*2:4096; while(nc < code_len + n) nc*=2; code_buf = realloc(code_buf, nc); code_cap = nc; }
+static void emit8(uint8_t b){ ensure_capacity(1); code_buf[code_len++] = b; }
+static void emit32(uint32_t v){ ensure_capacity(4); memcpy(code_buf + code_len, &v, 4); code_len += 4; }
+static void emit64(uint64_t v){ ensure_capacity(8); memcpy(code_buf + code_len, &v, 8); code_len += 8; }
+static size_t emit_pos(){ return code_len; }
+
+/* data buffer for .data */
+static uint8_t *data_buf = NULL;
+static size_t data_len = 0;
+static void data_append(const void *d, size_t n){ data_buf = realloc(data_buf, data_len + n); memcpy(data_buf + data_len, d, n); data_len += n; }
+
+/* relocation list */
+typedef enum { REL_PC32, REL_64 } rel_type;
+typedef struct rel_item {
+    size_t site_offset; // offset in .text where relocation applies (start of rel32 or 64)
+    rel_type type;
+    char *name;
+    struct rel_item *next;
+} rel_item;
+static rel_item *rel_head = NULL;
+static void add_reloc(size_t off, rel_type t, const char *name){
+    rel_item *r = calloc(1,sizeof(rel_item));
+    r->site_offset = off;
+    r->type = t;
+    r->name = strdup(name);
+    r->next = rel_head; rel_head = r;
+}
+
+/* local symbol list (functions and data) */
+typedef struct symrec {
+    char *name;
+    size_t offset; // offset in .text or .data
+    int is_text;
+    struct symrec *next;
+} symrec;
+static symrec *local_sym_head = NULL;
+static void add_local_sym(const char *name, size_t off, int is_text){
+    symrec *s = calloc(1,sizeof(symrec));
+    s->name = strdup(name);
+    s->offset = off;
+    s->is_text = is_text;
+    s->next = local_sym_head; local_sym_head = s;
+}
+
+/* simple register helpers and instruction emitters */
+static void emit_mov_rax_imm64(uint64_t imm){ emit8(0x48); emit8(0xB8); emit64(imm); }
+static void emit_push_rbp(){ emit8(0x55); }
+static void emit_mov_rbp_rsp(){ emit8(0x48); emit8(0x89); emit8(0xE5); }
+static void emit_sub_rsp_imm32(uint32_t imm){ emit8(0x48); emit8(0x81); emit8(0xEC); emit32(imm); }
+static void emit_leave(){ emit8(0xC9); }
+static void emit_ret(){ emit8(0xC3); }
+static void emit_push_rax(){ emit8(0x50); }
+static void emit_pop_rbx(){ emit8(0x5B); }
+static void emit_add_rax_rbx(){ emit8(0x48); emit8(0x01); emit8(0xD8); }
+static void emit_sub_rax_rbx(){ emit8(0x48); emit8(0x29); emit8(0xD8); }
+static void emit_imul_rax_rbx(){ emit8(0x48); emit8(0x0F); emit8(0xAF); emit8(0xC3); }
+static void emit_cqo(){ emit8(0x48); emit8(0x99); }
+static void emit_idiv_rbx(){ emit8(0x48); emit8(0xF7); emit8(0xFB); }
+static void emit_mov_rdi_rax(){ emit8(0x48); emit8(0x89); emit8(0xC7); }
+static void emit_mov_rsi_rax(){ emit8(0x48); emit8(0x89); emit8(0xC6); }
+static void emit_mov_rdx_rax(){ emit8(0x48); emit8(0x89); emit8(0xC2); }
+static void emit_mov_rcx_rax(){ emit8(0x48); emit8(0x89); emit8(0xC1); }
+static void emit_mov_r8_rax(){ emit8(0x4C); emit8(0x89); emit8(0xC0); }
+static void emit_mov_r9_rax(){ emit8(0x4C); emit8(0x89); emit8(0xC8); }
+
+/* store/load local variable at [rbp - disp] using disp as positive offset */
+static void emit_store_rax_to_rbp_disp32(int disp){
+    emit8(0x48); emit8(0x89); emit8(0x45); emit32((uint32_t)(-disp));
+}
+static void emit_load_rax_from_rbp_disp32(int disp){
+    emit8(0x48); emit8(0x8B); emit8(0x45); emit32((uint32_t)(-disp));
+}
+
+/* call rel32 placeholder: E8 <rel32> (we write 0 and record relocation) */
+static void emit_call_rel32_placeholder(const char *name){
+    emit8(0xE8);
+    size_t relpos = emit_pos();
+    emit32(0);
+    add_reloc(relpos, REL_PC32, name);
+}
+
+/* Evaluate expression into RAX (very small subset) */
+static void gen_expr(node *nd){
+    if(!nd){ emit_mov_rax_imm64(0); return; }
+    switch(nd->kind){
+        case ND_NUM:
+            emit_mov_rax_imm64((uint64_t)nd->val);
+            return;
+        case ND_STRING: {
+            // append string to data and return its address as relocation to be resolved by linker
+            size_t data_off = data_len;
+            // extract string content between quotes
+            char *s = nd->name;
+            int L = nd->len;
+            int i = 0;
+            while(i < L && s[i] != '\"') i++;
+            if(i >= L){ // no opening quote found, fallback
+                data_append("", 1);
+                emit_mov_rax_imm64(0);
+                return;
+            }
+            i++; // skip opening quote
+            int j = L - 1;
+            while(j > i && s[j] != '\"') j--;
+            if(j <= i){ // empty string
+                data_append("", 1);
+                emit_mov_rax_imm64(0);
+                return;
+            }
+            int slen = j - i;
+            // copy raw bytes (no unescape handling here)
+            data_append(s + i, slen);
+            data_append("\0",1);
+            // emit mov rax, 0 and add relocation for symbol ".LstrN"
+            emit_mov_rax_imm64(0);
+            char symname[64]; snprintf(symname, sizeof(symname), ".Lstr%zu", data_off);
+            add_reloc(emit_pos(), REL_64, symname);
+            add_local_sym(symname, data_off, 0);
+            return;
+        }
+        case ND_LOCAL:
+            // local variables not implemented: return 0
+            emit_mov_rax_imm64(0);
+            return;
+        case ND_ADD:
+            gen_expr(nd->op2); emit_push_rax();
+            gen_expr(nd->op1); emit_pop_rbx();
+            emit_add_rax_rbx();
+            return;
+        case ND_SUB:
+            gen_expr(nd->op2); emit_push_rax();
+            gen_expr(nd->op1); emit_pop_rbx();
+            emit_sub_rax_rbx();
+            return;
+        case ND_MUL:
+            gen_expr(nd->op2); emit_push_rax();
+            gen_expr(nd->op1); emit_pop_rbx();
+            emit_imul_rax_rbx();
+            return;
+        case ND_DIV:
+            gen_expr(nd->op2); emit_push_rax();
+            gen_expr(nd->op1); emit_pop_rbx();
+            emit_cqo(); emit_idiv_rbx();
+            return;
+        case ND_ASSIGN:
+            gen_expr(nd->op2);
+            // assignment to locals not implemented; keep value in RAX
+            return;
+        case ND_FUNC_CALL: {
+            // evaluate args into registers (up to 6)
+            int nargs = nd->val;
+            node **args = NULL;
+            if(nargs){
+                args = calloc(nargs, sizeof(node*));
+                int idx = nargs - 1;
+                for(node *a = nd->head; a; a = a->next){ args[idx--] = a; }
+            }
+            for(int i=0;i<nargs && i<6;i++){
+                gen_expr(args[i]);
+                switch(i){
+                    case 0: emit_mov_rdi_rax(); break;
+                    case 1: emit_mov_rsi_rax(); break;
+                    case 2: emit_mov_rdx_rax(); break;
+                    case 3: emit_mov_rcx_rax(); break;
+                    case 4: emit_mov_r8_rax(); break;
+                    case 5: emit_mov_r9_rax(); break;
+                }
+            }
+            for(int i = nargs - 1; i >= 6; i--){
+                gen_expr(args[i]); emit_push_rax();
+            }
+            if(args) free(args);
+            // call external function by name
+            char *fname = strndup(nd->name, nd->len);
+            emit_call_rel32_placeholder(fname);
+            return;
+        }
+        default:
+            emit_mov_rax_imm64(0);
+            return;
+    }
+}
+
+/* Generate code for a function node */
+static void gen_function(node *fn){
+    // record function symbol at current code offset
+    size_t func_pos = emit_pos();
+    char *fname = strndup(fn->name, fn->len);
+    add_local_sym(fname, func_pos, 1);
+
+    // prologue: push rbp; mov rbp, rsp; sub rsp, 32
+    emit_push_rbp();
+    emit_mov_rbp_rsp();
+    emit_sub_rsp_imm32(32);
+
+    // generate body
+    if(fn->op1){
+        node *b = fn->op1;
+        if(b->kind == ND_BLOCK){
+            for(node *it = b->head; it; it = it->next){
+                if(it->kind == ND_RET){
+                    if(it->op1) gen_expr(it->op1);
+                    emit_leave(); emit_ret();
+                } else {
+                    // expression statement
+                    gen_expr(it);
+                }
+            }
+        } else {
+            gen_expr(fn->op1);
+        }
+    }
+
+    // default epilogue (if function didn't return explicitly)
+    emit_leave(); emit_ret();
+}
+
+/* Generate code for all top-level nodes */
+static void gen_text(){
+    code_len = 0;
+    for(node *nd = node_head; nd; nd = nd->next){
+        if(nd->kind == ND_FUNC_DEF) gen_function(nd);
+    }
+}
+
+/* ---------------------------
+   ELF relocatable object writer and linker invocation
+   --------------------------- */
+
+#pragma pack(push,1)
+typedef struct {
+    unsigned char e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+} Elf64_Ehdr;
+
+typedef struct {
+    uint32_t sh_name;
+    uint32_t sh_type;
+    uint64_t sh_flags;
+    uint64_t sh_addr;
+    uint64_t sh_offset;
+    uint64_t sh_size;
+    uint32_t sh_link;
+    uint32_t sh_info;
+    uint64_t sh_addralign;
+    uint64_t sh_entsize;
+} Elf64_Shdr;
+
+typedef struct {
+    uint32_t st_name;
+    unsigned char st_info;
+    unsigned char st_other;
+    uint16_t st_shndx;
+    uint64_t st_value;
+    uint64_t st_size;
+} Elf64_Sym;
+
+typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+    int64_t  r_addend;
+} Elf64_Rela;
+#pragma pack(pop)
+
+enum { SHT_NULL=0, SHT_PROGBITS=1, SHT_SYMTAB=2, SHT_STRTAB=3, SHT_RELA=4 };
+enum { SHF_WRITE=0x1, SHF_ALLOC=0x2, SHF_EXECINSTR=0x4 };
+
+#define ELF64_R_INFO(sym,type) (((uint64_t)(sym) << 32) | (uint64_t)(type))
+#define ELF64_ST_INFO(bind,type) (((bind)<<4)+((type)&0xf))
+#define STB_GLOBAL 1
+#define STT_FUNC 2
+#define STT_OBJECT 1
+
+/* append helper */
+static void append_buf(uint8_t **buf, size_t *len, const void *data, size_t n){
+    *buf = realloc(*buf, *len + n);
+    memcpy(*buf + *len, data, n);
+    *len += n;
+}
+
+/* Build symtab and strtab */
+static void build_symtab_and_strtab(uint8_t **symtab_out, size_t *symtab_len,
+                                    uint8_t **strtab_out, size_t *strtab_len,
+                                    uint32_t *sym_count_out){
+    uint8_t *strtab = NULL; size_t strtab_len_local = 0;
+    append_buf(&strtab, &strtab_len_local, "\0", 1);
+
+    uint8_t *symtab = NULL; size_t symtab_len_local = 0;
+    Elf64_Sym zero_sym = {0};
+    append_buf(&symtab, &symtab_len_local, &zero_sym, sizeof(Elf64_Sym));
+    uint32_t sym_index = 1;
+
+    // local defined symbols
+    for(symrec *s = local_sym_head; s; s = s->next){
+        uint32_t name_off = (uint32_t)strtab_len_local;
+        append_buf(&strtab, &strtab_len_local, s->name, strlen(s->name)+1);
+        Elf64_Sym sym = {0};
+        sym.st_name = name_off;
+        sym.st_info = ELF64_ST_INFO(STB_GLOBAL, s->is_text ? STT_FUNC : STT_OBJECT);
+        sym.st_other = 0;
+        sym.st_shndx = s->is_text ? 1 : 2;
+        sym.st_value = s->offset;
+        sym.st_size = 0;
+        append_buf(&symtab, &symtab_len_local, &sym, sizeof(sym));
+        sym_index++;
+    }
+
+    // undefined symbols from relocations
+    for(rel_item *r = rel_head; r; r = r->next){
+        // check if already in strtab
+        int found = 0;
+        size_t pos = 1;
+        while(pos < strtab_len_local){
+            if(strcmp((char*)(strtab + pos), r->name) == 0){ found = 1; break; }
+            pos += strlen((char*)(strtab + pos)) + 1;
+        }
+        if(found) continue;
+        uint32_t name_off = (uint32_t)strtab_len_local;
+        append_buf(&strtab, &strtab_len_local, r->name, strlen(r->name)+1);
+        Elf64_Sym sym = {0};
+        sym.st_name = name_off;
+        sym.st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+        sym.st_other = 0;
+        sym.st_shndx = 0; // undefined
+        sym.st_value = 0;
+        sym.st_size = 0;
+        append_buf(&symtab, &symtab_len_local, &sym, sizeof(sym));
+        sym_index++;
+    }
+
+    *symtab_out = symtab; *symtab_len = symtab_len_local;
+    *strtab_out = strtab; *strtab_len = strtab_len_local;
+    *sym_count_out = sym_index;
+}
+
+/* Build rela.text */
+static void build_rela_text(uint8_t **rela_out, size_t *rela_len,
+                            uint8_t *strtab, size_t strtab_len,
+                            uint8_t *symtab, size_t symtab_len){
+    uint8_t *rela = NULL; size_t rela_len_local = 0;
+
+    // helper to find symbol index
+    uint32_t find_sym_index(const char *name){
+        uint32_t idx = 1;
+        for(symrec *s = local_sym_head; s; s = s->next){
+            if(strcmp(s->name, name) == 0) return idx;
+            idx++;
+        }
+        // then external symbols in strtab
+        size_t pos = 1; uint32_t cur = idx;
+        while(pos < strtab_len){
+            if(strcmp((char*)(strtab + pos), name) == 0) return cur;
+            pos += strlen((char*)(strtab + pos)) + 1; cur++;
+        }
+        return 0;
+    }
+
+    for(rel_item *r = rel_head; r; r = r->next){
+        Elf64_Rela entry;
+        entry.r_offset = r->site_offset;
+        uint32_t symidx = find_sym_index(r->name);
+        uint32_t rtype = (r->type == REL_PC32) ? 2 /*R_X86_64_PC32*/ : 1 /*R_X86_64_64*/;
+        entry.r_info = ELF64_R_INFO(symidx, rtype);
+        entry.r_addend = 0;
+        append_buf(&rela, &rela_len_local, &entry, sizeof(entry));
+    }
+    *rela_out = rela; *rela_len = rela_len_local;
+}
+
+/* Write relocatable object out.o and link with gcc to produce executable out */
+static void gen_code(){
+    // generate .text from AST
+    gen_text();
+
+    // build symtab/strtab
+    uint8_t *symtab = NULL; size_t symtab_len = 0;
+    uint8_t *strtab = NULL; size_t strtab_len = 0;
+    uint32_t sym_count = 0;
+    build_symtab_and_strtab(&symtab, &symtab_len, &strtab, &strtab_len, &sym_count);
+
+    // build rela.text
+    uint8_t *rela_text = NULL; size_t rela_text_len = 0;
+    build_rela_text(&rela_text, &rela_text_len, strtab, strtab_len, symtab, symtab_len);
+
+    // build shstrtab
+    uint8_t *shstr = NULL; size_t shstr_len = 0;
+    append_buf(&shstr, &shstr_len, "\0", 1);
+    const char *names[] = {".shstrtab", ".text", ".data", ".symtab", ".strtab", ".rela.text"};
+    for(int i=0;i<6;i++) append_buf(&shstr, &shstr_len, names[i], strlen(names[i])+1);
+
+    // compute offsets
+    size_t off = sizeof(Elf64_Ehdr);
+    size_t text_off = off; off += code_len; off = (off + 7) & ~7;
+    size_t data_off = off; off += data_len; off = (off + 7) & ~7;
+    size_t symtab_off = off; off += symtab_len; off = (off + 7) & ~7;
+    size_t strtab_off = off; off += strtab_len; off = (off + 7) & ~7;
+    size_t rela_off = off; off += rela_text_len; off = (off + 7) & ~7;
+    size_t shstr_off = off; off += shstr_len; off = (off + 7) & ~7;
+    size_t sh_off = (off + 7) & ~7;
+
+    // ELF header
+    Elf64_Ehdr ehdr; memset(&ehdr,0,sizeof(ehdr));
+    ehdr.e_ident[0]=0x7f; ehdr.e_ident[1]='E'; ehdr.e_ident[2]='L'; ehdr.e_ident[3]='F';
+    ehdr.e_ident[4]=2; ehdr.e_ident[5]=1; ehdr.e_ident[6]=1;
+    ehdr.e_type = 1; ehdr.e_machine = 0x3E; ehdr.e_version = 1;
+    ehdr.e_shoff = sh_off;
+    ehdr.e_ehsize = sizeof(Elf64_Ehdr);
+    ehdr.e_shentsize = sizeof(Elf64_Shdr);
+    ehdr.e_shnum = 7;
+    ehdr.e_shstrndx = 6;
+
+    FILE *f = fopen("out.o","wb");
+    if(!f){ perror("fopen out.o"); exit(1); }
+    fwrite(&ehdr,1,sizeof(ehdr),f);
+    if(code_len) fwrite(code_buf,1,code_len,f);
+    while(ftell(f) < (long)data_off) fputc(0,f);
+    if(data_len) fwrite(data_buf,1,data_len,f);
+    while(ftell(f) < (long)symtab_off) fputc(0,f);
+    if(symtab_len) fwrite(symtab,1,symtab_len,f);
+    while(ftell(f) < (long)strtab_off) fputc(0,f);
+    if(strtab_len) fwrite(strtab,1,strtab_len,f);
+    while(ftell(f) < (long)rela_off) fputc(0,f);
+    if(rela_text_len) fwrite(rela_text,1,rela_text_len,f);
+    while(ftell(f) < (long)shstr_off) fputc(0,f);
+    if(shstr_len) fwrite(shstr,1,shstr_len,f);
+    while(ftell(f) < (long)sh_off) fputc(0,f);
+
+    // section headers
+    Elf64_Shdr sh_null = {0};
+    Elf64_Shdr sh_text = {0};
+    Elf64_Shdr sh_data = {0};
+    Elf64_Shdr sh_symtab = {0};
+    Elf64_Shdr sh_strtab = {0};
+    Elf64_Shdr sh_rela = {0};
+    Elf64_Shdr sh_shstr = {0};
+
+    uint32_t off_shstr_text = 1 + (uint32_t)strlen(".shstrtab") + 1;
+    uint32_t off_shstr_data = off_shstr_text + (uint32_t)strlen(".text") + 1;
+    uint32_t off_shstr_symtab = off_shstr_data + (uint32_t)strlen(".data") + 1;
+    uint32_t off_shstr_strtab = off_shstr_symtab + (uint32_t)strlen(".symtab") + 1;
+    uint32_t off_shstr_rela = off_shstr_strtab + (uint32_t)strlen(".strtab") + 1;
+    uint32_t off_shstr_shstr = off_shstr_rela + (uint32_t)strlen(".rela.text") + 1;
+
+    sh_text.sh_name = off_shstr_text; sh_text.sh_type = SHT_PROGBITS; sh_text.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+    sh_text.sh_offset = text_off; sh_text.sh_size = code_len; sh_text.sh_addralign = 16;
+
+    sh_data.sh_name = off_shstr_data; sh_data.sh_type = SHT_PROGBITS; sh_data.sh_flags = SHF_ALLOC | SHF_WRITE;
+    sh_data.sh_offset = data_off; sh_data.sh_size = data_len; sh_data.sh_addralign = 8;
+
+    sh_symtab.sh_name = off_shstr_symtab; sh_symtab.sh_type = SHT_SYMTAB; sh_symtab.sh_offset = symtab_off;
+    sh_symtab.sh_size = symtab_len; sh_symtab.sh_link = 4; sh_symtab.sh_info = 1; sh_symtab.sh_addralign = 8; sh_symtab.sh_entsize = sizeof(Elf64_Sym);
+
+    sh_strtab.sh_name = off_shstr_strtab; sh_strtab.sh_type = SHT_STRTAB; sh_strtab.sh_offset = strtab_off; sh_strtab.sh_size = strtab_len; sh_strtab.sh_addralign = 1;
+
+    sh_rela.sh_name = off_shstr_rela; sh_rela.sh_type = SHT_RELA; sh_rela.sh_offset = rela_off; sh_rela.sh_size = rela_text_len; sh_rela.sh_link = 3; sh_rela.sh_info = 1; sh_rela.sh_addralign = 8; sh_rela.sh_entsize = sizeof(Elf64_Rela);
+
+    sh_shstr.sh_name = off_shstr_shstr; sh_shstr.sh_type = SHT_STRTAB; sh_shstr.sh_offset = shstr_off; sh_shstr.sh_size = shstr_len; sh_shstr.sh_addralign = 1;
+
+    fwrite(&sh_null,1,sizeof(sh_null),f);
+    fwrite(&sh_text,1,sizeof(sh_text),f);
+    fwrite(&sh_data,1,sizeof(sh_data),f);
+    fwrite(&sh_symtab,1,sizeof(sh_symtab),f);
+    fwrite(&sh_strtab,1,sizeof(sh_strtab),f);
+    fwrite(&sh_rela,1,sizeof(sh_rela),f);
+    fwrite(&sh_shstr,1,sizeof(sh_shstr),f);
+
+    fclose(f);
+
+    // cleanup
+    free(symtab); free(strtab); free(rela_text); free(shstr);
+
+    fprintf(stderr, "Wrote relocatable object out.o (%zu bytes .text, %zu bytes .data)\n", code_len, data_len);
+
+    // link with system linker (gcc) to produce dynamically linked executable
+    int rc = system("gcc out.o -o out");
+    if(rc != 0){
+        fprintf(stderr, "Linker returned non-zero exit code %d\n", rc);
+        fprintf(stderr, "You can link manually: gcc out.o -o out\n");
+    } else {
+        fprintf(stderr, "Linked executable out created. Run ./out\n");
+    }
+}
+
+/* ---------------------------
+   Main driver
+   --------------------------- */
+
+int main(int argc, char **argv){
+    if(argc < 2){ fprintf(stderr, "usage: %s input.c\n", argv[0]); return 1; }
+    FILE *f = fopen(argv[1],"rb");
+    if(!f){ perror("fopen input"); return 1; }
+    fseek(f,0,SEEK_END); long sz = ftell(f); fseek(f,0,SEEK_SET);
+    char *src = malloc((size_t)sz + 1);
+    if(!src){ perror("malloc"); fclose(f); return 1; }
+    if(fread(src,1,(size_t)sz,f) != (size_t)sz){ perror("fread"); fclose(f); free(src); return 1; }
+    src[sz]=0; fclose(f);
+
+    token *toks = tokenize(src);
+    program_parse(toks);
+
+    // generate code and link
+    gen_code();
+
+    free(src);
+    return 0;
+}

@@ -1,0 +1,1548 @@
+/* sparrow.c
+ *
+ * Single-file compiler for a tiny JavaScript-like language that emits
+ * x86-64 AT&T assembly.
+ *
+ * Build:
+ * gcc -std=c11 -O2 -o sparrow sparrow.c
+ * Run built-in tests:
+ * ./sparrow
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <errno.h>
+
+/* ---------------------------
+   Utility memory and errors
+   --------------------------- */
+
+static void die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "error: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    exit(1);
+}
+
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = calloc(1, n);
+    if (!p) die("out of memory");
+    memcpy(p, s, n);
+    return p;
+}
+
+static void *xrealloc(void *p, size_t newsize) {
+    void *q = realloc(p, newsize);
+    if (!q) die("out of memory");
+    return q;
+}
+
+/* ---------------------------
+   Lexer
+   --------------------------- */
+
+typedef enum {
+    TK_EOF,
+    TK_IDENT,
+    TK_NUMBER,
+    TK_STRING,
+    TK_KEYWORD,
+    TK_OP,
+} TokenKind;
+
+typedef struct {
+    TokenKind kind;
+    char *text;     /* for ident, keyword, string */
+    long num;       /* for number */
+    int op;         /* for operator token (single char or multi) */
+    int line;
+} Token;
+
+typedef struct {
+    const char *src;
+    size_t pos;
+    int line;
+} Lexer;
+
+static const char *keywords[] = {
+    "var", "function", "if", "else", "while", "for", "return", NULL
+};
+
+static int is_keyword(const char *s) {
+    for (int i = 0; keywords[i]; ++i) if (strcmp(s, keywords[i]) == 0) return 1;
+    return 0;
+}
+
+static void lex_skip_space(Lexer *lx) {
+    while (lx->src[lx->pos]) {
+        char c = lx->src[lx->pos];
+        if (c == '/' && lx->src[lx->pos+1] == '/') {
+            lx->pos += 2;
+            while (lx->src[lx->pos] && lx->src[lx->pos] != '\n') lx->pos++;
+            continue;
+        }
+        if (c == '/' && lx->src[lx->pos+1] == '*') {
+            lx->pos += 2;
+            while (lx->src[lx->pos] && !(lx->src[lx->pos]=='*' && lx->src[lx->pos+1]=='/')) {
+                if (lx->src[lx->pos] == '\n') lx->line++;
+                lx->pos++;
+            }
+            if (lx->src[lx->pos]) lx->pos += 2;
+            continue;
+        }
+        if (c == '\n') { lx->line++; lx->pos++; continue; }
+        if (isspace((unsigned char)c)) { lx->pos++; continue; }
+        break;
+    }
+}
+
+static Token lex_next(Lexer *lx) {
+    lex_skip_space(lx);
+    Token tk = {0};
+    tk.line = lx->line;
+    char c = lx->src[lx->pos];
+    if (!c) { tk.kind = TK_EOF; return tk; }
+
+    if (isalpha((unsigned char)c) || c == '_' ) {
+        size_t start = lx->pos;
+        while (isalnum((unsigned char)lx->src[lx->pos]) || lx->src[lx->pos] == '_') lx->pos++;
+        size_t len = lx->pos - start;
+        char *s = malloc(len+1);
+        memcpy(s, lx->src + start, len);
+        s[len] = 0;
+        if (is_keyword(s)) {
+            tk.kind = TK_KEYWORD;
+            tk.text = s;
+        } else {
+            tk.kind = TK_IDENT;
+            tk.text = s;
+        }
+        return tk;
+    }
+
+    if (isdigit((unsigned char)c)) {
+        long val = 0;
+        while (isdigit((unsigned char)lx->src[lx->pos])) {
+            val = val * 10 + (lx->src[lx->pos] - '0');
+            lx->pos++;
+        }
+        tk.kind = TK_NUMBER;
+        tk.num = val;
+        return tk;
+    }
+
+    if (c == '"' || c == '\'') {
+        char quote = c;
+        lx->pos++;
+        char *buf = NULL;
+        size_t bufsz = 0;
+        while (lx->src[lx->pos] && lx->src[lx->pos] != quote) {
+            if (lx->src[lx->pos] == '\\') {
+                lx->pos++;
+                char esc = lx->src[lx->pos];
+                char out = esc;
+                if (esc == 'n') out = '\n';
+                else if (esc == 't') out = '\t';
+                else if (esc == 'r') out = '\r';
+                else if (esc == '\\') out = '\\';
+                else if (esc == '"') out = '"';
+                else if (esc == '\'') out = '\'';
+                else out = esc;
+                buf = xrealloc(buf, bufsz + 2);
+                buf[bufsz++] = out;
+                lx->pos++;
+            } else {
+                buf = xrealloc(buf, bufsz + 2);
+                buf[bufsz++] = lx->src[lx->pos++];
+            }
+        }
+        if (lx->src[lx->pos] == quote) lx->pos++;
+        if (!buf) {
+            buf = malloc(1);
+            buf[0] = 0;
+        } else {
+            buf[bufsz] = 0;
+        }
+        tk.kind = TK_STRING;
+        tk.text = buf;
+        return tk;
+    }
+
+    /* multi-char operators: ==, !=, <=, >=, &&, || */
+    if ((c == '=' && lx->src[lx->pos+1] == '=') ||
+        (c == '!' && lx->src[lx->pos+1] == '=') ||
+        (c == '<' && lx->src[lx->pos+1] == '=') ||
+        (c == '>' && lx->src[lx->pos+1] == '=') ||
+        (c == '&' && lx->src[lx->pos+1] == '&') ||
+        (c == '|' && lx->src[lx->pos+1] == '|')) {
+        tk.kind = TK_OP;
+        tk.op = (lx->src[lx->pos] << 8) | lx->src[lx->pos+1];
+        lx->pos += 2;
+        return tk;
+    }
+
+    /* single char operators and punctuation (including ASSIGNMENT operator '=') */
+    lx->pos++;
+    tk.kind = TK_OP;
+    tk.op = (int)c;
+    return tk;
+}
+
+/* ---------------------------
+   Parser / AST
+   --------------------------- */
+
+typedef enum {
+    ND_NUM,
+    ND_STR,
+    ND_IDENT,
+    ND_BINOP,
+    ND_ASSIGN,
+    ND_MEMBER_ACCESS,
+    ND_INDEX_ACCESS,
+    ND_VARDECL,
+    ND_BLOCK,
+    ND_EXPR_STMT,
+    ND_IF,
+    ND_WHILE,
+    ND_FOR,
+    ND_RETURN,
+    ND_FUNC,
+    ND_CALL,
+    ND_PROGRAM,
+    ND_OBJ_LITERAL,
+    ND_ARRAY_LITERAL,
+} NodeKind;
+
+typedef struct LVar {
+    char *name;
+    int offset; // Offset von %rbp (e.g., -8, -16)
+} LVar;
+
+
+typedef struct Node {
+    NodeKind kind;
+    int line;
+    /* common */
+    struct Node *next; /* for statement lists */
+
+    /* for numbers and strings */
+    long num;
+    char *str;
+
+    /* identifier */
+    char *name;
+
+    /* binary, assign */
+    int op;
+    struct Node *lhs;
+    struct Node *rhs;
+
+    /* member access (ND_MEMBER_ACCESS) */
+    struct Node *target;
+    char *member_name;
+
+    /* index access (ND_INDEX_ACCESS) */
+    struct Node *index; // index expression
+
+    /* var decl */
+    char *var_name;
+    struct Node *init;
+
+    /* block */
+    struct Node *stmts;
+
+    /* if/while */
+    struct Node *cond;
+    struct Node *then_branch;
+    struct Node *else_branch;
+
+    /* for */
+    struct Node *init_stmt;
+    struct Node *cond_expr;
+    struct Node *post_expr;
+
+    /* function */
+    char **params;
+    int param_count;
+    struct Node *body;
+    LVar **locals;
+    int local_count;
+    int stack_size;
+
+    /* call */
+    struct Node **args;
+    int arg_count;
+
+    /* literal (object/array) */
+    char **keys;
+    struct Node **values;
+    int kv_count;
+} Node;
+
+/* Parser state */
+typedef struct {
+    Lexer lx;
+    Token cur;
+    Token peeked;
+    int has_peek;
+} Parser;
+
+static void parser_init(Parser *p, const char *src) {
+    p->lx.src = src;
+    p->lx.pos = 0;
+    p->lx.line = 1;
+    p->has_peek = 0;
+    p->cur.kind = TK_EOF;
+}
+
+/* token helpers */
+static Token parser_nexttok(Parser *p) {
+    if (p->has_peek) {
+        p->has_peek = 0;
+        p->cur = p->peeked;
+        return p->cur;
+    }
+    p->cur = lex_next(&p->lx);
+    return p->cur;
+}
+
+static Token parser_peektok(Parser *p) {
+    if (!p->has_peek) {
+        p->peeked = lex_next(&p->lx);
+        p->has_peek = 1;
+    }
+    return p->peeked;
+}
+
+static int accept_op(Parser *p, int ch) {
+    Token tk = parser_peektok(p);
+    if (tk.kind == TK_OP && tk.op == ch) {
+        parser_nexttok(p);
+        return 1;
+    }
+    return 0;
+}
+
+static void expect_op(Parser *p, int ch) {
+    Token tk = parser_peektok(p);
+    if (!(tk.kind == TK_OP && tk.op == ch)) {
+        die("expected '%c' at line %d (got kind %d, op %d)", ch, tk.line, tk.kind, tk.op);
+    }
+    parser_nexttok(p);
+}
+
+static void expect_keyword(Parser *p, const char *kw) {
+    Token tk = parser_peektok(p);
+    if (!(tk.kind == TK_KEYWORD && strcmp(tk.text, kw) == 0)) {
+        die("expected keyword '%s' at line %d", kw, tk.line);
+    }
+    parser_nexttok(p);
+}
+
+/* AST helpers */
+static Node *node_new(NodeKind k) {
+    Node *n = calloc(1, sizeof(Node));
+    if (!n) die("out of memory");
+    n->kind = k;
+    return n;
+}
+
+static Node *parse_expression(Parser *p);
+
+/* Hilfsfunktion zum Parsen von Literalen (Objekt und Array) */
+static Node *parse_literal(Parser *p, int open_op, int close_op, NodeKind kind) {
+    expect_op(p, open_op);
+    Node *lit = node_new(kind);
+    lit->kv_count = 0;
+    lit->keys = NULL;
+    lit->values = NULL;
+
+    while (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == close_op)) {
+        Node *val = NULL;
+        char *keyname = NULL;
+
+        if (kind == ND_OBJ_LITERAL) {
+            // Objektliteral: Schlüssel:Wert
+            Token keytk = parser_peektok(p);
+            if (keytk.kind == TK_STRING || keytk.kind == TK_IDENT) {
+                parser_nexttok(p);
+                keyname = xstrdup(keytk.text);
+            } else {
+                die("expected object key at line %d", keytk.line);
+            }
+            expect_op(p, ':');
+        } else {
+            // Arrayliteral: Wir verwenden einen Platzhalter als "Schlüssel"
+            keyname = xstrdup("");
+        }
+
+        val = parse_expression(p);
+
+        lit->keys = xrealloc(lit->keys, sizeof(char*) * (lit->kv_count + 1));
+        lit->values = xrealloc(lit->values, sizeof(Node*) * (lit->kv_count + 1));
+        lit->keys[lit->kv_count] = keyname;
+        lit->values[lit->kv_count] = val;
+        lit->kv_count++;
+
+        if (parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ',') {
+            parser_nexttok(p);
+            continue;
+        }
+        break;
+    }
+    expect_op(p, close_op);
+    return lit;
+}
+
+
+static Node *parse_primary(Parser *p) {
+    Token tk = parser_peektok(p);
+    if (tk.kind == TK_NUMBER) {
+        parser_nexttok(p);
+        Node *n = node_new(ND_NUM);
+        n->num = tk.num;
+        n->line = tk.line;
+        return n;
+    }
+    if (tk.kind == TK_STRING) {
+        parser_nexttok(p);
+        Node *n = node_new(ND_STR);
+        n->str = xstrdup(tk.text);
+        n->line = tk.line;
+        return n;
+    }
+    if (tk.kind == TK_IDENT) {
+        parser_nexttok(p);
+        Node *n = node_new(ND_IDENT);
+        n->name = xstrdup(tk.text);
+        n->line = tk.line;
+        return n;
+    }
+    if (tk.kind == TK_OP && tk.op == '(') {
+        parser_nexttok(p);
+        Node *n = parse_expression(p);
+        expect_op(p, ')');
+        return n;
+    }
+
+    // Objektliteral: { a: 1, b: 2 }
+    if (tk.kind == TK_OP && tk.op == '{') {
+        return parse_literal(p, '{', '}', ND_OBJ_LITERAL);
+    }
+
+    // Arrayliteral: [ 1, 2, 3 ]
+    if (tk.kind == TK_OP && tk.op == '[') {
+        return parse_literal(p, '[', ']', ND_ARRAY_LITERAL);
+    }
+
+    die("unexpected token at line %d (kind %d, op %d)", tk.line, tk.kind, tk.op);
+    return NULL;
+}
+
+/* Behandelt Funktionsaufrufe, Eigenschaftszugriffe und Indizierte Zugriffe */
+static Node *parse_postfix_expression(Parser *p) {
+    Node *n = parse_primary(p);
+
+    while (1) {
+        Token pk = parser_peektok(p);
+
+        /* 1. Function Call (a(b, c)) */
+        if (pk.kind == TK_OP && pk.op == '(') {
+            if (n->kind != ND_IDENT && n->kind != ND_MEMBER_ACCESS && n->kind != ND_INDEX_ACCESS) {
+                 die("call target must be a simple identifier, member, or index access at line %d", n->line);
+            }
+            parser_nexttok(p); /* consume '(' */
+
+            Node *call = node_new(ND_CALL);
+            call->name = (n->kind == ND_IDENT) ? xstrdup(n->name) : xstrdup("nested_call");
+            call->line = n->line;
+
+            call->arg_count = 0;
+            call->args = NULL;
+            if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ')')) {
+                while (1) {
+                    Node *arg = parse_expression(p);
+                    call->args = xrealloc(call->args, sizeof(Node*) * (call->arg_count + 1));
+                    call->args[call->arg_count++] = arg;
+                    if (parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ',') {
+                        parser_nexttok(p);
+                        continue;
+                    }
+                    break;
+                }
+            }
+            expect_op(p, ')');
+            n = call;
+            continue;
+        }
+
+        /* 2. Member Access (a.b) */
+        if (pk.kind == TK_OP && pk.op == '.') {
+            parser_nexttok(p); /* consume '.' */
+            Token member_tk = parser_peektok(p);
+            if (member_tk.kind != TK_IDENT) die("expected property name after '.' at line %d", member_tk.line);
+            parser_nexttok(p); /* consume property name */
+
+            Node *access = node_new(ND_MEMBER_ACCESS);
+            access->target = n;
+            access->member_name = xstrdup(member_tk.text);
+            access->line = n->line;
+            n = access;
+            continue;
+        }
+
+        /* 3. Indexed Access (a[b]) */
+        if (pk.kind == TK_OP && pk.op == '[') {
+            parser_nexttok(p); /* consume '[' */
+            Node *index_expr = parse_expression(p);
+            expect_op(p, ']');
+
+            Node *access = node_new(ND_INDEX_ACCESS);
+            access->target = n;
+            access->index = index_expr;
+            access->line = n->line;
+            n = access;
+            continue;
+        }
+
+        break; /* Keine weiteren Postfix-Operatoren */
+    }
+    return n;
+}
+
+
+/* operator precedence parsing */
+static int get_precedence(Token *t) {
+    if (t->kind != TK_OP) return -1;
+    int op = t->op;
+    if (op == '+' || op == '-') return 10;
+    if (op == '*' || op == '/') return 20;
+    if (op == '<' || op == '>' || op == ((int)'<'<<8 | '=' ) || op == ((int)'>'<<8 | '=')) return 5;
+    if (op == ((int)'='<<8 | '=') || op == ((int)'!'<<8 | '=')) return 4;
+    return -1;
+}
+
+static Node *parse_binop_rhs(Parser *p, int expr_prec, Node *lhs) {
+    while (1) {
+        Token next = parser_peektok(p);
+        int tok_prec = get_precedence(&next);
+        if (tok_prec < expr_prec) return lhs;
+
+        Token op = parser_nexttok(p); /* consume operator */
+        Node *rhs = parse_postfix_expression(p);
+        Token next2 = parser_peektok(p);
+        int next_prec = get_precedence(&next2);
+        if (tok_prec < next_prec) {
+            rhs = parse_binop_rhs(p, tok_prec + 1, rhs);
+        }
+
+        Node *newn = node_new(ND_BINOP);
+        newn->op = op.op;
+        newn->lhs = lhs;
+        newn->rhs = rhs;
+        lhs = newn;
+    }
+}
+
+/* Ruft parse_postfix_expression auf und behandelt Zuweisung */
+static Node *parse_expression(Parser *p) {
+    Node *lhs = parse_postfix_expression(p);
+
+    /* Zuweisungsprüfung (für ND_IDENT, ND_MEMBER_ACCESS oder ND_INDEX_ACCESS) */
+    if (lhs->kind == ND_IDENT || lhs->kind == ND_MEMBER_ACCESS || lhs->kind == ND_INDEX_ACCESS) {
+        Token pk = parser_peektok(p);
+        if (pk.kind == TK_OP && pk.op == '=') {
+            parser_nexttok(p); /* consume '=' */
+            Node *rhs = parse_expression(p);
+            Node *assign = node_new(ND_ASSIGN);
+            assign->lhs = lhs; /* The l-value node */
+            assign->rhs = rhs; /* The assigned value expression */
+            return assign;
+        }
+    }
+
+    return parse_binop_rhs(p, 0, lhs);
+}
+
+/* statements */
+static Node *parse_statement(Parser *p);
+
+static Node *parse_var_decl(Parser *p) {
+    expect_keyword(p, "var");
+    Token tk = parser_peektok(p);
+    if (tk.kind != TK_IDENT) die("expected identifier after var at line %d", tk.line);
+    parser_nexttok(p);
+    Node *n = node_new(ND_VARDECL);
+    n->var_name = xstrdup(tk.text);
+    n->line = tk.line;
+    if (parser_peektok(p).kind == TK_OP && parser_peektok(p).op == '=') {
+        parser_nexttok(p);
+        n->init = parse_expression(p);
+    } else {
+        n->init = NULL;
+    }
+    expect_op(p, ';');
+    return n;
+}
+
+static Node *parse_block(Parser *p) {
+    expect_op(p, '{');
+    Node *blk = node_new(ND_BLOCK);
+    blk->stmts = NULL;
+    Node **tail = &blk->stmts;
+    while (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == '}')) {
+        Node *s = parse_statement(p);
+        *tail = s;
+        while (*tail) tail = &((*tail)->next);
+    }
+    expect_op(p, '}');
+    return blk;
+}
+
+static Node *parse_if(Parser *p) {
+    expect_keyword(p, "if");
+    expect_op(p, '(');
+    Node *cond = parse_expression(p);
+    expect_op(p, ')');
+    Node *thenb = parse_statement(p);
+    Node *elseb = NULL;
+    if (parser_peektok(p).kind == TK_KEYWORD && strcmp(parser_peektok(p).text, "else") == 0) {
+        parser_nexttok(p);
+        elseb = parse_statement(p);
+    }
+    Node *n = node_new(ND_IF);
+    n->cond = cond;
+    n->then_branch = thenb;
+    n->else_branch = elseb;
+    return n;
+}
+
+static Node *parse_while(Parser *p) {
+    expect_keyword(p, "while");
+    expect_op(p, '(');
+    Node *cond = parse_expression(p);
+    expect_op(p, ')');
+    Node *body = parse_statement(p);
+    Node *n = node_new(ND_WHILE);
+    n->cond = cond;
+    n->then_branch = body;
+    return n;
+}
+
+static Node *parse_for(Parser *p) {
+    expect_keyword(p, "for");
+    expect_op(p, '(');
+    Node *init = NULL;
+    if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ';')) {
+        if (parser_peektok(p).kind == TK_KEYWORD && strcmp(parser_peektok(p).text, "var") == 0) {
+            init = parse_var_decl(p);
+        } else {
+            Node *e = parse_expression(p);
+            expect_op(p, ';');
+            Node *es = node_new(ND_EXPR_STMT);
+            es->lhs = e;
+            init = es;
+        }
+    } else {
+        expect_op(p, ';');
+    }
+    Node *cond = NULL;
+    if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ';')) {
+        cond = parse_expression(p);
+    }
+    expect_op(p, ';');
+    Node *post = NULL;
+    if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ')')) {
+        Node *e = parse_expression(p);
+        Node *es = node_new(ND_EXPR_STMT);
+        es->lhs = e;
+        post = es;
+    }
+    expect_op(p, ')');
+    Node *body = parse_statement(p);
+    Node *n = node_new(ND_FOR);
+    n->init_stmt = init;
+    n->cond_expr = cond;
+    n->post_expr = post;
+    n->then_branch = body;
+    return n;
+}
+
+static Node *parse_return(Parser *p) {
+    expect_keyword(p, "return");
+    Node *n = node_new(ND_RETURN);
+    if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ';')) {
+        n->lhs = parse_expression(p);
+    }
+    expect_op(p, ';');
+    return n;
+}
+
+static Node *parse_function(Parser *p) {
+    expect_keyword(p, "function");
+    Token tk = parser_peektok(p);
+    char *fname = NULL;
+    if (tk.kind == TK_IDENT) {
+        parser_nexttok(p);
+        fname = xstrdup(tk.text);
+    } else {
+        die("expected function name at line %d", tk.line);
+    }
+    expect_op(p, '(');
+    Node *fn = node_new(ND_FUNC);
+    fn->name = xstrdup(fname);
+    fn->param_count = 0;
+    fn->params = NULL;
+    if (!(parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ')')) {
+        while (1) {
+            Token pk = parser_peektok(p);
+            if (pk.kind != TK_IDENT) die("expected parameter name at line %d", pk.line);
+            parser_nexttok(p);
+            fn->params = xrealloc(fn->params, sizeof(char*) * (fn->param_count + 1));
+            fn->params[fn->param_count++] = xstrdup(pk.text);
+            if (parser_peektok(p).kind == TK_OP && parser_peektok(p).op == ',') {
+                parser_nexttok(p);
+                continue;
+            }
+            break;
+        }
+    }
+    expect_op(p, ')');
+    fn->body = parse_block(p);
+    return fn;
+}
+
+static Node *parse_statement(Parser *p) {
+    Token tk = parser_peektok(p);
+    if (tk.kind == TK_KEYWORD) {
+        if (strcmp(tk.text, "var") == 0) return parse_var_decl(p);
+        if (strcmp(tk.text, "if") == 0) return parse_if(p);
+        if (strcmp(tk.text, "while") == 0) return parse_while(p);
+        if (strcmp(tk.text, "for") == 0) return parse_for(p);
+        if (strcmp(tk.text, "return") == 0) return parse_return(p);
+        if (strcmp(tk.text, "function") == 0) return parse_function(p);
+    }
+    if (tk.kind == TK_OP && tk.op == '{') {
+        return parse_block(p);
+    }
+    /* expression statement */
+    Node *e = parse_expression(p);
+    expect_op(p, ';');
+    Node *es = node_new(ND_EXPR_STMT);
+    es->lhs = e;
+    return es;
+}
+
+/* top-level program parse */
+static Node *parse_program(Parser *p) {
+    Node *prog = node_new(ND_PROGRAM);
+    prog->stmts = NULL;
+    Node **tail = &prog->stmts;
+    while (1) {
+        Token tk = parser_peektok(p);
+        if (tk.kind == TK_EOF) break;
+        Node *s = parse_statement(p);
+        *tail = s;
+        while (*tail) tail = &((*tail)->next);
+    }
+    return prog;
+}
+
+/* ---------------------------
+   Code generation
+   --------------------------- */
+
+/* global tables for strings and globals */
+typedef struct {
+    char **names;
+    int count;
+} StrTable;
+
+static StrTable g_strings = {NULL, 0};
+
+static int add_string_literal(const char *s) {
+    for (int i = 0; i < g_strings.count; ++i) {
+        if (strcmp(g_strings.names[i], s) == 0) return i;
+    }
+    g_strings.names = xrealloc(g_strings.names, sizeof(char*) * (g_strings.count + 1));
+    g_strings.names[g_strings.count] = xstrdup(s);
+    return g_strings.count++;
+}
+
+typedef struct {
+    char **names;
+    int count;
+} GlobalTable;
+
+static GlobalTable g_globals = {NULL, 0};
+
+static int add_global(const char *name) {
+    for (int i = 0; i < g_globals.count; ++i) {
+        if (strcmp(g_globals.names[i], name) == 0) return i;
+    }
+    g_globals.names = xrealloc(g_globals.names, sizeof(char*) * (g_globals.count + 1));
+    g_globals.names[g_globals.count] = xstrdup(name);
+    return g_globals.count++;
+}
+
+/* assembly output */
+typedef struct {
+    FILE *f;
+    int label_id;
+} CodeGen;
+
+static void cg_emit(CodeGen *cg, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(cg->f, fmt, ap);
+    fprintf(cg->f, "\n");
+    va_end(ap);
+}
+
+static char *escape_asm_string(const char *s) {
+    /* escape backslashes and double quotes and control characters for .asciz */
+    size_t len = 0;
+    for (const char *p = s; *p; ++p) {
+        if (*p == '"' || *p == '\\' || *p == '\n' || *p == '\t' || *p == '\r') len += 2;
+        else len++;
+    }
+    char *out = malloc(len + 1);
+    if (!out) die("out of memory");
+    char *q = out;
+    for (const char *p = s; *p; ++p) {
+        if (*p == '"') { *q++ = '\\'; *q++ = '"'; }
+        else if (*p == '\\') { *q++ = '\\'; *q++ = '\\'; }
+        else if (*p == '\n') { *q++ = '\\'; *q++ = 'n'; }
+        else if (*p == '\t') { *q++ = '\\'; *q++ = 't'; }
+        else if (*p == '\r') { *q++ = '\\'; *q++ = 'r'; }
+        else *q++ = *p;
+    }
+    *q = 0;
+    return out;
+}
+
+
+/* forward declarations */
+static void cg_emit_stmt(CodeGen *cg, Node *n);
+static void cg_emit_data(CodeGen *cg);
+static void cg_emit_runtime(CodeGen *cg);
+static void cg_emit_expr(CodeGen *cg, Node *n);
+
+// Globaler Zeiger auf den aktuellen Funktions-Scope
+static Node *g_current_func_scope = NULL;
+
+// Hilfsfunktion zur Suche einer lokalen Variablen im aktuellen Scope
+static LVar *find_local(Node *func, const char *name) {
+    if (!func || func->kind != ND_FUNC) return NULL;
+    for (int i = 0; i < func->local_count; ++i) {
+        if (strcmp(func->locals[i]->name, name) == 0) return func->locals[i];
+    }
+    return NULL;
+}
+
+// Rekursive Suche nach allen VARDECLs innerhalb des Funktionskörpers (inkl. verschachtelter Blöcke)
+static void collect_vardecls_r(Node *n, Node *fn) {
+    if (!n) return;
+
+    // 1. Wenn VARDECL gefunden, füge es der Liste hinzu (falls nicht schon vorhanden)
+    if (n->kind == ND_VARDECL) {
+        if (!find_local(fn, n->var_name)) {
+            LVar *lv = calloc(1, sizeof(LVar));
+            if (!lv) die("out of memory");
+            lv->name = n->var_name;
+
+            fn->locals = xrealloc(fn->locals, sizeof(LVar*) * (fn->local_count + 1));
+            fn->locals[fn->local_count++] = lv;
+        }
+        return;
+    }
+
+    // 2. Rekursiv in Anweisungs-Containern suchen
+    switch (n->kind) {
+        case ND_BLOCK:
+        case ND_PROGRAM:
+            for (Node *s = n->stmts; s; s = s->next) collect_vardecls_r(s, fn);
+            break;
+        case ND_IF:
+            collect_vardecls_r(n->then_branch, fn);
+            collect_vardecls_r(n->else_branch, fn);
+            break;
+        case ND_WHILE:
+            collect_vardecls_r(n->then_branch, fn);
+            break;
+            // Nur den Body durchsuchen, da init_stmt (VARDECL) hier direkt behandelt wird.
+        case ND_FOR:
+            if (n->init_stmt)
+                collect_vardecls_r(n->init_stmt, fn);
+            if (n->cond_expr)
+                collect_vardecls_r(n->cond_expr, fn);
+            if (n->post_expr)
+                collect_vardecls_r(n->post_expr, fn);
+            collect_vardecls_r(n->then_branch, fn);
+            break;
+        default:
+            break;
+    }
+}
+
+
+// Analysefunktion für Funktionen (berechnet Offsets und Stack-Größe)
+static void analyze_function_scope(Node *fn) {
+    if (fn->kind != ND_FUNC) return;
+
+    fn->local_count = 0;
+    fn->locals = NULL;
+
+    // 1. Parameter als erste Locals erfassen (Offset später berechnet)
+    for (int i = 0; i < fn->param_count; ++i) {
+        LVar *lv = calloc(1, sizeof(LVar));
+        if (!lv) die("out of memory");
+        lv->name = fn->params[i];
+
+        fn->locals = xrealloc(fn->locals, sizeof(LVar*) * (fn->local_count + 1));
+        fn->locals[fn->local_count++] = lv;
+    }
+
+    // 2. Alle VARDECLs im Funktions-Body rekursiv sammeln
+    collect_vardecls_r(fn->body, fn);
+
+    // 3. Offset-Zuweisung für alle gesammelten Locals/Parameter
+    int offset = 0;
+    for (int i = 0; i < fn->local_count; ++i) {
+        LVar *lv = fn->locals[i];
+        offset -= 8; // Stack wächst nach unten, 8 Bytes pro 64-bit Wert
+        lv->offset = offset;
+    }
+
+    // 4. Stack-Größe auf 16 Bytes ausrichten (ABI)
+    // Die Allokation muss die 8 Bytes für 'push %rbp' kompensieren,
+    // um die 16-Byte-Ausrichtung des Stacks vor einem 'call' im Funktionskörper zu gewährleisten.
+    int locals_size = abs(offset);
+
+    // Der gesamte Stack-Frame (locals + %rbp) muss 16-Byte-aligned sein.
+    // D.h. (locals_size + 8) muss auf 16 aufgerundet werden.
+    int total_frame_size_aligned = ((locals_size + 8 + 15) & ~15);
+
+    // fn->stack_size ist der Wert, der im 'sub' Befehl verwendet wird.
+    // Wir ziehen die 8 Bytes für %rbp ab, da 'sub' nur die lokalen Variablen allokiert.
+    fn->stack_size = total_frame_size_aligned - 8;
+}
+
+
+/* Hilfsfunktion, um die Adresse eines l-value zu berechnen und in %rax zu legen */
+static void cg_emit_lvalue_addr(CodeGen *cg, Node *n) {
+    if (n->kind == ND_IDENT) {
+        LVar *lv = find_local(g_current_func_scope, n->name);
+        if (lv) {
+            // LOKALE VARIABLE: Adresse ist Offset von %rbp
+            cg_emit(cg, "    lea %d(%%rbp), %%rax", lv->offset);
+        } else {
+            // GLOBALE VARIABLE: Adresse ist statische Adresse
+            int gi = add_global(n->name);
+            cg_emit(cg, "    lea Lglob_%d(%%rip), %%rax", gi);
+        }
+    } else if (n->kind == ND_MEMBER_ACCESS) {
+        if (n->target->kind != ND_IDENT) {
+             die("member access target must be a simple identifier in this simple compiler");
+        }
+        // Konstruiere den geflatteten globalen Namen (z.B. obj_a)
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s_%s", n->target->name, n->member_name);
+
+        int gi = add_global(buf);
+        cg_emit(cg, "    lea Lglob_%d(%%rip), %%rax", gi); // Lade die Adresse von 'obj_a'
+    } else if (n->kind == ND_INDEX_ACCESS) {
+        // Indizierter Zugriff (arr[i])
+        // Berechne den Index * 8 in %rax
+        cg_emit_expr(cg, n->index);
+        cg_emit(cg, "    shl $3, %%rax"); // Index * 8 (da 8-byte/64-bit Werte)
+        cg_emit(cg, "    push %%rax");    // Offset speichern
+
+        // Basisadresse des Arrays in %rax holen
+        if (n->target->kind != ND_IDENT) {
+            die("array base must be a simple identifier in this simple compiler");
+        }
+        // Der Wert der Array-Variablen (z.B. Lglob_arr oder lokale) ist die Basisadresse (Pointer)
+        cg_emit_expr(cg, n->target); // Lädt den Wert (Adresse) des Arrays in %rax
+
+        // Offset addieren
+        cg_emit(cg, "    pop %%rbx");
+        cg_emit(cg, "    add %%rbx, %%rax");
+        // %rax hält jetzt die finale Adresse von arr[i]
+    } else {
+        die("l-value codegen not implemented for kind %d", n->kind);
+    }
+}
+
+
+/* expression codegen returns result in %rax */
+static void cg_emit_expr(CodeGen *cg, Node *n) {
+    if (!n) { cg_emit(cg, "    mov $0, %%rax"); return; }
+    switch (n->kind) {
+    case ND_NUM:
+        cg_emit(cg, "    mov $%ld, %%rax", n->num);
+        return;
+    case ND_STR: {
+        int idx = add_string_literal(n->str);
+        cg_emit(cg, "    lea Lstr_%d(%%rip), %%rax", idx);
+        return;
+    }
+    case ND_IDENT: {
+        LVar *lv = find_local(g_current_func_scope, n->name);
+        if (lv) {
+            // LOKALE VARIABLE: Wert von Stack laden
+            cg_emit(cg, "    mov %d(%%rbp), %%rax", lv->offset);
+        } else {
+            /* GLOBALE VARIABLE: Wert laden */
+            int gi = add_global(n->name);
+            cg_emit(cg, "    mov Lglob_%d(%%rip), %%rax", gi);
+        }
+        return;
+    }
+    case ND_MEMBER_ACCESS: {
+        /* Lade den Wert des Eigenschaftszugriffs */
+        cg_emit_lvalue_addr(cg, n);
+        cg_emit(cg, "    mov (%%rax), %%rax");
+        return;
+    }
+    case ND_INDEX_ACCESS: {
+        // Lade den Wert des indizierten Zugriffs
+        cg_emit_lvalue_addr(cg, n); // Adresse in %rax berechnen
+        cg_emit(cg, "    mov (%%rax), %%rax"); // Wert an Adresse laden
+        return;
+    }
+    case ND_BINOP: {
+        /* simple binary ops (unverändert) */
+        cg_emit_expr(cg, n->lhs);
+        cg_emit(cg, "    push %%rax");
+        cg_emit_expr(cg, n->rhs);
+        cg_emit(cg, "    mov %%rax, %%rbx");
+        cg_emit(cg, "    pop %%rax");
+        /* now lhs in %rax, rhs in %rbx */
+        int op = n->op;
+        if (op == '+') {
+            cg_emit(cg, "    add %%rbx, %%rax");
+        } else if (op == '-') {
+            cg_emit(cg, "    sub %%rbx, %%rax");
+        } else if (op == '*') {
+            cg_emit(cg, "    imul %%rbx, %%rax");
+        } else if (op == '/') {
+            cg_emit(cg, "    cqo");
+            cg_emit(cg, "    idiv %%rbx");
+        } else if (op == ((int)'='<<8 | '=')) {
+            cg_emit(cg, "    cmp %%rbx, %%rax");
+            cg_emit(cg, "    sete %%al");
+            cg_emit(cg, "    movzb %%al, %%rax");
+        } else if (op == ((int)'!'<<8 | '=')) {
+            cg_emit(cg, "    cmp %%rbx, %%rax");
+            cg_emit(cg, "    setne %%al");
+            cg_emit(cg, "    movzb %%al, %%rax");
+        } else if (op == '<') {
+            cg_emit(cg, "    cmp %%rbx, %%rax");
+            cg_emit(cg, "    setl %%al");
+            cg_emit(cg, "    movzb %%al, %%rax");
+        } else if (op == '>') {
+            cg_emit(cg, "    cmp %%rbx, %%rax");
+            cg_emit(cg, "    setg %%al");
+            cg_emit(cg, "    movzb %%al, %%rax");
+        } else {
+            die("unsupported binary op %d", op);
+        }
+        return;
+    }
+    case ND_ASSIGN: {
+        /* Zuweisungs-Codegen */
+        cg_emit_lvalue_addr(cg, n->lhs); // Adresse des Ziels in %rax
+        cg_emit(cg, "    push %%rax"); // Adresse sichern
+        cg_emit_expr(cg, n->rhs);      // Wert des RHS in %rax
+        cg_emit(cg, "    mov %%rax, %%rbx"); // Wert sichern
+        cg_emit(cg, "    pop %%rax");        // Adresse in %rax wiederherstellen
+        cg_emit(cg, "    mov %%rbx, (%%rax)"); // Wert an Adresse schreiben
+
+        cg_emit(cg, "    mov %%rbx, %%rax");
+        return;
+    }
+    case ND_CALL: {
+        Node *call = n;
+
+        // Push arguments (in reverse order)
+        for (int i = call->arg_count - 1; i >= 0; --i) {
+            cg_emit_expr(cg, call->args[i]);
+            cg_emit(cg, "    push %%rax");
+        }
+
+        // Pop arguments into registers
+        const char *argregs[] = {"%rdi","%rsi","%rdx","%rcx","%r8","%r9"};
+        for (int i = 0; i < call->arg_count && i < 6; ++i) {
+            cg_emit(cg, "    pop %s", argregs[i]);
+        }
+        if (call->arg_count > 6) {
+            die("more than 6 args not supported");
+        }
+
+        // FIX: Setze %rax auf 0 für variadische Funktionen (x86-64 ABI)
+        cg_emit(cg, "    xor %%rax, %%rax");
+
+        // Call the function (Result is in %rax)
+        cg_emit(cg, "    call %s", call->name);
+        return;
+    }
+    case ND_OBJ_LITERAL:
+    case ND_ARRAY_LITERAL: {
+        // Litale werden hier nicht zur Laufzeit erstellt. Der Ausdruck gibt die Adresse des ersten Elements (falls vorhanden) zurück.
+        if (n->kv_count > 0) {
+            char buf[256];
+            if (n->kind == ND_OBJ_LITERAL) {
+                 // Die Basisadresse des Objekts ist die Adresse des ersten geflatteten Members.
+                 snprintf(buf, sizeof(buf), "%s_%s", ((Node*)g_current_func_scope)->name, n->keys[0]);
+            } else {
+                 // Die Basisadresse des Arrays ist die Adresse des ersten geflatteten Elements.
+                 // Wir können hier nicht einfach eine Adresse laden, da das Literal selbst keinen Namen hat.
+                 die("Cannot use anonymous array/object literals in expressions: line %d", n->line);
+            }
+            int gi = add_global(buf); // Finde die Adresse des ersten Elements
+            cg_emit(cg, "    lea Lglob_%d(%%rip), %%rax", gi);
+        } else {
+            cg_emit(cg, "    mov $0, %%rax");
+        }
+        return;
+    }
+    default:
+        die("expr codegen not implemented for kind %d", n->kind);
+    }
+}
+
+/* statement codegen */
+static void cg_emit_stmt(CodeGen *cg, Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case ND_EXPR_STMT:
+        if (n->lhs && n->lhs->kind == ND_CALL) {
+            /* handle call expressions specially */
+            Node *call = n->lhs;
+
+            if (strcmp(call->name, "print") == 0) {
+                if (call->arg_count != 1) die("print expects 1 arg");
+                Node *arg = call->args[0];
+                if (arg->kind == ND_STR) {
+                    cg_emit_expr(cg, arg);
+                    cg_emit(cg, "    mov %%rax, %%rdi");
+                    cg_emit(cg, "    call puts");
+                } else {
+                    cg_emit_expr(cg, arg);
+                    cg_emit(cg, "    mov %%rax, %%rsi");
+                    cg_emit(cg, "    lea Lfmt_int(%%rip), %%rdi");
+                    cg_emit(cg, "    xor %%rax, %%rax"); // printf is variadic
+                    cg_emit(cg, "    call printf");
+                }
+                return;
+            }
+
+            // FIX: Special case for test harness printf("%ld\n", value)
+            if (strcmp(call->name, "printf") == 0) {
+                 if (call->arg_count != 2) die("printf in test harness expects 2 args");
+
+                // Arg 2 (The value to print, e.g., foo(1, 2) or a[i])
+                cg_emit_expr(cg, call->args[1]); // Result in %rax
+                cg_emit(cg, "    mov %%rax, %%rsi"); // Value to second register (%rsi)
+
+                // Arg 1 (The format string, e.g., "%ld\n")
+                cg_emit_expr(cg, call->args[0]); // Result in %rax (address of string)
+                cg_emit(cg, "    mov %%rax, %%rdi"); // Format string address to first register (%rdi)
+
+                // Prepare for variadic call (AL = 0)
+                cg_emit(cg, "    xor %%rax, %%rax");
+                cg_emit(cg, "    call printf");
+                return;
+            }
+
+            /* Generic function call (e.g., calling foo(1, 2)) */
+            cg_emit_expr(cg, n->lhs);
+            return;
+        } else {
+            cg_emit_expr(cg, n->lhs);
+            return;
+        }
+    case ND_VARDECL: {
+        if (g_current_func_scope) {
+            // LOKALE Variable: Initialisierung auf dem Stack
+            LVar *lv = find_local(g_current_func_scope, n->var_name);
+            if (!lv) die("internal error: local var '%s' not found for initialization", n->var_name);
+
+            if (n->init) {
+                cg_emit_expr(cg, n->init);
+                cg_emit(cg, "    mov %%rax, %d(%%rbp)", lv->offset);
+            } else {
+                // Lokale Variable mit 0 initialisieren
+                cg_emit(cg, "    mov $0, %d(%%rbp)", lv->offset);
+            }
+            return;
+        } else {
+            // GLOBALE Variable: (Bestehende Logik zur Globalen Deklaration/Initialisierung)
+            NodeKind init_kind = n->init ? n->init->kind : ND_NUM;
+
+            if (init_kind == ND_OBJ_LITERAL || init_kind == ND_ARRAY_LITERAL) {
+                // Logik zur Array- und Objekt-Flattenerung
+                for (int i = 0; i < n->init->kv_count; ++i) {
+                    char buf[256];
+                    if (init_kind == ND_OBJ_LITERAL) {
+                        snprintf(buf, sizeof(buf), "%s_%s", n->var_name, n->init->keys[i]);
+                    } else {
+                        snprintf(buf, sizeof(buf), "%s_%d", n->var_name, i);
+                    }
+
+                    add_global(buf); // Globales Speicher-Element anlegen
+
+                    /* Werte setzen (Ausdruck in %rax) */
+                    cg_emit_expr(cg, n->init->values[i]);
+                    int gi = add_global(buf);
+                    cg_emit(cg, "    mov %%rax, Lglob_%d(%%rip)", gi);
+                }
+
+                add_global(n->var_name); // Die Basisvariable selbst
+
+                /* Setze die Basisvariable auf die Adresse des ersten geflatteten Elements */
+                if (n->init->kv_count > 0) {
+                    char buf[256];
+                    if (init_kind == ND_OBJ_LITERAL) {
+                         snprintf(buf, sizeof(buf), "%s_%s", n->var_name, n->init->keys[0]);
+                    } else {
+                         snprintf(buf, sizeof(buf), "%s_%d", n->var_name, 0); // Erstes Array-Element
+                    }
+                    int gi = add_global(buf);
+                    cg_emit(cg, "    lea Lglob_%d(%%rip), %%rax", gi); // Lade die Adresse des ersten Elements
+                    int gmain = add_global(n->var_name);
+                    cg_emit(cg, "    mov %%rax, Lglob_%d(%%rip)", gmain); // Speichere die Adresse in der Basisvariablen
+                } else {
+                    int gmain = add_global(n->var_name);
+                    cg_emit(cg, "    mov $0, Lglob_%d(%%rip)", gmain); // Null setzen, falls leer
+                }
+                return; // Deklaration beendet
+            }
+
+            /* Skalare Initialisierung */
+            add_global(n->var_name);
+            if (n->init) {
+                cg_emit_expr(cg, n->init);
+                int gi = add_global(n->var_name);
+                cg_emit(cg, "    mov %%rax, Lglob_%d(%%rip)", gi);
+            }
+            return;
+        }
+    }
+    case ND_BLOCK: {
+        for (Node *s = n->stmts; s; s = s->next) cg_emit_stmt(cg, s);
+        return;
+    }
+    case ND_IF: {
+        int lid = ++cg->label_id;
+        cg_emit_expr(cg, n->cond);
+        cg_emit(cg, "    cmp $0, %%rax");
+        if (n->else_branch) {
+            cg_emit(cg, "    je .Lelse_%d", lid);
+            cg_emit_stmt(cg, n->then_branch);
+            cg_emit(cg, "    jmp .Lend_%d", lid);
+            cg_emit(cg, ".Lelse_%d:", lid);
+            cg_emit_stmt(cg, n->else_branch);
+            cg_emit(cg, ".Lend_%d:", lid);
+        } else {
+            cg_emit(cg, "    je .Lend_%d", lid);
+            cg_emit_stmt(cg, n->then_branch);
+            cg_emit(cg, ".Lend_%d:", lid);
+        }
+        return;
+    }
+    case ND_WHILE: {
+        int lid = ++cg->label_id;
+        cg_emit(cg, ".Lwhile_begin_%d:", lid);
+        cg_emit_expr(cg, n->cond);
+        cg_emit(cg, "    cmp $0, %%rax");
+        cg_emit(cg, "    je .Lwhile_end_%d", lid);
+        cg_emit_stmt(cg, n->then_branch);
+        cg_emit(cg, "    jmp .Lwhile_begin_%d", lid);
+        cg_emit(cg, ".Lwhile_end_%d:", lid);
+        return;
+    }
+    case ND_FOR: {
+        int lid = ++cg->label_id;
+        if (n->init_stmt) cg_emit_stmt(cg, n->init_stmt);
+        cg_emit(cg, ".Lfor_begin_%d:", lid);
+        if (n->cond_expr) {
+            cg_emit_expr(cg, n->cond_expr);
+            cg_emit(cg, "    cmp $0, %%rax");
+            cg_emit(cg, "    je .Lfor_end_%d", lid);
+        }
+        cg_emit_stmt(cg, n->then_branch);
+        if (n->post_expr) cg_emit_stmt(cg, n->post_expr);
+        cg_emit(cg, "    jmp .Lfor_begin_%d", lid);
+        cg_emit(cg, ".Lfor_end_%d:", lid);
+        return;
+    }
+    case ND_RETURN: {
+        if (n->lhs) cg_emit_expr(cg, n->lhs);
+        cg_emit(cg, "    jmp .Lfunc_end_%s", g_current_func_scope ? g_current_func_scope->name : "main");
+        return;
+    }
+    case ND_FUNC: {
+        // Stack-Analyse und Prolog/Epilog
+        analyze_function_scope(n); // Berechne lokale Offsets und Stack-Größe
+
+        cg_emit(cg, ".globl %s", n->name);
+        cg_emit(cg, "%s:", n->name);
+
+        // PROLOGUE
+        cg_emit(cg, "    push %%rbp");
+        cg_emit(cg, "    mov %%rsp, %%rbp");
+        if (n->stack_size > 0) {
+            // fn->stack_size ist so berechnet, dass es die 8 Bytes durch 'push %rbp' kompensiert
+            cg_emit(cg, "    sub $%d, %%rsp", n->stack_size);
+        }
+
+        // PARAMETER AUF DEN STACK SPEICHERN (Bis zu 6 Argumente)
+        const char *argregs[] = {"%rdi","%rsi","%rdx","%rcx","%r8","%r9"};
+        for (int i = 0; i < n->param_count && i < 6; ++i) {
+            LVar *lv = find_local(n, n->params[i]);
+            if (lv) {
+                cg_emit(cg, "    mov %s, %d(%%rbp)", argregs[i], lv->offset);
+            }
+        }
+
+        // FUNCTION BODY (Scope setzen)
+        Node *old_scope = g_current_func_scope;
+        g_current_func_scope = n;
+        cg_emit_stmt(cg, n->body);
+        g_current_func_scope = old_scope;
+
+        // EPILOGUE
+        cg_emit(cg, ".Lfunc_end_%s:", n->name);
+        cg_emit(cg, "    mov $0, %%rax"); // Standard-Rückgabewert 0
+        cg_emit(cg, "    mov %%rbp, %%rsp"); // Stack-Frame zurücksetzen
+        cg_emit(cg, "    pop %%rbp");
+        cg_emit(cg, "    ret");
+        return;
+    }
+    case ND_PROGRAM: {
+        /* emit main function that runs top-level statements */
+        cg_emit(cg, ".globl main");
+        cg_emit(cg, "main:");
+
+        // PROLOGUE
+        cg_emit(cg, "    push %%rbp");
+        cg_emit(cg, "    mov %%rsp, %%rbp");
+
+        // FIX: Stack Alignment für top-level Calls (sicherstellen, dass der Stack vor Calls 16-Byte aligned ist)
+        // Nach push %rbp (8 Bytes) ist der Stack nicht aligned, wir subtrahieren 8 weitere Bytes, um 16-Byte Alignment zu erreichen.
+        cg_emit(cg, "    sub $8, %%rsp");
+
+        // PROGRAM BODY (Global Scope setzen)
+        g_current_func_scope = NULL;
+        for (Node *s = n->stmts; s; s = s->next) {
+            cg_emit_stmt(cg, s);
+        }
+
+        // EPILOGUE (Stack restaurieren)
+        cg_emit(cg, "    add $8, %%rsp"); // Dealloziiere die 8 Bytes Padding
+
+        /* call exit(0) */
+        cg_emit(cg, ".Lfunc_end_main:");
+        cg_emit(cg, "    mov $0, %%edi");
+        cg_emit(cg, "    call exit");
+
+        cg_emit(cg, "    pop %%rbp");
+        cg_emit(cg, "    ret");
+        return;
+    }
+    default:
+        die("stmt codegen not implemented for kind %d", n->kind);
+    }
+}
+
+/* emit data section for strings and globals */
+static void cg_emit_data(CodeGen *cg) {
+    cg_emit(cg, ".section .rodata");
+    /* format strings for printing */
+    cg_emit(cg, "Lfmt_int: .asciz \"%%ld\\n\"");
+    for (int i = 0; i < g_strings.count; ++i) {
+        char *esc = escape_asm_string(g_strings.names[i]);
+        cg_emit(cg, "Lstr_%d: .asciz \"%s\"", i, esc);
+        free(esc);
+    }
+    cg_emit(cg, ".section .data");
+    for (int i = 0; i < g_globals.count; ++i) {
+        cg_emit(cg, "Lglob_%d: .quad 0", i);
+    }
+}
+
+/* append runtime assembly stubs for printing (none needed; use libc) */
+static void cg_emit_runtime(CodeGen *cg) {
+    cg_emit(cg, ".section .text");
+}
+
+/* top-level compile function */
+static void compile_to_asm(const char *src, const char *outpath) {
+    Parser p;
+    parser_init(&p, src);
+    Node *prog = parse_program(&p);
+
+    FILE *f = fopen(outpath, "w");
+    if (!f) die("cannot open output file %s: %s", outpath, strerror(errno));
+    CodeGen cg = {f, 0};
+
+    /* generate AT&T-style assembly (do not emit .intel_syntax) */
+    cg_emit(&cg, ".section .text");
+
+    /* generate program */
+    cg_emit_stmt(&cg, prog);
+
+    /* emit data */
+    cg_emit_data(&cg);
+
+    /* runtime stubs (none needed) */
+    cg_emit_runtime(&cg);
+
+    fclose(f);
+}
+
+/* ---------------------------
+   Simple test harness
+   --------------------------- */
+
+static void run_command(const char *fmt, ...) {
+    char cmd[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    int rc = system(cmd);
+    if (rc != 0) {
+        fprintf(stderr, "command failed: %s\n", cmd);
+    }
+}
+
+static void run_tests(void) {
+    struct Test { const char *name; const char *src; const char *expect; } tests[] = {
+        /* Array-Literal und Index-Zugriff */
+        { "arr-index", "var a = [100, 200, 300]; var i=1; printf(\"%ld\\n\", a[i]); a[0] = a[1] + a[2]; printf(\"%ld\\n\", a[0]);", "200\n500\n" },
+
+        /* Lokale Variablen, Funktionsaufruf (mit ABI-Fix und Scope-Fix) */
+        { "local-vars",
+          "var g=100; function foo(a, b) { var x=5; x=x+a; var y=1; y=y+b; g=g-1; return x*10 + y + g; } printf(\"%ld\\n\", foo(1, 2)); printf(\"%ld\\n\", g);",
+          "162\n99\n" },
+
+        /* If/Else und binäre Operatoren */
+        { "if-else-stmt",
+          "var x=10; var y=5; if (x > y) { y = x + 1; } else { y = x - 1; } printf(\"%ld\\n\", y);",
+          "11\n" },
+
+        /* Objekt/Member Access und Zuweisung */
+        { "obj-access",
+          "var obj = {name:'alice', age:30}; obj.age = obj.age + 1; printf(\"%ld\\n\", obj.age);",
+          "31\n" },
+
+        /* Loops und Return-Statement (mit Scope-Fix für 'i' und 'total') */
+        { "loop-return",
+          "function sum(n) { var total=0; for (var i=0; i<n; i=i+1) { total = total + i; } return total; } printf(\"%ld\\n\", sum(10));",
+          "45\n" },
+
+        { NULL, NULL, NULL }
+    };
+
+    int passed_count = 0;
+    int total_count = 0;
+    for (int i = 0; tests[i].name; ++i) {
+        total_count++;
+        char asmfile[256], exe[256];
+        snprintf(asmfile, sizeof(asmfile), "test_%s.s", tests[i].name);
+        snprintf(exe, sizeof(exe), "test_%s", tests[i].name);
+
+        /* reset tables */
+        for (int j = 0; j < g_strings.count; ++j) free(g_strings.names[j]);
+        free(g_strings.names); g_strings.names = NULL; g_strings.count = 0;
+        for (int j = 0; j < g_globals.count; ++j) free(g_globals.names[j]);
+        free(g_globals.names); g_globals.names = NULL; g_globals.count = 0;
+
+        printf("\nCompiling test %s...\n", tests[i].name);
+        compile_to_asm(tests[i].src, asmfile);
+
+        /* assemble and link */
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "gcc -no-pie -o %s %s -O2", exe, asmfile);
+        int rc = system(cmd);
+        if (rc != 0) {
+            fprintf(stderr, "compile failed for %s\n", tests[i].name);
+            continue;
+        }
+
+        /* run and capture output */
+        snprintf(cmd, sizeof(cmd), "./%s > out.txt 2>&1", exe);
+        rc = system(cmd);
+        if (rc != 0) {
+            fprintf(stderr, "run failed for %s\n", tests[i].name);
+            continue;
+        }
+
+        /* show output and check against expected */
+        FILE *f = fopen("out.txt", "r");
+        if (!f) {
+            fprintf(stderr, "cannot open out.txt\n");
+            continue;
+        }
+        char buf[8192]; size_t n = fread(buf, 1, sizeof(buf)-1, f); buf[n] = 0; fclose(f);
+
+        printf("--- Source ---\n%s\n", tests[i].src);
+        printf("--- Output ---\n%s", buf);
+        printf("--- Expect ---\n%s", tests[i].expect);
+
+        if (strcmp(buf, tests[i].expect) == 0) {
+            printf("\n✅ TEST PASSED: %s\n", tests[i].name);
+            passed_count++;
+        } else {
+            printf("\n❌ TEST FAILED: %s\n", tests[i].name);
+        }
+    }
+    printf("\n\n--- Zusammenfassung ---\n%d von %d Tests erfolgreich bestanden.\n", passed_count, total_count);
+}
+
+/* ---------------------------
+   Main
+   --------------------------- */
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        printf("sparrow: running built-in tests\n");
+        run_tests();
+        return 0;
+    }
+    const char *outpath = "out.s";
+    const char *inpath = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-o") == 0 && i+1 < argc) { outpath = argv[++i]; continue; }
+        inpath = argv[i];
+    }
+    if (!inpath) die("no input file");
+    /* read input */
+    FILE *f = fopen(inpath, "r");
+    if (!f) die("cannot open %s: %s", inpath, strerror(errno));
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *src = malloc(sz + 1);
+    if (!src) die("out of memory");
+    fread(src, 1, sz, f);
+    src[sz] = 0;
+    fclose(f);
+
+    compile_to_asm(src, outpath);
+    printf("wrote %s\n", outpath);
+    return 0;
+}

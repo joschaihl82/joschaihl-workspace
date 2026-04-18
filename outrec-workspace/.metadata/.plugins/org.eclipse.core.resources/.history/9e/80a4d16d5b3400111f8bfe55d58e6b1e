@@ -1,0 +1,71 @@
+#include <gst/gst.h>
+#include <stdio.h>
+#include <time.h>
+
+int main(int argc, char *argv[]) {
+    GstElement *pipeline;
+    GstBus *bus;
+    GstMessage *msg;
+
+    gst_init(&argc, &argv);
+
+    // Zeitstempel erzeugen
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+
+    char filename[256];
+    strftime(filename, sizeof(filename), "%Y-%m-%d-%H-%M-%S.wav", t);
+
+    printf("Aufnahme wird gespeichert in: %s\n", filename);
+
+    // Pipeline erstellen
+    char pipeline_desc[512];
+    snprintf(pipeline_desc, sizeof(pipeline_desc),
+        "pulsesrc ! audioconvert ! wavenc ! filesink location=%s", filename);
+
+    GError *error = NULL;
+    pipeline = gst_parse_launch(pipeline_desc, &error);
+
+    if (!pipeline) {
+        fprintf(stderr, "Fehler beim Erstellen der Pipeline: %s\n", error->message);
+        g_error_free(error);
+        return -1;
+    }
+
+    // Starten
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    printf("Aufnahme läuft... Drücke Ctrl+C zum Beenden.\n");
+
+    // Auf EOS oder Fehler warten
+    bus = gst_element_get_bus(pipeline);
+    msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
+                                     GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+
+    if (msg != NULL) {
+        GError *err;
+        gchar *debug_info;
+
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR:
+                gst_message_parse_error(msg, &err, &debug_info);
+                fprintf(stderr, "Fehler: %s\n", err->message);
+                g_error_free(err);
+                g_free(debug_info);
+                break;
+            case GST_MESSAGE_EOS:
+                printf("Aufnahme beendet.\n");
+                break;
+            default:
+                break;
+        }
+        gst_message_unref(msg);
+    }
+
+    // Aufräumen
+    gst_object_unref(bus);
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+
+    return 0;
+}

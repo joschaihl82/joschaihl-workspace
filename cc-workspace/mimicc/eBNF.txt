@@ -1,0 +1,33 @@
+0;/\C\<Alith\>//^finish$/+1,$Alith \%(=.*\)\@<!=
+finish
+
+program         = decl*
+decl            = type ident ("(" (type ident ("," type ident)*)? ")" ("{" stmt* "}" | ";") | ("[" num "]")* ";")
+stmt            = expr ";" |
+                    vardecl ";" |
+                    "{" stmt* "}" |
+                    "if" "(" expr ")" stmt ("else" "if" "(" expr ")" stmt)* ("else" stmt)? |
+                    "for" "(" expr? ";" expr? ";" expr? ") stmt |
+                    "while" "(" expr ")" stmt |
+                    "return" expr ";"
+vardecl         = basetype vardeclbody ("," vardeclbody)* ";"
+vardeclbody     = pointertype ident ("[" num "]")* var-initizlier?
+var-initializer = "=" (assign | "{" (assign ("," assign)*)? "}")
+expr            = assign ("," expr)*
+assign          = equality (("=" | "+=" | "-=") assign)?
+equality        = relational ("==" relational | "!=" relational)*
+relational      = add (">" add | "<" add | ">=" add | "<=" add)*
+add             = mul ("+" mul | "-" mul)*
+mul             = unary ("*" unary | "/" unary | "%" unary)*
+unary           = ("+" | "-")? postfix |
+                    ("++" | "--" | "&" | "*" | "!") unary |
+                    "sizeof" unary | "sizeof" "(" type ")"
+postfix			= ident "(" func-arg-list ")" postfix-tail* |
+                    primary postfix-tail*
+postfix-tail    = "[" expr "]" | "(" func-arg-list ")" | "." ident | "->" ident
+                  "++" | "--"
+func-arg-list   = expr ("," expr)*
+primary         = num | ident | string-literal | "(" expr ")"
+type            = basetype pointertype
+pointertype     = "*"*
+basetype        = "int" | "char" | "void"

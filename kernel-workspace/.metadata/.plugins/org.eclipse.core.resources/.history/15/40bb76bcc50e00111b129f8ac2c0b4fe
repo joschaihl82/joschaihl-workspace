@@ -1,0 +1,92 @@
+# Makefile for exectrace1 kernel module
+# Usage:
+#   make				# build (verbose if V=1)
+#   make V=1			# verbose kernel build
+#   make CC=/path/to/gcc  # force a specific compiler (optional)
+#   make clean
+#   make install		# copy .ko to ./out/
+#
+# This Makefile is robust when invoked from a separate build directory
+# (for example: make -f /path/to/this/Makefile from a CMake build dir).
+# It always tells the kernel build system to use the directory that
+# contains this Makefile as M=... so the kernel build finds the correct
+# Kbuild/Makefile and sources.
+
+MODULE := exectrace1
+obj-m := $(MODULE).o
+
+# Directory that contains this Makefile (the module source dir).
+# Works even if make is invoked from another directory with -f.
+SRCDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+
+# Default kernel build directory (auto-detect)
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+# Allow overriding the compiler used by the kernel build system
+# Example: make CC=/usr/bin/x86_64-linux-gnu-gcc
+ifeq ($(origin CC), command line)
+  KBUILD_CC := CC=$(CC)
+else
+  KBUILD_CC :=
+endif
+
+# Output directory for the built .ko (relative to the current working dir)
+OUTDIR ?= $(SRCDIR)/out
+
+# Default make program (use gmake if available)
+MAKEPROG ?= $(shell command -v gmake 2>/dev/null || command -v make)
+
+.PHONY: all default kbuild clean install check_kdir show
+default: all
+
+all: kbuild
+
+# Ensure KDIR exists before invoking kernel build
+check_kdir:
+	@if [ ! -d "$(KDIR)" ]; then \
+	  echo "ERROR: kernel build directory '$(KDIR)' not found."; \
+	  echo "Set KDIR to your kernel build dir, e.g. /lib/modules/$(shell uname -r)/build"; \
+	  exit 1; \
+	fi
+
+# Build the module using the kernel build system.
+# Pass V=1 for verbose build output: make V=1
+# IMPORTANT: pass M=$(SRCDIR) so the kernel build uses the directory that
+# contains this Makefile (not the current working directory).
+kbuild: check_kdir
+	@echo "Invoking kernel build: $(MAKEPROG) -C '$(KDIR)' M='$(SRCDIR)' modules"
+	@$(MAKEPROG) -C "$(KDIR)" M="$(SRCDIR)" $(KBUILD_CC) modules V=$(V)
+	@if [ -f "$(SRCDIR)/$(MODULE).ko" ]; then \
+	  mkdir -p "$(OUTDIR)"; \
+	  cp -u "$(SRCDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"; \
+	  echo "Built: $(OUTDIR)/$(MODULE).ko"; \
+	else \
+	  echo "ERROR: $(MODULE).ko not found after kernel build."; \
+	  echo "Suggested debug steps:"; \
+	  echo "  1) Run the kernel build verbosely and capture the log:"; \
+	  echo "	 $(MAKEPROG) -C $(KDIR) M=$(SRCDIR) modules V=1 2>&1 | tee build_kernel.log"; \
+	  echo "  2) Inspect build_kernel.log for the first compiler error."; \
+	  echo "  3) Ensure the kernel headers for $(shell uname -r) are installed and KDIR is correct."; \
+	  exit 1; \
+	fi
+
+# Clean build artifacts via kernel build system and remove out/
+clean: check_kdir
+	@$(MAKEPROG) -C "$(KDIR)" M="$(SRCDIR)" clean
+	@rm -rf "$(OUTDIR)" build_kernel.log
+	@echo "Cleaned."
+
+# Install (copy) the .ko to OUTDIR (runs build first)
+install: kbuild
+	@mkdir -p "$(OUTDIR)"
+	@cp -u "$(SRCDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"
+	@echo "Installed: $(OUTDIR)/$(MODULE).ko"
+
+# Convenience target to show configuration
+show:
+	@echo "MODULE:  $(MODULE)"
+	@echo "SRCDIR:  $(SRCDIR)"
+	@echo "KDIR:	$(KDIR)"
+	@echo "CC:	  $(CC)"
+	@echo "OUTDIR:  $(OUTDIR)"
+	@echo "MAKEPROG: $(MAKEPROG)"

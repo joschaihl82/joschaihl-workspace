@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_ext4recover_FILE /wrk/undelete-workspace/ext4recover/build/cmake.run.linux.x86_64.Local/ext4recover)
+set(__QT_DEPLOY_TARGET_ext4recover_TYPE EXECUTABLE)

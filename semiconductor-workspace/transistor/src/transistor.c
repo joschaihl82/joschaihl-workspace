@@ -1,0 +1,689 @@
+/*
+ * main.c
+ *
+ * Vollständige, kompilierbare Amalgam-Datei für ein kleines 2D-CAD-Demo:
+ *  - Xlib Windowing mit Double Buffer (Pixmap)
+ *  - Xft TrueType-Text (lade .ttf oder Fallback)
+ *  - Zoom (Tastatur + Mausrad)
+ *  - Oben- und Links-Lineale (mm / cm), die mit dem Zoom skaliert werden
+ *  - Rastergitter, das im Hintergrund bleibt und exakt mit den Linealmarkern übereinstimmt
+ *  - Reservierter Statusbereich unten (20 px) unterhalb der Lineale
+ *  - Fadenkreuz-Cursor (crosshair)
+ *
+ * Kompilieren:
+ *   gcc main.c -o cad -lX11 -lXft -lfreetype -lfontconfig -lm
+ *
+ * Aufruf:
+ *   ./cad [pfad/zur/schrift.ttf]
+ *
+ * Hinweise:
+ *  - Welt-Einheit: Millimeter (mm). px_per_mm wird aus Display-Metriken berechnet.
+ *  - Lineal-Bereich ist fest (RULER_THICKNESS px). Die Szene wird darunter/ rechts davon gezeichnet.
+ *  - Unten wird ein Statusbereich von STATUS_HEIGHT px freigehalten.
+ */
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xft/Xft.h>
+#include <X11/keysym.h>
+#include <X11/XKBlib.h>
+#include <X11/cursorfont.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <math.h>
+
+/* ---------------------------
+   Konfiguration
+   --------------------------- */
+
+#define RULER_THICKNESS 28   /* px: Höhe des oberen Lineals / Breite des linken Lineals */
+#define STATUS_HEIGHT 20     /* px: Platz unten für Statusmeldungen */
+#define MAX_CALLBACKS 32
+#define MAX_POINTS 4096
+
+/* ---------------------------
+   Typen / API (intern)
+   --------------------------- */
+
+typedef struct WindowContext WindowContext;
+
+typedef enum {
+    WIN_EVT_EXPOSE,
+    WIN_EVT_RESIZE,
+    WIN_EVT_KEY_PRESS,
+    WIN_EVT_KEY_RELEASE,
+    WIN_EVT_BUTTON_PRESS,
+    WIN_EVT_BUTTON_RELEASE,
+    WIN_EVT_MOTION,
+    WIN_EVT_CLOSE,
+    WIN_EVT_CUSTOM
+} WinEventType;
+
+typedef struct {
+    WinEventType type;
+    int x, y;            /* Mauskoordinaten (Screen coords) */
+    unsigned int state;  /* Modifier mask */
+    unsigned int key;    /* keycode */
+    unsigned int button; /* Mausbutton (4/5 wheel) */
+    int width, height;   /* bei Resize */
+    void *user;          /* optional */
+} WinEvent;
+
+typedef void (*WinEventCallback)(WindowContext *ctx, const WinEvent *evt, void *userdata);
+
+/* ---------------------------
+   WindowContext Definition
+   --------------------------- */
+
+struct CallbackEntry { WinEventCallback cb; void *userdata; };
+
+struct WindowContext {
+    Display *dpy;
+    int screen;
+    Window win;
+    GC gc;
+    Pixmap backbuffer;
+    int width, height;
+    Atom wm_delete;
+    struct CallbackEntry callbacks[MAX_CALLBACKS];
+    int cb_count;
+
+    /* Xft */
+    Visual *visual;
+    Colormap colormap;
+    XftDraw *xft_draw;
+    XftFont *xft_font;
+    XftColor xft_color;
+
+    /* Cursor */
+    Cursor cursor;
+
+    /* View transform (world -> screen) */
+    double zoom;    /* scale factor (1.0 = 100%) */
+    double pan_x;   /* world x at scene origin */
+    double pan_y;   /* world y at scene origin */
+
+    /* Display metrics for rulers */
+    double px_per_mm; /* pixels per millimeter */
+};
+
+/* ---------------------------
+   Forward declarations
+   --------------------------- */
+
+WindowContext *win_create(const char *title, int width, int height);
+void win_destroy(WindowContext *ctx);
+int win_register_callback(WindowContext *ctx, WinEventCallback cb, void *userdata);
+void win_poll_events(WindowContext *ctx);
+Display *win_get_display(WindowContext *ctx);
+Drawable win_get_backbuffer(WindowContext *ctx);
+GC win_get_gc(WindowContext *ctx);
+void win_begin_frame(WindowContext *ctx, unsigned long bg_color);
+void win_end_frame(WindowContext *ctx);
+void win_get_size(WindowContext *ctx, int *w, int *h);
+int win_load_ttf_font(WindowContext *ctx, const char *ttf_path, int size);
+
+/* View / transform helpers */
+static void world_to_screen(WindowContext *ctx, double wx, double wy, int *sx, int *sy);
+static void screen_to_world(WindowContext *ctx, int sx, int sy, double *wx, double *wy);
+static void adjust_zoom_at(WindowContext *ctx, double new_zoom, int screen_x, int screen_y);
+static void zoom_in(WindowContext *ctx, int screen_x, int screen_y);
+static void zoom_out(WindowContext *ctx, int screen_x, int screen_y);
+
+/* Ruler / grid helpers */
+static inline int left_w_px(void) { return RULER_THICKNESS; }
+static inline int top_h_px(void)  { return RULER_THICKNESS; }
+static double choose_mm_step(double px_per_mm_screen);
+
+/* Drawing */
+static void draw_rulers(WindowContext *ctx, Drawable bb);
+static void draw_scene(WindowContext *ctx);
+
+/* Event handler */
+static void app_event_handler(WindowContext *ctx, const WinEvent *e, void *ud);
+
+/* ---------------------------
+   Implementation: Windowing
+   --------------------------- */
+
+static void dispatch_event(WindowContext *ctx, const WinEvent *evt) {
+    if (!ctx) return;
+    for (int i = 0; i < ctx->cb_count; ++i)
+        if (ctx->callbacks[i].cb)
+            ctx->callbacks[i].cb(ctx, evt, ctx->callbacks[i].userdata);
+}
+
+WindowContext *win_create(const char *title, int width, int height) {
+    WindowContext *ctx = calloc(1, sizeof(WindowContext));
+    if (!ctx) return NULL;
+
+    ctx->dpy = XOpenDisplay(NULL);
+    if (!ctx->dpy) { free(ctx); return NULL; }
+    ctx->screen = DefaultScreen(ctx->dpy);
+    ctx->width = width; ctx->height = height;
+    ctx->visual = DefaultVisual(ctx->dpy, ctx->screen);
+    ctx->colormap = DefaultColormap(ctx->dpy, ctx->screen);
+
+    ctx->win = XCreateSimpleWindow(ctx->dpy, RootWindow(ctx->dpy, ctx->screen),
+                                   10,10,width,height,1,
+                                   BlackPixel(ctx->dpy, ctx->screen),
+                                   WhitePixel(ctx->dpy, ctx->screen));
+
+    XSelectInput(ctx->dpy, ctx->win,
+                 ExposureMask | KeyPressMask | KeyReleaseMask |
+                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                 StructureNotifyMask);
+
+    if (title) XStoreName(ctx->dpy, ctx->win, title);
+
+    ctx->gc = XCreateGC(ctx->dpy, ctx->win, 0, NULL);
+    if (!ctx->gc) { XDestroyWindow(ctx->dpy, ctx->win); XCloseDisplay(ctx->dpy); free(ctx); return NULL; }
+
+    ctx->backbuffer = XCreatePixmap(ctx->dpy, ctx->win, width, height,
+                                    DefaultDepth(ctx->dpy, ctx->screen));
+    if (!ctx->backbuffer) { XFreeGC(ctx->dpy, ctx->gc); XDestroyWindow(ctx->dpy, ctx->win); XCloseDisplay(ctx->dpy); free(ctx); return NULL; }
+
+    ctx->xft_draw = XftDrawCreate(ctx->dpy, ctx->backbuffer, ctx->visual, ctx->colormap);
+    if (!ctx->xft_draw) { /* nicht fatal */ }
+
+    ctx->wm_delete = XInternAtom(ctx->dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(ctx->dpy, ctx->win, &ctx->wm_delete, 1);
+
+    /* Create crosshair cursor and assign to window */
+    ctx->cursor = XCreateFontCursor(ctx->dpy, XC_crosshair);
+    if (ctx->cursor)
+        XDefineCursor(ctx->dpy, ctx->win, ctx->cursor);
+
+    XMapWindow(ctx->dpy, ctx->win);
+    XFlush(ctx->dpy);
+
+    ctx->cb_count = 0;
+    ctx->xft_font = NULL;
+    ctx->zoom = 1.0;
+    ctx->pan_x = 0.0;
+    ctx->pan_y = 0.0;
+
+    /* Bestimme px/mm aus Display-Metriken (Fallback auf 96dpi wenn 0) */
+    int disp_w_px = DisplayWidth(ctx->dpy, ctx->screen);
+    int disp_w_mm = DisplayWidthMM(ctx->dpy, ctx->screen);
+    if (disp_w_mm > 0)
+        ctx->px_per_mm = (double)disp_w_px / (double)disp_w_mm;
+    else
+        ctx->px_per_mm = 96.0 / 25.4; /* ≈3.7795 px/mm */
+
+    return ctx;
+}
+
+void win_destroy(WindowContext *ctx) {
+    if (!ctx) return;
+    if (ctx->xft_font) { XftFontClose(ctx->dpy, ctx->xft_font); ctx->xft_font = NULL; }
+    if (ctx->xft_draw) { XftDrawDestroy(ctx->xft_draw); ctx->xft_draw = NULL; }
+    if (ctx->backbuffer) XFreePixmap(ctx->dpy, ctx->backbuffer);
+    if (ctx->gc) XFreeGC(ctx->dpy, ctx->gc);
+    if (ctx->cursor) { XFreeCursor(ctx->dpy, ctx->cursor); ctx->cursor = 0; }
+    if (ctx->win) XDestroyWindow(ctx->dpy, ctx->win);
+    if (ctx->dpy) XCloseDisplay(ctx->dpy);
+    free(ctx);
+}
+
+int win_register_callback(WindowContext *ctx, WinEventCallback cb, void *userdata) {
+    if (!ctx || !cb) return -1;
+    if (ctx->cb_count >= MAX_CALLBACKS) return -2;
+    ctx->callbacks[ctx->cb_count].cb = cb;
+    ctx->callbacks[ctx->cb_count].userdata = userdata;
+    ctx->cb_count++;
+    return 0;
+}
+
+static void translate_and_dispatch(WindowContext *ctx, XEvent *xev) {
+    WinEvent evt; memset(&evt,0,sizeof(evt));
+    switch (xev->type) {
+    case Expose: evt.type = WIN_EVT_EXPOSE; dispatch_event(ctx,&evt); break;
+    case ConfigureNotify:
+        if (xev->xconfigure.width != ctx->width || xev->xconfigure.height != ctx->height) {
+            ctx->width = xev->xconfigure.width; ctx->height = xev->xconfigure.height;
+            if (ctx->backbuffer) XFreePixmap(ctx->dpy, ctx->backbuffer);
+            ctx->backbuffer = XCreatePixmap(ctx->dpy, ctx->win, ctx->width, ctx->height,
+                                            DefaultDepth(ctx->dpy, ctx->screen));
+            if (ctx->xft_draw) { XftDrawDestroy(ctx->xft_draw); ctx->xft_draw = XftDrawCreate(ctx->dpy, ctx->backbuffer, ctx->visual, ctx->colormap); }
+            evt.type = WIN_EVT_RESIZE; evt.width = ctx->width; evt.height = ctx->height;
+            dispatch_event(ctx,&evt);
+        }
+        break;
+    case KeyPress: evt.type = WIN_EVT_KEY_PRESS; evt.key = xev->xkey.keycode; evt.state = xev->xkey.state; dispatch_event(ctx,&evt); break;
+    case KeyRelease: evt.type = WIN_EVT_KEY_RELEASE; evt.key = xev->xkey.keycode; evt.state = xev->xkey.state; dispatch_event(ctx,&evt); break;
+    case ButtonPress: evt.type = WIN_EVT_BUTTON_PRESS; evt.x = xev->xbutton.x; evt.y = xev->xbutton.y; evt.state = xev->xbutton.state; evt.button = xev->xbutton.button; dispatch_event(ctx,&evt); break;
+    case ButtonRelease: evt.type = WIN_EVT_BUTTON_RELEASE; evt.x = xev->xbutton.x; evt.y = xev->xbutton.y; evt.state = xev->xbutton.state; evt.button = xev->xbutton.button; dispatch_event(ctx,&evt); break;
+    case MotionNotify: evt.type = WIN_EVT_MOTION; evt.x = xev->xmotion.x; evt.y = xev->xmotion.y; evt.state = xev->xmotion.state; dispatch_event(ctx,&evt); break;
+    case ClientMessage:
+        if ((Atom)xev->xclient.data.l[0] == ctx->wm_delete) { evt.type = WIN_EVT_CLOSE; dispatch_event(ctx,&evt); }
+        break;
+    default: break;
+    }
+}
+
+void win_poll_events(WindowContext *ctx) {
+    if (!ctx) return;
+    while (XPending(ctx->dpy)) { XEvent ev; XNextEvent(ctx->dpy,&ev); translate_and_dispatch(ctx,&ev); }
+}
+
+void win_wait_and_poll(WindowContext *ctx) {
+    if (!ctx) return;
+    XEvent ev; XNextEvent(ctx->dpy,&ev); translate_and_dispatch(ctx,&ev); win_poll_events(ctx);
+}
+
+Display *win_get_display(WindowContext *ctx) { return ctx ? ctx->dpy : NULL; }
+Drawable win_get_backbuffer(WindowContext *ctx) { return ctx ? ctx->backbuffer : 0; }
+GC win_get_gc(WindowContext *ctx) { return ctx ? ctx->gc : NULL; }
+
+void win_begin_frame(WindowContext *ctx, unsigned long bg_color) {
+    if (!ctx) return;
+    XSetForeground(ctx->dpy, ctx->gc, bg_color);
+    XFillRectangle(ctx->dpy, ctx->backbuffer, ctx->gc, 0, 0, ctx->width, ctx->height);
+}
+
+void win_end_frame(WindowContext *ctx) {
+    if (!ctx) return;
+    XCopyArea(ctx->dpy, ctx->backbuffer, ctx->win, ctx->gc, 0,0, ctx->width, ctx->height, 0,0);
+    XFlush(ctx->dpy);
+}
+
+void win_get_size(WindowContext *ctx, int *w, int *h) { if (!ctx) return; if (w) *w = ctx->width; if (h) *h = ctx->height; }
+
+/* ---------------------------
+   Xft Font Helpers
+   --------------------------- */
+
+int win_load_ttf_font(WindowContext *ctx, const char *ttf_path, int size) {
+    if (!ctx || !ttf_path) return -1;
+    char pattern[1024];
+    snprintf(pattern, sizeof(pattern), "file=%s:size=%d", ttf_path, size);
+    if (ctx->xft_font) { XftFontClose(ctx->dpy, ctx->xft_font); ctx->xft_font = NULL; }
+    ctx->xft_font = XftFontOpenName(ctx->dpy, ctx->screen, pattern);
+    if (!ctx->xft_font) ctx->xft_font = XftFontOpenName(ctx->dpy, ctx->screen, "sans-12");
+    if (!ctx->xft_font) return -1;
+    XRenderColor xrcol = { .red=0x0000, .green=0x0000, .blue=0x0000, .alpha=0xffff };
+    XftColorAllocValue(ctx->dpy, ctx->visual, ctx->colormap, &xrcol, &ctx->xft_color);
+    return 0;
+}
+
+/* ---------------------------
+   View Transform Helpers (world <-> screen)
+   --------------------------- */
+
+/* Scene content size excludes ruler areas and bottom status area */
+static void get_content_size(WindowContext *ctx, int *cw, int *ch) {
+    int w,h; win_get_size(ctx,&w,&h);
+    if (cw) *cw = w - left_w_px();
+    if (ch) *ch = h - top_h_px() - STATUS_HEIGHT;
+}
+
+/* world -> screen uses content area (not including rulers and status area) */
+static void world_to_screen(WindowContext *ctx, double wx, double wy, int *sx, int *sy) {
+    int w,h; win_get_size(ctx,&w,&h);
+    int content_w = w - left_w_px();
+    int content_h = h - top_h_px() - STATUS_HEIGHT;
+    double origin_x = left_w_px() + (double)content_w / 2.0;
+    double origin_y = top_h_px()  + (double)content_h / 2.0;
+    double zx = (wx - ctx->pan_x) * ctx->zoom;
+    double zy = (wy - ctx->pan_y) * ctx->zoom;
+    if (sx) *sx = (int)round(origin_x + zx);
+    if (sy) *sy = (int)round(origin_y + zy);
+}
+
+static void screen_to_world(WindowContext *ctx, int sx, int sy, double *wx, double *wy) {
+    int w,h; win_get_size(ctx,&w,&h);
+    int content_w = w - left_w_px();
+    int content_h = h - top_h_px() - STATUS_HEIGHT;
+    double origin_x = left_w_px() + (double)content_w / 2.0;
+    double origin_y = top_h_px()  + (double)content_h / 2.0;
+    if (wx) *wx = (double)(sx - origin_x) / ctx->zoom + ctx->pan_x;
+    if (wy) *wy = (double)(sy - origin_y) / ctx->zoom + ctx->pan_y;
+}
+
+/* Adjust zoom while keeping a given screen point stable in world coordinates. */
+static void adjust_zoom_at(WindowContext *ctx, double new_zoom, int screen_x, int screen_y) {
+    if (!ctx || new_zoom <= 0.0) return;
+    double wx_before, wy_before;
+    screen_to_world(ctx, screen_x, screen_y, &wx_before, &wy_before);
+    ctx->zoom = new_zoom;
+    ctx->pan_x = wx_before - (double)screen_x / ctx->zoom;
+    ctx->pan_y = wy_before - (double)screen_y / ctx->zoom;
+}
+static void zoom_in(WindowContext *ctx, int screen_x, int screen_y) {
+    double factor = 1.15; double new_zoom = ctx->zoom * factor; if (new_zoom > 100.0) new_zoom = 100.0; adjust_zoom_at(ctx,new_zoom,screen_x,screen_y);
+}
+static void zoom_out(WindowContext *ctx, int screen_x, int screen_y) {
+    double factor = 1.15; double new_zoom = ctx->zoom / factor; if (new_zoom < 0.01) new_zoom = 0.01; adjust_zoom_at(ctx,new_zoom,screen_x,screen_y);
+}
+
+/* ---------------------------
+   Ruler / Grid Helpers
+   --------------------------- */
+
+/* Choose an adaptive mm step so that step_mm * px_per_mm_screen >= ~12 px */
+static double choose_mm_step(double px_per_mm_screen) {
+    const double target_px = 12.0;
+    if (px_per_mm_screen <= 0.0) return 1.0;
+    double seq[] = {1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0};
+    for (size_t i = 0; i < sizeof(seq)/sizeof(seq[0]); ++i) {
+        if (seq[i] * px_per_mm_screen >= target_px) return seq[i];
+    }
+    double mm = 1000.0;
+    while (mm * px_per_mm_screen < target_px) mm *= 2.0;
+    return mm;
+}
+
+/* ---------------------------
+   Scene / Data
+   --------------------------- */
+
+static double points_x[MAX_POINTS];
+static double points_y[MAX_POINTS];
+static int points_count = 0;
+
+/* ---------------------------
+   Drawing: grid first (background), then rulers (foreground), then status bar
+   --------------------------- */
+
+static void draw_rulers(WindowContext *ctx, Drawable bb); /* forward */
+
+static void draw_scene(WindowContext *ctx) {
+    if (!ctx) return;
+    Display *dpy = ctx->dpy;
+    GC gc = ctx->gc;
+    Drawable bb = ctx->backbuffer;
+    int w,h; win_get_size(ctx,&w,&h);
+
+    /* Clear entire backbuffer */
+    win_begin_frame(ctx, WhitePixel(dpy, ctx->screen));
+
+    /* px per mm on screen */
+    double pxmm = ctx->px_per_mm * ctx->zoom;
+    if (pxmm <= 0.0) pxmm = 3.7795275591 * ctx->zoom;
+
+    /* adaptive step in mm */
+    double step_mm = choose_mm_step(pxmm);
+    double major_mm = 10.0;
+    if (step_mm > 10.0) major_mm = step_mm;
+
+    /* visible world bounds (use content area) */
+    double wx0, wy0, wx1, wy1;
+    screen_to_world(ctx, 0, 0, &wx0, &wy0);
+    screen_to_world(ctx, w, h, &wx1, &wy1);
+
+    /* Align start positions to step_mm so grid matches ruler ticks */
+    double start_x_mm = floor(wx0 / step_mm) * step_mm;
+    double end_x_mm   = ceil(wx1 / step_mm) * step_mm;
+    double start_y_mm = floor(wy0 / step_mm) * step_mm;
+    double end_y_mm   = ceil(wy1 / step_mm) * step_mm;
+
+    /* Draw grid lines FIRST (background) - they will remain behind rulers */
+    XSetForeground(dpy, gc, 0xE0E0E0);
+    for (double xm = start_x_mm; xm <= end_x_mm + 0.5*step_mm; xm += step_mm) {
+        int sx0, sy0, sx1, sy1;
+        world_to_screen(ctx, xm, wy0, &sx0, &sy0);
+        world_to_screen(ctx, xm, wy1, &sx1, &sy1);
+        if (fmod(fabs(xm), major_mm) < 1e-6) {
+            XSetForeground(dpy, gc, 0xC0C0C0);
+            XDrawLine(dpy, bb, gc, sx0, sy0, sx1, sy1);
+            XSetForeground(dpy, gc, 0xE0E0E0);
+        } else {
+            XDrawLine(dpy, bb, gc, sx0, sy0, sx1, sy1);
+        }
+    }
+    for (double ym = start_y_mm; ym <= end_y_mm + 0.5*step_mm; ym += step_mm) {
+        int sx0, sy0, sx1, sy1;
+        world_to_screen(ctx, wx0, ym, &sx0, &sy0);
+        world_to_screen(ctx, wx1, ym, &sx1, &sy1);
+        if (fmod(fabs(ym), major_mm) < 1e-6) {
+            XSetForeground(dpy, gc, 0xC0C0C0);
+            XDrawLine(dpy, bb, gc, sx0, sy0, sx1, sy1);
+            XSetForeground(dpy, gc, 0xE0E0E0);
+        } else {
+            XDrawLine(dpy, bb, gc, sx0, sy0, sx1, sy1);
+        }
+    }
+
+    /* Draw points (on top of grid but still below rulers) */
+    XSetForeground(dpy, gc, BlackPixel(dpy, ctx->screen));
+    for (int i = 0; i < points_count; ++i) {
+        int sx, sy; world_to_screen(ctx, points_x[i], points_y[i], &sx, &sy);
+        int r = (int)fmax(2.0, 3.0 * ctx->zoom);
+        XFillArc(dpy, bb, gc, sx - r, sy - r, r*2, r*2, 0, 360*64);
+    }
+
+    /* Now draw rulers on top so they are not overdrawn by the grid */
+    draw_rulers(ctx, bb);
+
+    /* Draw bottom status bar (reserved area) */
+    int status_h = STATUS_HEIGHT;
+    int status_y = h - status_h;
+    /* background */
+    XSetForeground(dpy, gc, 0xF8F8F8);
+    XFillRectangle(dpy, bb, gc, 0, status_y, w, status_h);
+    /* separator line */
+    XSetForeground(dpy, gc, 0xC0C0C0);
+    XDrawLine(dpy, bb, gc, 0, status_y, w, status_y);
+
+    /* status text (zoom etc.) */
+    char status[128];
+    snprintf(status, sizeof(status), "Zoom: %.1f%%   Points: %d", ctx->zoom * 100.0, points_count);
+    if (ctx->xft_draw && ctx->xft_font) {
+        XftDrawStringUtf8(ctx->xft_draw, &ctx->xft_color, ctx->xft_font, 8, status_y + status_h - 6, (const FcChar8 *)status, strlen(status));
+    } else {
+        XSetForeground(dpy, gc, BlackPixel(dpy, ctx->screen));
+        XDrawString(dpy, bb, gc, 8, status_y + status_h - 6, status, (int)strlen(status));
+    }
+
+    win_end_frame(ctx);
+}
+
+/* Draw rulers (foreground) - uses same origin and step as grid so ticks align exactly */
+static void draw_rulers(WindowContext *ctx, Drawable bb) {
+    Display *dpy = ctx->dpy;
+    GC gc = ctx->gc;
+    int w,h; win_get_size(ctx,&w,&h);
+
+    int top_h = top_h_px();
+    int left_w = left_w_px();
+    int content_w = w - left_w;
+    int content_h = h - top_h - STATUS_HEIGHT;
+
+    /* Background for rulers (they sit on top of grid) */
+    unsigned long bg = 0xF0F0F0;
+    XSetForeground(dpy, gc, bg);
+    XFillRectangle(dpy, bb, gc, 0, 0, w, top_h);            /* top */
+    XFillRectangle(dpy, bb, gc, 0, 0, left_w, h);           /* left */
+
+    /* Separators */
+    XSetForeground(dpy, gc, 0xA0A0A0);
+    XDrawLine(dpy, bb, gc, 0, top_h-1, w, top_h-1);
+    XDrawLine(dpy, bb, gc, left_w-1, 0, left_w-1, h);
+
+    /* px per world-mm on screen (includes zoom) */
+    double pxmm = ctx->px_per_mm * ctx->zoom;
+    if (pxmm <= 0.0) pxmm = 3.7795275591 * ctx->zoom;
+
+    /* Origin (world 0,0) in screen coords (center of content area) */
+    int origin_sx = left_w + content_w / 2;
+    int origin_sy = top_h  + content_h / 2;
+
+    /* Origin markers */
+    XSetForeground(dpy, gc, BlackPixel(dpy, ctx->screen));
+    XDrawLine(dpy, bb, gc, origin_sx, 0, origin_sx, top_h-1);
+    XDrawLine(dpy, bb, gc, 0, origin_sy, left_w-1, origin_sy);
+
+    /* Adaptive step in mm */
+    double step_mm = choose_mm_step(pxmm);
+    double major_mm = 10.0;
+    if (step_mm > 10.0) major_mm = step_mm;
+
+    /* Visible extents in mm from origin */
+    int max_left_px = origin_sx - left_w;
+    int max_right_px = (left_w + content_w) - origin_sx;
+    int max_up_px = origin_sy - top_h;
+    int max_down_px = (top_h + content_h) - origin_sy;
+
+    int max_left_mm = (int)ceil((double)max_left_px / pxmm);
+    int max_right_mm = (int)ceil((double)max_right_px / pxmm);
+    int max_up_mm = (int)ceil((double)max_up_px / pxmm);
+    int max_down_mm = (int)ceil((double)max_down_px / pxmm);
+
+    /* Draw top ruler ticks (horizontal) */
+    int kmin = (int)floor(-max_left_mm / step_mm) - 1;
+    int kmax = (int)ceil(max_right_mm / step_mm) + 1;
+    for (int k = kmin; k <= kmax; ++k) {
+        double mmpos = k * step_mm;
+        double sx = origin_sx + mmpos * pxmm;
+        if (sx < left_w - 2 || sx > left_w + content_w + 2) continue;
+        if (fmod(fabs(mmpos), major_mm) < 1e-6) {
+            XDrawLine(dpy, bb, gc, (int)round(sx), top_h-1, (int)round(sx), top_h-1 - 12);
+            int cm = (int)round(fabs(mmpos) / 10.0);
+            char buf[32];
+            if (fabs(mmpos) < 0.5) snprintf(buf, sizeof(buf), "0");
+            else snprintf(buf, sizeof(buf), "%dcm", cm);
+            if (ctx->xft_draw && ctx->xft_font) {
+                XftDrawStringUtf8(ctx->xft_draw, &ctx->xft_color, ctx->xft_font,
+                                  (int)round(sx) - 12, top_h - 14, (const FcChar8 *)buf, strlen(buf));
+            } else {
+                XDrawString(dpy, bb, gc, (int)round(sx) - 12, top_h - 6, buf, (int)strlen(buf));
+            }
+        } else {
+            XDrawLine(dpy, bb, gc, (int)round(sx), top_h-1, (int)round(sx), top_h-1 - 6);
+        }
+    }
+
+    /* Draw left ruler ticks (vertical) */
+    kmin = (int)floor(-max_up_mm / step_mm) - 1;
+    kmax = (int)ceil(max_down_mm / step_mm) + 1;
+    for (int k = kmin; k <= kmax; ++k) {
+        double mmpos = k * step_mm;
+        double sy = origin_sy + mmpos * pxmm;
+        if (sy < top_h - 2 || sy > top_h + content_h + 2) continue;
+        if (fmod(fabs(mmpos), major_mm) < 1e-6) {
+            XDrawLine(dpy, bb, gc, left_w-1, (int)round(sy), left_w-1 - 12, (int)round(sy));
+            int cm = (int)round(fabs(mmpos) / 10.0);
+            char buf[32];
+            if (fabs(mmpos) < 0.5) snprintf(buf, sizeof(buf), "0");
+            else snprintf(buf, sizeof(buf), "%dcm", cm);
+            if (ctx->xft_draw && ctx->xft_font) {
+                XftDrawStringUtf8(ctx->xft_draw, &ctx->xft_color, ctx->xft_font,
+                                  4, (int)round(sy) + 4, (const FcChar8 *)buf, strlen(buf));
+            } else {
+                XDrawString(dpy, bb, gc, 4, (int)round(sy) + 4, buf, (int)strlen(buf));
+            }
+        } else {
+            XDrawLine(dpy, bb, gc, left_w-1, (int)round(sy), left_w-1 - 6, (int)round(sy));
+        }
+    }
+
+    /* Corner label */
+    if (ctx->xft_draw && ctx->xft_font) {
+        const char *lbl = "mm / cm";
+        XftDrawStringUtf8(ctx->xft_draw, &ctx->xft_color, ctx->xft_font, 6, top_h - 6, (const FcChar8 *)lbl, strlen(lbl));
+    } else {
+        const char *lbl = "mm / cm";
+        XDrawString(dpy, bb, gc, 6, top_h - 6, lbl, (int)strlen(lbl));
+    }
+}
+
+/* ---------------------------
+   Event Handler (Zoom + Points + Wheel)
+   --------------------------- */
+
+static void app_event_handler(WindowContext *ctx, const WinEvent *e, void *ud) {
+    (void)ud;
+    if (!ctx || !e) return;
+
+    if (e->type == WIN_EVT_CLOSE) { win_destroy(ctx); exit(0); }
+    else if (e->type == WIN_EVT_EXPOSE || e->type == WIN_EVT_RESIZE) { draw_scene(ctx); }
+    else if (e->type == WIN_EVT_BUTTON_PRESS) {
+        /* Mouse wheel: 4 = up (zoom in), 5 = down (zoom out) */
+        if (e->button == 4) { zoom_in(ctx, e->x, e->y); draw_scene(ctx); return; }
+        else if (e->button == 5) { zoom_out(ctx, e->x, e->y); draw_scene(ctx); return; }
+        else {
+            /* Left click: add point at world coordinate */
+            double wx, wy; screen_to_world(ctx, e->x, e->y, &wx, &wy);
+            if (points_count < MAX_POINTS) { points_x[points_count] = wx; points_y[points_count] = wy; points_count++; }
+            draw_scene(ctx);
+            return;
+        }
+    } else if (e->type == WIN_EVT_KEY_PRESS) {
+        /* Use XkbKeycodeToKeysym (not deprecated) */
+        KeySym ks = XkbKeycodeToKeysym(ctx->dpy, (KeyCode)e->key, 0, 0);
+        if (ks == XK_Escape) { win_destroy(ctx); exit(0); }
+        if (ks == XK_plus || ks == XK_KP_Add || ks == XK_equal) {
+            int w,h; win_get_size(ctx,&w,&h);
+            int cx = left_w_px() + (w - left_w_px())/2;
+            int cy = top_h_px()  + (h - top_h_px() - STATUS_HEIGHT)/2;
+            zoom_in(ctx, cx, cy);
+            draw_scene(ctx);
+            return;
+        } else if (ks == XK_minus || ks == XK_KP_Subtract) {
+            int w,h; win_get_size(ctx,&w,&h);
+            int cx = left_w_px() + (w - left_w_px())/2;
+            int cy = top_h_px()  + (h - top_h_px() - STATUS_HEIGHT)/2;
+            zoom_out(ctx, cx, cy);
+            draw_scene(ctx);
+            return;
+        }
+    }
+}
+
+/* ---------------------------
+   Utility: sleep
+   --------------------------- */
+#ifdef _WIN32
+#include <windows.h>
+static void msleep(unsigned int ms) { Sleep(ms); }
+#else
+#include <time.h>
+static void msleep(unsigned int ms) {
+    struct timespec ts; ts.tv_sec = ms/1000; ts.tv_nsec = (ms%1000)*1000000; nanosleep(&ts,NULL);
+}
+#endif
+
+/* ---------------------------
+   main
+   --------------------------- */
+
+int main(int argc, char **argv) {
+    const char *ttf_path = NULL;
+    if (argc >= 2) ttf_path = argv[1];
+
+    WindowContext *w = win_create("Mini CAD mit skalierenden Linealen (mm/cm) und synchronem Gitter", 1200, 800);
+    if (!w) { fprintf(stderr, "Fehler: Fenster konnte nicht erstellt werden\n"); return 1; }
+
+    /* Lade Schrift (TTF) */
+    int font_ok = 0;
+    if (ttf_path) {
+        if (win_load_ttf_font(w, ttf_path, 12) == 0) { font_ok = 1; fprintf(stderr, "Verwende Schrift: %s\n", ttf_path); }
+        else fprintf(stderr, "Warnung: Konnte angegebene Schrift nicht laden: %s\n", ttf_path);
+    }
+    if (!font_ok) {
+        const char *fallback = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+        if (win_load_ttf_font(w, fallback, 12) == 0) { font_ok = 1; fprintf(stderr, "Verwende Fallback-Schrift: %s\n", fallback); }
+        else fprintf(stderr, "Warnung: Keine TTF-Schrift geladen; Text wird mit Xlib-Fallback gezeichnet\n");
+    }
+
+    /* Register event handler */
+    if (win_register_callback(w, app_event_handler, NULL) != 0) {
+        fprintf(stderr, "Warnung: Callback-Registrierung fehlgeschlagen\n");
+    }
+
+    /* Initiales Zeichnen */
+    draw_scene(w);
+
+    /* Main loop */
+    while (1) {
+        win_poll_events(w);
+        msleep(10);
+    }
+
+    win_destroy(w);
+    return 0;
+}

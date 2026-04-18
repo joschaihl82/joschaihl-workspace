@@ -1,0 +1,748 @@
+// cia-antivirus.cpp
+// Qt6 GUI + libclamav + ALSA, Scan läuft in Hintergrundthread (std::thread innerhalb QObject Worker)
+// Tray-Icon mit Theme-Fallbacks, Laufzeit-Theme-Auswahl, WebEngine Popup bei Virenfund
+// Floating semi-transparent progress overlay (300x30) mit Floating-Point-Progress und aktuellem Dateinamen
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QProgressBar>
+#include <QTextEdit>
+#include <QVBoxLayout>
+#include <QDirIterator>
+#include <QMutex>
+#include <QDateTime>
+#include <QSizePolicy>
+#include <QTimer>
+#include <QMetaObject>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QAction>
+#include <QActionGroup>
+#include <QCloseEvent>
+#include <QDialog>
+#include <QLabel>
+#include <QHBoxLayout>
+#include <QUrl>
+#include <QIcon>
+#include <QFileInfo>
+#include <QMutexLocker>
+#include <QScreen>
+#include <QPainter>
+#include <QWebEngineView>
+
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <cstring>
+#include <cmath>
+#include <thread>
+#include <atomic>
+#include <vector>
+
+#include <alsa/asoundlib.h>
+
+extern "C" {
+#include <clamav.h>
+}
+
+// --- get_cnt_dir: rekursives Zählen ---
+unsigned long get_cnt_dir(const char *ptr_path) {
+    unsigned long cnt_tot = 0;
+    struct dirent *str_ent;
+    DIR *ptr_dir = opendir(ptr_path);
+
+    if (!ptr_dir) {
+        return 0;
+    }
+
+    while ((str_ent = readdir(ptr_dir)) != NULL) {
+        if (strcmp(str_ent->d_name, ".") == 0 || strcmp(str_ent->d_name, "..") == 0) {
+            continue;
+        }
+
+        char chr_sub[1024];
+        snprintf(chr_sub, sizeof(chr_sub), "%s/%s", ptr_path, str_ent->d_name);
+
+        if (str_ent->d_type == DT_DIR) {
+            cnt_tot += get_cnt_dir(chr_sub);
+        } else if (str_ent->d_type == DT_REG) {
+            cnt_tot++;
+        }
+    }
+
+    closedir(ptr_dir);
+    return cnt_tot;
+}
+
+// --- libclamav callbacks (nicht-NULL) ---
+static cl_error_t sigload_progress_cb(size_t total_items, size_t now_completed, void *context) {
+    Q_UNUSED(total_items);
+    Q_UNUSED(now_completed);
+    Q_UNUSED(context);
+    return CL_SUCCESS;
+}
+
+static void clamav_msg_cb(enum cl_msg severity, const char *fullmsg, const char *msg, void *context) {
+    Q_UNUSED(severity);
+    Q_UNUSED(context);
+    if (fullmsg) {
+        fprintf(stderr, "clamav: %s\n", fullmsg);
+    } else if (msg) {
+        fprintf(stderr, "clamav: %s\n", msg);
+    }
+}
+
+// --- Worker (QObject) der den Scan in einem std::thread ausführt ---
+class ScannerWorker : public QObject {
+    Q_OBJECT
+public:
+    explicit ScannerWorker(const QStringList &roots, QObject *parent = nullptr)
+        : QObject(parent), m_roots(roots), m_running(false) {}
+
+    ~ScannerWorker() override {
+        stop();
+    }
+
+    void start() {
+        if (m_running.load()) return;
+        m_running.store(true);
+        m_thread = std::thread(&ScannerWorker::scanLoop, this);
+    }
+
+    void stop() {
+        if (!m_running.load()) return;
+        m_running.store(false);
+        if (m_thread.joinable()) m_thread.join();
+    }
+
+signals:
+    void fileScanning(const QString &path);            // NEW: emitted when a file scan starts
+    void fileScanned(const QString &path, bool infected);
+    void virusFound(const QString &path, const QString &virusName);
+    void logMessage(const QString &msg, bool important);
+    void finishedScanning();
+
+private:
+    void scanLoop() {
+        if (!m_running.load()) {
+            emit finishedScanning();
+            return;
+        }
+
+        if (cl_init(CL_INIT_DEFAULT) != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_init failed"), true);
+            emit finishedScanning();
+            return;
+        }
+
+        struct cl_engine *engine = cl_engine_new();
+        if (!engine) {
+            emit logMessage(QStringLiteral("cl_engine_new failed"), true);
+            emit finishedScanning();
+            return;
+        }
+
+        const char *dbdir = cl_retdbdir();
+        const char *usepath = (dbdir && dbdir[0]) ? dbdir : "/var/lib/clamav";
+
+        unsigned int sigs = 0;
+        cl_error_t loadrc = cl_load(usepath, engine, &sigs, 0);
+        if (loadrc != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_load failed: %1").arg(cl_strerror(loadrc)), true);
+            cl_engine_free(engine);
+            emit finishedScanning();
+            return;
+        }
+
+        cl_engine_set_clcb_sigload_progress(engine, sigload_progress_cb, nullptr);
+        cl_set_clcb_msg(clamav_msg_cb);
+
+        if (cl_engine_compile(engine) != CL_SUCCESS) {
+            emit logMessage(QStringLiteral("cl_engine_compile failed"), true);
+            cl_engine_free(engine);
+            emit finishedScanning();
+            return;
+        }
+
+        struct cl_scan_options scanopts;
+        memset(&scanopts, 0, sizeof(scanopts));
+
+        for (const QString &root : m_roots) {
+            if (!m_running.load()) break;
+            QDirIterator it(root, QDir::Files | QDir::NoSymLinks | QDir::NoDotAndDotDot,
+                            QDirIterator::Subdirectories);
+            while (it.hasNext() && m_running.load()) {
+                QString path = it.next();
+                if (path.startsWith("/proc") || path.startsWith("/sys") || path.startsWith("/dev"))
+                    continue;
+
+                // Notify UI which file is about to be scanned
+                emit fileScanning(path);
+
+                const char *cpath = path.toUtf8().constData();
+                const char *virname = nullptr;
+                unsigned long int scanned = 0;
+
+                cl_error_t rc = cl_scanfile(cpath, &virname, &scanned, engine, &scanopts);
+
+                if (rc == CL_VIRUS) {
+                    QString v = virname ? QString::fromUtf8(virname) : QStringLiteral("(unknown)");
+                    emit virusFound(path, v);
+                } else if (rc != CL_CLEAN && rc != CL_SUCCESS) {
+                    emit logMessage(QStringLiteral("Scan error %1 for %2").arg(cl_strerror(rc)).arg(path), true);
+                }
+
+                emit fileScanned(path, rc == CL_VIRUS);
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+
+        cl_engine_free(engine);
+        emit finishedScanning();
+        m_running.store(false);
+    }
+
+    QStringList m_roots;
+    std::thread m_thread;
+    std::atomic<bool> m_running;
+};
+
+// --- FloatingProgressWidget: semi-transparent overlay 300x30 ---
+class FloatingProgressWidget : public QWidget {
+    Q_OBJECT
+public:
+    explicit FloatingProgressWidget(QWidget *parent = nullptr)
+        : QWidget(parent)
+    {
+        setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+        setAttribute(Qt::WA_TranslucentBackground);
+        setAttribute(Qt::WA_ShowWithoutActivating);
+        setFixedSize(300, 30);
+        setWindowOpacity(0.75);
+
+        QHBoxLayout *lay = new QHBoxLayout(this);
+        lay->setContentsMargins(6, 4, 6, 4);
+        lay->setSpacing(6);
+
+        m_progress = new QProgressBar(this);
+        m_progress->setTextVisible(true);
+        m_progress->setRange(0, 1000); // internal scale for one decimal place
+        m_progress->setFixedSize(200, 22);
+        m_progress->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+        m_progress->setStyleSheet(
+            "QProgressBar { border-radius: 6px; background: rgba(255,255,255,0.08); color: white; }"
+            "QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #4caf50, stop:1 #2e7d32); border-radius:6px; }"
+        );
+
+        m_label = new QLabel(this);
+        m_label->setStyleSheet("QLabel { color: white; }");
+        m_label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+        m_label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        m_label->setText(QStringLiteral(""));
+
+        lay->addWidget(m_progress);
+        lay->addWidget(m_label);
+    }
+
+    void setProgressDouble(double pct) {
+        int v = static_cast<int>(std::round(pct * 10.0)); // 0..1000
+        m_progress->setValue(qBound(0, v, 1000));
+        double display = static_cast<double>(m_progress->value()) / 10.0;
+        int decimals = (std::fabs(display - std::floor(display)) > 0.0) ? 1 : 0;
+        m_progress->setFormat(QString::number(display, 'f', decimals) + QStringLiteral("%"));
+    }
+
+    void setFileName(const QString &name) {
+        QString shortName = name;
+        if (shortName.length() > 60) shortName = QStringLiteral("...") + shortName.right(57);
+        m_label->setText(shortName);
+    }
+
+protected:
+    void paintEvent(QPaintEvent *ev) override {
+        Q_UNUSED(ev);
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        QColor bg(0, 0, 0, 160); // semi-transparent dark background
+        p.setBrush(bg);
+        p.setPen(Qt::NoPen);
+        p.drawRoundedRect(rect(), 8, 8);
+    }
+
+private:
+    QProgressBar *m_progress;
+    QLabel *m_label;
+};
+
+// --- Virus Info Dialog (mit Browser) ---
+class VirusInfoDialog : public QDialog {
+    Q_OBJECT
+public:
+    VirusInfoDialog(const QString &virusName, const QString &path, QWidget *parent = nullptr)
+        : QDialog(parent) {
+        setWindowTitle(QStringLiteral("Virus found: %1").arg(virusName));
+        resize(900, 700);
+
+        QVBoxLayout *lay = new QVBoxLayout(this);
+        QLabel *lbl = new QLabel(QStringLiteral("<b>%1</b><br/>%2").arg(virusName, path));
+        lbl->setTextFormat(Qt::RichText);
+        lay->addWidget(lbl);
+
+        QWebEngineView *view = new QWebEngineView(this);
+        QString query = virusName;
+        query.replace(' ', '+');
+        QUrl url(QStringLiteral("https://www.google.com/search?q=%1").arg(query));
+        view->load(url);
+        lay->addWidget(view, 1);
+
+        setLayout(lay);
+    }
+};
+
+// --- MainWindow mit Tray-Icon, Theme-Fallbacks, ALSA-Alarm, Floating Overlay ---
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        QWidget *central = new QWidget;
+        QVBoxLayout *lay = new QVBoxLayout;
+        central->setLayout(lay);
+        setCentralWidget(central);
+
+        m_progress = new QProgressBar;
+        m_progress->setTextVisible(true);
+        m_progress->setMinimum(0);
+        m_progress->setValue(0);
+        m_progress->setFixedHeight(30);
+        m_progress->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        lay->addWidget(m_progress);
+
+        m_log = new QTextEdit;
+        m_log->setReadOnly(true);
+        m_log->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+        lay->addWidget(m_log);
+
+        lay->setStretchFactor(m_progress, 0);
+        lay->setStretchFactor(m_log, 1);
+
+        // Floating overlay
+        m_floating = new FloatingProgressWidget;
+        positionFloatingWidget();
+        m_floating->hide();
+
+        // Tray initialisieren (Icons werden geladen, Theme kann zur Laufzeit gewechselt werden)
+        m_iconThemeName = QStringLiteral("Default");
+        createTray();
+
+        // Gesamtanzahl per get_cnt_dir("/") ermitteln — Zählung in Hintergrund
+        m_progress->setMaximum(1000000);
+        std::thread([this]() {
+            unsigned long total = get_cnt_dir("/");
+            if (total == 0) {
+                return;
+            }
+            QMetaObject::invokeMethod(this, "setTotalCount", Qt::QueuedConnection,
+                                      Q_ARG(unsigned long, total));
+        }).detach();
+
+        updateProgressFormat(0, m_progress->maximum());
+
+        QStringList roots;
+        roots << "/";
+
+        m_worker = new ScannerWorker(roots, this);
+
+        connect(m_worker, &ScannerWorker::fileScanning, this, &MainWindow::onFileScanning);
+        connect(m_worker, &ScannerWorker::fileScanned, this, &MainWindow::onFileScanned);
+        connect(m_worker, &ScannerWorker::virusFound, this, &MainWindow::onVirusFound);
+        connect(m_worker, &ScannerWorker::logMessage, this, &MainWindow::appendLog);
+        connect(m_worker, &ScannerWorker::finishedScanning, this, &MainWindow::onFinished);
+
+        m_worker->start();
+        setWindowTitle(QStringLiteral("CIA Antivirus"));
+        resize(1000, 700);
+
+        // reposition floating widget on screen geometry changes
+        connect(QGuiApplication::primaryScreen(), &QScreen::geometryChanged, this, [this]() { positionFloatingWidget(); });
+    }
+
+    ~MainWindow() override {
+        if (m_worker) {
+            m_worker->stop();
+            m_worker->deleteLater();
+        }
+        if (m_trayIcon) {
+            m_trayIcon->hide();
+            delete m_trayIcon;
+        }
+        if (m_floating) {
+            m_floating->hide();
+            delete m_floating;
+        }
+    }
+
+protected:
+    void closeEvent(QCloseEvent *event) override {
+        event->ignore();
+        hide();
+        if (m_trayIcon) {
+            m_trayIcon->showMessage(QStringLiteral("CIA Antivirus"),
+                                    QStringLiteral("Scan läuft im Hintergrund. Rechtsklick für Optionen."),
+                                    QSystemTrayIcon::Information, 3000);
+        }
+    }
+
+public slots:
+    void setTotalCount(unsigned long total) {
+        if (total == 0) return;
+        if (total < (1ULL<<31)) {
+            m_progress->setMaximum(static_cast<int>(total));
+        } else {
+            m_progress->setMaximum(1000000);
+        }
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+    }
+
+    void onFileScanning(const QString &path) {
+        // Show filename in floating widget (queued to GUI thread)
+        QMetaObject::invokeMethod(this, [this, path]() {
+            if (!m_floating) return;
+            m_floating->setFileName(path);
+            m_floating->show();
+            m_floating->raise();
+        }, Qt::QueuedConnection);
+    }
+
+    void onFileScanned(const QString &path, bool infected) {
+        QMutexLocker locker(&m_mutex);
+        int nextVal = m_progress->value() + 1;
+        if (nextVal > m_progress->maximum()) nextVal = m_progress->maximum();
+        m_progress->setValue(nextVal);
+
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+        updateTrayProgress(m_progress->value(), m_progress->maximum());
+
+        // Update floating progress as floating point percentage
+        if (m_floating) {
+            double pct = 0.0;
+            if (m_progress->maximum() > 0) {
+                pct = (static_cast<double>(m_progress->value()) * 100.0) / static_cast<double>(m_progress->maximum());
+            }
+            m_floating->setProgressDouble(pct);
+            if (m_progress->value() >= m_progress->maximum()) {
+                m_floating->hide();
+            } else {
+                m_floating->show();
+            }
+        }
+
+        if (infected) {
+            m_log->setTextColor(Qt::red);
+            QFont f = m_log->currentFont();
+            f.setBold(true);
+            m_log->setCurrentFont(f);
+            m_log->append(QString("[%1] INFECTED: %2").arg(QDateTime::currentDateTime().toString(), path));
+            m_log->setTextColor(Qt::black);
+            f.setBold(false);
+            m_log->setCurrentFont(f);
+        } else {
+            m_log->setTextColor(Qt::black);
+            QFont f = m_log->currentFont();
+            f.setBold(false);
+            m_log->setCurrentFont(f);
+            m_log->append(QString("[%1] OK: %2").arg(QDateTime::currentDateTime().toString(), path));
+        }
+    }
+
+    void onVirusFound(const QString &path, const QString &virusName) {
+        setTrayIconState(State::Infected);
+
+        QMetaObject::invokeMethod(this, [this, virusName, path]() {
+            VirusInfoDialog *dlg = new VirusInfoDialog(virusName, path, this);
+            dlg->setAttribute(Qt::WA_DeleteOnClose);
+            dlg->exec();
+        }, Qt::QueuedConnection);
+
+        playAlertToneALSA(440.0, 1.0, 880.0, 1.0);
+    }
+
+    void appendLog(const QString &msg, bool important) {
+        Q_UNUSED(important);
+        m_log->append(msg);
+    }
+
+    void onFinished() {
+        m_log->append("Scan finished.");
+        updateProgressFormat(m_progress->value(), m_progress->maximum());
+        setTrayIconState(State::Idle);
+        if (m_floating) m_floating->hide();
+    }
+
+    void onTrayShowHide() {
+        if (isVisible()) {
+            hide();
+        } else {
+            show();
+            raise();
+            activateWindow();
+        }
+    }
+
+    void onTrayQuit() {
+        if (m_worker) m_worker->stop();
+        qApp->quit();
+    }
+
+private:
+    enum class State { Idle, Scanning, Infected };
+
+    // --- Tray / Theme handling ---
+    void createTray() {
+        m_trayIcon = new QSystemTrayIcon(this);
+
+        // Load icons using theme names first, then resource fallbacks
+        reloadTrayIcons();
+
+        // Kontextmenü
+        QMenu *menu = new QMenu;
+
+        m_actionShowHide = new QAction(QStringLiteral("Show/Hide"), this);
+        connect(m_actionShowHide, &QAction::triggered, this, &MainWindow::onTrayShowHide);
+        menu->addAction(m_actionShowHide);
+
+        m_actionProgress = new QAction(QStringLiteral("Progress: 0%"), this);
+        m_actionProgress->setEnabled(false);
+        menu->addAction(m_actionProgress);
+
+        menu->addSeparator();
+
+        // Theme Submenu
+        m_themeMenu = new QMenu(QStringLiteral("Icon Theme"), menu);
+        QActionGroup *themeGroup = new QActionGroup(this);
+        themeGroup->setExclusive(true);
+
+        QStringList themes = { "Default", "Classic", "Modern" };
+        for (const QString &t : themes) {
+            QAction *a = new QAction(t, this);
+            a->setCheckable(true);
+            a->setChecked(t == m_iconThemeName);
+            themeGroup->addAction(a);
+            m_themeMenu->addAction(a);
+            connect(a, &QAction::triggered, this, [this, t]() {
+                if (m_iconThemeName == t) return;
+                m_iconThemeName = t;
+                reloadTrayIcons();
+            });
+        }
+        menu->addMenu(m_themeMenu);
+
+        menu->addSeparator();
+
+        QAction *quitAct = new QAction(QStringLiteral("Quit"), this);
+        connect(quitAct, &QAction::triggered, this, &MainWindow::onTrayQuit);
+        menu->addAction(quitAct);
+
+        m_trayIcon->setContextMenu(menu);
+        m_trayIcon->show();
+
+        connect(m_trayIcon, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
+            if (reason == QSystemTrayIcon::Trigger) {
+                onTrayShowHide();
+            }
+        });
+
+        setTrayIconState(State::Idle);
+    }
+
+    void reloadTrayIcons() {
+        QStringList idleNames = { "security-high", "security-medium", "dialog-information", "system-run" };
+        QStringList scanningNames = { "view-refresh", "system-search", "process-working", "system-run" };
+        QStringList infectedNames = { "emblem-danger", "dialog-warning", "security-low", "dialog-error" };
+
+        auto load = [this](const QStringList &names, const QString &fileBase) -> QIcon {
+            for (const QString &n : names) {
+                QIcon ic = QIcon::fromTheme(n);
+                if (!ic.isNull()) return ic;
+            }
+            QString resPath = QStringLiteral(":/icons/%1/%2.png").arg(m_iconThemeName, fileBase);
+            QIcon res(resPath);
+            if (!res.isNull()) return res;
+            QString defPath = QStringLiteral(":/icons/Default/%1.png").arg(fileBase);
+            QIcon def(defPath);
+            if (!def.isNull()) return def;
+            return QIcon();
+        };
+
+        m_iconIdle = load(idleNames, QStringLiteral("idle"));
+        m_iconScanning = load(scanningNames, QStringLiteral("scanning"));
+        m_iconInfected = load(infectedNames, QStringLiteral("infected"));
+
+        if (m_iconIdle.isNull()) m_iconIdle = windowIcon();
+        if (m_iconScanning.isNull()) m_iconScanning = m_iconIdle;
+        if (m_iconInfected.isNull()) m_iconInfected = m_iconIdle;
+
+        if (m_progress && m_progress->value() < m_progress->maximum()) {
+            setTrayIconState(State::Scanning);
+        } else {
+            setTrayIconState(State::Idle);
+        }
+    }
+
+    void updateTrayProgress(int current, int total) {
+        QString percentStr = formatPercent(current, total);
+        QString tip = QStringLiteral("CIA Antivirus — %1 scanned (%2/%3)").arg(percentStr, QString::number(current), QString::number(total));
+        if (m_trayIcon) m_trayIcon->setToolTip(tip);
+        if (m_actionProgress) m_actionProgress->setText(QStringLiteral("Progress: %1").arg(percentStr));
+        setTrayIconState(State::Scanning);
+    }
+
+    void setTrayIconState(State s) {
+        if (!m_trayIcon) return;
+        switch (s) {
+            case State::Idle:
+                if (!m_iconIdle.isNull()) m_trayIcon->setIcon(m_iconIdle);
+                break;
+            case State::Scanning:
+                if (!m_iconScanning.isNull()) m_trayIcon->setIcon(m_iconScanning);
+                break;
+            case State::Infected:
+                if (!m_iconInfected.isNull()) m_trayIcon->setIcon(m_iconInfected);
+                break;
+        }
+    }
+
+    // --- Progress formatting ---
+    void updateProgressFormat(int current, int total) {
+        QString percentStr = formatPercent(current, total);
+        QString fmt = QString("%1  %2/%3").arg(percentStr, QString::number(current), QString::number(total));
+        m_progress->setFormat(fmt);
+    }
+
+    QString formatPercent(int current, int total) {
+        if (total <= 0) return QStringLiteral("0%");
+        double pct = (static_cast<double>(current) * 100.0) / static_cast<double>(total);
+
+        int digits = 1;
+        if (total > 0) {
+            digits = static_cast<int>(std::floor(std::log10(static_cast<double>(total)))) + 1;
+        }
+
+        int decimals = 3 - digits;
+        if (decimals < 0) decimals = 0;
+        if (decimals > 6) decimals = 6;
+
+        return QString::number(pct, 'f', decimals) + QStringLiteral("%");
+    }
+
+    // --- ALSA alert tones ---
+    void playAlertToneALSA(double freq1, double dur1, double freq2, double dur2) {
+        std::thread([freq1, dur1, freq2, dur2]() {
+            const unsigned int sampleRate = 44100;
+            const unsigned int channels = 1;
+            const snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+            const double amplitude = 0.6 * 32767.0;
+
+            auto playTone = [&](double freq, double duration) -> void {
+                int rc;
+                snd_pcm_t *pcmHandle = nullptr;
+                snd_pcm_hw_params_t *params = nullptr;
+
+                rc = snd_pcm_open(&pcmHandle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+                if (rc < 0) return;
+
+                snd_pcm_hw_params_malloc(&params);
+                snd_pcm_hw_params_any(pcmHandle, params);
+                snd_pcm_hw_params_set_access(pcmHandle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+                snd_pcm_hw_params_set_format(pcmHandle, params, format);
+                snd_pcm_hw_params_set_channels(pcmHandle, params, channels);
+                unsigned int rate = sampleRate;
+                snd_pcm_hw_params_set_rate_near(pcmHandle, params, &rate, 0);
+
+                snd_pcm_uframes_t frames = 1024;
+                snd_pcm_hw_params_set_period_size_near(pcmHandle, params, &frames, 0);
+
+                rc = snd_pcm_hw_params(pcmHandle, params);
+                if (rc < 0) {
+                    snd_pcm_hw_params_free(params);
+                    snd_pcm_close(pcmHandle);
+                    return;
+                }
+
+                snd_pcm_hw_params_free(params);
+
+                const size_t totalSamples = static_cast<size_t>(std::ceil(duration * sampleRate));
+                std::vector<int16_t> buffer(totalSamples * channels);
+
+                constexpr double PI = 3.14159265358979323846;
+                for (size_t i = 0; i < totalSamples; ++i) {
+                    double t = static_cast<double>(i) / static_cast<double>(sampleRate);
+                    double v = amplitude * std::sin(2.0 * PI * freq * t);
+                    buffer[i] = static_cast<int16_t>(v);
+                }
+
+                size_t offset = 0;
+                while (offset < totalSamples) {
+                    snd_pcm_sframes_t framesToWrite = std::min<size_t>(frames, totalSamples - offset);
+                    rc = snd_pcm_writei(pcmHandle, buffer.data() + offset * channels, framesToWrite);
+                    if (rc == -EPIPE) {
+                        snd_pcm_prepare(pcmHandle);
+                    } else if (rc < 0) {
+                        break;
+                    } else {
+                        offset += static_cast<size_t>(rc);
+                    }
+                }
+
+                snd_pcm_drain(pcmHandle);
+                snd_pcm_close(pcmHandle);
+            };
+
+            playTone(freq1, dur1);
+            playTone(freq2, dur2);
+        }).detach();
+    }
+
+    // --- Floating widget positioning ---
+    void positionFloatingWidget() {
+        if (!m_floating) return;
+        QScreen *screen = QGuiApplication::primaryScreen();
+        if (!screen) return;
+        QRect g = screen->availableGeometry();
+        int x = g.right() - m_floating->width() - 20;
+        int y = g.bottom() - m_floating->height() - 40;
+        m_floating->move(x, y);
+    }
+
+    // Members
+    QProgressBar *m_progress = nullptr;
+    QTextEdit *m_log = nullptr;
+    ScannerWorker *m_worker = nullptr;
+    QMutex m_mutex;
+
+    // Tray / icons
+    QSystemTrayIcon *m_trayIcon = nullptr;
+    QAction *m_actionShowHide = nullptr;
+    QAction *m_actionProgress = nullptr;
+    QMenu *m_themeMenu = nullptr;
+    QString m_iconThemeName;
+    QIcon m_iconIdle;
+    QIcon m_iconScanning;
+    QIcon m_iconInfected;
+
+    // Floating overlay
+    FloatingProgressWidget *m_floating = nullptr;
+};
+
+#include "cia-antivirus4.moc"
+
+int main(int argc, char **argv) {
+    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+    QApplication app(argc, argv);
+
+    MainWindow w;
+    w.setWindowState(w.windowState() | Qt::WindowMaximized);
+    w.show();
+    return app.exec();
+}

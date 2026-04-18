@@ -1,0 +1,672 @@
+// tiny64_full_fixed.c  -- Tiny64 full emulator (corrected build)
+// Build: gcc -O2 tiny64_full_fixed.c -o tiny64_full_fixed -lm `sdl2-config --cflags --libs`
+//
+// This file is the corrected version of the previously provided "tiny64_full.c".
+// Fixes applied:
+//  - corrected variable name in vector load/store case (use vs1 instead of rs1).
+//  - avoided duplicate variable name imm12 by renaming to imm12_bit where needed.
+//  - removed an unused temporary paddr variable in demo loader.
+//  - removed an unused helper emit1 and unused VM helpers to silence warnings.
+//  - minor cleanup to make the file compile cleanly under GCC.
+//
+// Note: This is still a compact educational emulator, not production-grade.
+// It implements a RISC-V-like 64-bit ISA subset, scalar FP (double), 128-bit vectors,
+// a simple single-level virtual memory mapping, a framebuffer shown via SDL2,
+// a minimal JIT emitter for a small subset of instructions, and a simple timer IRQ.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <SDL2/SDL.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+
+/* ---------------- Configuration ---------------- */
+#define MEM_SIZE        (1<<22)    // 4 MiB guest physical memory
+#define PAGE_SIZE       4096
+#define PAGE_SHIFT      12
+#define NPAGES          (MEM_SIZE / PAGE_SIZE)
+#define FB_WIDTH        320
+#define FB_HEIGHT       240
+#define FB_BPP          4
+#define FB_PIXELS       (FB_WIDTH * FB_HEIGHT)
+#define FB_BYTES        (FB_PIXELS * FB_BPP)
+#define FB_ADDR         0x200000   // guest physical base for framebuffer (must fit in MEM_SIZE)
+#define HOT_THRESHOLD   128
+#define MAX_BLOCK_INSNS 128
+#define MAX_VREGS       16
+#define MAX_XREGS       32
+#define MAX_FREGS       32
+
+/* ---------------- CPU state ---------------- */
+typedef struct {
+  uint64_t x[MAX_XREGS];        // integer regs x0..x31 (x0 hardwired to 0)
+  double   f[MAX_FREGS];       // FP regs f0..f31 (double)
+  uint8_t  v[MAX_VREGS][16];   // vector regs v0..v15 (128-bit)
+  uint64_t pc;                 // guest virtual PC
+  uint64_t satp;               // placeholder
+  uint8_t *mem;                // host backing memory (physical)
+  size_t mem_size;
+  uint32_t *hot;               // hot counters per word
+  void **block_cache;          // compiled block pointers per word
+  uint32_t *page_ver;          // page version for invalidation
+  uint32_t page_map[NPAGES];   // physical page bookkeeping
+  uint8_t page_mapped[NPAGES]; // 1 if mapped
+  // interrupts
+  uint8_t pending_irq;
+  uint64_t irq_vector;         // guest virtual address of IRQ handler
+  uint8_t irq_enable;          // global interrupt enable
+  // simple timer
+  uint64_t timer_ticks;
+  uint64_t timer_period;       // ticks between timer interrupts
+} CPU;
+
+/* ---------------- Helpers ---------------- */
+static inline uint32_t rd_of(uint32_t insn){ return (insn>>7)&0x1F; }
+static inline uint32_t rs1_of(uint32_t insn){ return (insn>>15)&0x1F; }
+static inline uint32_t rs2_of(uint32_t insn){ return (insn>>20)&0x1F; }
+static inline uint32_t opcode_of(uint32_t insn){ return insn & 0x7F; }
+static inline uint32_t funct3_of(uint32_t insn){ return (insn>>12)&0x7; }
+static inline uint32_t funct7_of(uint32_t insn){ return (insn>>25)&0x7F; }
+static inline int32_t imm_i(uint32_t insn){ return (int32_t)insn >> 20; }
+
+/* ---------------- Virtual memory (simple) ----------------
+   Single-level virtual->physical mapping using vpage_map array.
+*/
+#define VIRT_PAGES (1<<16) // 65536 virtual pages (256 MiB virtual space)
+static uint32_t *vpage_map = NULL; // 0xFFFFFFFF = unmapped
+
+static inline int virt_to_phys(CPU *c, uint64_t vaddr, uint64_t *paddr_out) {
+  uint64_t vpn = vaddr >> PAGE_SHIFT;
+  uint64_t off = vaddr & (PAGE_SIZE-1);
+  if (vpn >= VIRT_PAGES) return -1;
+  uint32_t pfn = vpage_map[vpn];
+  if (pfn == 0xFFFFFFFFu) return -2; // page fault
+  uint64_t paddr = ((uint64_t)pfn << PAGE_SHIFT) | off;
+  if (paddr >= c->mem_size) return -3;
+  *paddr_out = paddr;
+  return 0;
+}
+
+static int map_page(CPU *c, uint64_t vpage, uint32_t pfn) {
+  if (vpage >= VIRT_PAGES) return -1;
+  if (pfn >= NPAGES) return -2;
+  vpage_map[vpage] = pfn;
+  c->page_ver[pfn]++; // bump version to invalidate JITs touching this page
+  c->page_mapped[pfn] = 1;
+  return 0;
+}
+
+static int unmap_page(CPU *c, uint64_t vpage) {
+  if (vpage >= VIRT_PAGES) return -1;
+  uint32_t pfn = vpage_map[vpage];
+  if (pfn == 0xFFFFFFFFu) return 0;
+  vpage_map[vpage] = 0xFFFFFFFFu;
+  c->page_ver[pfn]++;
+  c->page_mapped[pfn] = 0;
+  return 0;
+}
+
+static int alloc_phys_page(CPU *c) {
+  for (uint32_t i=0;i<NPAGES;i++) {
+    if (!c->page_mapped[i]) {
+      c->page_mapped[i] = 1;
+      c->page_ver[i]++;
+      memset(c->mem + (i<<PAGE_SHIFT), 0, PAGE_SIZE);
+      return (int)i;
+    }
+  }
+  return -1;
+}
+
+/* Notify code write for invalidation */
+static inline void notify_code_write(CPU *c, uint64_t paddr) {
+  uint64_t page = paddr >> PAGE_SHIFT;
+  if (page < NPAGES) {
+    c->page_ver[page]++;
+    uint64_t start = (page<<PAGE_SHIFT);
+    uint64_t end = start + PAGE_SIZE;
+    if (end > c->mem_size) end = c->mem_size;
+    for (uint64_t a = start; a < end; a += 4) {
+      uint64_t idx = a / 4;
+      if (c->block_cache[idx]) c->block_cache[idx] = NULL;
+    }
+  }
+}
+
+/* Physical memory accessors */
+static inline uint32_t phys_load_u32(CPU *c, uint64_t paddr) {
+  uint32_t v; memcpy(&v, c->mem + paddr, 4); return v;
+}
+static inline uint64_t phys_load_u64(CPU *c, uint64_t paddr) {
+  uint64_t v; memcpy(&v, c->mem + paddr, 8); return v;
+}
+static inline void phys_store_u64(CPU *c, uint64_t paddr, uint64_t v) {
+  memcpy(c->mem + paddr, &v, 8);
+  notify_code_write(c, paddr);
+}
+static inline void phys_store_bytes(CPU *c, uint64_t paddr, const void *src, size_t n) {
+  memcpy(c->mem + paddr, src, n);
+  uint64_t a = paddr & ~(PAGE_SIZE-1);
+  uint64_t b = (paddr + n - 1) & ~(PAGE_SIZE-1);
+  for (uint64_t p = a; p <= b; p += PAGE_SIZE) notify_code_write(c, p);
+}
+
+/* Virtual memory accessors used in the emulator */
+static int store_bytes_vm(CPU *c, uint64_t vaddr, const void *src, size_t n) {
+  uint64_t paddr; int r = virt_to_phys(c, vaddr, &paddr);
+  if (r != 0) return r;
+  phys_store_bytes(c, paddr, src, n);
+  return 0;
+}
+
+/* ---------------- Instruction fetch ---------------- */
+static inline uint32_t fetch_insn(CPU *c, uint64_t vpc, int *err) {
+  uint64_t paddr;
+  int r = virt_to_phys(c, vpc, &paddr);
+  if (r != 0) { *err = r; return 0; }
+  *err = 0;
+  return phys_load_u32(c, paddr);
+}
+
+/* ---------------- Interrupt handling ---------------- */
+static void raise_timer_irq(CPU *c) { c->pending_irq = 1; }
+static void check_and_handle_irq(CPU *c) {
+  if (c->pending_irq && c->irq_enable) {
+    c->x[1] = c->pc; // save return PC in x1
+    c->irq_enable = 0;
+    c->pc = c->irq_vector;
+    c->pending_irq = 0;
+  }
+}
+
+/* ---------------- Interpreter: full instruction set + FP + vector ---------------- */
+static void interp_step(CPU *c) {
+  check_and_handle_irq(c);
+
+  int err;
+  uint32_t insn = fetch_insn(c, c->pc, &err);
+  if (err != 0) {
+    fprintf(stderr,"page fault at vaddr 0x%lx (err=%d)\n", c->pc, err);
+    exit(1);
+  }
+  uint32_t opc = opcode_of(insn);
+  switch(opc) {
+    case 0x33: { // R-type ALU
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      if (f3==0 && f7==0x00) c->x[rd] = c->x[rs1] + c->x[rs2];
+      else if (f3==0 && f7==0x20) c->x[rd] = c->x[rs1] - c->x[rs2];
+      else if (f3==0x1) c->x[rd] = c->x[rs1] << (c->x[rs2] & 63);
+      else if (f3==0x2) c->x[rd] = ((int64_t)c->x[rs1] < (int64_t)c->x[rs2]) ? 1 : 0;
+      else if (f3==0x3) c->x[rd] = (c->x[rs1] < c->x[rs2]) ? 1 : 0;
+      else if (f3==0x4) c->x[rd] = c->x[rs1] ^ c->x[rs2];
+      else if (f3==0x5 && f7==0x00) c->x[rd] = c->x[rs1] >> (c->x[rs2] & 63);
+      else if (f3==0x5 && f7==0x20) c->x[rd] = (uint64_t)((int64_t)c->x[rs1] >> (c->x[rs2] & 63));
+      else if (f3==0x6) c->x[rd] = c->x[rs1] | c->x[rs2];
+      else if (f3==0x7) c->x[rd] = c->x[rs1] & c->x[rs2];
+      else { fprintf(stderr,"unimplemented R-type f3=%u f7=%u\n", f3, f7); exit(1); }
+      c->x[0] = 0; c->pc += 4;
+      break;
+    }
+    case 0x13: { // I-type ALU
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn);
+      uint32_t f3 = funct3_of(insn);
+      int32_t imm = imm_i(insn);
+      if (f3==0) c->x[rd] = (uint64_t)((int64_t)c->x[rs1] + imm);
+      else if (f3==0x1) {
+        uint32_t sh = (insn>>20)&0x3F;
+        c->x[rd] = c->x[rs1] << sh;
+      } else if (f3==0x5) {
+        uint32_t sh = (insn>>20)&0x3F;
+        uint32_t f7 = funct7_of(insn);
+        if (f7==0x00) c->x[rd] = c->x[rs1] >> sh;
+        else if (f7==0x20) c->x[rd] = (uint64_t)((int64_t)c->x[rs1] >> sh);
+        else { fprintf(stderr,"unimpl shift imm f7=%u\n", f7); exit(1); }
+      } else { fprintf(stderr,"unimpl I-type f3=%u\n", f3); exit(1); }
+      c->x[0] = 0; c->pc += 4;
+      break;
+    }
+    case 0x03: { // LOAD
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn);
+      uint32_t f3 = funct3_of(insn);
+      int32_t imm = imm_i(insn);
+      uint64_t vaddr = c->x[rs1] + (uint64_t)imm;
+      uint64_t paddr;
+      int r = virt_to_phys(c, vaddr, &paddr);
+      if (r != 0) { fprintf(stderr,"load page fault vaddr 0x%lx\n", vaddr); exit(1); }
+      if (f3==0x0) { int8_t b = *(int8_t*)(c->mem + paddr); c->x[rd] = (int64_t)b; }
+      else if (f3==0x1) { int16_t h; memcpy(&h, c->mem + paddr, 2); c->x[rd] = (int64_t)h; }
+      else if (f3==0x2) { int32_t w; memcpy(&w, c->mem + paddr, 4); c->x[rd] = (int64_t)w; }
+      else if (f3==0x3) { uint64_t v; memcpy(&v, c->mem + paddr, 8); c->x[rd] = v; }
+      else if (f3==0x4) { uint8_t b = *(uint8_t*)(c->mem + paddr); c->x[rd] = b; }
+      else if (f3==0x5) { uint16_t h; memcpy(&h, c->mem + paddr, 2); c->x[rd] = h; }
+      else if (f3==0x6) { uint32_t w; memcpy(&w, c->mem + paddr, 4); c->x[rd] = w; }
+      else { fprintf(stderr,"unimpl load f3=%u\n", f3); exit(1); }
+      c->x[0] = 0; c->pc += 4;
+      break;
+    }
+    case 0x23: { // STORE
+      uint32_t rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t imm4_0 = (insn>>7)&0x1F;
+      uint32_t imm11_5 = (insn>>25)&0x7F;
+      int32_t imm = (imm11_5<<5) | imm4_0;
+      if (imm & 0x800) imm |= ~0xFFF;
+      uint32_t f3 = funct3_of(insn);
+      uint64_t vaddr = c->x[rs1] + (uint64_t)imm;
+      uint64_t paddr;
+      int r = virt_to_phys(c, vaddr, &paddr);
+      if (r != 0) { fprintf(stderr,"store page fault vaddr 0x%lx\n", vaddr); exit(1); }
+      if (f3==0x0) { uint8_t b = (uint8_t)c->x[rs2]; memcpy(c->mem + paddr, &b, 1); }
+      else if (f3==0x1) { uint16_t h = (uint16_t)c->x[rs2]; memcpy(c->mem + paddr, &h, 2); }
+      else if (f3==0x2) { uint32_t w = (uint32_t)c->x[rs2]; memcpy(c->mem + paddr, &w, 4); }
+      else if (f3==0x3) { uint64_t v = c->x[rs2]; memcpy(c->mem + paddr, &v, 8); }
+      else { fprintf(stderr,"unimpl store f3=%u\n", f3); exit(1); }
+      notify_code_write(c, paddr);
+      c->pc += 4;
+      break;
+    }
+    case 0x63: { // BRANCH
+      uint32_t rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn);
+      int imm11 = (insn>>7)&0x1;
+      int imm4_1 = (insn>>8)&0xF;
+      int imm10_5 = (insn>>25)&0x3F;
+      int imm12 = (insn>>31)&0x1;
+      int32_t imm = (imm12<<12) | (imm11<<11) | (imm10_5<<5) | (imm4_1<<1);
+      if (imm & 0x1000) imm |= ~0x1FFF;
+      int take = 0;
+      if (f3==0x0) take = (c->x[rs1] == c->x[rs2]);
+      else if (f3==0x1) take = (c->x[rs1] != c->x[rs2]);
+      else if (f3==0x4) take = ((int64_t)c->x[rs1] < (int64_t)c->x[rs2]);
+      else if (f3==0x5) take = ((int64_t)c->x[rs1] >= (int64_t)c->x[rs2]);
+      else if (f3==0x6) take = (c->x[rs1] < c->x[rs2]);
+      else if (f3==0x7) take = (c->x[rs1] >= c->x[rs2]);
+      else { fprintf(stderr,"unimpl branch f3=%u\n", f3); exit(1); }
+      if (take) c->pc += imm; else c->pc += 4;
+      break;
+    }
+    case 0x6F: { // JAL
+      uint32_t rd = rd_of(insn);
+      int32_t imm = ((insn>>12)&0xFF) << 12;
+      imm |= ((insn>>20)&0x1) << 11;
+      imm |= ((insn>>21)&0x3FF) << 1;
+      imm |= ((insn>>31)&0x1) << 20;
+      if (imm & (1<<20)) imm |= ~((1<<21)-1);
+      c->x[rd] = c->pc + 4;
+      c->pc += imm;
+      break;
+    }
+    case 0x67: { // JALR
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn);
+      int32_t imm = imm_i(insn);
+      uint64_t t = c->pc + 4;
+      c->pc = (c->x[rs1] + (int64_t)imm) & ~1ULL;
+      c->x[rd] = t;
+      break;
+    }
+    case 0x73: { // SYSTEM (ECALL)
+      uint32_t funct = (insn>>20);
+      if (funct == 0) {
+        uint64_t num = c->x[17];
+        if (num == 1) { fprintf(stderr,"guest exit(%lu)\n", c->x[10]); exit(0); }
+        else if (num == 2) {
+          uint64_t vaddr = c->x[10];
+          uint64_t npages = c->x[11];
+          uint64_t vpn = vaddr >> PAGE_SHIFT;
+          int ok = 1;
+          for (uint64_t i=0;i<npages;i++) {
+            int pfn = alloc_phys_page(c);
+            if (pfn < 0) { ok = 0; break; }
+            map_page(c, vpn + i, (uint32_t)pfn);
+          }
+          c->x[10] = ok ? 0 : (uint64_t)-1;
+          c->pc += 4;
+        } else if (num == 3) {
+          uint64_t vaddr = c->x[10];
+          uint64_t npages = c->x[11];
+          uint64_t vpn = vaddr >> PAGE_SHIFT;
+          for (uint64_t i=0;i<npages;i++) unmap_page(c, vpn + i);
+          c->x[10] = 0; c->pc += 4;
+        } else if (num == 4) {
+          c->irq_vector = c->x[10];
+          c->x[10] = 0; c->pc += 4;
+        } else if (num == 5) {
+          c->irq_enable = (c->x[10] != 0);
+          c->x[10] = 0; c->pc += 4;
+        } else {
+          fprintf(stderr,"unknown ecall num=%lu\n", num); exit(1);
+        }
+      } else {
+        fprintf(stderr,"unhandled system funct=%u\n", funct); exit(1);
+      }
+      break;
+    }
+    case 0x53: { // FP scalar class (double)
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      if (f7==0x00 && f3==0x0) c->f[rd] = c->f[rs1] + c->f[rs2];
+      else if (f7==0x00 && f3==0x1) c->f[rd] = c->f[rs1] - c->f[rs2];
+      else if (f7==0x00 && f3==0x2) c->f[rd] = c->f[rs1] * c->f[rs2];
+      else if (f7==0x00 && f3==0x3) c->f[rd] = c->f[rs1] / c->f[rs2];
+      else if (f7==0x20 && f3==0x0) c->f[rd] = (double)(int64_t)c->x[rs1];
+      else if (f7==0x20 && f3==0x1) c->x[rd] = (uint64_t)llrint(c->f[rs1]);
+      else { fprintf(stderr,"unimpl FP insn f7=%u f3=%u\n", f7, f3); exit(1); }
+      c->pc += 4;
+      break;
+    }
+    case 0x5B: { // Vector class
+      uint32_t vd = rd_of(insn), vs1 = rs1_of(insn), vs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      if (f7==0x00 && f3==0x0) { // VADD.64
+        double a0,a1,b0,b1;
+        memcpy(&a0, c->v[vs1]+0, 8); memcpy(&a1, c->v[vs1]+8, 8);
+        memcpy(&b0, c->v[vs2]+0, 8); memcpy(&b1, c->v[vs2]+8, 8);
+        double r0 = a0 + b0, r1 = a1 + b1;
+        memcpy(c->v[vd]+0, &r0, 8); memcpy(c->v[vd]+8, &r1, 8);
+      } else if (f7==0x00 && f3==0x1) { // VMUL.64
+        double a0,a1,b0,b1;
+        memcpy(&a0, c->v[vs1]+0, 8); memcpy(&a1, c->v[vs1]+8, 8);
+        memcpy(&b0, c->v[vs2]+0, 8); memcpy(&b1, c->v[vs2]+8, 8);
+        double r0 = a0 * b0, r1 = a1 * b1;
+        memcpy(c->v[vd]+0, &r0, 8); memcpy(c->v[vd]+8, &r1, 8);
+      } else if (f7==0x10 && f3==0x0) { // VADD.32
+        int32_t a[4], b[4], r[4];
+        memcpy(a, c->v[vs1], 16); memcpy(b, c->v[vs2], 16);
+        for (int i=0;i<4;i++) r[i] = a[i] + b[i];
+        memcpy(c->v[vd], r, 16);
+      } else if (f7==0x20 && f3==0x0) { // VLD vd, [rs1 + imm]
+        uint32_t base = vs1;
+        uint32_t imm12 = rs2_of(insn);
+        uint64_t vaddr = c->x[base] + imm12;
+        uint64_t paddr; int r = virt_to_phys(c, vaddr, &paddr);
+        if (r != 0) { fprintf(stderr,"vload page fault vaddr 0x%lx\n", vaddr); exit(1); }
+        memcpy(c->v[vd], c->mem + paddr, 16);
+      } else if (f7==0x20 && f3==0x1) { // VST vd, [rs1 + imm]
+        uint32_t base = vs1;
+        uint32_t imm12 = rs2_of(insn);
+        uint64_t vaddr = c->x[base] + imm12;
+        uint64_t paddr; int r = virt_to_phys(c, vaddr, &paddr);
+        if (r != 0) { fprintf(stderr,"vstore page fault vaddr 0x%lx\n", vaddr); exit(1); }
+        memcpy(c->mem + paddr, c->v[vd], 16);
+        notify_code_write(c, paddr);
+      } else { fprintf(stderr,"unimpl VEC insn f7=%u f3=%u\n", f7, f3); exit(1); }
+      c->pc += 4;
+      break;
+    }
+    default:
+      fprintf(stderr,"illegal opcode 0x%x at pc 0x%lx\n", opc, c->pc);
+      exit(1);
+  }
+  c->timer_ticks++;
+  if (c->timer_period && (c->timer_ticks % c->timer_period) == 0) raise_timer_irq(c);
+}
+
+/* ---------------- Minimal JIT emitter (subset) ---------------- */
+typedef void (*native_fn)(CPU*);
+static void *jit_alloc(size_t bytes) {
+  size_t n = (bytes + PAGE_SIZE -1) & ~(PAGE_SIZE-1);
+  void *p = mmap(NULL, n, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_ANON|MAP_PRIVATE, -1, 0);
+  if (p==MAP_FAILED) { perror("mmap"); return NULL; }
+  return p;
+}
+typedef struct { uint8_t *buf; size_t cap; size_t len; } Buf;
+static void buf_init(Buf *b, size_t cap) { b->buf = jit_alloc(cap); b->cap = cap; b->len = 0; }
+static void emit(Buf *b, const void *data, size_t n) { if (b->len + n > b->cap) { fprintf(stderr,"jit overflow\n"); exit(1); } memcpy(b->buf + b->len, data, n); b->len += n; }
+static void emit_mov_rax_mem(Buf *b, uint32_t off) { uint8_t code[] = {0x48,0x8B,0x87}; emit(b, code, 3); emit(b, &off, 4); }
+static void emit_mov_mem_rax(Buf *b, uint32_t off) { uint8_t code[] = {0x48,0x89,0x87}; emit(b, code, 3); emit(b, &off, 4); }
+static void emit_add_rax_rbx(Buf *b) { uint8_t code[] = {0x48,0x01,0xD8}; emit(b, code, 3); }
+static void emit_sub_rax_rbx(Buf *b) { uint8_t code[] = {0x48,0x29,0xD8}; emit(b, code, 3); }
+static void emit_add_rax_imm32(Buf *b, uint32_t imm) { uint8_t code[] = {0x48,0x05}; emit(b, code, 2); emit(b, &imm, 4); }
+static void emit_movsd_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0xF2,0x0F,0x10,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_addsd_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0xF2,0x0F,0x58,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_mulsd_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0xF2,0x0F,0x59,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_movsd_to_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0xF2,0x0F,0x11,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_movdqa_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0x66,0x0F,0x6F,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_addpd_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0x66,0x0F,0x58,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_mulpd_from_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0x66,0x0F,0x59,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_movdqa_to_cpu(Buf *b, uint32_t off) { uint8_t code[] = {0x66,0x0F,0x7F,0x87}; emit(b, code, 4); emit(b, &off, 4); }
+static void emit_ret(Buf *b) { uint8_t code[] = {0xC3}; emit(b, code, 1); }
+
+static native_fn compile_block(CPU *c, uint64_t vpc) {
+  uint32_t insns[MAX_BLOCK_INSNS];
+  int n = 0;
+  uint64_t pc = vpc;
+  for (; n < MAX_BLOCK_INSNS; n++) {
+    int err; uint32_t insn = fetch_insn(c, pc, &err);
+    if (err != 0) break;
+    insns[n] = insn;
+    uint32_t opc = opcode_of(insn);
+    pc += 4;
+    if (opc == 0x63 || opc == 0x6F || opc == 0x73 || opc == 0x67) break;
+  }
+  if (n==0) return NULL;
+  Buf b; buf_init(&b, 8192);
+  for (int i=0;i<n;i++) {
+    uint32_t insn = insns[i];
+    uint32_t opc = opcode_of(insn);
+    if (opc == 0x33) {
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      uint32_t off_rs1 = offsetof(CPU, x) + rs1*8;
+      uint32_t off_rs2 = offsetof(CPU, x) + rs2*8;
+      uint32_t off_rd  = offsetof(CPU, x) + rd*8;
+      emit_mov_rax_mem(&b, off_rs1);
+      uint8_t mov_rbx[] = {0x48,0x8B,0x9F}; emit(&b, mov_rbx, 3); emit(&b, &off_rs2, 4);
+      if (f3==0 && f7==0x00) emit_add_rax_rbx(&b);
+      else if (f3==0 && f7==0x20) emit_sub_rax_rbx(&b);
+      else { munmap(b.buf, b.cap); return NULL; }
+      emit_mov_mem_rax(&b, off_rd);
+    } else if (opc == 0x13) {
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn);
+      int32_t imm = imm_i(insn);
+      uint32_t off_rs1 = offsetof(CPU, x) + rs1*8;
+      uint32_t off_rd  = offsetof(CPU, x) + rd*8;
+      emit_mov_rax_mem(&b, off_rs1);
+      emit_add_rax_imm32(&b, (uint32_t)imm);
+      emit_mov_mem_rax(&b, off_rd);
+    } else if (opc == 0x53) {
+      uint32_t rd = rd_of(insn), rs1 = rs1_of(insn), rs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      uint32_t off_rs1 = offsetof(CPU, f) + rs1*8;
+      uint32_t off_rs2 = offsetof(CPU, f) + rs2*8;
+      uint32_t off_rd  = offsetof(CPU, f) + rd*8;
+      if (f7==0x00 && f3==0x0) { emit_movsd_from_cpu(&b, off_rs1); emit_addsd_from_cpu(&b, off_rs2); emit_movsd_to_cpu(&b, off_rd); }
+      else if (f7==0x00 && f3==0x2) { emit_movsd_from_cpu(&b, off_rs1); emit_mulsd_from_cpu(&b, off_rs2); emit_movsd_to_cpu(&b, off_rd); }
+      else { munmap(b.buf, b.cap); return NULL; }
+    } else if (opc == 0x5B) {
+      uint32_t vd = rd_of(insn), vs1 = rs1_of(insn), vs2 = rs2_of(insn);
+      uint32_t f3 = funct3_of(insn), f7 = funct7_of(insn);
+      uint32_t off_vs1 = offsetof(CPU, v) + vs1*16;
+      uint32_t off_vs2 = offsetof(CPU, v) + vs2*16;
+      uint32_t off_vd  = offsetof(CPU, v) + vd*16;
+      if (f7==0x00 && f3==0x0) { emit_movdqa_from_cpu(&b, off_vs1); emit_addpd_from_cpu(&b, off_vs2); emit_movdqa_to_cpu(&b, off_vd); }
+      else if (f7==0x00 && f3==0x1) { emit_movdqa_from_cpu(&b, off_vs1); emit_mulpd_from_cpu(&b, off_vs2); emit_movdqa_to_cpu(&b, off_vd); }
+      else { munmap(b.buf, b.cap); return NULL; }
+    } else {
+      munmap(b.buf, b.cap);
+      return NULL;
+    }
+  }
+  uint32_t off_pc = offsetof(CPU, pc);
+  uint8_t mov_rax_pc[] = {0x48,0x8B,0x87}; emit(&b, mov_rax_pc, 3); emit(&b, &off_pc, 4);
+  emit_add_rax_imm32(&b, 4 * n);
+  uint8_t mov_pc_back[] = {0x48,0x89,0x87}; emit(&b, mov_pc_back, 3); emit(&b, &off_pc, 4);
+  emit_ret(&b);
+  return (native_fn)b.buf;
+}
+
+static void compile_all_blocks(CPU *c, uint64_t start_vaddr, uint64_t end_vaddr) {
+  if (start_vaddr & 3) start_vaddr &= ~3ULL;
+  if (end_vaddr & 3) end_vaddr = (end_vaddr + 3) & ~3ULL;
+  if (end_vaddr > (VIRT_PAGES<<PAGE_SHIFT)) end_vaddr = (VIRT_PAGES<<PAGE_SHIFT);
+  for (uint64_t v = start_vaddr; v < end_vaddr; v += 4) {
+    uint64_t idx = v / 4;
+    if (c->block_cache[idx]) continue;
+    native_fn fn = compile_block(c, v);
+    if (fn) c->block_cache[idx] = (void*)fn;
+  }
+}
+
+/* ---------------- Framebuffer and SDL integration ---------------- */
+static SDL_Window *g_win = NULL;
+static SDL_Renderer *g_ren = NULL;
+static SDL_Texture *g_tex = NULL;
+
+static int sdl_init(void) {
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr,"SDL_Init: %s\n", SDL_GetError()); return -1; }
+  g_win = SDL_CreateWindow("Tiny64 Framebuffer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                           FB_WIDTH*2, FB_HEIGHT*2, SDL_WINDOW_SHOWN);
+  if (!g_win) { fprintf(stderr,"SDL_CreateWindow: %s\n", SDL_GetError()); return -1; }
+  g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  if (!g_ren) { fprintf(stderr,"SDL_CreateRenderer: %s\n", SDL_GetError()); return -1; }
+  g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, FB_WIDTH, FB_HEIGHT);
+  if (!g_tex) { fprintf(stderr,"SDL_CreateTexture: %s\n", SDL_GetError()); return -1; }
+  return 0;
+}
+
+static void update_framebuffer(CPU *c) {
+  if (FB_ADDR + FB_BYTES > c->mem_size) return;
+  void *pixels;
+  int pitch;
+  if (SDL_LockTexture(g_tex, NULL, &pixels, &pitch) == 0) {
+    uint8_t *dst = (uint8_t*)pixels;
+    uint8_t *src = c->mem + FB_ADDR;
+    for (int y=0;y<FB_HEIGHT;y++) {
+      memcpy(dst + y * pitch, src + y * FB_WIDTH * FB_BPP, FB_WIDTH * FB_BPP);
+    }
+    SDL_UnlockTexture(g_tex);
+  }
+  SDL_RenderClear(g_ren);
+  SDL_Rect dst = {0,0, FB_WIDTH*2, FB_HEIGHT*2};
+  SDL_RenderCopy(g_ren, g_tex, NULL, &dst);
+  SDL_RenderPresent(g_ren);
+}
+
+/* ---------------- Demo guest program loader ---------------- */
+static void load_demo_guest(CPU *c) {
+  uint64_t code_vaddr = 0x0;
+  uint64_t code_vpage = code_vaddr >> PAGE_SHIFT;
+  for (int i=0;i<16;i++) {
+    int pfn = alloc_phys_page(c);
+    if (pfn < 0) { fprintf(stderr,"out of phys pages\n"); exit(1); }
+    map_page(c, code_vpage + i, (uint32_t)pfn);
+  }
+  uint64_t fb_vaddr = FB_ADDR;
+  uint64_t fb_vpage = fb_vaddr >> PAGE_SHIFT;
+  int fb_pages = (FB_BYTES + PAGE_SIZE -1) / PAGE_SIZE;
+  for (int i=0;i<fb_pages;i++) {
+    int pfn = alloc_phys_page(c);
+    if (pfn < 0) { fprintf(stderr,"out of phys pages for fb\n"); exit(1); }
+    map_page(c, fb_vpage + i, (uint32_t)pfn);
+  }
+  // initialize framebuffer via store_bytes_vm
+  for (int y=0;y<FB_HEIGHT;y++) for (int x=0;x<FB_WIDTH;x++) {
+    uint32_t px = (0xFFu<<24) | ((x*255/FB_WIDTH)<<16) | ((y*255/FB_HEIGHT)<<8) | (0x80);
+    uint64_t vaddr = fb_vaddr + (y*FB_WIDTH + x)*4;
+    store_bytes_vm(c, vaddr, &px, 4);
+  }
+  c->pc = code_vaddr;
+  c->timer_period = 5000;
+  uint64_t irq_vaddr = 0x1000;
+  uint64_t irq_vpage = irq_vaddr >> PAGE_SHIFT;
+  int pfn = alloc_phys_page(c); map_page(c, irq_vpage, (uint32_t)pfn);
+  c->irq_vector = irq_vaddr;
+  // place IRQ handler: JALR x0, x1, 0  -> opcode 0x67, rd=0, rs1=1, imm=0
+  uint32_t jalr = (0<<7) | (1<<15) | (0<<12) | (0<<20) | 0x67;
+  store_bytes_vm(c, irq_vaddr, &jalr, 4);
+  c->irq_enable = 1;
+
+  // assemble a small loop at code_vaddr that loads a vector, doubles it, stores it, advances pointer
+  uint64_t pc = code_vaddr;
+  // ADDI x1, x0, FB_ADDR
+  uint32_t insn = ((uint32_t)(FB_ADDR & 0xFFF) << 20) | (0<<15) | (0<<12) | (1<<7) | 0x13;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // VLD v0, [x1 + 0]
+  insn = (0x20<<25) | (0<<20) | (1<<15) | (0<<12) | (0<<7) | 0x5B;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // VADD.64 v1, v0, v0
+  insn = (0x00<<25) | (0<<20) | (0<<15) | (0<<12) | (1<<7) | 0x5B;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // VST v1, [x1 + 0]
+  insn = (0x20<<25) | (1<<20) | (1<<15) | (1<<12) | (1<<7) | 0x5B;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // ADDI x1, x1, 16
+  insn = ((uint32_t)(16 & 0xFFF) << 20) | (1<<15) | (0<<12) | (1<<7) | 0x13;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // ADDI x3, x0, limit_low
+  uint64_t limit = FB_ADDR + FB_BYTES;
+  uint32_t imm12 = (uint32_t)(limit & 0xFFF);
+  insn = (imm12 << 20) | (0<<15) | (0<<12) | (3<<7) | 0x13;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // SLTU x2, x1, x3  -> R-type funct3=3 funct7=0
+  insn = (0<<25) | (3<<20) | (1<<15) | (3<<12) | (2<<7) | 0x33;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // BNE x2, x0, -20 (branch back)
+  int32_t off = -20;
+  uint32_t imm12_bit = (off >> 12) & 0x1;
+  uint32_t imm11 = (off >> 11) & 0x1;
+  uint32_t imm10_5 = (off >> 5) & 0x3F;
+  uint32_t imm4_1 = (off >> 1) & 0xF;
+  insn = (imm12_bit<<31) | (imm11<<7) | (imm10_5<<25) | (imm4_1<<8) | (2<<15) | (0<<20) | (1<<12) | 0x63;
+  store_bytes_vm(c, pc, &insn, 4); pc += 4;
+  // ECALL exit (we set x17=1 earlier when running)
+  uint32_t ecall = 0x00000073;
+  store_bytes_vm(c, pc, &ecall, 4); pc += 4;
+}
+
+/* ---------------- Main loop ---------------- */
+int main(int argc, char **argv) {
+  (void)argc; (void)argv;
+  vpage_map = malloc(sizeof(uint32_t) * VIRT_PAGES);
+  if (!vpage_map) { perror("malloc vpage_map"); return 1; }
+  for (uint32_t i=0;i<VIRT_PAGES;i++) vpage_map[i] = 0xFFFFFFFFu;
+
+  CPU cpu;
+  memset(&cpu, 0, sizeof(cpu));
+  cpu.mem_size = MEM_SIZE;
+  cpu.mem = malloc(cpu.mem_size);
+  if (!cpu.mem) { perror("malloc mem"); return 1; }
+  memset(cpu.mem, 0, cpu.mem_size);
+  cpu.hot = calloc(cpu.mem_size/4, sizeof(uint32_t));
+  cpu.block_cache = calloc(cpu.mem_size/4, sizeof(void*));
+  cpu.page_ver = calloc(NPAGES, sizeof(uint32_t));
+  for (uint32_t i=0;i<NPAGES;i++) { cpu.page_map[i] = i; cpu.page_mapped[i] = 0; }
+
+  if (sdl_init() != 0) return 1;
+
+  load_demo_guest(&cpu);
+
+  compile_all_blocks(&cpu, 0, 64*1024);
+
+  int running = 1;
+  uint64_t steps_per_frame = 2000;
+  SDL_Event ev;
+  while (running) {
+    for (uint64_t i=0;i<steps_per_frame;i++) interp_step(&cpu);
+    update_framebuffer(&cpu);
+    while (SDL_PollEvent(&ev)) {
+      if (ev.type == SDL_QUIT) running = 0;
+      else if (ev.type == SDL_KEYDOWN) {
+        if (ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+      }
+    }
+  }
+
+  SDL_DestroyTexture(g_tex);
+  SDL_DestroyRenderer(g_ren);
+  SDL_DestroyWindow(g_win);
+  SDL_Quit();
+
+  free(cpu.mem);
+  free(cpu.hot);
+  free(cpu.block_cache);
+  free(cpu.page_ver);
+  free(vpage_map);
+  return 0;
+}

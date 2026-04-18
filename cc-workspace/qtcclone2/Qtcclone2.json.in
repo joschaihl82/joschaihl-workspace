@@ -1,0 +1,11 @@
+{
+    \"Name\" : \"Qtcclone2\",
+    \"Version\" : \"0.0.1\",
+    \"CompatVersion\" : \"0.0.1\",
+    \"Vendor\" : \"CIA\",
+    \"Copyright\" : \"(C) CIA\",
+    \"License\" : \"BSD\",
+    \"Description\" : \"Clone a Project\",
+    \"Url\" : \"https://www.cia.gov\",
+    $$dependencyList
+}

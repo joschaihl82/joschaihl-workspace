@@ -1,0 +1,394 @@
+/*
+  genhdr_simple.c
+  Minimal, safer prototype extractor with convention over configuration.
+
+  Build:
+    gcc -std=c11 -O2 -Wall -Wextra -o genhdr_simple genhdr_simple.c
+
+  Usage:
+    ./genhdr_simple [-o out.h] file1.c [file2.c ...]
+*/
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+#include <sys/stat.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* ---------------- Safe allocation helpers ---------------- */
+
+static int mul_overflow_size(size_t a, size_t b, size_t *out) {
+    if (b && a > SIZE_MAX / b) return 1;
+    *out = a * b;
+    return 0;
+}
+
+static void *xcalloc(size_t nmemb, size_t size) {
+    size_t total;
+    if (mul_overflow_size(nmemb, size, &total)) {
+        fprintf(stderr, "Allocation overflow: %zu * %zu\n", nmemb, size);
+        exit(2);
+    }
+    void *p = calloc(1, total);
+    if (!p) {
+        fprintf(stderr, "Out of memory allocating %zu bytes\n", total);
+        exit(2);
+    }
+    return p;
+}
+
+static void *xreallocarray(void *ptr, size_t nmemb, size_t size) {
+    size_t total;
+    if (mul_overflow_size(nmemb, size, &total)) {
+        fprintf(stderr, "Reallocation overflow: %zu * %zu\n", nmemb, size);
+        exit(2);
+    }
+    void *p = realloc(ptr, total);
+    if (!p) {
+        fprintf(stderr, "Out of memory reallocating %zu bytes\n", total);
+        exit(2);
+    }
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = xcalloc(n, 1);
+    memcpy(p, s, n);
+    return p;
+}
+
+/* ---------------- Simple file reader ---------------- */
+
+#define READ_STEP 65536
+
+static char *read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = READ_STEP;
+    char *buf = xcalloc(cap + 1, 1);
+    size_t len = 0;
+    while (1) {
+        size_t want = READ_STEP;
+        if (len + want + 1 > cap) {
+            size_t newcap = cap + READ_STEP;
+            buf = xreallocarray(buf, newcap + 1, 1);
+            cap = newcap;
+        }
+        size_t r = fread(buf + len, 1, want, f);
+        len += r;
+        if (r < want) break;
+    }
+    buf[len] = '\0';
+    fclose(f);
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+/* ---------------- Minimal lexer (skip comments/strings) ---------------- */
+
+static char *strip_comments_and_strings(const char *s) {
+    size_t n = strlen(s);
+    char *out = xcalloc(n + 1, 1);
+    size_t i = 0, j = 0;
+    while (i < n) {
+        if (s[i] == '/' && i + 1 < n && s[i+1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(s[i] == '*' && s[i+1] == '/')) {
+                if (s[i] == '\n') out[j++] = '\n';
+                i++;
+            }
+            if (i + 1 < n) i += 2;
+        } else if (s[i] == '/' && i + 1 < n && s[i+1] == '/') {
+            i += 2;
+            while (i < n && s[i] != '\n') i++;
+        } else if (s[i] == '"' || s[i] == '\'') {
+            char q = s[i++];
+            out[j++] = ' ';
+            while (i < n) {
+                if (s[i] == '\\' && i + 1 < n) { i += 2; continue; }
+                if (s[i] == q) { i++; break; }
+                if (s[i] == '\n') out[j++] = '\n';
+                i++;
+            }
+            out[j++] = ' ';
+        } else {
+            out[j++] = s[i++];
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* ---------------- Heuristic prototype extraction ----------------
+   Strategy:
+   - Find a ')' followed shortly by '{'
+   - Backtrack to the previous ';' or '}' or start to get the signature
+   - Reject obvious non-functions (typedef, struct, enum, union, macros)
+   - Strip trailing attributes and parameter names (simple heuristic)
+*/
+
+static void trim(char *s) {
+    if (!s) return;
+    char *a = s;
+    while (*a && isspace((unsigned char)*a)) a++;
+    if (a != s) memmove(s, a, strlen(a) + 1);
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len-1])) s[--len] = '\0';
+}
+
+static int is_control_word(const char *w) {
+    const char *kw[] = {"if","for","while","switch","return","sizeof","else","case","do","goto"};
+    for (size_t i = 0; i < sizeof(kw)/sizeof(kw[0]); ++i)
+        if (strcmp(w, kw[i]) == 0) return 1;
+    return 0;
+}
+
+/* Remove simple trailing attributes like __attribute__((...)) or __declspec(...) */
+static void strip_trailing_attributes(char *s) {
+    if (!s) return;
+    char *p;
+    while ((p = strstr(s, "__attribute__")) != NULL) {
+        char *q = strchr(p, '(');
+        if (!q) break;
+        int depth = 0;
+        char *r = q;
+        while (*r) {
+            if (*r == '(') depth++;
+            else if (*r == ')') {
+                depth--;
+                if (depth == 0) { r++; break; }
+            }
+            r++;
+        }
+        if (*r == '\0') break;
+        memmove(p, r, strlen(r) + 1);
+    }
+    while ((p = strstr(s, "__declspec")) != NULL) {
+        char *q = strchr(p, '(');
+        if (!q) break;
+        int depth = 0;
+        char *r = q;
+        while (*r) {
+            if (*r == '(') depth++;
+            else if (*r == ')') {
+                depth--;
+                if (depth == 0) { r++; break; }
+            }
+            r++;
+        }
+        if (*r == '\0') break;
+        memmove(p, r, strlen(r) + 1);
+    }
+}
+
+/* Strip parameter names heuristically: "int a, const char *b" -> "int, const char *" */
+static char *strip_param_names(const char *params) {
+    if (!params) return xstrdup("()");
+    size_t n = strlen(params);
+    char *out = xcalloc(n + 1, 1);
+    size_t oi = 0;
+    size_t i = 0;
+    if (params[i] == '(') out[oi++] = params[i++];
+    int depth = 0;
+    while (i < n) {
+        if (params[i] == ')' && depth == 0) { out[oi++] = ')'; i++; break; }
+        if (params[i] == '(') { depth++; out[oi++] = '('; i++; continue; }
+        if (params[i] == ')') { depth--; out[oi++] = ')'; i++; continue; }
+        size_t start = i;
+        size_t j = i;
+        int local_depth = depth;
+        while (j < n) {
+            if (params[j] == '(') local_depth++;
+            else if (params[j] == ')') {
+                if (local_depth == 0) break;
+                local_depth--;
+            } else if (params[j] == ',' && local_depth == depth) break;
+            j++;
+        }
+        size_t plen = j - start;
+        char *part = xcalloc(plen + 1, 1);
+        memcpy(part, params + start, plen);
+        part[plen] = '\0';
+        trim(part);
+        /* remove trailing identifier if present */
+        size_t k = strlen(part);
+        if (k > 0) {
+            while (k > 0 && isspace((unsigned char)part[k-1])) part[--k] = '\0';
+            size_t endid = k;
+            while (endid > 0 && (isalnum((unsigned char)part[endid-1]) || part[endid-1]=='_' )) endid--;
+            if (endid < k) {
+                size_t p = endid;
+                while (p > 0 && isspace((unsigned char)part[p-1])) p--;
+                if (p > 0) {
+                    part[endid] = '\0';
+                    trim(part);
+                }
+            }
+        }
+        size_t plen2 = strlen(part);
+        if (oi + plen2 + 4 > n) { free(part); free(out); return xstrdup("()"); }
+        memcpy(out + oi, part, plen2);
+        oi += plen2;
+        free(part);
+        if (j < n && params[j] == ',') {
+            out[oi++] = ',';
+            out[oi++] = ' ';
+            j++;
+        }
+        i = j;
+    }
+    out[oi] = '\0';
+    return out;
+}
+
+/* Main extraction: scan cleaned buffer for ')' followed by '{' and backtrack */
+static void extract_prototypes_from_buffer(const char *buf, FILE *out) {
+    size_t len = strlen(buf);
+    size_t i = 0;
+    while (i < len) {
+        if (buf[i] == '{') {
+            size_t j = i;
+            while (j > 0 && isspace((unsigned char)buf[j-1])) j--;
+            if (j == 0 || buf[j-1] != ')') { i++; continue; }
+            /* find matching '(' */
+            size_t r = j - 1;
+            int depth = 0;
+            while (r > 0) {
+                if (buf[r] == ')') depth++;
+                else if (buf[r] == '(') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+                r--;
+            }
+            if (r == 0 && buf[r] != '(') { i++; continue; }
+            /* backtrack to previous ';' or '}' or start */
+            size_t start = r;
+            while (start > 0 && buf[start-1] != ';' && buf[start-1] != '}') start--;
+            /* expand a bit to include return type (cap at 1024 chars) */
+            size_t ext = (start > 128) ? start - 128 : 0;
+            start = ext;
+            size_t siglen = i - start;
+            if (siglen == 0 || siglen > 8192) { i++; continue; }
+            char *sig = xcalloc(siglen + 1, 1);
+            memcpy(sig, buf + start, siglen);
+            sig[siglen] = '\0';
+            trim(sig);
+            /* quick rejects */
+            if (strstr(sig, "typedef") || strstr(sig, "struct") || strstr(sig, "enum") || strstr(sig, "union")) {
+                free(sig); i++; continue;
+            }
+            /* find last '(' and ')' in sig */
+            char *rparen = strrchr(sig, ')');
+            char *lparen = NULL;
+            if (rparen) {
+                int d = 0;
+                for (char *p = rparen; p >= sig; --p) {
+                    if (*p == ')') d++;
+                    else if (*p == '(') {
+                        d--;
+                        if (d == 0) { lparen = p; break; }
+                    }
+                }
+            }
+            if (!lparen) { free(sig); i++; continue; }
+            /* extract name before '(' */
+            char namebuf[256] = {0};
+            char *p = lparen - 1;
+            while (p >= sig && isspace((unsigned char)*p)) p--;
+            char *end = p;
+            while (p >= sig && (isalnum((unsigned char)*p) || *p == '_' || *p == '*')) p--;
+            p++;
+            size_t nlen = end - p + 1;
+            if (nlen >= sizeof(namebuf)) nlen = sizeof(namebuf)-1;
+            memcpy(namebuf, p, nlen);
+            namebuf[nlen] = '\0';
+            trim(namebuf);
+            if (namebuf[0] == '\0' || is_control_word(namebuf)) { free(sig); i++; continue; }
+            /* skip static functions (convention) */
+            if (strstr(sig, "static") != NULL) { free(sig); i++; continue; }
+            /* extract params and clean */
+            size_t lidx = lparen - sig;
+            size_t ridx = rparen - sig;
+            size_t plen = ridx - lidx + 1;
+            char *params = xcalloc(plen + 1, 1);
+            memcpy(params, sig + lidx, plen);
+            params[plen] = '\0';
+            char *clean_params = strip_param_names(params);
+            /* build prototype: everything before '(' + clean_params + ';' */
+            size_t prelen = lidx;
+            char *proto = xcalloc(prelen + strlen(clean_params) + 4, 1);
+            memcpy(proto, sig, prelen);
+            proto[prelen] = '\0';
+            trim(proto);
+            strip_trailing_attributes(proto);
+            /* append cleaned params and semicolon */
+            strcat(proto, clean_params);
+            strcat(proto, ";");
+            fprintf(out, "%s\n\n", proto);
+            free(params);
+            free(clean_params);
+            free(proto);
+            free(sig);
+            i++;
+        } else i++;
+    }
+}
+
+/* ---------------- Main (minimal CLI) ---------------- */
+
+static void usage(const char *prog) {
+    fprintf(stderr, "Usage: %s [-o out.h] file1.c [file2.c ...]\n", prog);
+}
+
+int main(int argc, char **argv) {
+    const char *outname = "prototypes.h";
+    int argi = 1;
+    if (argc < 2) { usage(argv[0]); return 1; }
+    if (strcmp(argv[1], "-o") == 0) {
+        if (argc < 4) { usage(argv[0]); return 1; }
+        outname = argv[2];
+        argi = 3;
+    }
+    if (argi >= argc) { usage(argv[0]); return 1; }
+
+    FILE *out = fopen(outname, "w");
+    if (!out) { fprintf(stderr, "Cannot open %s: %s\n", outname, strerror(errno)); return 1; }
+
+    /* simple guard */
+    char guard[256];
+    size_t gj = 0;
+    for (size_t i = 0; outname[i] && gj + 2 < sizeof(guard); ++i) {
+        unsigned char c = (unsigned char)outname[i];
+        if (isalnum(c)) guard[gj++] = toupper(c);
+        else guard[gj++] = '_';
+    }
+    if (gj + 3 < sizeof(guard)) { guard[gj++] = '_'; guard[gj++] = 'H'; guard[gj] = '\0'; }
+    else guard[gj-1] = '\0';
+
+    fprintf(out, "#ifndef %s\n#define %s\n\n", guard, guard);
+    fprintf(out, "/* Prototypes extracted by genhdr_simple (convention over configuration) */\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+
+    for (int i = argi; i < argc; ++i) {
+        size_t len;
+        char *buf = read_file(argv[i], &len);
+        if (!buf) { fprintf(stderr, "Warning: cannot read %s\n", argv[i]); continue; }
+        char *clean = strip_comments_and_strings(buf);
+        free(buf);
+        if (!clean) { fprintf(stderr, "Memory error\n"); fclose(out); return 1; }
+        extract_prototypes_from_buffer(clean, out);
+        free(clean);
+    }
+
+    fprintf(out, "#ifdef __cplusplus\n}\n#endif\n\n#endif /* %s */\n", guard);
+    fclose(out);
+    return 0;
+}

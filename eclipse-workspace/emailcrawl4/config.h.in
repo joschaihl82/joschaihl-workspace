@@ -1,0 +1,2 @@
+#define emailcrawl3_VERSION_MAJOR @emailcrawl3_VERSION_MAJOR@
+#define emailcrawl3_VERSION_MINOR @emailcrawl3_VERSION_MINOR@

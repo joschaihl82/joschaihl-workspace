@@ -1,0 +1,143 @@
+// exectrace1.c
+// Portable sched_process_exec probe: try register_trace helper, then __tracepoint pointer.
+// Build: obj-m := exectrace1.o
+// make -C /lib/modules/$(uname -r)/build M=$PWD modules V=1
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("josh");
+MODULE_DESCRIPTION("Trace exec paths (portable registration) - tries register_trace helper then tracepoint pointer");
+MODULE_VERSION("1.0");
+
+/* Rate-limit state */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+static struct kprobe kp = {
+    .symbol_name = "do_execve", // change this to "bprm_execve"
+};
+
+/* Probe callback */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+    char *buf;
+    char *path;
+
+    if (!p || !bprm)
+        return;
+
+    if (!__ratelimit(&exectrace_rl))
+        return;
+
+    if (bprm->file) {
+        struct path fpath = bprm->file->f_path;
+
+        path_get(&fpath);
+
+        buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!buf) {
+            path_put(&fpath);
+            pr_info("exectrace: pid=%d comm=%s filename=%s (no mem)\n",
+                    p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+            return;
+        }
+
+        path = d_path(&fpath, buf, PATH_MAX);
+        if (IS_ERR(path)) {
+            pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+                    p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+        } else {
+            pr_info("exectrace: pid=%d comm=%s path=%s\n",
+                    p->pid, p->comm, path);
+        }
+
+        kfree(buf);
+        path_put(&fpath);
+    } else {
+        pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+    }
+}
+
+/*
+ * Declare the helper and tracepoint pointer as weak symbols.
+ * If the kernel exports them, they will be used; if not, they remain NULL/absent.
+ *
+ * Note: weak externs reduce the chance of modpost failing when the symbol is not exported.
+ * Some toolchains/kernels still require the symbol; if you still see modpost errors,
+ * use an in-tree build or the user-space alternative below.
+ */
+
+/* register_trace_sched_process_exec helper (if exported) */
+extern int register_trace_sched_process_exec(void *probe, void *data) __attribute__((weak));
+extern void unregister_trace_sched_process_exec(void *probe, void *data) __attribute__((weak));
+
+/* exported tracepoint pointer (if available) */
+extern struct tracepoint __tracepoint_sched_process_exec __attribute__((weak));
+
+static struct tracepoint *tp_sched = NULL;
+static int used_method = 0; /* 1=helper, 2=tracepoint pointer */
+
+/* Module init: try helper first, then tracepoint pointer */
+static int __init exectrace_init(void)
+{
+    int ret;
+
+    /* 1) try register_trace_sched_process_exec helper if present */
+    if ((void *)register_trace_sched_process_exec != NULL) {
+        ret = register_trace_sched_process_exec(probe_sched_process_exec, NULL);
+        if (ret == 0) {
+            used_method = 1;
+            pr_info("exectrace: registered via register_trace_sched_process_exec helper\n");
+            return 0;
+        }
+        pr_warn("exectrace: register_trace_sched_process_exec present but registration failed (ret=%d)\n", ret);
+    }
+
+    /* 2) try exported tracepoint pointer if present */
+    if ((void *)&__tracepoint_sched_process_exec != NULL) {
+        tp_sched = &__tracepoint_sched_process_exec;
+        ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+        if (ret == 0) {
+            used_method = 2;
+            pr_info("exectrace: registered via __tracepoint_sched_process_exec pointer\n");
+            return 0;
+        }
+        pr_warn("exectrace: tracepoint_probe_register failed (ret=%d)\n", ret);
+        tp_sched = NULL;
+    }
+
+    pr_err("exectrace: no supported registration method available\n");
+    return -ENODEV;
+}
+
+/* Module exit: unregister according to method used */
+static void __exit exectrace_exit(void)
+{
+    if (used_method == 1) {
+        if ((void *)unregister_trace_sched_process_exec != NULL)
+            unregister_trace_sched_process_exec(probe_sched_process_exec, NULL);
+    } else if (used_method == 2) {
+        if (tp_sched)
+            tracepoint_probe_unregister(tp_sched, (void *)probe_sched_process_exec, NULL);
+    }
+
+    pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);

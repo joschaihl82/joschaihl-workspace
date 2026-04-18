@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;unused-optimizer5/unused-optimizer2.cpp&apos; to &apos;unused-optimizer1-old.cpp&apos;" description="Rename resource &apos;unused-optimizer2.cpp&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="unused-optimizer2.cpp" name="unused-optimizer1-old.cpp" stamp="1771675718512" updateReferences="true"/>
+</session>

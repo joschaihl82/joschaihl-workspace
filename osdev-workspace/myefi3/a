@@ -1,0 +1,71 @@
+ld.lld: error: kernel/kernel.o:(function load_idt: .text+0x788): relocation R_X86_64_32S out of range: -140737488256966 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function load_idt: .text+0x79c): relocation R_X86_64_32S out of range: -140737488256964 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x7d1): relocation R_X86_64_32S out of range: -140737488269312 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x7e9): relocation R_X86_64_32S out of range: -140737488269312 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x7ff): relocation R_X86_64_32S out of range: -140737488269308 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x817): relocation R_X86_64_32S out of range: -140737488269308 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x82d): relocation R_X86_64_32S out of range: -140737488269312 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function isr_keyboard: .text+0x837): relocation R_X86_64_32S out of range: -140737488269308 is not in [-2147483648, 2147483647]; references section '.bss'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x8cc): relocation R_X86_64_32S out of range: -140737488269304 is not in [-2147483648, 2147483647]; references 'fbb'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x8db): relocation R_X86_64_32S out of range: -140737488269296 is not in [-2147483648, 2147483647]; references 'pps'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x8f3): relocation R_X86_64_32S out of range: -140737488269292 is not in [-2147483648, 2147483647]; references 'screen_height'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x8fc): relocation R_X86_64_32S out of range: -140737488269292 is not in [-2147483648, 2147483647]; references 'screen_height'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x903): relocation R_X86_64_32S out of range: -140737488269296 is not in [-2147483648, 2147483647]; references 'pps'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x925): relocation R_X86_64_32S out of range: -140737488269304 is not in [-2147483648, 2147483647]; references 'fbb'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x945): relocation R_X86_64_32S out of range: -140737488277504 is not in [-2147483648, 2147483647]; references section '.data'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x955): relocation R_X86_64_32S out of range: -140737488269292 is not in [-2147483648, 2147483647]; references 'screen_height'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x97b): relocation R_X86_64_32S out of range: -140737488269304 is not in [-2147483648, 2147483647]; references 'fbb'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0x987): relocation R_X86_64_32S out of range: -140737488269304 is not in [-2147483648, 2147483647]; references 'fbb'
+>>> referenced by kernel.c
+>>> defined in kernel/kernel.o
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0xa75): relocation R_X86_64_32S out of range: -140737488277504 is not in [-2147483648, 2147483647]; references section '.data'
+>>> referenced by kernel.c
+
+ld.lld: error: kernel/kernel.o:(function fb_scroll_fast: .text+0xa84): relocation R_X86_64_32S out of range: -140737488277504 is not in [-2147483648, 2147483647]; references section '.data'
+>>> referenced by kernel.c
+
+ld.lld: error: too many errors emitted, stopping now (use --error-limit=0 to see all errors)
+make: *** [Makefile:92: kernel/kernel.elf] Fehler 1

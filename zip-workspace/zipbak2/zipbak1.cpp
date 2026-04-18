@@ -1,0 +1,376 @@
+// main.cpp
+#include <QApplication>
+#include <QWidget>
+#include <QPushButton>
+#include <QProgressBar>
+#include <QLabel>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QFileDialog>
+#include <QThread>
+#include <QElapsedTimer>
+#include <QDir>
+#include <QFileInfo>
+#include <QMessageBox>
+#include <QTimer>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QListWidget>
+#include <zip.h>
+
+#include <vector>
+#include <utility>
+
+struct FileEntry { QString absolute; QString relative; qint64 size; };
+
+class ZipWorker : public QObject {
+    Q_OBJECT
+public:
+    ZipWorker() = default;
+    void setPaths(const QString &input, const QString &output) {
+        inputDir = input;
+        outputDir = output;
+    }
+
+signals:
+    void subfolderStarted(const QString &name, qint64 totalBytes);
+    void subfolderProgress(qint64 processedBytes, qint64 totalBytes, qint64 elapsedMs);
+    void overallProgress(qint64 processedBytes, qint64 totalBytes, qint64 elapsedMs);
+    void subfolderFinished(const QString &name);
+    void fileAdded(const QString &relativePath);
+    void finished();
+    void error(const QString &msg);
+
+public slots:
+    void process() {
+        QDir in(inputDir);
+        if (!in.exists()) { emit error(tr("Input folder does not exist")); emit finished(); return; }
+        QDir out(outputDir);
+        if (!out.exists()) {
+            if (!QDir().mkpath(out.absolutePath())) { emit error(tr("Cannot create output directory")); emit finished(); return; }
+        }
+
+        QFileInfoList subdirs = in.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
+        if (subdirs.isEmpty()) { emit error(tr("No subfolders found")); emit finished(); return; }
+
+        struct FolderInfo { QString name; qint64 size; std::vector<FileEntry> files; };
+        std::vector<FolderInfo> folders;
+        qint64 grandTotal = 0;
+
+        for (const QFileInfo &fi : subdirs) {
+            QDir sub(fi.absoluteFilePath());
+            FolderInfo fiinfo;
+            fiinfo.name = fi.fileName();
+            fiinfo.size = computeFolderSize(sub);
+            collectFiles(sub, sub, fiinfo.files);
+            folders.push_back(std::move(fiinfo));
+            grandTotal += folders.back().size;
+        }
+
+        qint64 overallProcessed = 0;
+        QElapsedTimer overallTimer;
+        overallTimer.start();
+
+        for (const auto &folder : folders) {
+            emit subfolderStarted(folder.name, folder.size);
+            QElapsedTimer subTimer;
+            subTimer.start();
+
+            QString zipPath = out.filePath(folder.name + ".zip");
+            int err = 0;
+            zip_t *za = zip_open(zipPath.toUtf8().constData(), ZIP_CREATE | ZIP_TRUNCATE, &err);
+            if (!za) {
+                emit error(tr("Failed to create zip for %1 (libzip error %2)").arg(folder.name).arg(err));
+                continue;
+            }
+
+            qint64 subProcessed = 0;
+            for (const auto &fe : folder.files) {
+                zip_source_t *zs = zip_source_file(za, fe.absolute.toUtf8().constData(), 0, 0);
+                if (!zs) {
+                    // skip file but continue
+                    continue;
+                }
+                zip_int64_t idx = zip_file_add(za, fe.relative.toUtf8().constData(), zs, ZIP_FL_ENC_UTF_8);
+                if (idx < 0) {
+                    zip_source_free(zs);
+                    continue;
+                }
+
+                // Notify UI about the file that was added
+                emit fileAdded(fe.relative);
+
+                subProcessed += fe.size;
+                overallProcessed += fe.size;
+
+                emit subfolderProgress(subProcessed, folder.size, subTimer.elapsed());
+                emit overallProgress(overallProcessed, grandTotal, overallTimer.elapsed());
+
+                // Small sleep to keep UI responsive on very fast loops
+                QThread::msleep(1);
+            }
+
+            if (zip_close(za) < 0) {
+                zip_discard(za);
+                emit error(tr("Failed to finalize zip %1").arg(zipPath));
+            }
+
+            emit subfolderFinished(folder.name);
+        }
+
+        emit finished();
+    }
+
+private:
+    QString inputDir;
+    QString outputDir;
+
+    static qint64 computeFolderSize(const QDir &dir) {
+        qint64 total = 0;
+        QFileInfoList entries = dir.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::DirsFirst);
+        for (const QFileInfo &fi : entries) {
+            if (fi.isDir()) total += computeFolderSize(QDir(fi.absoluteFilePath()));
+            else total += fi.size();
+        }
+        return total;
+    }
+
+    static void collectFiles(const QDir &base, const QDir &current, std::vector<FileEntry> &out) {
+        QFileInfoList entries = current.entryInfoList(QDir::Files | QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden | QDir::System, QDir::DirsFirst);
+        for (const QFileInfo &fi : entries) {
+            if (fi.isDir()) collectFiles(base, QDir(fi.absoluteFilePath()), out);
+            else {
+                FileEntry e;
+                e.absolute = fi.absoluteFilePath();
+                e.relative = base.relativeFilePath(e.absolute);
+                e.size = fi.size();
+                out.push_back(std::move(e));
+            }
+        }
+    }
+};
+
+class MainWindow : public QWidget {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr) : QWidget(parent) {
+        setWindowTitle(tr("Per Subfolder Zip Archiver"));
+
+        auto *layout = new QVBoxLayout(this);
+
+        auto *pickLayout = new QHBoxLayout();
+        inputLabel = new QLabel(tr("Input folder: <none>"));
+        outputLabel = new QLabel(tr("Output folder: <none>"));
+        QPushButton *pickInput = new QPushButton(tr("Choose Input Folder"));
+        QPushButton *pickOutput = new QPushButton(tr("Choose Output Folder"));
+        pickLayout->addWidget(pickInput);
+        pickLayout->addWidget(inputLabel);
+        pickLayout->addWidget(pickOutput);
+        pickLayout->addWidget(outputLabel);
+        layout->addLayout(pickLayout);
+
+        subLabel = new QLabel(tr("Current Subfolder: -"));
+        subProgress = new QProgressBar();
+        subProgress->setRange(0, 1000);
+        subEta = new QLabel(tr("ETA Subfolder: --:--:--"));
+
+        overallLabel = new QLabel(tr("Overall Progress"));
+        overallProgress = new QProgressBar();
+        overallProgress->setRange(0, 1000);
+        overallEta = new QLabel(tr("ETA Overall: --:--:--"));
+
+        layout->addWidget(subLabel);
+        layout->addWidget(subProgress);
+        layout->addWidget(subEta);
+        layout->addSpacing(10);
+        layout->addWidget(overallLabel);
+        layout->addWidget(overallProgress);
+        layout->addWidget(overallEta);
+
+        // File output area
+        QLabel *filesLabel = new QLabel(tr("Files being compressed"));
+        fileList = new QListWidget();
+        fileList->setSelectionMode(QAbstractItemView::NoSelection);
+        fileList->setFocusPolicy(Qt::NoFocus);
+        fileList->setMinimumHeight(160);
+        layout->addWidget(filesLabel);
+        layout->addWidget(fileList);
+
+        startButton = new QPushButton(tr("Start"));
+        startButton->setEnabled(false);
+        layout->addWidget(startButton);
+
+        connect(pickInput, &QPushButton::clicked, this, &MainWindow::chooseInput);
+        connect(pickOutput, &QPushButton::clicked, this, &MainWindow::chooseOutput);
+        connect(startButton, &QPushButton::clicked, this, &MainWindow::startWork);
+
+        workerThread = nullptr;
+        worker = nullptr;
+    }
+
+    ~MainWindow() override {
+        if (workerThread) {
+            workerThread->quit();
+            workerThread->wait();
+            delete workerThread;
+        }
+    }
+
+private slots:
+    void chooseInput() {
+        QString dir = QFileDialog::getExistingDirectory(this, tr("Select Input Folder"));
+        if (!dir.isEmpty()) {
+            inputPath = dir;
+            inputLabel->setText(tr("Input folder: %1").arg(dir));
+            updateStartEnabled();
+        }
+    }
+    void chooseOutput() {
+        QString dir = QFileDialog::getExistingDirectory(this, tr("Select Output Folder"));
+        if (!dir.isEmpty()) {
+            outputPath = dir;
+            outputLabel->setText(tr("Output folder: %1").arg(dir));
+            updateStartEnabled();
+        }
+    }
+    void startWork() {
+        startButton->setEnabled(false);
+        subProgress->setValue(0);
+        overallProgress->setValue(0);
+        subLabel->setText(tr("Current Subfolder: -"));
+        subEta->setText(tr("ETA Subfolder: --:--:--"));
+        overallEta->setText(tr("ETA Overall: --:--:--"));
+        fileList->clear();
+
+        workerThread = new QThread();
+        worker = new ZipWorker();
+        worker->setPaths(inputPath, outputPath);
+        worker->moveToThread(workerThread);
+
+        connect(workerThread, &QThread::started, worker, &ZipWorker::process);
+        connect(worker, &ZipWorker::finished, this, &MainWindow::onFinished);
+        connect(worker, &ZipWorker::finished, workerThread, &QThread::quit);
+        connect(workerThread, &QThread::finished, workerThread, &QThread::deleteLater);
+        connect(worker, &ZipWorker::error, this, &MainWindow::onError);
+
+        connect(worker, &ZipWorker::subfolderStarted, this, &MainWindow::onSubfolderStarted);
+        connect(worker, &ZipWorker::subfolderProgress, this, &MainWindow::onSubfolderProgress);
+        connect(worker, &ZipWorker::overallProgress, this, &MainWindow::onOverallProgress);
+        connect(worker, &ZipWorker::subfolderFinished, this, &MainWindow::onSubfolderFinished);
+
+        // New connection for file output
+        connect(worker, &ZipWorker::fileAdded, this, &MainWindow::onFileAdded);
+
+        workerThread->start();
+    }
+
+    void onSubfolderStarted(const QString &name, qint64 totalBytes) {
+        currentSubTotal = totalBytes;
+        currentSubProcessed = 0;
+        subLabel->setText(tr("Current Subfolder: %1").arg(name));
+        subProgress->setValue(0);
+        subStart.restart();
+    }
+
+    void onSubfolderProgress(qint64 processed, qint64 total, qint64 elapsedMs) {
+        Q_UNUSED(total);
+        currentSubProcessed = processed;
+        updateProgressBar(subProgress, processed, currentSubTotal);
+        subEta->setText(tr("ETA Subfolder: %1").arg(formatEta(processed, currentSubTotal, elapsedMs)));
+    }
+
+    void onOverallProgress(qint64 processed, qint64 total, qint64 elapsedMs) {
+        overallTotal = total;
+        overallProcessed = processed;
+        updateProgressBar(overallProgress, processed, overallTotal);
+        overallEta->setText(tr("ETA Overall: %1").arg(formatEta(processed, overallTotal, elapsedMs)));
+    }
+
+    void onSubfolderFinished(const QString &name) {
+        Q_UNUSED(name);
+        subProgress->setValue(subProgress->maximum());
+        subEta->setText(tr("ETA Subfolder: 00:00:00"));
+    }
+
+    void onFileAdded(const QString &relativePath) {
+        // Append to list and keep it trimmed
+        fileList->addItem(relativePath);
+        // Keep only last N entries
+        const int maxItems = 200;
+        while (fileList->count() > maxItems) {
+            delete fileList->takeItem(0);
+        }
+        fileList->scrollToBottom();
+    }
+
+    void onFinished() {
+        QMessageBox::information(this, tr("Done"), tr("All subfolders processed"));
+        startButton->setEnabled(true);
+        if (worker) { worker->deleteLater(); worker = nullptr; }
+        workerThread = nullptr;
+    }
+
+    void onError(const QString &msg) {
+        QMessageBox::warning(this, tr("Error"), msg);
+        startButton->setEnabled(true);
+    }
+
+private:
+    QLabel *inputLabel;
+    QLabel *outputLabel;
+    QLabel *subLabel;
+    QLabel *subEta;
+    QLabel *overallLabel;
+    QLabel *overallEta;
+    QProgressBar *subProgress;
+    QProgressBar *overallProgress;
+    QPushButton *startButton;
+    QListWidget *fileList;
+
+    QString inputPath;
+    QString outputPath;
+
+    QThread *workerThread;
+    ZipWorker *worker;
+
+    qint64 currentSubTotal = 0;
+    qint64 currentSubProcessed = 0;
+    qint64 overallTotal = 0;
+    qint64 overallProcessed = 0;
+    QElapsedTimer subStart;
+
+    void updateStartEnabled() {
+        startButton->setEnabled(!inputPath.isEmpty() && !outputPath.isEmpty());
+    }
+
+    static void updateProgressBar(QProgressBar *bar, qint64 processed, qint64 total) {
+        if (total <= 0) { bar->setValue(bar->maximum()); return; }
+        double frac = double(processed) / double(total);
+        int val = int(frac * bar->maximum());
+        bar->setValue(val);
+    }
+
+    static QString formatEta(qint64 processed, qint64 total, qint64 elapsedMs) {
+        if (elapsedMs <= 0 || processed <= 0 || total <= processed) return QStringLiteral("00:00:00");
+        double rate = double(processed) / (elapsedMs / 1000.0);
+        if (rate <= 0.0) return QStringLiteral("--:--:--");
+        double remaining = double(total - processed);
+        qint64 eta = qint64(remaining / rate);
+        int h = int(eta / 3600);
+        int m = int((eta % 3600) / 60);
+        int s = int(eta % 60);
+        return QString("%1:%2:%3").arg(h,2,10,QChar('0')).arg(m,2,10,QChar('0')).arg(s,2,10,QChar('0'));
+    }
+};
+
+#include "zipback1.moc"
+
+int main(int argc, char *argv[]) {
+    QApplication a(argc, argv);
+    MainWindow w;
+    w.resize(900, 520);
+    w.show();
+    return a.exec();
+}
+
+#include <QObject>

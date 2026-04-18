@@ -1,0 +1,175 @@
+==== https://www.army.mil ====
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta content='width=device-width, initial-scale=1.0' name='viewport' />
+    <meta name="apple-itunes-app" content="app-id=342689843">
+    <meta property="og:title" content="The Official Home Page of the United States Army" />
+<meta property="og:type" content="website" />
+<meta property="og:description" content="The latest news, images, videos, career information, and links from the U.S. Army." />
+<meta property="og:image" co
+
+==== https://www.nsa.gov ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;nsa&#46;gov&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;aee22517&#46;1761578739&#46;6e6c7a77
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;aee22517&#46;1761578739&#46;6e6c7a77</P>
+</BODY>
+</HTML>
+
+
+==== https://www.af.mil ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;af&#46;mil&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;9fe22517&#46;1761578739&#46;1fe8b967
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;9fe22517&#46;1761578739&#46;1fe8b967</P>
+</BODY>
+</HTML>
+
+
+==== https://www.spaceforce.mil ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;spaceforce&#46;mil&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;b7e22517&#46;1761578739&#46;5f7e145d
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;b7e22517&#46;1761578739&#46;5f7e145d</P>
+</BODY>
+</HTML>
+
+
+==== https://www.marines.mil ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;marines&#46;mil&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;76e22517&#46;1761578739&#46;84c598e8
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;76e22517&#46;1761578739&#46;84c598e8</P>
+</BODY>
+</HTML>
+
+
+==== https://www.defense.gov ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;defense&#46;gov&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;9878ce17&#46;1761578740&#46;18960d19
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;9878ce17&#46;1761578740&#46;18960d19</P>
+</BODY>
+</HTML>
+
+
+==== https://www.state.gov ====
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Technical Difficulties</title>
+    <style>
+    	body, html {
+		  height: 80%;
+		  display: grid;
+		}
+		body{
+			padding:0 1em;
+		}
+		div.main { /* thing to center */
+		  margin: auto;
+		  text-align:center;
+		  width:100%;
+		}
+		.main p {
+			font-family: Arial, "Helvetica Neue", Helvetica, sans-serif;
+			font-size: 110%;
+			font-style: normal
+
+==== https://www.nps.gov ====
+
+
+==== https://www.fbi.gov ====
+<!DOCTYPE html><html lang="en-US"><head><title>Just a moment...</title><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><meta http-equiv="X-UA-Compatible" content="IE=Edge"><meta name="robots" content="noindex,nofollow"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box;margin:0;padding:0}html{line-height:1.15;-webkit-text-size-adjust:100%;color:#313131;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helve
+
+==== https://www.navy.mil ====
+<HTML><HEAD>
+<TITLE>Access Denied</TITLE>
+</HEAD><BODY>
+<H1>Access Denied</H1>
+ 
+You don't have permission to access "http&#58;&#47;&#47;www&#46;navy&#46;mil&#47;" on this server.<P>
+Reference&#32;&#35;18&#46;d4e22517&#46;1761578742&#46;7098e201
+<P>https&#58;&#47;&#47;errors&#46;edgesuite&#46;net&#47;18&#46;d4e22517&#46;1761578742&#46;7098e201</P>
+</BODY>
+</HTML>
+
+
+==== https://www.loc.gov ====
+<!DOCTYPE html>
+
+
+<html lang="en" class="no-js" prefix="lc: http://loc.gov/#">
+<head>
+
+<meta name="description"
+      content="The Library of Congress is the nation's oldest federal cultural institution, and it serves as the research arm of Congress. It is also the largest library in the world, with more than 162 million items. The collections include books, sound recordings, motion pictures, photographs, maps, and manuscripts." />
+
+<meta name="dc.identifier"
+      content="http://www.loc.gov/" 
+
+==== https://www.whitehouse.gov ====
+<!DOCTYPE html>
+<html lang="en-US">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name='robots' content='index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1' />
+	<style>img:is([sizes="auto" i], [sizes^="auto," i]) { contain-intrinsic-size: 3000px 1500px }</style>
+	
+	<meta name="description" content="President Donald J. Trump and Vice President JD Vance are committed to lowering costs for all Americans, secu
+
+==== https://www.dhs.gov ====
+<!DOCTYPE html>
+<html lang="en" dir="ltr" prefix="og: https://ogp.me/ns#">
+  <head>
+    <meta charset="utf-8" />
+<script async src="/sites/default/files/google_analytics/gtag.js?t4sg7w"></script>
+<script>window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments)};gtag("js", new Date());gtag("set", "developer_id.dMDhkMT", true);gtag("config", "UA-32318423-1", {"groups":"default","anonymize_ip":true,"page_placeholder":"PLACEHOLDER_page_path","allow_ad_personalization_signa
+
+==== https://www.justice.gov ====
+
+<!DOCTYPE html>
+<html lang="en" dir="ltr" prefix="og: https://ogp.me/ns#">
+  <head>
+    <meta charset="utf-8" />
+<meta name="description" content="Official website of the U.S. Department of Justice (DOJ). DOJ’s mission is to enforce the law and defend the interests of the United States according to the law; to ensure public safety against threats foreign and domestic; to provide federal leadership in preventing and controlling crime; to seek just punishment for those guilty of unlawful behavi
+
+==== https://www.va.gov ====
+<!DOCTYPE html><!--[if lt IE 7 ]> <html lang="en" class="ie6"> <![endif]--><!--[if IE 7 ]> <html lang="en" class="ie7"> <![endif]--><!--[if IE 8 ]> <html lang="en" class="ie8"> <![endif]--><!--[if IE 9 ]> <html lang="en" class="ie9"> <![endif]--><!--[if (gt IE 9)|!(IE)]><!--><html lang="en"><!--<![endif]--><!--
+  layout: home.drupal.liquid
+  path: 
+  entityId: N/A
+--><head>
+  <meta charset="utf-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="HandheldFriendly" content="T
+
+==== https://www.cia.gov ====
+<!DOCTYPE html><html lang="en"><head><meta charSet="utf-8"/><meta http-equiv="x-ua-compatible" content="ie=edge"/><meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no"/><style id="typography.js">html{font-family:sans-serif;-ms-text-size-adjust:100%;-webkit-text-size-adjust:100%}body{margin:0}article,aside,details,figcaption,figure,footer,header,main,menu,nav,section,summary{display:block}audio,canvas,progress,video{display:inline-block}audio:not([controls]){displa
+

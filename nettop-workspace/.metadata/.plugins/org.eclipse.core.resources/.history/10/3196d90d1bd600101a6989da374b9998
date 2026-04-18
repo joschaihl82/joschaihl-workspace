@@ -1,0 +1,12 @@
+[
+{
+  "directory": "/home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local/nettop_qt_autogen/include -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -isystem /usr/include/x86_64-linux-gnu/qt5 -isystem /usr/include/x86_64-linux-gnu/qt5/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt5/QtGui -isystem /usr/include/x86_64-linux-gnu/qt5/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt5/mkspecs/linux-g++ -O3 -DNDEBUG -Wall -Wextra -Wpedantic -fPIC -std=gnu++17 -o CMakeFiles/nettop_qt.dir/nettop_qt_autogen/mocs_compilation.cpp.o -c /home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local/nettop_qt_autogen/mocs_compilation.cpp",
+  "file": "/home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local/nettop_qt_autogen/mocs_compilation.cpp"
+},
+{
+  "directory": "/home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/josh/nettop-workspace/nettop/build/cmake.run.linux.x86_64.Local/nettop_qt_autogen/include -I/usr/include/dbus-1.0 -I/usr/lib/x86_64-linux-gnu/dbus-1.0/include -isystem /usr/include/x86_64-linux-gnu/qt5 -isystem /usr/include/x86_64-linux-gnu/qt5/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt5/QtGui -isystem /usr/include/x86_64-linux-gnu/qt5/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt5/mkspecs/linux-g++ -O3 -DNDEBUG -Wall -Wextra -Wpedantic -fPIC -std=gnu++17 -o CMakeFiles/nettop_qt.dir/nettop.cpp.o -c /home/josh/nettop-workspace/nettop/nettop.cpp",
+  "file": "/home/josh/nettop-workspace/nettop/nettop.cpp"
+}
+]

@@ -1,0 +1,1 @@
+buildme.sh: 17: clangwrap: not found

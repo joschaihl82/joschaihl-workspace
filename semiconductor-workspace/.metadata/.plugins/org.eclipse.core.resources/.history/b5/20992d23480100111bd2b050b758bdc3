@@ -1,0 +1,450 @@
+// main.cpp
+// Qt6 Paint-like application (single-file example)
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QToolBar>
+#include <QAction>
+#include <QIcon>
+#include <QPainter>
+#include <QMouseEvent>
+#include <QImage>
+#include <QColorDialog>
+#include <QFileDialog>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QWidget>
+#include <QLabel>
+#include <QSlider>
+#include <QPushButton>
+#include <QComboBox>
+#include <QStack>
+#include <QKeyEvent>
+#include <QStatusBar>
+#include <QMessageBox>
+
+// Tools
+enum class Tool {
+    Pencil,
+    Brush,
+    Eraser,
+    Line,
+    Rect,
+    FillRect
+};
+
+// Simple undo snapshot (store QImage)
+using Snapshot = QImage;
+
+class Canvas : public QWidget {
+    Q_OBJECT
+public:
+    Canvas(QWidget* parent = nullptr)
+        : QWidget(parent),
+          m_tool(Tool::Pencil),
+          m_brushSize(4),
+          m_color(Qt::black),
+          m_bgColor(Qt::white),
+          m_drawing(false),
+          m_preview(false)
+    {
+        setAttribute(Qt::WA_StaticContents);
+        // default canvas size
+        m_image = QImage(1024, 768, QImage::Format_ARGB32);
+        m_image.fill(m_bgColor);
+        setMinimumSize(800, 600);
+    }
+
+    // API
+    void setTool(Tool t) { m_tool = t; }
+    void setBrushSize(int s) { m_brushSize = s; }
+    void setColor(const QColor& c) { m_color = c; }
+    void clear() {
+        pushUndo();
+        m_image.fill(m_bgColor);
+        update();
+    }
+    bool saveImage(const QString& path) {
+        return m_image.save(path);
+    }
+    bool loadImage(const QString& path) {
+        QImage img;
+        if (!img.load(path)) return false;
+        pushUndo();
+        m_image = img.convertToFormat(QImage::Format_ARGB32);
+        update();
+        return true;
+    }
+    void pushUndo() {
+        // limit undo stack size
+        m_undo.push(m_image);
+        if (m_undo.size() > 20) m_undo.remove(0);
+    }
+    void undo() {
+        if (!m_undo.isEmpty()) {
+            m_image = m_undo.pop();
+            update();
+        }
+    }
+
+protected:
+    void paintEvent(QPaintEvent* /*ev*/) override {
+        QPainter p(this);
+        p.fillRect(rect(), m_bgColor);
+        // center image if smaller than widget
+        QRect target(0,0, width(), height());
+        p.drawImage(target, m_image);
+
+        // preview overlay
+        if (m_preview) {
+            p.setRenderHint(QPainter::Antialiasing, true);
+            QPen pen(m_color);
+            pen.setWidth(m_brushSize);
+            pen.setStyle(Qt::SolidLine);
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            QColor semi = m_color;
+            semi.setAlpha(180);
+            pen.setColor(semi);
+            p.setPen(pen);
+            if (m_tool == Tool::Line) {
+                p.drawLine(m_startPoint, m_lastPoint);
+            } else if (m_tool == Tool::Rect || m_tool == Tool::FillRect) {
+                QRect r(m_startPoint, m_lastPoint);
+                if (m_tool == Tool::FillRect) {
+                    QColor fill = m_color; fill.setAlpha(160);
+                    p.fillRect(r.normalized(), fill);
+                } else {
+                    p.drawRect(r.normalized());
+                }
+            }
+        }
+    }
+
+    void mousePressEvent(QMouseEvent* ev) override {
+        if (ev->button() != Qt::LeftButton) return;
+        QPoint pos = ev->pos();
+        if (!rect().contains(pos)) return;
+
+        // convert to image coordinates (1:1 mapping here)
+        QPoint imgPos = pos;
+
+        // start drawing
+        m_drawing = true;
+        m_lastPoint = imgPos;
+        m_startPoint = imgPos;
+
+        // For immediate tools (pencil/brush/eraser) draw a point and push undo
+        if (m_tool == Tool::Pencil || m_tool == Tool::Brush || m_tool == Tool::Eraser) {
+            pushUndo();
+            QPainter p(&m_image);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            QColor col = (m_tool == Tool::Eraser) ? m_bgColor : m_color;
+            QPen pen(col);
+            pen.setWidth(m_brushSize);
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            p.setPen(pen);
+            p.drawPoint(imgPos);
+            update();
+        } else {
+            // for shape tools enable preview (no immediate commit)
+            m_preview = true;
+        }
+    }
+
+    void mouseMoveEvent(QMouseEvent* ev) override {
+        if (!m_drawing) return;
+        QPoint pos = ev->pos();
+        QPoint imgPos = pos;
+        // constrain to widget bounds
+        imgPos.setX(qBound(0, imgPos.x(), m_image.width()-1));
+        imgPos.setY(qBound(0, imgPos.y(), m_image.height()-1));
+
+        if (m_tool == Tool::Pencil || m_tool == Tool::Brush || m_tool == Tool::Eraser) {
+            // draw continuous line from last to current
+            QPainter p(&m_image);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            QColor col = (m_tool == Tool::Eraser) ? m_bgColor : m_color;
+            QPen pen(col);
+            pen.setWidth(m_brushSize);
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            p.setPen(pen);
+            p.drawLine(m_lastPoint, imgPos);
+            m_lastPoint = imgPos;
+            update();
+        } else {
+            // shape preview
+            m_lastPoint = imgPos;
+            // if Shift pressed, constrain angle to 0/45/90
+            if (QApplication::keyboardModifiers() & Qt::ShiftModifier) {
+                QPoint delta = m_lastPoint - m_startPoint;
+                int dx = delta.x();
+                int dy = delta.y();
+                if (abs(dx) > abs(dy)) {
+                    // horizontal
+                    m_lastPoint.setY(m_startPoint.y());
+                } else if (abs(dy) > abs(dx)) {
+                    // vertical
+                    m_lastPoint.setX(m_startPoint.x());
+                } else {
+                    // diagonal 45°
+                    int s = (dx >= 0 ? 1 : -1);
+                    m_lastPoint.setX(m_startPoint.x() + s * abs(dy));
+                }
+            }
+            update();
+        }
+    }
+
+    void mouseReleaseEvent(QMouseEvent* ev) override {
+        if (!m_drawing || ev->button() != Qt::LeftButton) return;
+        QPoint pos = ev->pos();
+        QPoint imgPos = pos;
+        imgPos.setX(qBound(0, imgPos.x(), m_image.width()-1));
+        imgPos.setY(qBound(0, imgPos.y(), m_image.height()-1));
+
+        if (m_tool == Tool::Pencil || m_tool == Tool::Brush || m_tool == Tool::Eraser) {
+            // already drawn during move; nothing else
+            // but ensure we have an undo snapshot (already pushed on press)
+        } else {
+            // commit shape to image
+            pushUndo();
+            QPainter p(&m_image);
+            p.setRenderHint(QPainter::Antialiasing, true);
+            if (m_tool == Tool::Line) {
+                QPen pen(m_color);
+                pen.setWidth(m_brushSize);
+                pen.setCapStyle(Qt::RoundCap);
+                p.setPen(pen);
+                p.drawLine(m_startPoint, imgPos);
+            } else if (m_tool == Tool::Rect) {
+                QPen pen(m_color);
+                pen.setWidth(m_brushSize);
+                p.setPen(pen);
+                QRect r(m_startPoint, imgPos);
+                p.drawRect(r.normalized());
+            } else if (m_tool == Tool::FillRect) {
+                QColor fill = m_color;
+                p.fillRect(QRect(m_startPoint, imgPos).normalized(), fill);
+            }
+        }
+
+        m_drawing = false;
+        m_preview = false;
+        update();
+    }
+
+    QSize sizeHint() const override {
+        return QSize(m_image.width(), m_image.height());
+    }
+
+public slots:
+    void setCanvasSize(int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        pushUndo();
+        QImage newImg(w, h, QImage::Format_ARGB32);
+        newImg.fill(m_bgColor);
+        QPainter p(&newImg);
+        p.drawImage(0,0, m_image);
+        m_image = newImg;
+        update();
+    }
+
+private:
+    QImage m_image;
+    Tool m_tool;
+    int m_brushSize;
+    QColor m_color;
+    QColor m_bgColor;
+
+    bool m_drawing;
+    bool m_preview;
+    QPoint m_lastPoint;
+    QPoint m_startPoint;
+
+    QStack<Snapshot> m_undo;
+};
+
+// Main window with toolbar and controls
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        setWindowTitle("Qt6 Paint Clone");
+
+        m_canvas = new Canvas(this);
+        setCentralWidget(m_canvas);
+
+        createActions();
+        createToolBar();
+        createSidePanel();
+        createStatusBar();
+        resize(1100, 760);
+    }
+
+private slots:
+    void selectPencil() { m_canvas->setTool(Tool::Pencil); updateStatus(); }
+    void selectBrush()  { m_canvas->setTool(Tool::Brush); updateStatus(); }
+    void selectEraser() { m_canvas->setTool(Tool::Eraser); updateStatus(); }
+    void selectLine()   { m_canvas->setTool(Tool::Line); updateStatus(); }
+    void selectRect()   { m_canvas->setTool(Tool::Rect); updateStatus(); }
+    void selectFillRect(){ m_canvas->setTool(Tool::FillRect); updateStatus(); }
+
+    void chooseColor() {
+        QColor c = QColorDialog::getColor(Qt::black, this, "Wähle Farbe");
+        if (c.isValid()) {
+            m_color = c;
+            m_canvas->setColor(m_color);
+            m_colorPreview->setStyleSheet(QString("background-color: %1").arg(c.name()));
+            updateStatus();
+        }
+    }
+
+    void brushSizeChanged(int v) {
+        m_canvas->setBrushSize(v);
+        updateStatus();
+    }
+
+    void newCanvas() {
+        if (QMessageBox::question(this, "Neu", "Leeres Bild erstellen? Aktuelle Arbeit wird verworfen (kann rückgängig gemacht werden).") == QMessageBox::Yes) {
+            m_canvas->clear();
+        }
+    }
+
+    void save() {
+        QString fn = QFileDialog::getSaveFileName(this, "Speichern als PNG", QString(), "PNG Files (*.png)");
+        if (!fn.isEmpty()) {
+            if (!fn.endsWith(".png", Qt::CaseInsensitive)) fn += ".png";
+            if (!m_canvas->saveImage(fn)) {
+                QMessageBox::warning(this, "Fehler", "Speichern fehlgeschlagen.");
+            }
+        }
+    }
+
+    void load() {
+        QString fn = QFileDialog::getOpenFileName(this, "Bild öffnen", QString(), "Images (*.png *.jpg *.bmp)");
+        if (!fn.isEmpty()) {
+            if (!m_canvas->loadImage(fn)) {
+                QMessageBox::warning(this, "Fehler", "Laden fehlgeschlagen.");
+            }
+        }
+    }
+
+    void undo() {
+        m_canvas->undo();
+    }
+
+private:
+    void createActions() {
+        // actions created inline in toolbar
+    }
+
+    void createToolBar() {
+        QToolBar* tb = addToolBar("Werkzeuge");
+        tb->setMovable(false);
+
+        QAction* aPencil = tb->addAction("Pencil");
+        connect(aPencil, &QAction::triggered, this, &MainWindow::selectPencil);
+
+        QAction* aBrush = tb->addAction("Brush");
+        connect(aBrush, &QAction::triggered, this, &MainWindow::selectBrush);
+
+        QAction* aEraser = tb->addAction("Eraser");
+        connect(aEraser, &QAction::triggered, this, &MainWindow::selectEraser);
+
+        QAction* aLine = tb->addAction("Line");
+        connect(aLine, &QAction::triggered, this, &MainWindow::selectLine);
+
+        QAction* aRect = tb->addAction("Rect");
+        connect(aRect, &QAction::triggered, this, &MainWindow::selectRect);
+
+        QAction* aFillRect = tb->addAction("FillRect");
+        connect(aFillRect, &QAction::triggered, this, &MainWindow::selectFillRect);
+
+        tb->addSeparator();
+
+        QAction* aColor = tb->addAction("Color...");
+        connect(aColor, &QAction::triggered, this, &MainWindow::chooseColor);
+
+        QAction* aUndo = tb->addAction("Undo");
+        connect(aUndo, &QAction::triggered, this, &MainWindow::undo);
+
+        QAction* aSave = tb->addAction("Save");
+        connect(aSave, &QAction::triggered, this, &MainWindow::save);
+
+        QAction* aLoad = tb->addAction("Load");
+        connect(aLoad, &QAction::triggered, this, &MainWindow::load);
+
+        QAction* aNew = tb->addAction("New");
+        connect(aNew, &QAction::triggered, this, &MainWindow::newCanvas);
+    }
+
+    void createSidePanel() {
+        QWidget* side = new QWidget(this);
+        QVBoxLayout* v = new QVBoxLayout(side);
+        v->setContentsMargins(6,6,6,6);
+
+        QLabel* lbl = new QLabel("Pinselgröße:");
+        v->addWidget(lbl);
+
+        QSlider* slider = new QSlider(Qt::Horizontal);
+        slider->setRange(1, 50);
+        slider->setValue(4);
+        connect(slider, &QSlider::valueChanged, this, &MainWindow::brushSizeChanged);
+        v->addWidget(slider);
+
+        QLabel* lblColor = new QLabel("Farbe:");
+        v->addWidget(lblColor);
+
+        m_colorPreview = new QLabel;
+        m_colorPreview->setFixedSize(64,64);
+        m_colorPreview->setStyleSheet("background-color: black");
+        v->addWidget(m_colorPreview);
+
+        QPushButton* btnColor = new QPushButton("Farbe wählen...");
+        connect(btnColor, &QPushButton::clicked, this, &MainWindow::chooseColor);
+        v->addWidget(btnColor);
+
+        v->addStretch(1);
+
+        // Dock the side panel to the right
+        QWidget* container = new QWidget;
+        QHBoxLayout* layout = new QHBoxLayout(container);
+        layout->setContentsMargins(0,0,0,0);
+        layout->addWidget(m_canvas);
+        layout->addWidget(side);
+        setCentralWidget(container);
+
+        // initialize color
+        m_color = Qt::black;
+        m_canvas->setColor(m_color);
+    }
+
+    void createStatusBar() {
+        statusBar()->showMessage("Tool: Pencil | Brush size: 4");
+    }
+
+    void updateStatus() {
+        QString toolName;
+        Tool t = m_canvas->property("tool").isValid() ? m_canvas->property("tool").value<Tool>() : Tool::Pencil;
+        // we don't store tool property; instead query via UI state: simpler to show generic
+        // show brush size and color
+        statusBar()->showMessage(QString("Brush size: %1 | Color: %2").arg(m_canvas->property("brushSize").toInt()).arg(m_color.name()));
+    }
+
+private:
+    Canvas* m_canvas;
+    QLabel* m_colorPreview;
+    QColor m_color;
+};
+
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include "main.moc"

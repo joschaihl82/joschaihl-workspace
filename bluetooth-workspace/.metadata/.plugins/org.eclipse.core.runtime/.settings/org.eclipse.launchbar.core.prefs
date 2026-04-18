@@ -1,0 +1,9 @@
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.cdt.debug.core.coreBuildDescriptorType\:pc-dialer2,org.eclipse.launchbar.core.descriptorType.default\:qt_bt_headset,org.eclipse.launchbar.core.descriptorType.default\:qt_bt_headset (1)
+eclipse.preferences.version=1
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:pc-dialer/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:pc-dialer/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:pc-dialer2/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:pc-dialer2/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

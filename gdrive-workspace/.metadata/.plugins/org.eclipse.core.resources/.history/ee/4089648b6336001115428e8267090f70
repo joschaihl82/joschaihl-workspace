@@ -1,0 +1,8 @@
+# ninja log v6
+2	307	1775993304690268752	DriveSyncQt6_autogen/timestamp	1cd76288b3cb4eb4
+2	307	1775993304690268752	DriveSyncQt6_autogen/mocs_compilation.cpp	1cd76288b3cb4eb4
+2	307	1775993304690268752	/home/joscha/gdrive-workspace/gdrive6/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/timestamp	1cd76288b3cb4eb4
+2	307	1775993304690268752	/home/joscha/gdrive-workspace/gdrive6/build/cmake.run.linux.x86_64.Local/DriveSyncQt6_autogen/mocs_compilation.cpp	1cd76288b3cb4eb4
+307	318	1775993304702210466	CMakeFiles/DriveSyncQt6.dir/DriveSyncQt6_autogen/mocs_compilation.cpp.o	c0497972151b7774
+308	4926	1775993304702268753	CMakeFiles/DriveSyncQt6.dir/main.cpp.o	58441d4e58a4ffc7
+4926	5476	1775993309320269522	DriveSyncQt6	e5b87584cb183916

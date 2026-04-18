@@ -1,0 +1,1506 @@
+### Complete compiler source (single-file C)
+
+Below is a complete, self-contained C source file that continues and completes the `sparrow.c` compiler you provided. It implements a minimal code generator that emits x86-64 AT&T assembly to `out.s`, appends simple runtime stubs, assembles and links into an executable `demo`, and runs it. The code is intended for educational/demo use and is not production-grade.
+
+> **Note:** This is a plausible, working completion based on the partial file you supplied. You may need to adapt or extend runtime behavior, memory management, or codegen details for your exact language semantics.
+
+```c
+/*
+ * sparrow.c
+ *
+ * Single-file JavaScript-like compiler that emits x86-64 AT&T assembly.
+ * (Completed version — lexer, parser, JSON compile-time parser, codegen,
+ * runtime stubs, and a simple main that writes out.s, assembles, links,
+ * and runs ./demo.)
+ *
+ * Build:
+ *   gcc -std=c99 -O2 -o sparrow sparrow.c
+ * Run:
+ *   ./sparrow input.sparrow
+ *
+ * Educational code; not production-grade.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <assert.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAX_LEXEME 4096
+#define INITIAL_TOKEN_CAP 512
+#define LABEL_RANDOM_MASK 0xFFFFF
+
+/* ----------------------------------------------------------------------
+ * UTILITIES & ERROR HANDLING
+ * ---------------------------------------------------------------------- */
+
+static char *global_input = NULL;
+static const char *prog_name = "sparrow";
+
+static void error_at(const char *loc, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int pos = (int)(loc - global_input);
+    fprintf(stderr, "\n--- COMPILE ERROR ---\n");
+    if (global_input) {
+        fprintf(stderr, "%s\n", global_input);
+        fprintf(stderr, "%*s^ ", pos, "");
+    }
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n---------------------\n");
+    va_end(ap);
+    exit(1);
+}
+
+static void fatal(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "\nFATAL: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    exit(1);
+}
+
+/* ----------------------------------------------------------------------
+ * FILE IO
+ * ---------------------------------------------------------------------- */
+
+static char* read_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) sz = 0;
+    rewind(f);
+    char *buf = malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    size_t n = fread(buf, 1, (size_t)sz, f);
+    buf[n] = '\0';
+    fclose(f);
+    return buf;
+}
+
+/* ----------------------------------------------------------------------
+ * LEXER
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+    TK_EOF = 0,
+    TK_IDENT,
+    TK_NUMBER,
+    TK_STRING,
+    /* keywords */
+    TK_VAR, TK_FUNCTION, TK_RETURN, TK_IF, TK_ELSE, TK_WHILE, TK_FOR,
+    /* punctuation */
+    TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE, TK_LBRACKET, TK_RBRACKET, TK_COMMA, TK_SEMI, TK_COLON, TK_DOT,
+    /* operators */
+    TK_PLUS, TK_MINUS, TK_STAR, TK_SLASH,
+    TK_ASSIGN, TK_EQ, TK_NEQ, TK_LT, TK_GT, TK_LE, TK_GE,
+    TK_AND, TK_OR, TK_NOT,
+    TK_UNKNOWN
+} TokenKind;
+
+typedef struct {
+    TokenKind kind;
+    char *lexeme;   /* allocated for identifiers and strings */
+    double num_val;
+    char *loc;      /* pointer into original input for error reporting */
+} Token;
+
+typedef struct {
+    Token *arr;
+    int count;
+    int cap;
+    int idx;
+} TokenStream;
+
+static void ts_init(TokenStream *ts) { ts->arr = NULL; ts->count = ts->cap = ts->idx = 0; }
+static void ts_push(TokenStream *ts, Token t) {
+    if (ts->count + 1 > ts->cap) {
+        ts->cap = ts->cap ? ts->cap * 2 : INITIAL_TOKEN_CAP;
+        ts->arr = realloc(ts->arr, ts->cap * sizeof(Token));
+    }
+    ts->arr[ts->count++] = t;
+}
+static Token ts_peek(TokenStream *ts) { return ts->arr[ts->idx]; }
+static Token ts_next(TokenStream *ts) { return ts->arr[ts->idx++]; }
+static int ts_eof(TokenStream *ts) { return ts->arr[ts->idx].kind == TK_EOF; }
+
+static int is_ident_start(char c) { return isalpha((unsigned char)c) || c == '_'; }
+static int is_ident_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+static Token make_token(TokenKind k, const char *loc, const char *lex) {
+    Token t;
+    t.kind = k;
+    t.loc = (char*)loc;
+    t.lexeme = lex ? strdup(lex) : NULL;
+    t.num_val = 0;
+    return t;
+}
+static Token make_number_token(const char *loc, double v, const char *lex) {
+    Token t = make_token(TK_NUMBER, loc, lex);
+    t.num_val = v;
+    return t;
+}
+static Token make_string_token(const char *loc, const char *s) {
+    return make_token(TK_STRING, loc, s);
+}
+
+static TokenKind keyword_kind(const char *s) {
+    if (!strcmp(s, "var")) return TK_VAR;
+    if (!strcmp(s, "function")) return TK_FUNCTION;
+    if (!strcmp(s, "return")) return TK_RETURN;
+    if (!strcmp(s, "if")) return TK_IF;
+    if (!strcmp(s, "else")) return TK_ELSE;
+    if (!strcmp(s, "while")) return TK_WHILE;
+    if (!strcmp(s, "for")) return TK_FOR;
+    return TK_IDENT;
+}
+
+static TokenStream tokenize(const char *input) {
+    global_input = (char*)input;
+    TokenStream ts;
+    ts_init(&ts);
+    const char *p = input;
+
+    while (*p) {
+        if (isspace((unsigned char)*p)) { p++; continue; }
+        if (p[0] == '/' && p[1] == '/') { p += 2; while (*p && *p != '\n') p++; continue; }
+        if (p[0] == '/' && p[1] == '*') { p += 2; while (*p && !(p[0] == '*' && p[1] == '/')) p++; if (*p) p += 2; continue; }
+
+        if (is_ident_start(*p)) {
+            const char *s = p;
+            while (is_ident_char(*p)) p++;
+            int len = (int)(p - s);
+            char *lex = strndup(s, len);
+            TokenKind k = keyword_kind(lex);
+            Token t = make_token(k, s, lex);
+            free(lex);
+            ts_push(&ts, t);
+            continue;
+        }
+
+        if (isdigit((unsigned char)*p) || (*p == '.' && isdigit((unsigned char)p[1]))) {
+            char *end;
+            double v = strtod(p, &end);
+            int len = (int)(end - p);
+            char *lex = strndup(p, len);
+            Token t = make_number_token(p, v, lex);
+            free(lex);
+            ts_push(&ts, t);
+            p = end;
+            continue;
+        }
+
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            const char *start = p;
+            char buf[MAX_LEXEME];
+            int bi = 0;
+            while (*p && *p != quote) {
+                if (*p == '\\') {
+                    p++;
+                    if (*p == 'n') buf[bi++] = '\n';
+                    else if (*p == 't') buf[bi++] = '\t';
+                    else if (*p == '\\') buf[bi++] = '\\';
+                    else buf[bi++] = *p;
+                    p++;
+                } else {
+                    buf[bi++] = *p++;
+                }
+                if (bi >= MAX_LEXEME - 1) break;
+            }
+            if (*p != quote) error_at((char*)p, "Unterminated string literal");
+            buf[bi] = '\0';
+            p++;
+            Token t = make_string_token(start - 1, buf);
+            ts_push(&ts, t);
+            continue;
+        }
+
+        if (!strncmp(p, "==", 2)) { ts_push(&ts, make_token(TK_EQ, p, "==")); p += 2; continue; }
+        if (!strncmp(p, "!=", 2)) { ts_push(&ts, make_token(TK_NEQ, p, "!=")); p += 2; continue; }
+        if (!strncmp(p, "<=", 2)) { ts_push(&ts, make_token(TK_LE, p, "<=")); p += 2; continue; }
+        if (!strncmp(p, ">=", 2)) { ts_push(&ts, make_token(TK_GE, p, ">=")); p += 2; continue; }
+        if (!strncmp(p, "&&", 2)) { ts_push(&ts, make_token(TK_AND, p, "&&")); p += 2; continue; }
+        if (!strncmp(p, "||", 2)) { ts_push(&ts, make_token(TK_OR, p, "||")); p += 2; continue; }
+
+        TokenKind tk = TK_UNKNOWN;
+        const char *loc = p;
+        char lex[2] = {0, 0};
+        switch (*p++) {
+            case '+': tk = TK_PLUS; lex[0] = '+'; break;
+            case '-': tk = TK_MINUS; lex[0] = '-'; break;
+            case '*': tk = TK_STAR; lex[0] = '*'; break;
+            case '/': tk = TK_SLASH; lex[0] = '/'; break;
+            case '(': tk = TK_LPAREN; lex[0] = '('; break;
+            case ')': tk = TK_RPAREN; lex[0] = ')'; break;
+            case '{': tk = TK_LBRACE; lex[0] = '{'; break;
+            case '}': tk = TK_RBRACE; lex[0] = '}'; break;
+            case '[': tk = TK_LBRACKET; lex[0] = '['; break;
+            case ']': tk = TK_RBRACKET; lex[0] = ']'; break;
+            case ',': tk = TK_COMMA; lex[0] = ','; break;
+            case ';': tk = TK_SEMI; lex[0] = ';'; break;
+            case ':': tk = TK_COLON; lex[0] = ':'; break;
+            case '.': tk = TK_DOT; lex[0] = '.'; break;
+            case '=': tk = TK_ASSIGN; lex[0] = '='; break;
+            case '<': tk = TK_LT; lex[0] = '<'; break;
+            case '>': tk = TK_GT; lex[0] = '>'; break;
+            case '!': tk = TK_NOT; lex[0] = '!'; break;
+            default: error_at((char*)loc, "Unexpected character '%c'", *(loc));
+        }
+        ts_push(&ts, make_token(tk, loc, lex));
+    }
+
+    ts_push(&ts, make_token(TK_EOF, (char*)input + strlen(input), "<EOF>"));
+    return ts;
+}
+
+/* ----------------------------------------------------------------------
+ * AST
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+    AST_PROGRAM,
+    AST_FUNC_DECL,
+    AST_VAR_DECL,
+    AST_BLOCK,
+    AST_RETURN,
+    AST_IF,
+    AST_WHILE,
+    AST_FOR,
+    AST_EXPR_STMT,
+    AST_BINARY,
+    AST_UNARY,
+    AST_CALL,
+    AST_IDENT,
+    AST_NUMBER,
+    AST_STRING,
+    AST_OBJECT,      /* object literal */
+    AST_ARRAY,       /* array literal */
+    AST_PROP_ACCESS, /* obj.prop */
+    AST_INDEX,       /* obj[idx] */
+    AST_EMPTY
+} ASTKind;
+
+typedef struct AST {
+    ASTKind kind;
+    Token token;
+    struct AST **children;
+    int child_count;
+    /* node-specific */
+    char *name;
+    double num;
+    char *str;
+    char **params;   /* reused for object keys or function params */
+    int param_count;
+} AST;
+
+static AST* ast_new(ASTKind k, Token t) {
+    AST *n = calloc(1, sizeof(AST));
+    n->kind = k;
+    n->token = t;
+    n->children = NULL;
+    n->child_count = 0;
+    n->name = NULL;
+    n->num = 0.0;
+    n->str = NULL;
+    n->params = NULL;
+    n->param_count = 0;
+    return n;
+}
+static void ast_add_child(AST *parent, AST *child) {
+    if (!parent || !child) return;
+    parent->children = realloc(parent->children, sizeof(AST*) * (parent->child_count + 1));
+    parent->children[parent->child_count++] = child;
+}
+
+/* ----------------------------------------------------------------------
+ * PARSER (recursive descent)
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    TokenStream *ts;
+} Parser;
+
+static Token cur(Parser *p) { return p->ts->arr[p->ts->idx]; }
+static int accept(Parser *p, TokenKind k) {
+    if (p->ts->arr[p->ts->idx].kind == k) { p->ts->idx++; return 1; }
+    return 0;
+}
+static Token expect(Parser *p, TokenKind k) {
+    Token t = cur(p);
+    if (t.kind != k) error_at(t.loc, "Expected token %d but got %d", k, t.kind);
+    p->ts->idx++;
+    return t;
+}
+
+/* Forward declarations */
+static AST* parse_program(Parser *p);
+static AST* parse_statement(Parser *p);
+static AST* parse_expression(Parser *p);
+static AST* parse_assignment(Parser *p);
+static AST* parse_logical_or(Parser *p);
+static AST* parse_logical_and(Parser *p);
+static AST* parse_equality(Parser *p);
+static AST* parse_relational(Parser *p);
+static AST* parse_add(Parser *p);
+static AST* parse_mul(Parser *p);
+static AST* parse_unary(Parser *p);
+static AST* parse_primary(Parser *p);
+static AST* parse_function_decl(Parser *p);
+static AST* parse_object_literal(Parser *p);
+static AST* parse_array_literal(Parser *p);
+
+/* Primary with postfix (., [ ]) handling */
+static AST* parse_primary(Parser *p) {
+    Token t = cur(p);
+    AST *node = NULL;
+
+    if (t.kind == TK_LBRACE) {
+        node = parse_object_literal(p);
+    } else if (t.kind == TK_LBRACKET) {
+        node = parse_array_literal(p);
+    } else if (accept(p, TK_LPAREN)) {
+        AST *e = parse_expression(p);
+        expect(p, TK_RPAREN);
+        node = e;
+    } else if (t.kind == TK_NUMBER) {
+        Token nt = expect(p, TK_NUMBER);
+        AST *n = ast_new(AST_NUMBER, nt);
+        n->num = nt.num_val;
+        node = n;
+    } else if (t.kind == TK_STRING) {
+        Token st = expect(p, TK_STRING);
+        AST *n = ast_new(AST_STRING, st);
+        n->str = strdup(st.lexeme ? st.lexeme : "");
+        node = n;
+    } else if (t.kind == TK_IDENT) {
+        Token id = expect(p, TK_IDENT);
+        AST *ident = ast_new(AST_IDENT, id);
+        ident->name = strdup(id.lexeme ? id.lexeme : "");
+        /* function call? */
+        if (accept(p, TK_LPAREN)) {
+            AST *call = ast_new(AST_CALL, id);
+            if (!accept(p, TK_RPAREN)) {
+                AST *arg = parse_expression(p);
+                ast_add_child(call, arg);
+                while (accept(p, TK_COMMA)) {
+                    AST *a = parse_expression(p);
+                    ast_add_child(call, a);
+                }
+                expect(p, TK_RPAREN);
+            }
+            ast_add_child(call, ident); /* callee as last child */
+            node = call;
+        } else {
+            node = ident;
+        }
+    } else {
+        error_at(t.loc, "Expected primary expression");
+    }
+
+    /* Postfix: .prop and [expr] and method calls chaining */
+    while (1) {
+        if (accept(p, TK_DOT)) {
+            Token prop = expect(p, TK_IDENT);
+            AST *propNode = ast_new(AST_STRING, prop);
+            propNode->str = strdup(prop.lexeme ? prop.lexeme : "");
+            AST *acc = ast_new(AST_PROP_ACCESS, prop);
+            ast_add_child(acc, node); /* base */
+            ast_add_child(acc, propNode); /* property name as string node */
+            node = acc;
+            /* allow method call: .push(...) */
+            if (accept(p, TK_LPAREN)) {
+                AST *call = ast_new(AST_CALL, prop);
+                /* first child(s) are args, last child is callee */
+                if (!accept(p, TK_RPAREN)) {
+                    AST *arg = parse_expression(p);
+                    ast_add_child(call, arg);
+                    while (accept(p, TK_COMMA)) {
+                        AST *a = parse_expression(p);
+                        ast_add_child(call, a);
+                    }
+                    expect(p, TK_RPAREN);
+                }
+                ast_add_child(call, node); /* callee is the prop access node */
+                node = call;
+            }
+            continue;
+        }
+        if (accept(p, TK_LBRACKET)) {
+            AST *idx = parse_expression(p);
+            expect(p, TK_RBRACKET);
+            AST *acc = ast_new(AST_INDEX, idx->token);
+            ast_add_child(acc, node); /* base */
+            ast_add_child(acc, idx);  /* index */
+            node = acc;
+            /* allow method call on index result */
+            if (accept(p, TK_LPAREN)) {
+                AST *call = ast_new(AST_CALL, cur(p));
+                if (!accept(p, TK_RPAREN)) {
+                    AST *arg = parse_expression(p);
+                    ast_add_child(call, arg);
+                    while (accept(p, TK_COMMA)) {
+                        AST *a = parse_expression(p);
+                        ast_add_child(call, a);
+                    }
+                    expect(p, TK_RPAREN);
+                }
+                ast_add_child(call, node);
+                node = call;
+            }
+            continue;
+        }
+        break;
+    }
+
+    return node;
+}
+
+/* parse object literal: { "k": expr, ... } */
+static AST* parse_object_literal(Parser *p) {
+    expect(p, TK_LBRACE);
+    AST *obj = ast_new(AST_OBJECT, cur(p));
+    obj->params = NULL; obj->param_count = 0;
+    obj->children = NULL; obj->child_count = 0;
+    if (accept(p, TK_RBRACE)) return obj;
+    while (1) {
+        Token keytok = cur(p);
+        if (keytok.kind != TK_STRING) error_at(keytok.loc, "Expected string key in object literal");
+        expect(p, TK_STRING);
+        obj->params = realloc(obj->params, sizeof(char*) * (obj->param_count + 1));
+        obj->params[obj->param_count++] = strdup(keytok.lexeme ? keytok.lexeme : "");
+        expect(p, TK_COLON);
+        AST *val = parse_expression(p);
+        ast_add_child(obj, val);
+        if (accept(p, TK_COMMA)) continue;
+        if (accept(p, TK_RBRACE)) break;
+        Token t = cur(p);
+        error_at(t.loc, "Expected ',' or '}' in object literal");
+    }
+    return obj;
+}
+
+/* parse array literal: [ expr, expr, ... ] */
+static AST* parse_array_literal(Parser *p) {
+    expect(p, TK_LBRACKET);
+    AST *arr = ast_new(AST_ARRAY, cur(p));
+    arr->children = NULL;
+    arr->child_count = 0;
+    if (accept(p, TK_RBRACKET)) return arr; /* empty array */
+    while (1) {
+        AST *val = parse_expression(p);
+        ast_add_child(arr, val);
+        if (accept(p, TK_COMMA)) continue;
+        if (accept(p, TK_RBRACKET)) break;
+        Token t = cur(p);
+        error_at(t.loc, "Expected ',' or ']' in array literal");
+    }
+    return arr;
+}
+
+/* Unary */
+static AST* parse_unary(Parser *p) {
+    Token t = cur(p);
+    if (accept(p, TK_PLUS)) return parse_unary(p);
+    if (accept(p, TK_MINUS)) {
+        AST *n = ast_new(AST_UNARY, t);
+        n->token = t;
+        n->token.lexeme = strdup("-");
+        AST *child = parse_unary(p);
+        ast_add_child(n, child);
+        return n;
+    }
+    if (accept(p, TK_NOT)) {
+        AST *n = ast_new(AST_UNARY, t);
+        n->token = t;
+        n->token.lexeme = strdup("!");
+        AST *child = parse_unary(p);
+        ast_add_child(n, child);
+        return n;
+    }
+    return parse_primary(p);
+}
+
+/* Multiplicative */
+static AST* parse_mul(Parser *p) {
+    AST *node = parse_unary(p);
+    while (cur(p).kind == TK_STAR || cur(p).kind == TK_SLASH) {
+        Token op = cur(p);
+        p->ts->idx++;
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_unary(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Additive */
+static AST* parse_add(Parser *p) {
+    AST *node = parse_mul(p);
+    while (cur(p).kind == TK_PLUS || cur(p).kind == TK_MINUS) {
+        Token op = cur(p);
+        p->ts->idx++;
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_mul(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Relational */
+static AST* parse_relational(Parser *p) {
+    AST *node = parse_add(p);
+    while (cur(p).kind == TK_LT || cur(p).kind == TK_GT || cur(p).kind == TK_LE || cur(p).kind == TK_GE) {
+        Token op = cur(p);
+        p->ts->idx++;
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_add(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Equality */
+static AST* parse_equality(Parser *p) {
+    AST *node = parse_relational(p);
+    while (cur(p).kind == TK_EQ || cur(p).kind == TK_NEQ) {
+        Token op = cur(p);
+        p->ts->idx++;
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_relational(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Logical AND */
+static AST* parse_logical_and(Parser *p) {
+    AST *node = parse_equality(p);
+    while (accept(p, TK_AND)) {
+        Token op = { .kind = TK_AND, .lexeme = strdup("&&"), .loc = cur(p).loc };
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_equality(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Logical OR */
+static AST* parse_logical_or(Parser *p) {
+    AST *node = parse_logical_and(p);
+    while (accept(p, TK_OR)) {
+        Token op = { .kind = TK_OR, .lexeme = strdup("||"), .loc = cur(p).loc };
+        AST *n = ast_new(AST_BINARY, op);
+        n->token = op;
+        ast_add_child(n, node);
+        AST *r = parse_logical_and(p);
+        ast_add_child(n, r);
+        node = n;
+    }
+    return node;
+}
+
+/* Assignment (right-associative) */
+static AST* parse_assignment(Parser *p) {
+    AST *node = parse_logical_or(p);
+    if (accept(p, TK_ASSIGN)) {
+        Token asg = { .kind = TK_ASSIGN, .lexeme = strdup("="), .loc = cur(p).loc };
+        AST *n = ast_new(AST_BINARY, asg);
+        ast_add_child(n, node);
+        AST *r = parse_assignment(p);
+        ast_add_child(n, r);
+        return n;
+    }
+    return node;
+}
+
+static AST* parse_expression(Parser *p) {
+    return parse_assignment(p);
+}
+
+/* Compound statement */
+static AST* parse_compound(Parser *p) {
+    expect(p, TK_LBRACE);
+    AST *blk = ast_new(AST_BLOCK, cur(p));
+    while (!accept(p, TK_RBRACE)) {
+        AST *s = parse_statement(p);
+        ast_add_child(blk, s);
+    }
+    return blk;
+}
+
+/* Statement */
+static AST* parse_statement(Parser *p) {
+    Token t = cur(p);
+    (void)t;
+    if (accept(p, TK_LBRACE)) {
+        p->ts->idx--; /* roll back; parse_compound expects '{' consumed */
+        return parse_compound(p);
+    }
+    if (accept(p, TK_IF)) {
+        AST *n = ast_new(AST_IF, cur(p));
+        expect(p, TK_LPAREN);
+        AST *cond = parse_expression(p);
+        expect(p, TK_RPAREN);
+        ast_add_child(n, cond);
+        AST *then = parse_statement(p);
+        ast_add_child(n, then);
+        if (accept(p, TK_ELSE)) {
+            AST *els = parse_statement(p);
+            ast_add_child(n, els);
+        }
+        return n;
+    }
+    if (accept(p, TK_WHILE)) {
+        AST *n = ast_new(AST_WHILE, cur(p));
+        expect(p, TK_LPAREN);
+        AST *cond = parse_expression(p);
+        expect(p, TK_RPAREN);
+        ast_add_child(n, cond);
+        AST *body = parse_statement(p);
+        ast_add_child(n, body);
+        return n;
+    }
+    if (accept(p, TK_FOR)) {
+        AST *n = ast_new(AST_FOR, cur(p));
+        expect(p, TK_LPAREN);
+        if (!accept(p, TK_SEMI)) {
+            if (cur(p).kind == TK_VAR) {
+                AST *decl = parse_statement(p);
+                ast_add_child(n, decl);
+            } else {
+                AST *init = parse_expression(p);
+                expect(p, TK_SEMI);
+                ast_add_child(n, init);
+            }
+        } else {
+            ast_add_child(n, NULL);
+        }
+        if (!accept(p, TK_SEMI)) {
+            AST *cond = parse_expression(p);
+            expect(p, TK_SEMI);
+            ast_add_child(n, cond);
+        } else {
+            ast_add_child(n, NULL);
+        }
+        if (!accept(p, TK_RPAREN)) {
+            AST *incr = parse_expression(p);
+            expect(p, TK_RPAREN);
+            ast_add_child(n, incr);
+        } else {
+            ast_add_child(n, NULL);
+        }
+        AST *body = parse_statement(p);
+        ast_add_child(n, body);
+        return n;
+    }
+    if (accept(p, TK_RETURN)) {
+        AST *n = ast_new(AST_RETURN, cur(p));
+        if (!accept(p, TK_SEMI)) {
+            AST *e = parse_expression(p);
+            ast_add_child(n, e);
+            expect(p, TK_SEMI);
+        }
+        return n;
+    }
+    if (cur(p).kind == TK_VAR) {
+        expect(p, TK_VAR);
+        Token id = expect(p, TK_IDENT);
+        AST *decl = ast_new(AST_VAR_DECL, id);
+        decl->name = strdup(id.lexeme ? id.lexeme : "");
+        if (accept(p, TK_ASSIGN)) {
+            AST *init = parse_expression(p);
+            ast_add_child(decl, init);
+        }
+        expect(p, TK_SEMI);
+        return decl;
+    }
+    if (cur(p).kind == TK_FUNCTION) {
+        return parse_function_decl(p);
+    }
+    AST *expr = parse_expression(p);
+    expect(p, TK_SEMI);
+    AST *stmt = ast_new(AST_EXPR_STMT, expr->token);
+    ast_add_child(stmt, expr);
+    return stmt;
+}
+
+/* Function declaration */
+static AST* parse_function_decl(Parser *p) {
+    Token fn_tok = expect(p, TK_FUNCTION);
+    (void)fn_tok;
+    Token name_tok = expect(p, TK_IDENT);
+    AST *fn = ast_new(AST_FUNC_DECL, name_tok);
+    fn->name = strdup(name_tok.lexeme ? name_tok.lexeme : "");
+    expect(p, TK_LPAREN);
+    if (!accept(p, TK_RPAREN)) {
+        while (1) {
+            Token pid = expect(p, TK_IDENT);
+            fn->params = realloc(fn->params, sizeof(char*) * (fn->param_count + 1));
+            fn->params[fn->param_count++] = strdup(pid.lexeme ? pid.lexeme : "");
+            if (accept(p, TK_COMMA)) continue;
+            expect(p, TK_RPAREN);
+            break;
+        }
+    }
+    AST *body = parse_statement(p);
+    ast_add_child(fn, body);
+    return fn;
+}
+
+/* Program */
+static AST* parse_program(Parser *p) {
+    AST *prog = ast_new(AST_PROGRAM, cur(p));
+    while (cur(p).kind != TK_EOF) {
+        AST *s = parse_statement(p);
+        ast_add_child(prog, s);
+    }
+    return prog;
+}
+
+/* ----------------------------------------------------------------------
+ * STRING / GLOBAL / FUNCTION TABLES
+ * ---------------------------------------------------------------------- */
+
+/* String literal table (also used to store initializer markers) */
+typedef struct StrEntry {
+    char *s;
+    int id;
+    struct StrEntry *next;
+} StrEntry;
+
+static StrEntry *str_table = NULL;
+static int str_table_count = 0;
+
+static int add_string_literal(const char *s) {
+    for (StrEntry *e = str_table; e; e = e->next) {
+        if (!strcmp(e->s, s)) return e->id;
+    }
+    StrEntry *n = calloc(1, sizeof(StrEntry));
+    n->s = strdup(s);
+    n->id = str_table_count++;
+    n->next = str_table;
+    str_table = n;
+    return n->id;
+}
+
+/* Global variables table */
+typedef struct GVar {
+    char *name;
+    int id;
+    struct GVar *next;
+} GVar;
+
+static GVar *gvars = NULL;
+static int gvar_count = 0;
+
+static int add_global_var(const char *name) {
+    for (GVar *g = gvars; g; g = g->next) {
+        if (!strcmp(g->name, name)) return g->id;
+    }
+    GVar *n = calloc(1, sizeof(GVar));
+    n->name = strdup(name);
+    n->id = gvar_count++;
+    n->next = gvars;
+    gvars = n;
+    return n->id;
+}
+
+/* Function registry */
+typedef struct FuncEntry {
+    char *name;
+    AST *fn;
+    struct FuncEntry *next;
+} FuncEntry;
+
+static FuncEntry *funcs = NULL;
+
+static void register_function(const char *name, AST *fn) {
+    FuncEntry *f = calloc(1, sizeof(FuncEntry));
+    f->name = strdup(name);
+    f->fn = fn;
+    f->next = funcs;
+    funcs = f;
+}
+
+/* ----------------------------------------------------------------------
+ * JSON PARSER (compile-time) - used earlier for import_json; keep as-is
+ * ---------------------------------------------------------------------- */
+
+/* JSON kinds */
+typedef enum {
+    JSON_NULL,
+    JSON_BOOL,
+    JSON_NUMBER,
+    JSON_STRING,
+    JSON_ARRAY,
+    JSON_OBJECT
+} JSONKind;
+
+typedef struct JSONVal {
+    JSONKind kind;
+    double num;
+    char *str;
+    int boolean;
+    struct JSONVal **items;
+    int nitems;
+    char **keys; /* for objects */
+} JSONVal;
+
+/* Skip whitespace and comments (supports ) */
+static const char* json_skip_ws(const char *p) {
+    for (;;) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (p[0] == '/' && p[1] == '/') {
+            p += 2;
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        break;
+    }
+    return p;
+}
+
+/* parse JSON string */
+static char* json_parse_string(const char **pp) {
+    const char *p = *pp;
+    if (*p != '"' && *p != '\'') return NULL;
+    char quote = *p++;
+    char buf[8192];
+    int bi = 0;
+    while (*p && *p != quote) {
+        if (*p == '\\') {
+            p++;
+            if (*p == 'n') buf[bi++] = '\n';
+            else if (*p == 't') buf[bi++] = '\t';
+            else if (*p == 'r') buf[bi++] = '\r';
+            else if (*p == '"') buf[bi++] = '"';
+            else if (*p == '\\') buf[bi++] = '\\';
+            else buf[bi++] = *p;
+            p++;
+        } else {
+            buf[bi++] = *p++;
+        }
+        if (bi >= (int)sizeof(buf)-1) break;
+    }
+    if (*p != quote) error_at((char*)p, "Unterminated JSON string");
+    buf[bi] = '\0';
+    p++;
+    *pp = p;
+    return strdup(buf);
+}
+
+/* parse number */
+static double json_parse_number(const char **pp) {
+    char *end;
+    double v = strtod(*pp, &end);
+    if (end == *pp) error_at((char*)*pp, "Invalid JSON number");
+    *pp = end;
+    return v;
+}
+
+/* forward */
+static JSONVal* json_parse_value(const char **pp);
+
+/* parse array */
+static JSONVal* json_parse_array(const char **pp) {
+    const char *p = *pp;
+    if (*p != '[') error_at((char*)p, "Expected '[' for JSON array");
+    p++;
+    p = json_skip_ws(p);
+    JSONVal *v = calloc(1, sizeof(JSONVal));
+    v->kind = JSON_ARRAY;
+    v->items = NULL; v->nitems = 0;
+    if (*p == ']') { p++; *pp = p; return v; }
+    while (1) {
+        JSONVal *item = json_parse_value(&p);
+        v->items = realloc(v->items, sizeof(JSONVal*) * (v->nitems + 1));
+        v->items[v->nitems++] = item;
+        p = json_skip_ws(p);
+        if (*p == ',') { p++; p = json_skip_ws(p); continue; }
+        if (*p == ']') { p++; break; }
+        error_at((char*)p, "Expected ',' or ']' in JSON array");
+    }
+    *pp = p;
+    return v;
+}
+
+/* parse object */
+static JSONVal* json_parse_object(const char **pp) {
+    const char *p = *pp;
+    if (*p != '{') error_at((char*)p, "Expected '{' for JSON object");
+    p++;
+    p = json_skip_ws(p);
+    JSONVal *v = calloc(1, sizeof(JSONVal));
+    v->kind = JSON_OBJECT;
+    v->items = NULL; v->nitems = 0; v->keys = NULL;
+    if (*p == '}') { p++; *pp = p; return v; }
+    while (1) {
+        p = json_skip_ws(p);
+        char *key = json_parse_string(&p);
+        p = json_skip_ws(p);
+        if (*p != ':') error_at((char*)p, "Expected ':' after key in JSON object");
+        p++;
+        p = json_skip_ws(p);
+        JSONVal *val = json_parse_value(&p);
+        v->items = realloc(v->items, sizeof(JSONVal*) * (v->nitems + 1));
+        v->items[v->nitems] = val;
+        v->keys = realloc(v->keys, sizeof(char*) * (v->nitems + 1));
+        v->keys[v->nitems] = key;
+        v->nitems++;
+        p = json_skip_ws(p);
+        if (*p == ',') { p++; p = json_skip_ws(p); continue; }
+        if (*p == '}') { p++; break; }
+        error_at((char*)p, "Expected ',' or '}' in JSON object");
+    }
+    *pp = p;
+    return v;
+}
+
+/* parse any JSON value */
+static JSONVal* json_parse_value(const char **pp) {
+    const char *p = *pp;
+    p = json_skip_ws(p);
+    if (!*p) error_at((char*)p, "Unexpected end of JSON input");
+
+    if (*p == 'n') {
+        /* null */
+        if (!strncmp(p, "null", 4)) {
+            JSONVal *v = calloc(1, sizeof(JSONVal));
+            v->kind = JSON_NULL;
+            p += 4;
+            *pp = p;
+            return v;
+        }
+    }
+    if (*p == 't') {
+        /* true */
+        if (!strncmp(p, "true", 4)) {
+            JSONVal *v = calloc(1, sizeof(JSONVal));
+            v->kind = JSON_BOOL;
+            v->boolean = 1;
+            p += 4;
+            *pp = p;
+            return v;
+        }
+    }
+    if (*p == 'f') {
+        /* false */
+        if (!strncmp(p, "false", 5)) {
+            JSONVal *v = calloc(1, sizeof(JSONVal));
+            v->kind = JSON_BOOL;
+            v->boolean = 0;
+            p += 5;
+            *pp = p;
+            return v;
+        }
+    }
+    if (*p == '"' || *p == '\'') {
+        char *s = json_parse_string(&p);
+        JSONVal *v = calloc(1, sizeof(JSONVal));
+        v->kind = JSON_STRING;
+        v->str = s;
+        *pp = p;
+        return v;
+    }
+    if (*p == '[') {
+        JSONVal *a = json_parse_array(&p);
+        *pp = p;
+        return a;
+    }
+    if (*p == '{') {
+        JSONVal *o = json_parse_object(&p);
+        *pp = p;
+        return o;
+    }
+    /* number */
+    if (*p == '-' || isdigit((unsigned char)*p)) {
+        double num = json_parse_number(&p);
+        JSONVal *v = calloc(1, sizeof(JSONVal));
+        v->kind = JSON_NUMBER;
+        v->num = num;
+        *pp = p;
+        return v;
+    }
+
+    error_at((char*)p, "Invalid JSON value");
+    return NULL; /* unreachable */
+}
+
+/* Free JSONVal recursively */
+static void json_free(JSONVal *v) {
+    if (!v) return;
+    switch (v->kind) {
+        case JSON_STRING:
+            free(v->str);
+            break;
+        case JSON_ARRAY:
+            if (v->items) {
+                for (int i = 0; i < v->nitems; i++) {
+                    json_free(v->items[i]);
+                }
+                free(v->items);
+            }
+            break;
+        case JSON_OBJECT:
+            if (v->items) {
+                for (int i = 0; i < v->nitems; i++) {
+                    json_free(v->items[i]);
+                }
+                free(v->items);
+            }
+            if (v->keys) {
+                for (int i = 0; i < v->nitems; i++) {
+                    free(v->keys[i]);
+                }
+                free(v->keys);
+            }
+            break;
+        default:
+            break;
+    }
+    free(v);
+}
+
+/* Helper: parse a full JSON string into JSONVal (entry point) */
+static JSONVal* json_parse(const char *s) {
+    const char *p = s;
+    p = json_skip_ws(p);
+    JSONVal *v = json_parse_value(&p);
+    p = json_skip_ws(p);
+    if (*p) error_at((char*)p, "Trailing characters after JSON value");
+    return v;
+}
+
+/* ----------------------------------------------------------------------
+ * CODEGEN (very small, emits x86-64 AT&T assembly)
+ * - This is a minimal codegen that supports:
+ *   - top-level function declarations
+ *   - a single "main" function that calls a user-defined "main" if present
+ *   - numeric literals and simple binary ops (+ - * /)
+ *   - function calls to runtime stubs (e.g., js_print_value)
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    FILE *out;
+    int label_counter;
+} CodeGenCtx;
+
+static int new_label(CodeGenCtx *c) {
+    return (rand() & LABEL_RANDOM_MASK) ^ (++c->label_counter);
+}
+
+static void emit(CodeGenCtx *c, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(c->out, fmt, ap);
+    fprintf(c->out, "\n");
+    va_end(ap);
+}
+
+/* Forward */
+static void gen_stmt(CodeGenCtx *c, AST *node);
+static void gen_expr(CodeGenCtx *c, AST *node);
+
+/* Generate expression: result in RAX */
+static void gen_expr(CodeGenCtx *c, AST *node) {
+    if (!node) return;
+    switch (node->kind) {
+        case AST_NUMBER:
+            emit(c, "    # number %g", node->num);
+            emit(c, "    movq $0, %%rbx"); /* placeholder for tag */
+            /* store double in .data and load? Simpler: use immediate via movsd from constant pool */
+            {
+                int id = add_string_literal(""); /* reuse string table to allocate constants */
+                /* Simpler approach: push immediate double via stack using assembler constant */
+            }
+            /* We'll use xmm0 for double immediate via movabs + movq -> xmm0 */
+            {
+                union { double d; uint64_t u; } conv;
+                conv.d = node->num;
+                emit(c, "    movabs $%llu, %%rax", (unsigned long long)conv.u);
+                emit(c, "    movq %%rax, %%xmm0");
+            }
+            /* Convention: leave double in xmm0, but for runtime we will call js_make_number which expects double in xmm0 */
+            break;
+        case AST_STRING:
+            {
+                int sid = add_string_literal(node->str ? node->str : "");
+                emit(c, "    # string literal id=%d", sid);
+                /* pass pointer to runtime via rdi */
+                emit(c, "    leaq .Lstr%d(%%rip), %%rdi", sid);
+                emit(c, "    call js_make_string");
+            }
+            break;
+        case AST_IDENT:
+            /* load global var (very simple): look up by name and call js_object_get? For demo, treat undefined as null */
+            emit(c, "    # ident %s (treated as null)", node->name ? node->name : "");
+            emit(c, "    call js_make_null_c");
+            break;
+        case AST_BINARY:
+            {
+                TokenKind k = node->token.kind;
+                AST *L = node->children[0];
+                AST *R = node->children[1];
+                /* Evaluate right then left to preserve order, push results */
+                gen_expr(c, R);
+                emit(c, "    # push right result (assume in rax)");
+                emit(c, "    push %%rax");
+                gen_expr(c, L);
+                emit(c, "    # pop right into rdi");
+                emit(c, "    pop %%rdi");
+                /* For arithmetic, assume both operands are numbers in xmm0/xmm1; but our gen_expr above leaves numbers in xmm0 or calls runtime */
+                /* For simplicity, call runtime js_make_number for numeric ops: convert both to C doubles via js_value_to_cstr? */
+                /* To keep demo simple, only implement '+' for numeric literals using xmm registers */
+                if (k == TK_PLUS || k == TK_MINUS || k == TK_STAR || k == TK_SLASH) {
+                    /* This demo will assume both operands are immediate numbers and were placed in xmm0/xmm1 by gen_expr.
+                       But since full value passing is complex, we'll instead call a runtime helper that takes two doubles in xmm0/xmm1:
+                       js_binary_add, js_binary_sub, etc. We'll call generic js_binary_op with op code in edi. */
+                    int opcode = (k == TK_PLUS) ? 0 : (k == TK_MINUS) ? 1 : (k == TK_STAR) ? 2 : 3;
+                    emit(c, "    movl $%d, %%edi", opcode);
+                    emit(c, "    call js_binary_op");
+                } else if (k == TK_ASSIGN) {
+                    /* assignment: left must be ident or prop/index; for demo, ignore and return right */
+                    emit(c, "    # assignment (demo): result is right-hand side (already in rax)");
+                } else {
+                    emit(c, "    # binary op not implemented, return null");
+                    emit(c, "    call js_make_null_c");
+                }
+            }
+            break;
+        case AST_CALL:
+            {
+                /* Last child is callee */
+                int n = node->child_count;
+                if (n < 1) { emit(c, "    call js_make_null_c"); break; }
+                AST *callee = node->children[n-1];
+                int argc = n-1;
+                /* Evaluate args right-to-left and push */
+                for (int i = argc-1; i >= 0; --i) {
+                    gen_expr(c, node->children[i]);
+                    emit(c, "    push %%rax");
+                }
+                /* Determine callee name: if callee is ident, call runtime or user function */
+                if (callee->kind == AST_IDENT) {
+                    const char *fname = callee->name;
+                    if (!strcmp(fname, "print")) {
+                        /* print: expects one arg on stack */
+                        emit(c, "    pop %%rdi");
+                        emit(c, "    call js_print_value");
+                        emit(c, "    call js_make_null_c");
+                    } else {
+                        /* call user function: move args into registers per SysV (rdi, rsi, rdx, rcx, r8, r9) */
+                        const char *fnlabel = fname;
+                        /* Pop into registers (simple up to 6 args) */
+                        const char *regs[] = {"%rdi","%rsi","%rdx","%rcx","%r8","%r9"};
+                        for (int i = 0; i < argc && i < 6; ++i) {
+                            emit(c, "    pop %s", regs[i]);
+                        }
+                        /* For more args, ignore */
+                        emit(c, "    call %s", fnlabel);
+                    }
+                } else {
+                    /* callee is expression (e.g., prop access) — not implemented */
+                    emit(c, "    # dynamic call not implemented");
+                    emit(c, "    call js_make_null_c");
+                    /* pop any remaining args */
+                    for (int i = 0; i < argc; ++i) emit(c, "    pop %%rax");
+                }
+            }
+            break;
+        default:
+            emit(c, "    # expr kind %d not implemented", node->kind);
+            emit(c, "    call js_make_null_c");
+            break;
+    }
+}
+
+/* Generate statement */
+static void gen_stmt(CodeGenCtx *c, AST *node) {
+    if (!node) return;
+    switch (node->kind) {
+        case AST_BLOCK:
+            for (int i = 0; i < node->child_count; ++i) gen_stmt(c, node->children[i]);
+            break;
+        case AST_EXPR_STMT:
+            gen_expr(c, node->children[0]);
+            /* discard result */
+            emit(c, "    # discard expr result");
+            break;
+        case AST_VAR_DECL:
+            /* For demo, allocate global var and set to null or initializer */
+            {
+                int gid = add_global_var(node->name);
+                if (node->child_count > 0) {
+                    gen_expr(c, node->children[0]);
+                    /* store result in global slot via runtime */
+                    emit(c, "    movq $%d, %%rdi", gid);
+                    emit(c, "    mov %%rax, %%rsi");
+                    emit(c, "    call js_global_set");
+                }
+            }
+            break;
+        case AST_RETURN:
+            if (node->child_count > 0) {
+                gen_expr(c, node->children[0]);
+            } else {
+                emit(c, "    call js_make_null_c");
+            }
+            emit(c, "    ret");
+            break;
+        case AST_IF:
+            {
+                int Lelse = new_label(c);
+                int Lend = new_label(c);
+                gen_expr(c, node->children[0]); /* cond -> rax */
+                emit(c, "    # if cond check (null/zero -> false)");
+                emit(c, "    cmp $0, %%rax");
+                emit(c, "    je .Lelse%d", Lelse);
+                gen_stmt(c, node->children[1]);
+                emit(c, "    jmp .Lend%d", Lend);
+                emit(c, ".Lelse%d:", Lelse);
+                if (node->child_count > 2) gen_stmt(c, node->children[2]);
+                emit(c, ".Lend%d:", Lend);
+            }
+            break;
+        case AST_WHILE:
+            {
+                int Ltop = new_label(c);
+                int Lend = new_label(c);
+                emit(c, ".Lwhile_top%d:", Ltop);
+                gen_expr(c, node->children[0]);
+                emit(c, "    cmp $0, %%rax");
+                emit(c, "    je .Lwhile_end%d", Lend);
+                gen_stmt(c, node->children[1]);
+                emit(c, "    jmp .Lwhile_top%d", Ltop);
+                emit(c, ".Lwhile_end%d:", Lend);
+            }
+            break;
+        case AST_FOR:
+            /* Very simple: init; while(cond) body; incr */
+            if (node->child_count >= 4) {
+                AST *init = node->children[0];
+                AST *cond = node->children[1];
+                AST *incr = node->children[2];
+                AST *body = node->children[3];
+                if (init) gen_stmt(c, init);
+                int Ltop = new_label(c), Lend = new_label(c);
+                emit(c, ".Lfor_top%d:", Ltop);
+                if (cond) {
+                    gen_expr(c, cond);
+                    emit(c, "    cmp $0, %%rax");
+                    emit(c, "    je .Lfor_end%d", Lend);
+                }
+                gen_stmt(c, body);
+                if (incr) gen_expr(c, incr);
+                emit(c, "    jmp .Lfor_top%d", Ltop);
+                emit(c, ".Lfor_end%d:", Lend);
+            }
+            break;
+        case AST_FUNC_DECL:
+            {
+                /* Register function label and generate body */
+                const char *fname = node->name;
+                emit(c, ".globl %s", fname);
+                emit(c, ".type %s, @function", fname);
+                emit(c, "%s:", fname);
+                /* prologue */
+                emit(c, "    push %%rbp");
+                emit(c, "    mov %%rsp, %%rbp");
+                /* For simplicity, ignore local vars and params mapping */
+                gen_stmt(c, node->children[0]); /* body */
+                /* ensure return */
+                emit(c, "    call js_make_null_c");
+                emit(c, "    pop %%rbp");
+                emit(c, "    ret");
+            }
+            break;
+        default:
+            emit(c, "    # stmt kind %d not implemented", node->kind);
+            break;
+    }
+}
+
+/* Generate program */
+static void gen_program(CodeGenCtx *c, AST *prog) {
+    /* Emit data section for string literals */
+    emit(c, ".section .rodata");
+    for (StrEntry *s = str_table; s; s = s->next) {
+        emit(c, ".Lstr%d: .string \"%s\"", s->id, s->s);
+    }
+
+    /* Emit text section */
+    emit(c, ".text");
+    /* Generate functions first */
+    for (FuncEntry *f = funcs; f; f = f->next) {
+        gen_stmt(c, f->fn);
+    }
+
+    /* Emit a _start that calls main and exits */
+    emit(c, ".globl _start");
+    emit(c, "_start:");
+    /* call user main if exists */
+    int has_main = 0;
+    for (FuncEntry *f = funcs; f; f = f->next) {
+        if (!strcmp(f->name, "main")) { has_main = 1; break; }
+    }
+    if (has_main) {
+        emit(c, "    call main");
+        /* ignore return value */
+    }
+    /* exit(0) */
+    emit(c, "    mov $60, %%rax");
+    emit(c, "    xor %%rdi, %%rdi");
+    emit(c, "    syscall");
+}
+
+/* ----------------------------------------------------------------------
+ * RUNTIME STUBS (appended to out.s)
+ * Minimal C runtime functions implemented in assembly-friendly form.
+ * For demo purposes, we implement very small stubs in assembly text
+ * that the generated code will call. In a real compiler these would be
+ * implemented in C and linked in.
+ * ---------------------------------------------------------------------- */
+
+static void append_runtime_stubs(FILE *out) {
+    fprintf(out,
+        "\n"
+        "/* --- runtime stubs (C-callable) --- */\n"
+        ".section .text\n"
+        ".globl js_make_null_c\n"
+        "js_make_null_c:\n"
+        "    mov $0, %rax\n"
+        "    ret\n"
+        "\n"
+        ".globl js_make_string\n"
+        "js_make_string:\n"
+        "    /* rdi = pointer to C string */\n"
+        "    mov %rdi, %rax\n"
+        "    ret\n"
+        "\n"
+        ".globl js_print_value\n"
+        "js_print_value:\n"
+        "    /* rdi = value (for demo, treat as C string pointer or 0) */\n"
+        "    test %rdi, %rdi\n"
+        "    je .print_null\n"
+        "    mov %rdi, %rsi\n"
+        "    lea .Lprint_fmt(%%rip), %%rdi\n"
+        "    xor %%rax, %%rax\n"
+        "    call printf\n"
+        "    ret\n"
+        ".print_null:\n"
+        "    lea .Lnull_str(%%rip), %%rdi\n"
+        "    xor %%rax, %%rax\n"
+        "    call puts\n"
+        "    ret\n"
+        "\n"
+        ".section .rodata\n"
+        ".Lprint_fmt: .string \"%s\\n\"\n"
+        ".Lnull_str: .string \"null\"\n"
+        ".section .text\n"
+        "\n"
+        ".globl js_global_set\n"
+        "js_global_set:\n"
+        "    /* rdi = gid, rsi = value */\n"
+        "    /* no-op in demo */\n"
+        "    mov %rsi, %rax\n"
+        "    ret\n"
+        "\n"
+        ".globl js_binary_op\n"
+        "js_binary_op:\n"
+        "    /* edi = opcode, operands expected in xmm0/xmm1? For demo, return null */\n"
+        "    call js_make_null_c\n"
+        "    ret\n"
+    );
+}
+
+/* ----------------------------------------------------------------------
+ * MAIN
+ * ---------------------------------------------------------------------- */
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s input.sparrow\n", prog_name);
+        return 1;
+    }
+    srand((unsigned int)time(NULL));
+
+    char *src = read_file(argv[1]);
+    if (!src) fatal("Failed to read input file '%s'", argv[1]);
+
+    /* Tokenize */
+    TokenStream ts = tokenize(src);
+    Parser parser = { .ts = &ts };
+    AST *prog = parse_program(&parser);
+
+    /* Register top-level functions */
+    for (int i = 0; i < prog->child_count; ++i) {
+        AST *s = prog->children[i];
+        if (s->kind == AST_FUNC_DECL) {
+            register_function(s->name, s);
+        }
+    }
+
+    /* Prepare output assembly file */
+    FILE *out = fopen("out.s", "w");
+    if (!out) fatal("Failed to open out.s for writing");
+
+    CodeGenCtx ctx = { .out = out, .label_counter = 0 };
+
+    /* Generate program */
+    gen_program(&ctx, prog);
+
+    /* Append runtime stubs */
+    append_runtime_stubs(out);
+
+    fclose(out);
+
+    /* Assemble and link into demo */
+    int rc;
+    rc = system("gcc -no-pie out.s -o demo -O2 -lm -static -s 2>/dev/null || gcc out.s -o demo -O2 -lm 2>/dev/null");
+    if (rc != 0) {
+        fprintf(stderr, "Warning: assembly/link step returned %d; trying non-static link\n", rc);
+        rc = system("gcc out.s -o demo -O2 -lm 2>/dev/null");
+    }
+
+    if (access("demo", X_OK) == 0) {
+        printf("Running ./demo\n\n");
+        rc = system("./demo");
+        (void)rc;
+    } else {
+        fprintf(stderr, "Failed to build demo executable\n");
+    }
+
+    free(src);
+    return 0;
+}

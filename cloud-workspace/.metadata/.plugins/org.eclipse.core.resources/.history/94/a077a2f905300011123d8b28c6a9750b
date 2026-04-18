@@ -1,0 +1,773 @@
+// main.cpp
+// Qt6 C++ single-file: Tray + Notify + OAuth2 + Drive sync
+// Updated: removed QKeychain dependency; fixed Qt6 API deprecations and signal signatures.
+
+#include <QApplication>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QAction>
+#include <QFileSystemWatcher>
+#include <QDir>
+#include <QDialog>
+#include <QListWidget>
+#include <QVBoxLayout>
+#include <QTimer>
+#include <QNetworkAccessManager>
+#include <QNetworkRequest>
+#include <QNetworkReply>
+#include <QOAuth2AuthorizationCodeFlow>
+#include <QOAuthHttpServerReplyHandler>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QFile>
+#include <QDesktopServices>
+#include <QUrlQuery>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QFileInfo>
+#include <QSet>
+#include <QDateTime>
+#include <QDebug>
+#include <QCryptographicHash>
+#include <QHostInfo>
+#include <QSysInfo>
+#include <QEventLoop>
+#include <QtGlobal>
+#include <functional>
+#include <memory>
+#include <signal.h>
+
+// --------------------------- Configuration ---------------------------
+static QString tokenFilePath() { return QDir::homePath() + "/.google_drive_tokens.json"; }
+static QString localSyncFolder() { return QDir::homePath() + "/google-drive"; }
+static QString logFilePath() { return QDir::homePath() + "/.google_drive_sync.log"; }
+static int REMOTE_POLL_INTERVAL_MS = 30 * 1000; // 30s polling
+static const qint64 CHUNK_SIZE = 256 * 1024; // 256 KiB
+static const int MAX_RETRIES = 4;
+static const int MAX_CONCURRENT_UPLOADS = 2;
+static const int MAX_CONCURRENT_DOWNLOADS = 2;
+
+// --------------------------- Logging ---------------------------
+static QFile *g_logFile = nullptr;
+static QMutex g_logMutex;
+
+static void logMsg(const QString &msg) {
+    QMutexLocker locker(&g_logMutex);
+    if (!g_logFile) {
+        g_logFile = new QFile(logFilePath());
+        if (!g_logFile->open(QIODevice::Append | QIODevice::Text)) {
+            delete g_logFile;
+            g_logFile = nullptr;
+            return;
+        }
+    }
+    QString line = QDateTime::currentDateTime().toString(Qt::ISODate) + " " + msg + "\n";
+    g_logFile->write(line.toUtf8());
+    g_logFile->flush();
+}
+
+// --------------------------- Graceful shutdown ---------------------------
+static QCoreApplication *g_app_for_signal = nullptr;
+static void handleSignal(int) {
+    if (g_app_for_signal) {
+        logMsg("Signal received: quitting");
+        g_app_for_signal->quit();
+    }
+}
+
+// --------------------------- Secure token storage (file-based fallback only) ---------------------------
+// Use a best-effort XOR with SHA256-derived key when no OS keyring is used.
+
+static QByteArray deriveKeyFallback() {
+    QString user = qgetenv("USER");
+    if (user.isEmpty()) user = qgetenv("USERNAME");
+    QString host = QHostInfo::localHostName();
+    QString sys = QSysInfo::prettyProductName();
+    QByteArray seed = (user + "@" + host + "|" + sys).toUtf8();
+    return QCryptographicHash::hash(seed, QCryptographicHash::Sha256);
+}
+
+static QByteArray xorTransform(const QByteArray &data, const QByteArray &key) {
+    if (key.isEmpty()) return data;
+    QByteArray out; out.resize(data.size());
+    for (int i = 0; i < data.size(); ++i) out[i] = data[i] ^ key[i % key.size()];
+    return out;
+}
+
+static bool saveTokensSecure(const QJsonObject &obj) {
+    QJsonDocument doc(obj);
+    QByteArray plain = doc.toJson(QJsonDocument::Compact);
+
+    // Fallback: XOR with derived key and write to file
+    QByteArray key = deriveKeyFallback();
+    QByteArray cipher = xorTransform(plain, key);
+    QFile f(tokenFilePath());
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    bool ok = (f.write(cipher) == cipher.size());
+    f.close();
+
+#ifdef Q_OS_UNIX
+    // Restrict permissions to owner only
+    QFile::Permissions perms = QFile::ReadOwner | QFile::WriteOwner;
+    QFile::setPermissions(tokenFilePath(), perms);
+#endif
+
+    return ok;
+}
+
+static bool loadTokensSecure(QJsonObject &outObj) {
+    QFile f(tokenFilePath());
+    if (!f.exists()) return false;
+    if (!f.open(QIODevice::ReadOnly)) return false;
+    QByteArray cipher = f.readAll();
+    f.close();
+    QByteArray key = deriveKeyFallback();
+    QByteArray plain = xorTransform(cipher, key);
+    QJsonDocument d = QJsonDocument::fromJson(plain);
+    if (!d.isObject()) return false;
+    outObj = d.object();
+    return true;
+}
+
+// --------------------------- OAuth helper ---------------------------
+class OAuthHelper : public QObject {
+    Q_OBJECT
+public:
+    OAuthHelper(QObject *parent = nullptr) : QObject(parent) {
+        nam = new QNetworkAccessManager(this);
+        oauth = new QOAuth2AuthorizationCodeFlow(this);
+        oauth->setNetworkAccessManager(nam);
+
+        oauth->setAuthorizationUrl(QUrl("https://accounts.google.com/o/oauth2/v2/auth"));
+        // Qt6: use setTokenUrl instead of deprecated setAccessTokenUrl
+        oauth->setTokenUrl(QUrl("https://oauth2.googleapis.com/token"));
+        oauth->setPkceMethod(QOAuth2AuthorizationCodeFlow::PkceMethod::S256);
+
+        // Qt6 expects ModifyParametersFunction with pointer to QMultiMap
+        oauth->setModifyParametersFunction([](QAbstractOAuth::Stage stage, QMultiMap<QString,QVariant> *params){
+            if (stage == QAbstractOAuth::Stage::RequestingAuthorization && params) {
+                params->insert("access_type", "offline");
+                params->insert("prompt", "consent");
+            }
+        });
+
+        if (!loadClientSecrets()) {
+            qWarning() << "client_secret.json missing or invalid. Create credentials in Google Cloud Console.";
+            logMsg("client_secret.json missing or invalid");
+        }
+
+        auto *handler = new QOAuthHttpServerReplyHandler(replyPort, this);
+        oauth->setReplyHandler(handler);
+
+        connect(oauth, &QOAuth2AuthorizationCodeFlow::granted, this, &OAuthHelper::onGranted);
+        connect(oauth, &QOAuth2AuthorizationCodeFlow::authorizeWithBrowser, &QDesktopServices::openUrl);
+
+#if QT_VERSION >= QT_VERSION_CHECK(6,6,0)
+        // Newer Qt6: serverReportedErrorOccurred has 3 args (error, description, uri)
+        connect(oauth, &QAbstractOAuth2::serverReportedErrorOccurred, this, [](const QString &err, const QString &desc, const QUrl &){
+            qWarning() << "OAuth server-reported error:" << err << desc;
+            logMsg(QString("OAuth server error: %1 %2").arg(err, desc));
+        });
+#else
+        // Fallback: older Qt6 still exposes deprecated error signal (2-arg or 3-arg depending on version)
+        connect(oauth, &QOAuth2AuthorizationCodeFlow::error, this, [](const QString &err, const QString &desc){
+            qWarning() << "OAuth error:" << err << desc;
+            logMsg(QString("OAuth error: %1 %2").arg(err, desc));
+        });
+#endif
+    }
+
+    void start() {
+        if (!oauth) return;
+        oauth->setClientIdentifier(clientId);
+        oauth->setClientIdentifierSharedKey(clientSecret);
+
+        // Qt6: use requested scope tokens instead of deprecated setScope
+        QSet<QByteArray> scopeTokens;
+        for (const QString &s : scopes) scopeTokens.insert(s.toUtf8());
+        oauth->setRequestedScopeTokens(scopeTokens);
+
+        if (loadSavedTokens()) {
+            emit ready();
+            return;
+        }
+        oauth->grant();
+    }
+
+    QString accessToken() const { return oauth ? oauth->token() : QString(); }
+    QOAuth2AuthorizationCodeFlow* flow() const { return oauth; }
+
+signals:
+    void ready();
+
+private slots:
+    void onGranted() {
+        if (!oauth) return;
+        QJsonObject o;
+        o["access_token"] = oauth->token();
+        o["refresh_token"] = oauth->refreshToken();
+        // Qt6: use expirationAt()
+        o["expiry"] = QString::number(oauth->expirationAt().toSecsSinceEpoch());
+        if (!saveTokensSecure(o)) {
+            logMsg("Failed to save tokens securely");
+        } else {
+            logMsg("OAuth granted and tokens saved securely");
+        }
+        emit ready();
+    }
+
+private:
+    bool loadClientSecrets() {
+        QFile f("client_secret.json");
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        QJsonDocument d = QJsonDocument::fromJson(f.readAll());
+        f.close();
+        if (!d.isObject()) return false;
+        QJsonObject root = d.object();
+        QJsonObject cfg = root.contains("web") ? root["web"].toObject() : root.contains("installed") ? root["installed"].toObject() : QJsonObject();
+        if (cfg.isEmpty()) return false;
+        clientId = cfg.value("client_id").toString();
+        clientSecret = cfg.value("client_secret").toString();
+        auto arr = cfg.value("redirect_uris").toArray();
+        if (!arr.isEmpty()) {
+            QUrl r(arr.first().toString());
+            replyPort = r.port(1337);
+            if (replyPort == -1) replyPort = 1337;
+        }
+        scopes = {"https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/userinfo.email"};
+        return !clientId.isEmpty();
+    }
+
+    bool loadSavedTokens() {
+        QJsonObject o;
+        if (!loadTokensSecure(o)) {
+            logMsg("No secure token file found or failed to load");
+            return false;
+        }
+        if (o.contains("refresh_token")) {
+            if (oauth) oauth->setRefreshToken(o["refresh_token"].toString());
+            logMsg("Loaded refresh token from secure storage");
+            return true;
+        }
+        return false;
+    }
+
+    QNetworkAccessManager *nam = nullptr;
+    QOAuth2AuthorizationCodeFlow *oauth = nullptr;
+    QString clientId, clientSecret;
+    int replyPort = 1337;
+    QStringList scopes;
+};
+
+// --------------------------- Notify window ---------------------------
+class NotifyWindow : public QDialog {
+    Q_OBJECT
+public:
+    NotifyWindow(QWidget *parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Google Drive Sync - Aktivitäten");
+        resize(480, 260);
+        QVBoxLayout *lay = new QVBoxLayout(this);
+        m_list = new QListWidget(this);
+        lay->addWidget(m_list);
+    }
+
+public slots:
+    void onJobStarted(const QString &file, const QString &dir) {
+        QString key = QString("%1|%2").arg(dir, file);
+        if (!m_items.contains(key)) {
+            QListWidgetItem *it = new QListWidgetItem(QString("%1: %2").arg(dir, file));
+            it->setData(Qt::UserRole, key);
+            m_list->addItem(it);
+            m_items.insert(key, it);
+        }
+        show();
+        raise();
+        activateWindow();
+    }
+
+    void onJobProgress(const QString &file, const QString &dir, int percent) {
+        QString key = QString("%1|%2").arg(dir, file);
+        if (m_items.contains(key)) {
+            QListWidgetItem *it = m_items.value(key);
+            it->setText(QString("%1: %2 — %3%").arg(dir, file).arg(percent));
+        }
+    }
+
+    void onJobFinished(const QString &file, const QString &dir) {
+        QString key = QString("%1|%2").arg(dir, file);
+        if (m_items.contains(key)) {
+            QListWidgetItem *it = m_items.take(key);
+            it->setText(QString("%1: %2 — fertig").arg(dir, file));
+            QTimer::singleShot(1500, [this, it]() {
+                delete it;
+                if (m_items.isEmpty()) hide();
+            });
+        }
+    }
+
+private:
+    QListWidget *m_list;
+    QMap<QString, QListWidgetItem*> m_items;
+};
+
+// --------------------------- Network retry helper ---------------------------
+class NetworkRetryHelper : public QObject {
+    Q_OBJECT
+public:
+    NetworkRetryHelper(QNetworkAccessManager *nam, OAuthHelper *oauth, QObject *parent = nullptr)
+        : QObject(parent), m_nam(nam), m_oauth(oauth) {}
+
+    void performWithRetry(std::function<QNetworkReply*()> creator, std::function<void(QNetworkReply*)> onFinished, int attempt = 0) {
+        if (attempt >= MAX_RETRIES) {
+            QNetworkReply *r = creator();
+            connect(r, &QNetworkReply::finished, this, [r, onFinished]() {
+                onFinished(r);
+                r->deleteLater();
+            });
+            return;
+        }
+        QNetworkReply *r = creator();
+        connect(r, &QNetworkReply::finished, this, [this, creator, onFinished, r, attempt]() {
+            int status = 0;
+            QVariant v = r->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+            if (v.isValid()) status = v.toInt();
+            bool authError = (r->error() == QNetworkReply::AuthenticationRequiredError) || (status == 401);
+            if (authError) {
+                logMsg(QString("401 detected, triggering reauth (attempt %1)").arg(attempt));
+                if (m_oauth && m_oauth->flow()) m_oauth->flow()->grant();
+                int backoffMs = (1 << attempt) * 500;
+                r->deleteLater();
+                QTimer::singleShot(backoffMs, this, [this, creator, onFinished, attempt]() {
+                    performWithRetry(creator, onFinished, attempt + 1);
+                });
+                return;
+            }
+            if (r->error() != QNetworkReply::NoError) {
+                int backoffMs = (1 << attempt) * 500;
+                logMsg(QString("Network error: %1; retrying in %2 ms (attempt %3)").arg(r->errorString()).arg(backoffMs).arg(attempt));
+                r->deleteLater();
+                QTimer::singleShot(backoffMs, this, [this, creator, onFinished, attempt]() {
+                    performWithRetry(creator, onFinished, attempt + 1);
+                });
+                return;
+            }
+            onFinished(r);
+            r->deleteLater();
+        });
+    }
+
+private:
+    QNetworkAccessManager *m_nam;
+    OAuthHelper *m_oauth;
+};
+
+// --------------------------- Sync manager ---------------------------
+class SyncManager : public QObject {
+    Q_OBJECT
+public:
+    SyncManager(OAuthHelper *oauth, const QString &localPath, QObject *parent = nullptr)
+        : QObject(parent), m_oauth(oauth), m_localPath(localPath) {
+        m_nam = new QNetworkAccessManager(this);
+        m_retry = new NetworkRetryHelper(m_nam, m_oauth, this);
+        if (!QDir(m_localPath).exists()) QDir().mkpath(m_localPath);
+        m_watcher = new QFileSystemWatcher(this);
+        m_watcher->addPath(m_localPath);
+        connect(m_watcher, &QFileSystemWatcher::directoryChanged, this, &SyncManager::onDirectoryChanged);
+        QTimer::singleShot(0, this, &SyncManager::initialScan);
+
+        m_pollTimer = new QTimer(this);
+        connect(m_pollTimer, &QTimer::timeout, this, &SyncManager::pollRemote);
+        m_pollTimer->start(REMOTE_POLL_INTERVAL_MS);
+    }
+
+signals:
+    void jobStarted(const QString &file, const QString &direction);
+    void jobProgress(const QString &file, const QString &direction, int percent);
+    void jobFinished(const QString &file, const QString &direction);
+
+public slots:
+    void initialScan() {
+        QDir dir(m_localPath);
+        QFileInfoList list = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+        for (const QFileInfo &fi : list) {
+            m_knownFiles.insert(fi.fileName());
+        }
+        pollRemote();
+    }
+
+    void onDirectoryChanged(const QString &path) {
+        Q_UNUSED(path);
+        QDir dir(m_localPath);
+        QFileInfoList list = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+        QSet<QString> current;
+        for (const QFileInfo &fi : list) current.insert(fi.fileName());
+        for (const QString &f : current) {
+            if (!m_knownFiles.contains(f)) {
+                m_knownFiles.insert(f);
+                if (m_remoteFiles.contains(f)) {
+                    QJsonObject remoteMeta = m_remoteFiles.value(f);
+                    decideSyncForFile(QDir(m_localPath).filePath(f), remoteMeta);
+                } else {
+                    enqueueUpload(QDir(m_localPath).filePath(f));
+                }
+            }
+        }
+        QSet<QString> removed = m_knownFiles - current;
+        for (const QString &f : removed) {
+            m_knownFiles.remove(f);
+        }
+    }
+
+    void pollRemote() {
+        if (!m_oauth || m_oauth->accessToken().isEmpty()) {
+            logMsg("No access token yet; skipping remote poll");
+            return;
+        }
+        QUrl url("https://www.googleapis.com/drive/v3/files");
+        QUrlQuery q;
+        q.addQueryItem("pageSize", "1000");
+        q.addQueryItem("fields", "files(id,name,modifiedTime,md5Checksum)");
+        url.setQuery(q);
+        QNetworkRequest req(url);
+        req.setRawHeader("Authorization", QString("Bearer %1").arg(m_oauth->accessToken()).toUtf8());
+
+        auto creator = [this, req]() -> QNetworkReply* {
+            return m_nam->get(req);
+        };
+        m_retry->performWithRetry(creator, [this](QNetworkReply *r) {
+            QByteArray body = r->readAll();
+            QJsonDocument doc = QJsonDocument::fromJson(body);
+            if (!doc.isObject()) return;
+            QJsonObject root = doc.object();
+            QJsonArray files = root.value("files").toArray();
+
+            // rebuild remote metadata cache
+            m_remoteFiles.clear();
+            QSet<QString> remoteNames;
+            QMap<QString, QJsonObject> remoteMap;
+            for (const QJsonValue &v : files) {
+                if (!v.isObject()) continue;
+                QJsonObject fo = v.toObject();
+                QString name = fo.value("name").toString();
+                remoteNames.insert(name);
+                remoteMap.insert(name, fo);
+                m_remoteFiles.insert(name, fo);
+            }
+
+            // For each remote file decide whether to download or skip
+            for (const QString &rname : remoteNames) {
+                QString localPath = QDir(m_localPath).filePath(rname);
+                if (m_knownFiles.contains(rname)) {
+                    QJsonObject remoteMeta = remoteMap.value(rname);
+                    decideSyncForFile(localPath, remoteMeta);
+                } else {
+                    if (!m_pendingDownloads.contains(rname)) {
+                        QJsonObject fo = remoteMap.value(rname);
+                        QString id = fo.value("id").toString();
+                        QString localTarget = QDir(m_localPath).filePath(rname);
+                        m_pendingDownloads.insert(rname);
+                        enqueueDownload(id, localTarget);
+                    }
+                }
+            }
+
+            // For local files not present remotely -> upload
+            QDir dir(m_localPath);
+            QFileInfoList list = dir.entryInfoList(QDir::Files | QDir::NoDotAndDotDot);
+            for (const QFileInfo &fi : list) {
+                if (!remoteNames.contains(fi.fileName()) && !m_activeUploads.contains(fi.absoluteFilePath())) {
+                    enqueueUpload(fi.absoluteFilePath());
+                }
+            }
+        });
+    }
+
+    void decideSyncForFile(const QString &localPath, const QJsonObject &remoteMeta) {
+        QFileInfo lfi(localPath);
+        if (!lfi.exists()) return;
+        QFile f(localPath);
+        if (!f.open(QIODevice::ReadOnly)) return;
+        QByteArray localData = f.readAll();
+        f.close();
+        QByteArray localMd5 = QCryptographicHash::hash(localData, QCryptographicHash::Md5).toHex();
+        QString localMd5Str = QString(localMd5);
+
+        QString remoteMd5 = remoteMeta.value("md5Checksum").toString();
+        QString remoteModified = remoteMeta.value("modifiedTime").toString();
+
+        if (!remoteMd5.isEmpty() && remoteMd5 == localMd5Str) {
+            return;
+        }
+
+        QDateTime remoteDt = QDateTime::fromString(remoteModified, Qt::ISODate);
+        QDateTime localDt = lfi.lastModified();
+
+        if (remoteDt.isValid() && remoteDt > localDt) {
+            QString fileId = remoteMeta.value("id").toString();
+            if (!fileId.isEmpty()) {
+                enqueueDownload(fileId, localPath);
+            }
+            return;
+        }
+
+        enqueueUpload(localPath);
+    }
+
+    void enqueueUpload(const QString &filePath) {
+        QMutexLocker locker(&m_mutex);
+        if (m_activeUploads.contains(filePath)) return;
+        if (m_activeUploads.size() >= MAX_CONCURRENT_UPLOADS) {
+            QTimer::singleShot(1000, this, [this, filePath]() { enqueueUpload(filePath); });
+            return;
+        }
+        m_activeUploads.insert(filePath);
+        emit jobStarted(filePath, "Upload");
+
+        QString name = QFileInfo(filePath).fileName();
+        if (m_remoteFiles.contains(name)) {
+            QJsonObject remoteMeta = m_remoteFiles.value(name);
+            QFile f(filePath);
+            if (f.open(QIODevice::ReadOnly)) {
+                QByteArray localData = f.readAll();
+                f.close();
+                QByteArray localMd5 = QCryptographicHash::hash(localData, QCryptographicHash::Md5).toHex();
+                QString localMd5Str = QString(localMd5);
+                QString remoteMd5 = remoteMeta.value("md5Checksum").toString();
+                QString remoteModified = remoteMeta.value("modifiedTime").toString();
+                QDateTime remoteDt = QDateTime::fromString(remoteModified, Qt::ISODate);
+                QDateTime localDt = QFileInfo(filePath).lastModified();
+
+                if (!remoteMd5.isEmpty() && remoteMd5 == localMd5Str) {
+                    logMsg(QString("Skipping upload for %1: identical to remote").arg(filePath));
+                    emit jobFinished(filePath, "Upload");
+                    QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                    return;
+                }
+                if (remoteDt.isValid() && remoteDt > localDt) {
+                    QString fileId = remoteMeta.value("id").toString();
+                    if (!fileId.isEmpty()) {
+                        logMsg(QString("Remote newer than local for %1; scheduling download").arg(filePath));
+                        enqueueDownload(fileId, filePath);
+                        QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                        return;
+                    }
+                }
+            }
+        }
+
+        QFileInfo fi(filePath);
+        QFile file(filePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+            emit jobFinished(filePath, "Upload");
+            QMutexLocker l2(&m_mutex); m_activeUploads.remove(filePath);
+            return;
+        }
+        QByteArray fileData = file.readAll();
+        file.close();
+
+        QJsonObject meta;
+        meta["name"] = fi.fileName();
+
+        QNetworkRequest req(QUrl("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"));
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json; charset=UTF-8");
+        req.setRawHeader("X-Upload-Content-Type", "application/octet-stream");
+        req.setRawHeader("X-Upload-Content-Length", QByteArray::number(fileData.size()));
+        req.setRawHeader("Authorization", QString("Bearer %1").arg(m_oauth->accessToken()).toUtf8());
+
+        auto creator = [this, req, meta]() -> QNetworkReply* {
+            return m_nam->post(req, QJsonDocument(meta).toJson());
+        };
+        m_retry->performWithRetry(creator, [this, filePath, fileData](QNetworkReply *r) {
+            QVariant loc = r->header(QNetworkRequest::LocationHeader);
+            QString uploadUrl = loc.toString();
+            if (uploadUrl.isEmpty()) {
+                logMsg("No upload URL returned");
+                emit jobFinished(filePath, "Upload");
+                QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                return;
+            }
+            qint64 total = fileData.size();
+            if (total <= CHUNK_SIZE) {
+                QNetworkRequest putReq{QUrl(uploadUrl)}; // use braces to avoid most-vexing-parse
+                putReq.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+                putReq.setRawHeader("Content-Length", QByteArray::number(total));
+                putReq.setRawHeader("Authorization", QString("Bearer %1").arg(m_oauth->accessToken()).toUtf8());
+                auto creatorPut = [this, putReq, fileData]() -> QNetworkReply* { return m_nam->put(putReq, fileData); };
+                m_retry->performWithRetry(creatorPut, [this, filePath](QNetworkReply *putReply) {
+                    if (putReply->error() != QNetworkReply::NoError) {
+                        logMsg(QString("Upload failed: %1").arg(putReply->errorString()));
+                    } else {
+                        logMsg(QString("Upload finished for %1").arg(filePath));
+                    }
+                    emit jobFinished(filePath, "Upload");
+                    QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                });
+            } else {
+                struct State { qint64 offset = 0; qint64 total = 0; QString url; QByteArray data; };
+                auto state = std::make_shared<State>();
+                state->offset = 0;
+                state->total = total;
+                state->url = uploadUrl;
+                state->data = fileData;
+
+                std::function<void()> sendNextChunk;
+                sendNextChunk = [this, state, filePath, &sendNextChunk]() {
+                    qint64 start = state->offset;
+                    qint64 end = qMin(state->offset + CHUNK_SIZE - 1, state->total - 1);
+                    QByteArray chunk = state->data.mid(start, end - start + 1);
+                    QNetworkRequest chunkReq{QUrl(state->url)};
+                    chunkReq.setHeader(QNetworkRequest::ContentTypeHeader, "application/octet-stream");
+                    QString contentRange = QString("bytes %1-%2/%3").arg(start).arg(end).arg(state->total);
+                    chunkReq.setRawHeader("Content-Range", contentRange.toUtf8());
+                    chunkReq.setRawHeader("Authorization", QString("Bearer %1").arg(m_oauth->accessToken()).toUtf8());
+
+                    auto creatorChunk = [this, chunkReq, chunk]() -> QNetworkReply* { return m_nam->put(chunkReq, chunk); };
+                    m_retry->performWithRetry(creatorChunk, [this, state, filePath, &sendNextChunk](QNetworkReply *chunkReply) {
+                        if (chunkReply->error() != QNetworkReply::NoError) {
+                            logMsg(QString("Chunk upload failed: %1").arg(chunkReply->errorString()));
+                            emit jobFinished(filePath, "Upload");
+                            QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                            return;
+                        }
+                        state->offset = qMin(state->offset + CHUNK_SIZE, state->total);
+                        int percent = state->total > 0 ? int((state->offset * 100) / state->total) : 0;
+                        emit jobProgress(filePath, "Upload", percent);
+                        if (state->offset < state->total) {
+                            sendNextChunk();
+                        } else {
+                            logMsg(QString("Chunked upload finished for %1").arg(filePath));
+                            emit jobFinished(filePath, "Upload");
+                            QMutexLocker l(&m_mutex); m_activeUploads.remove(filePath);
+                        }
+                    });
+                };
+                sendNextChunk();
+            }
+        });
+    }
+
+    void enqueueDownload(const QString &fileId, const QString &localTarget) {
+        QMutexLocker locker(&m_mutex);
+        if (m_activeDownloads.contains(localTarget)) return;
+        if (m_activeDownloads.size() >= MAX_CONCURRENT_DOWNLOADS) {
+            QTimer::singleShot(1000, this, [this, fileId, localTarget]() { enqueueDownload(fileId, localTarget); });
+            return;
+        }
+        m_activeDownloads.insert(localTarget);
+        emit jobStarted(localTarget, "Download");
+
+        QNetworkRequest req(QUrl(QString("https://www.googleapis.com/drive/v3/files/%1?alt=media").arg(fileId)));
+        req.setRawHeader("Authorization", QString("Bearer %1").arg(m_oauth->accessToken()).toUtf8());
+
+        auto creator = [this, req]() -> QNetworkReply* { return m_nam->get(req); };
+        m_retry->performWithRetry(creator, [this, localTarget](QNetworkReply *r) {
+            if (r->error() == QNetworkReply::NoError) {
+                QString part = localTarget + ".part";
+                QFile f(part);
+                if (f.open(QIODevice::WriteOnly)) {
+                    f.write(r->readAll());
+                    f.close();
+                    if (QFile::exists(localTarget)) QFile::remove(localTarget);
+                    if (!QFile::rename(part, localTarget)) {
+                        logMsg(QString("Failed to rename %1 -> %2").arg(part, localTarget));
+                    } else {
+                        logMsg(QString("Downloaded %1").arg(localTarget));
+                        m_knownFiles.insert(QFileInfo(localTarget).fileName());
+                    }
+                } else {
+                    logMsg(QString("Failed to open part file %1").arg(part));
+                }
+            } else {
+                logMsg(QString("Download failed: %1").arg(r->errorString()));
+            }
+            emit jobFinished(localTarget, "Download");
+            QMutexLocker l(&m_mutex); m_activeDownloads.remove(localTarget);
+            m_pendingDownloads.remove(QFileInfo(localTarget).fileName());
+        });
+    }
+
+private:
+    OAuthHelper *m_oauth;
+    QString m_localPath;
+    QFileSystemWatcher *m_watcher = nullptr;
+    QNetworkAccessManager *m_nam = nullptr;
+    NetworkRetryHelper *m_retry = nullptr;
+    QSet<QString> m_knownFiles;
+    QSet<QString> m_activeUploads;
+    QSet<QString> m_activeDownloads;
+    QSet<QString> m_pendingDownloads;
+    QMap<QString, QJsonObject> m_remoteFiles;
+    QTimer *m_pollTimer = nullptr;
+    QMutex m_mutex;
+};
+
+// --------------------------- main ---------------------------
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    g_app_for_signal = &app;
+
+    signal(SIGINT, handleSignal);
+    signal(SIGTERM, handleSignal);
+
+    // Ensure log file exists
+    logMsg("Starting google-drive-sync");
+
+    // Tray icon and menu
+    QSystemTrayIcon tray;
+    QMenu menu;
+    QAction actOpenFolder("Open Sync Folder");
+    QAction actShowActivity("Show Activity");
+    QAction actAuthenticate("Authenticate");
+    QAction actQuit("Quit");
+
+    menu.addAction(&actOpenFolder);
+    menu.addAction(&actShowActivity);
+    menu.addAction(&actAuthenticate);
+    menu.addSeparator();
+    menu.addAction(&actQuit);
+
+    tray.setContextMenu(&menu);
+    tray.setIcon(QIcon::fromTheme("folder-sync", QIcon()));
+    tray.setToolTip("Google Drive Sync");
+    tray.show();
+
+    // OAuth and sync
+    OAuthHelper oauth;
+    NotifyWindow notify;
+    SyncManager *sync = nullptr;
+
+    QObject::connect(&actOpenFolder, &QAction::triggered, [&]() {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(localSyncFolder()));
+    });
+    QObject::connect(&actShowActivity, &QAction::triggered, [&]() {
+        notify.show();
+        notify.raise();
+        notify.activateWindow();
+    });
+    QObject::connect(&actAuthenticate, &QAction::triggered, [&]() {
+        oauth.start();
+    });
+    QObject::connect(&actQuit, &QAction::triggered, [&]() {
+        logMsg("Quit requested from tray");
+        app.quit();
+    });
+
+    QObject::connect(&oauth, &OAuthHelper::ready, [&]() {
+        if (!sync) {
+            sync = new SyncManager(&oauth, localSyncFolder(), &app);
+            QObject::connect(sync, &SyncManager::jobStarted, &notify, &NotifyWindow::onJobStarted);
+            QObject::connect(sync, &SyncManager::jobProgress, &notify, &NotifyWindow::onJobProgress);
+            QObject::connect(sync, &SyncManager::jobFinished, &notify, &NotifyWindow::onJobFinished);
+        }
+    });
+
+    // Start auth flow (will load saved refresh token if present)
+    oauth.start();
+
+    int ret = app.exec();
+    logMsg("Exiting google-drive-sync");
+    return ret;
+}
+
+#include "main.moc"

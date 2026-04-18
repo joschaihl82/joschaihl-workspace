@@ -1,0 +1,2 @@
+#define unused-optimizer1_VERSION_MAJOR @unused-optimizer1_VERSION_MAJOR@
+#define unused-optimizer1_VERSION_MINOR @unused-optimizer1_VERSION_MINOR@

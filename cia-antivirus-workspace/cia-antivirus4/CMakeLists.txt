@@ -1,0 +1,107 @@
+cmake_minimum_required(VERSION 3.16)
+project(cia-antivirus LANGUAGES CXX)
+
+# --- Einstellungen ---
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Enable Qt automoc/auto features
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTOUIC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
+
+# --- Find Qt6 Widgets ---
+find_package(Qt6 COMPONENTS Widgets REQUIRED)
+
+# --- Try pkg-config for libclamav and alsa (preferred) ---
+find_package(PkgConfig QUIET)
+
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(PC_CLAMAV QUIET libclamav)
+    pkg_check_modules(PC_ALSA QUIET alsa)
+endif()
+
+# --- Fallback: find libraries if pkg-config not available or failed ---
+if(NOT PC_CLAMAV_FOUND)
+    find_library(CLAMAV_LIB NAMES clamav libclamav)
+else()
+    set(CLAMAV_LIB ${PC_CLAMAV_LIBRARIES})
+    include_directories(${PC_CLAMAV_INCLUDE_DIRS})
+    link_directories(${PC_CLAMAV_LIBRARY_DIRS})
+endif()
+
+if(NOT PC_ALSA_FOUND)
+    find_library(ALSA_LIB NAMES asound snd)
+else()
+    set(ALSA_LIB ${PC_ALSA_LIBRARIES})
+    include_directories(${PC_ALSA_INCLUDE_DIRS})
+    link_directories(${PC_ALSA_LIBRARY_DIRS})
+endif()
+
+# --- Source files ---
+set(SRC
+    cia-antivirus4.cpp
+)
+
+# If you split into multiple sources, add them here:
+# list(APPEND SRC otherfile.cpp)
+
+# --- Target ---
+add_executable(${PROJECT_NAME} ${SRC})
+
+# Include Qt headers
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets)
+
+# Link libclamav and alsa (if found)
+if(CLAMAV_LIB)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CLAMAV_LIB})
+else()
+    message(WARNING "libclamav not found. You may need to install libclamav-dev or adjust CMakeLists.")
+endif()
+
+if(ALSA_LIB)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${ALSA_LIB})
+else()
+    message(WARNING "ALSA library not found. You may need to install libasound2-dev or adjust CMakeLists.")
+endif()
+
+# Threads
+find_package(Threads REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
+
+# Include directories (project local + pkg-config includes if present)
+target_include_directories(${PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(PC_CLAMAV_FOUND)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${PC_CLAMAV_INCLUDE_DIRS})
+endif()
+if(PC_ALSA_FOUND)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${PC_ALSA_INCLUDE_DIRS})
+endif()
+
+# Compiler warnings (optional)
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# RPATH handling for runtime (useful on some Linux setups)
+set_target_properties(${PROJECT_NAME} PROPERTIES
+    BUILD_WITH_INSTALL_RPATH ON
+    INSTALL_RPATH "$ORIGIN/../lib"
+)
+
+# --- Install (optional) ---
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+
+# --- Useful build hints ---
+message(STATUS "Project: ${PROJECT_NAME}")
+message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
+if(PC_CLAMAV_FOUND)
+    message(STATUS "libclamav (pkg-config) found: ${PC_CLAMAV_LIBRARIES}")
+endif()
+if(PC_ALSA_FOUND)
+    message(STATUS "alsa (pkg-config) found: ${PC_ALSA_LIBRARIES}")
+endif()

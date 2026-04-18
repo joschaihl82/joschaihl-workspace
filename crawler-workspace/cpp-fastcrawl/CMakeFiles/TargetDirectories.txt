@@ -1,0 +1,3 @@
+/home/josh/cpp-fastcrawl/CMakeFiles/HighPerfCrawler.dir
+/home/josh/cpp-fastcrawl/CMakeFiles/edit_cache.dir
+/home/josh/cpp-fastcrawl/CMakeFiles/rebuild_cache.dir

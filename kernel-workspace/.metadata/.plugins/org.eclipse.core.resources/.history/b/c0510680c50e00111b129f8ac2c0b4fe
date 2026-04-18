@@ -1,0 +1,206 @@
+// exectrace1.c
+// Portable sched_process_exec tracepoint probe that locates the tracepoint
+// at runtime by scanning the kernel's tracepoint table if necessary.
+//
+// Build: place next to a Makefile with `obj-m := exectrace1.o` and run
+//   make -C /lib/modules/$(uname -r)/build M=$PWD modules V=1
+//
+// Notes:
+// - This tries three registration methods in order:
+//   1) register_trace_sched_process_exec (if the kernel exports it)
+//   2) &__tracepoint_sched_process_exec (if the kernel exports that symbol)
+//   3) runtime scan of the kernel tracepoint table (__start___tracepoints..__stop___tracepoints)
+// - The runtime scan is the most portable fallback and avoids undefined symbol
+//   references that cause modpost errors.
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+#include <linux/string.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Josh + Copilot");
+MODULE_DESCRIPTION("Trace executed binaries and print resolved full path using sched_process_exec tracepoint");
+MODULE_VERSION("0.7");
+
+/* Portable ratelimit state */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+/* Probe callback */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+	char *buf = NULL;
+	char *path = NULL;
+
+	if (!p || !bprm)
+		return;
+
+	if (!__ratelimit(&exectrace_rl))
+		return;
+
+	if (bprm->file) {
+		struct path fpath;
+
+		fpath = bprm->file->f_path;
+		path_get(&fpath);
+
+		buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+		if (!buf) {
+			path_put(&fpath);
+			pr_info("exectrace: pid=%d comm=%s filename=%s (no mem)\n",
+				p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+			return;
+		}
+
+		path = d_path(&fpath, buf, PATH_MAX);
+		if (IS_ERR(path)) {
+			pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+				p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+		} else {
+			pr_info("exectrace: pid=%d comm=%s path=%s\n",
+				p->pid, p->comm, path);
+		}
+
+		kfree(buf);
+		path_put(&fpath);
+	} else {
+		pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+			p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+	}
+}
+
+/* --- Fallback helpers for locating the tracepoint at runtime --- */
+
+/* Some kernels export a registration helper; declare weakly (may not be present). */
+extern int register_trace_sched_process_exec(void (*probe)(void *data,
+                                                           struct task_struct *p,
+                                                           pid_t old_pid,
+                                                           struct linux_binprm *bprm),
+                                            void *data);
+extern void unregister_trace_sched_process_exec(void (*probe)(void *data,
+                                                               struct task_struct *p,
+                                                               pid_t old_pid,
+                                                               struct linux_binprm *bprm),
+                                                void *data);
+
+/* Some kernels export the tracepoint symbol __tracepoint_sched_process_exec */
+extern struct tracepoint __tracepoint_sched_process_exec;
+
+/* Kernel tracepoint table boundaries (used for runtime scan fallback).
+ * These symbols are provided by the kernel linker script when tracepoints
+ * are compiled into the kernel. They may or may not be exported; declaring
+ * them extern here allows us to iterate if present.
+ */
+extern struct tracepoint __start___tracepoints[];
+extern struct tracepoint __stop___tracepoints[];
+
+/* Pointer to the tracepoint we registered with (if any) */
+static struct tracepoint *tp_sched = NULL;
+/* Track which registration method succeeded:
+ * 1 = register_trace_* helper
+ * 2 = &__tracepoint_sched_process_exec
+ * 3 = runtime scan
+ */
+static int tp_method = 0;
+
+/* Try to find the tracepoint by scanning the kernel's tracepoint table.
+ * Returns pointer or NULL.
+ */
+static struct tracepoint *find_tracepoint_by_name(const char *name)
+{
+	struct tracepoint *tp;
+
+	/* If the kernel provides the start/stop symbols, iterate them */
+	if (&__start___tracepoints && &__stop___tracepoints) {
+		for (tp = __start___tracepoints; tp < __stop___tracepoints; tp++) {
+			/* tp->name may be NULL in some kernels; guard against that */
+			if (tp->name && strcmp(tp->name, name) == 0)
+				return tp;
+		}
+	}
+
+	/* Not found */
+	return NULL;
+}
+
+/* Module init: try multiple registration methods */
+static int __init exectrace_init(void)
+{
+	int ret = 0;
+
+	/* 1) Try register_trace_sched_process_exec helper if available.
+	 * If the symbol is not present in the kernel, the linker will still allow
+	 * the module to build only if the symbol is weak/optional; otherwise modpost
+	 * would have failed earlier. We attempt and check return value.
+	 */
+	if ((void *)register_trace_sched_process_exec != NULL) {
+		/* Some kernels may not export this symbol; calling it when NULL is guarded above */
+		ret = register_trace_sched_process_exec(probe_sched_process_exec, NULL);
+		if (ret == 0) {
+			tp_method = 1;
+			pr_info("exectrace: registered via register_trace_sched_process_exec\n");
+			return 0;
+		}
+		/* If it failed, fall through to other methods */
+	}
+
+	/* 2) Try kernel-exported tracepoint symbol __tracepoint_sched_process_exec */
+	if ((void *)&__tracepoint_sched_process_exec != NULL) {
+		tp_sched = &__tracepoint_sched_process_exec;
+		ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+		if (ret == 0) {
+			tp_method = 2;
+			pr_info("exectrace: registered via __tracepoint_sched_process_exec\n");
+			return 0;
+		}
+		/* If registration failed, clear tp_sched and fall through */
+		tp_sched = NULL;
+	}
+
+	/* 3) Runtime scan of tracepoint table */
+	tp_sched = find_tracepoint_by_name("sched_process_exec");
+	if (tp_sched) {
+		ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+		if (ret == 0) {
+			tp_method = 3;
+			pr_info("exectrace: registered via runtime tracepoint scan\n");
+			return 0;
+		}
+		/* registration failed */
+		tp_sched = NULL;
+	}
+
+	/* If we reach here, registration failed */
+	pr_err("exectrace: failed to register probe for sched_process_exec (ret=%d)\n", ret);
+	return ret ? ret : -ENOENT;
+}
+
+/* Module exit: unregister according to the method used */
+static void __exit exectrace_exit(void)
+{
+	if (tp_method == 1) {
+		/* If we used register_trace_* helper, try to unregister via the helper if available */
+		if ((void *)unregister_trace_sched_process_exec != NULL)
+			unregister_trace_sched_process_exec(probe_sched_process_exec, NULL);
+	} else if (tp_method == 2 || tp_method == 3) {
+		if (tp_sched)
+			tracepoint_probe_unregister(tp_sched, (void *)probe_sched_process_exec, NULL);
+	}
+
+	pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);

@@ -1,0 +1,413 @@
+// main.c
+// Wasserleitungssimulator mit GLUT, GLEW, GLSL und PSO-ähnlicher Partikelsimulation
+// Kompiliere mit: gcc -o wasser_sim main.c -lGL -lGLEW -lglut -lm
+
+#include <GL/glew.h>
+#include <GL/glut.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+
+#define WIN_W 1200
+#define WIN_H 700
+
+// Simulation parameters
+#define NUM_PARTICLES 4000
+#define NUM_PIPES 12
+#define PIPE_SEGMENTS 20
+
+typedef struct { float x,y; } vec2;
+typedef struct {
+    vec2 pos;
+    vec2 vel;
+    vec2 pbest;    // persönliche beste Position (PSO)
+    float pbest_val;
+    int pipe_index; // in welchem Rohrsegment der Partikel ist (für rendering)
+} Particle;
+
+Particle *particles = NULL;
+
+// Pipe representation: each pipe is a polyline from left to right
+typedef struct {
+    vec2 pts[PIPE_SEGMENTS+1];
+    float thickness; // base thickness
+} Pipe;
+
+Pipe pipes[NUM_PIPES];
+
+// GL objects
+GLuint particleVBO = 0;
+GLuint particleVAO = 0;
+GLuint shaderProgram = 0;
+GLuint lineShaderProgram = 0;
+
+// Utility
+float randf(){ return (float)rand() / (float)RAND_MAX; }
+float clampf(float v, float a, float b){ if(v<a) return a; if(v>b) return b; return v; }
+
+// Simple evaluation function for PSO: prefer moving rightwards along pipe centerline
+float eval_particle(Particle *p, Pipe *pipe){
+    // reward x position (to the right) and closeness to pipe centerline (distance to nearest segment)
+    float score = p->pos.x * 0.5f;
+    // distance to nearest pipe point
+    float mind = 1e6f;
+    for(int i=0;i<=PIPE_SEGMENTS;i++){
+        float dx = p->pos.x - pipe->pts[i].x;
+        float dy = p->pos.y - pipe->pts[i].y;
+        float d = sqrtf(dx*dx + dy*dy);
+        if(d < mind) mind = d;
+    }
+    score -= mind * 2.0f; // penalize distance
+    return score;
+}
+
+// Initialize pipes: left side thick, right side thin
+void init_pipes(){
+    float leftX = -0.9f, rightX = 0.9f;
+    float heightSpan = 1.6f;
+    for(int i=0;i<NUM_PIPES;i++){
+        float y = -0.8f + (heightSpan/(NUM_PIPES-1)) * i;
+        float thickness = 0.08f * (1.0f - (float)i/(NUM_PIPES-1)) + 0.01f; // thicker on left
+        pipes[i].thickness = thickness;
+        for(int s=0;s<=PIPE_SEGMENTS;s++){
+            float t = (float)s / (float)PIPE_SEGMENTS;
+            // slight vertical jitter to make pipes not perfectly straight
+            float jitter = 0.02f * sinf((float)i*0.7f + t*6.28f);
+            pipes[i].pts[s].x = leftX + (rightX-leftX) * t;
+            pipes[i].pts[s].y = y + jitter;
+        }
+    }
+}
+
+// Initialize particles: spawn near left side of pipes, more particles in thicker pipes
+void init_particles(){
+    particles = (Particle*)malloc(sizeof(Particle)*NUM_PARTICLES);
+    int idx = 0;
+    // compute weights by thickness
+    float total = 0.0f;
+    float weights[NUM_PIPES];
+    for(int i=0;i<NUM_PIPES;i++){ weights[i] = pipes[i].thickness; total += weights[i]; }
+    while(idx < NUM_PARTICLES){
+        // choose pipe by weighted probability
+        float r = randf() * total;
+        int chosen = 0;
+        float acc = 0;
+        for(int i=0;i<NUM_PIPES;i++){
+            acc += weights[i];
+            if(r <= acc){ chosen = i; break; }
+        }
+        // spawn near leftmost segment of chosen pipe
+        float sx = pipes[chosen].pts[0].x + 0.02f * randf();
+        float sy = pipes[chosen].pts[0].y + (randf()-0.5f) * pipes[chosen].thickness * 2.0f;
+        particles[idx].pos.x = sx;
+        particles[idx].pos.y = sy;
+        particles[idx].vel.x = 0.01f + 0.02f*randf();
+        particles[idx].vel.y = (randf()-0.5f)*0.01f;
+        particles[idx].pbest = particles[idx].pos;
+        particles[idx].pbest_val = eval_particle(&particles[idx], &pipes[chosen]);
+        particles[idx].pipe_index = chosen;
+        idx++;
+    }
+}
+
+// Simple nearest point on pipe polyline
+vec2 pipe_direction_at(Pipe *pipe, float x){
+    // find segment where x lies
+    for(int s=0;s<PIPE_SEGMENTS;s++){
+        vec2 a = pipe->pts[s], b = pipe->pts[s+1];
+        if((x >= a.x && x <= b.x) || (x >= b.x && x <= a.x)){
+            vec2 dir = { b.x - a.x, b.y - a.y };
+            float len = sqrtf(dir.x*dir.x + dir.y*dir.y);
+            if(len > 1e-6f){ dir.x /= len; dir.y /= len; }
+            return dir;
+        }
+    }
+    // fallback: direction from first to last
+    vec2 dir = { pipe->pts[PIPE_SEGMENTS].x - pipe->pts[0].x, pipe->pts[PIPE_SEGMENTS].y - pipe->pts[0].y };
+    float len = sqrtf(dir.x*dir.x + dir.y*dir.y);
+    if(len > 1e-6f){ dir.x /= len; dir.y /= len; }
+    return dir;
+}
+
+// Update particles using PSO-like rules + neighbor cohesion + random wave impulses
+void update_particles(float dt){
+    // PSO coefficients
+    const float w = 0.6f;   // inertia
+    const float c1 = 1.2f;  // cognitive
+    const float c2 = 0.9f;  // social (global)
+    // compute a simple global best per pipe (encourages flow along pipe)
+    vec2 gbest_pos[NUM_PIPES];
+    float gbest_val[NUM_PIPES];
+    for(int i=0;i<NUM_PIPES;i++){ gbest_val[i] = -1e9f; gbest_pos[i].x = pipes[i].pts[PIPE_SEGMENTS].x; gbest_pos[i].y = pipes[i].pts[PIPE_SEGMENTS].y; }
+    for(int i=0;i<NUM_PARTICLES;i++){
+        int pi = particles[i].pipe_index;
+        float val = eval_particle(&particles[i], &pipes[pi]);
+        if(val > gbest_val[pi]){
+            gbest_val[pi] = val;
+            gbest_pos[pi] = particles[i].pos;
+        }
+    }
+
+    // neighbor cohesion radius
+    const float neighR = 0.03f;
+    for(int i=0;i<NUM_PARTICLES;i++){
+        Particle *p = &particles[i];
+        Pipe *pipe = &pipes[p->pipe_index];
+        // update personal best
+        float val = eval_particle(p, pipe);
+        if(val > p->pbest_val){
+            p->pbest_val = val;
+            p->pbest = p->pos;
+        }
+        // PSO velocity update towards pbest and gbest (for the pipe)
+        vec2 gpos = gbest_pos[p->pipe_index];
+        float r1 = randf(), r2 = randf();
+        p->vel.x = w * p->vel.x + c1 * r1 * (p->pbest.x - p->pos.x) + c2 * r2 * (gpos.x - p->pos.x);
+        p->vel.y = w * p->vel.y + c1 * r1 * (p->pbest.y - p->pos.y) + c2 * r2 * (gpos.y - p->pos.y);
+
+        // add directional bias along pipe
+        vec2 dir = pipe_direction_at(pipe, p->pos.x);
+        p->vel.x += dir.x * 0.02f;
+        p->vel.y += dir.y * 0.005f;
+
+        // neighbor cohesion (simple)
+        float cx = 0, cy = 0; int cn = 0;
+        for(int j=0;j<NUM_PARTICLES;j+=50){ // sample subset for performance
+            if(i==j) continue;
+            float dx = particles[j].pos.x - p->pos.x;
+            float dy = particles[j].pos.y - p->pos.y;
+            float d2 = dx*dx + dy*dy;
+            if(d2 < neighR*neighR){
+                cx += particles[j].pos.x;
+                cy += particles[j].pos.y;
+                cn++;
+            }
+        }
+        if(cn>0){
+            cx /= cn; cy /= cn;
+            p->vel.x += (cx - p->pos.x) * 0.01f;
+            p->vel.y += (cy - p->pos.y) * 0.01f;
+        }
+
+        // random wave impulses near center of pipe to create oscillations
+        if(randf() < 0.002f){
+            p->vel.y += (randf()-0.5f) * 0.05f;
+        }
+
+        // integrate
+        p->pos.x += p->vel.x * dt;
+        p->pos.y += p->vel.y * dt;
+
+        // keep particle near pipe bounds: if too far, project back to nearest pipe point
+        float mind = 1e6f; vec2 nearest = p->pos;
+        for(int s=0;s<=PIPE_SEGMENTS;s++){
+            float dx = p->pos.x - pipe->pts[s].x;
+            float dy = p->pos.y - pipe->pts[s].y;
+            float d = sqrtf(dx*dx + dy*dy);
+            if(d < mind){ mind = d; nearest = pipe->pts[s]; }
+        }
+        if(mind > 0.2f){ // escaped pipe, respawn near left
+            p->pos.x = pipe->pts[0].x + 0.01f*randf();
+            p->pos.y = pipe->pts[0].y + (randf()-0.5f)*pipe->thickness*2.0f;
+            p->vel.x = 0.01f + 0.02f*randf();
+            p->vel.y = (randf()-0.5f)*0.01f;
+        }
+
+        // if reached right end, wrap to left (continuous flow)
+        if(p->pos.x > pipe->pts[PIPE_SEGMENTS].x + 0.02f){
+            p->pos.x = pipe->pts[0].x + 0.01f*randf();
+            p->pos.y = pipe->pts[0].y + (randf()-0.5f)*pipe->thickness*2.0f;
+            p->vel.x *= 0.2f;
+            p->vel.y *= 0.2f;
+        }
+    }
+}
+
+// GLSL simple particle shader (vertex + fragment)
+const char *particleVertSrc =
+"#version 330 core\n"
+"layout(location=0) in vec2 inPos;\n"
+"layout(location=1) in float inSize;\n"
+"uniform mat4 uProj;\n"
+"out float vSize;\n"
+"void main(){\n"
+"  gl_Position = uProj * vec4(inPos, 0.0, 1.0);\n"
+"  vSize = inSize;\n"
+"  gl_PointSize = inSize;\n}\n";
+
+const char *particleFragSrc =
+"#version 330 core\n"
+"out vec4 fragColor;\n"
+"void main(){\n"
+"  float r = length(gl_PointCoord - vec2(0.5));\n"
+"  float alpha = smoothstep(0.5, 0.45, r);\n"
+"  fragColor = vec4(0.2, 0.5, 0.9, alpha);\n"}\n";
+
+// Line shader for pipes (simple color)
+const char *lineVertSrc =
+"#version 330 core\n"
+"layout(location=0) in vec2 inPos;\n"
+"uniform mat4 uProj;\n"
+"void main(){ gl_Position = uProj * vec4(inPos, 0.0, 1.0); }\n";
+
+const char *lineFragSrc =
+"#version 330 core\n"
+"out vec4 fragColor;\n"
+"uniform vec3 uColor;\n"
+"void main(){ fragColor = vec4(uColor, 1.0); }\n";
+
+// Shader compile helpers
+GLuint compile_shader(const char *src, GLenum type){
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if(!ok){
+        char buf[1024]; glGetShaderInfoLog(s,1024,NULL,buf);
+        fprintf(stderr,"Shader compile error: %s\n",buf);
+    }
+    return s;
+}
+GLuint link_program(const char *vsrc, const char *fsrc){
+    GLuint vs = compile_shader(vsrc, GL_VERTEX_SHADER);
+    GLuint fs = compile_shader(fsrc, GL_FRAGMENT_SHADER);
+    GLuint p = glCreateProgram();
+    glAttachShader(p, vs); glAttachShader(p, fs);
+    glLinkProgram(p);
+    GLint ok; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if(!ok){ char buf[1024]; glGetProgramInfoLog(p,1024,NULL,buf); fprintf(stderr,"Link error: %s\n",buf); }
+    glDeleteShader(vs); glDeleteShader(fs);
+    return p;
+}
+
+// Projection matrix (orthographic)
+void mat4_ortho(float *m, float left, float right, float bottom, float top){
+    for(int i=0;i<16;i++) m[i]=0.0f;
+    m[0] = 2.0f/(right-left);
+    m[5] = 2.0f/(top-bottom);
+    m[10] = -1.0f;
+    m[12] = -(right+left)/(right-left);
+    m[13] = -(top+bottom)/(top-bottom);
+    m[15] = 1.0f;
+}
+
+// OpenGL init
+void init_gl(){
+    glewExperimental = GL_TRUE;
+    if(glewInit() != GLEW_OK){ fprintf(stderr,"GLEW init failed\n"); exit(1); }
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    shaderProgram = link_program(particleVertSrc, particleFragSrc);
+    lineShaderProgram = link_program(lineVertSrc, lineFragSrc);
+
+    // VBO for particles: we'll upload positions each frame
+    glGenBuffers(1, &particleVBO);
+    glGenVertexArrays(1, &particleVAO);
+    glBindVertexArray(particleVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    // allocate enough space: vec2 + float size per particle
+    glBufferData(GL_ARRAY_BUFFER, NUM_PARTICLES * (2+1) * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    // attribute 0: vec2 pos
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)0);
+    // attribute 1: float size
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)(2*sizeof(float)));
+    glBindVertexArray(0);
+}
+
+// Render pipes as lines
+void render_pipes(float proj[16]){
+    glUseProgram(lineShaderProgram);
+    GLint loc = glGetUniformLocation(lineShaderProgram, "uProj");
+    glUniformMatrix4fv(loc, 1, GL_FALSE, proj);
+    GLint colorLoc = glGetUniformLocation(lineShaderProgram, "uColor");
+    for(int i=0;i<NUM_PIPES;i++){
+        // color gradient based on thickness
+        float t = (float)i/(NUM_PIPES-1);
+        float r = 0.2f*(1.0f-t) + 0.05f*t;
+        float g = 0.2f*(1.0f-t) + 0.4f*t;
+        float b = 0.2f*(1.0f-t) + 0.8f*t;
+        glUniform3f(colorLoc, r,g,b);
+        // draw line strip
+        glLineWidth(2.0f + pipes[i].thickness*40.0f);
+        glBegin(GL_LINE_STRIP);
+        for(int s=0;s<=PIPE_SEGMENTS;s++){
+            glVertex2f(pipes[i].pts[s].x, pipes[i].pts[s].y);
+        }
+        glEnd();
+    }
+    glUseProgram(0);
+}
+
+// Render particles
+void render_particles(float proj[16]){
+    // upload particle positions and sizes
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    float *buf = (float*)malloc(NUM_PARTICLES * 3 * sizeof(float));
+    for(int i=0;i<NUM_PARTICLES;i++){
+        buf[i*3+0] = particles[i].pos.x;
+        buf[i*3+1] = particles[i].pos.y;
+        // size depends on pipe thickness and a bit of velocity
+        float base = pipes[particles[i].pipe_index].thickness * 200.0f;
+        float vmag = sqrtf(particles[i].vel.x*particles[i].vel.x + particles[i].vel.y*particles[i].vel.y);
+        buf[i*3+2] = clampf(base + vmag*200.0f, 1.0f, 30.0f);
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, 0, NUM_PARTICLES * 3 * sizeof(float), buf);
+    free(buf);
+
+    glUseProgram(shaderProgram);
+    GLint loc = glGetUniformLocation(shaderProgram, "uProj");
+    glUniformMatrix4fv(loc, 1, GL_FALSE, proj);
+    glBindVertexArray(particleVAO);
+    glDrawArrays(GL_POINTS, 0, NUM_PARTICLES);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+// GLUT display + idle
+float lastTime = 0.0f;
+void display(){
+    float now = (float)glutGet(GLUT_ELAPSED_TIME) / 1000.0f;
+    float dt = now - lastTime;
+    if(dt > 0.033f) dt = 0.033f;
+    lastTime = now;
+
+    update_particles(dt);
+
+    glViewport(0,0,WIN_W,WIN_H);
+    glClearColor(0.05f,0.07f,0.12f,1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    float proj[16];
+    mat4_ortho(proj, -1.0f, 1.0f, -1.0f * (float)WIN_H/WIN_W, 1.0f * (float)WIN_H/WIN_W);
+
+    render_pipes(proj);
+    render_particles(proj);
+
+    glutSwapBuffers();
+    glutPostRedisplay();
+}
+
+void keyboard(unsigned char key, int x, int y){
+    if(key == 27) exit(0);
+}
+
+int main(int argc, char** argv){
+    srand((unsigned int)time(NULL));
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA | GLUT_DEPTH);
+    glutInitWindowSize(WIN_W, WIN_H);
+    glutCreateWindow("Wasserleitungssimulator - PSO Partikelstrom");
+    init_pipes();
+    init_particles();
+    init_gl();
+    lastTime = (float)glutGet(GLUT_ELAPSED_TIME) / 1000.0f;
+    glutDisplayFunc(display);
+    glutKeyboardFunc(keyboard);
+    glutMainLoop();
+    return 0;
+}

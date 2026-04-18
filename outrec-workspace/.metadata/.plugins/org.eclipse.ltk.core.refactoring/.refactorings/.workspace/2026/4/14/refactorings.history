@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Copy Project &apos;sndrec&apos;" description="Copy Project &apos;sndrec&apos;" destination="/home/joscha/outrec-workspace" element="/sndrec" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="sndrec2" stamp="1775394630356"/>&#x0A;<refactoring comment="Copy Project &apos;sndrec2&apos;" description="Copy Project &apos;sndrec2&apos;" destination="/home/joscha/outrec-workspace" element="/sndrec2" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="loopback-probe" stamp="1775395525073"/>
+</session>

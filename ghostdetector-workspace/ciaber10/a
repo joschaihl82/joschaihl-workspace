@@ -1,0 +1,112 @@
+main.c: In function ‘draw_overlay_manual’:
+main.c:492:13: error: redefinition of ‘prev_x’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |             ^~~~~~
+main.c:501:5: note: in expansion of macro ‘PLOT_GRAPH’
+  501 |     PLOT_GRAPH(stats->avgHistory, 0, 255, 0, 200);
+      |     ^~~~~~~~~~
+main.c:492:13: note: previous definition of ‘prev_x’ with type ‘int’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |             ^~~~~~
+main.c:500:5: note: in expansion of macro ‘PLOT_GRAPH’
+  500 |     PLOT_GRAPH(stats->shortHistory, 255, 255, 255, 128);
+      |     ^~~~~~~~~~
+main.c:492:29: error: redefinition of ‘prev_y’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |                             ^~~~~~
+main.c:501:5: note: in expansion of macro ‘PLOT_GRAPH’
+  501 |     PLOT_GRAPH(stats->avgHistory, 0, 255, 0, 200);
+      |     ^~~~~~~~~~
+main.c:492:29: note: previous definition of ‘prev_y’ with type ‘int’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |                             ^~~~~~
+main.c:500:5: note: in expansion of macro ‘PLOT_GRAPH’
+  500 |     PLOT_GRAPH(stats->shortHistory, 255, 255, 255, 128);
+      |     ^~~~~~~~~~
+main.c:492:13: error: redefinition of ‘prev_x’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |             ^~~~~~
+main.c:502:5: note: in expansion of macro ‘PLOT_GRAPH’
+  502 |     PLOT_GRAPH(stats->longHistory, 0, 128, 255, 200);
+      |     ^~~~~~~~~~
+main.c:492:13: note: previous definition of ‘prev_x’ with type ‘int’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |             ^~~~~~
+main.c:501:5: note: in expansion of macro ‘PLOT_GRAPH’
+  501 |     PLOT_GRAPH(stats->avgHistory, 0, 255, 0, 200);
+      |     ^~~~~~~~~~
+main.c:492:29: error: redefinition of ‘prev_y’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |                             ^~~~~~
+main.c:502:5: note: in expansion of macro ‘PLOT_GRAPH’
+  502 |     PLOT_GRAPH(stats->longHistory, 0, 128, 255, 200);
+      |     ^~~~~~~~~~
+main.c:492:29: note: previous definition of ‘prev_y’ with type ‘int’
+  492 |         int prev_x = 0; int prev_y = GET_Y_POS(history[0]); \
+      |                             ^~~~~~
+main.c:501:5: note: in expansion of macro ‘PLOT_GRAPH’
+  501 |     PLOT_GRAPH(stats->avgHistory, 0, 255, 0, 200);
+      |     ^~~~~~~~~~
+main.c: In function ‘refresh_gui’:
+main.c:563:9: warning: ‘gtk_widget_override_color’ is deprecated [-Wdeprecated-declarations]
+  563 |         gtk_widget_override_color(g_alert_bar, GTK_STATE_FLAG_NORMAL, color);
+      |         ^~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/gtk-3.0/gtk/gtkapplication.h:27,
+                 from /usr/include/gtk-3.0/gtk/gtkwindow.h:33,
+                 from /usr/include/gtk-3.0/gtk/gtkdialog.h:32,
+                 from /usr/include/gtk-3.0/gtk/gtkaboutdialog.h:30,
+                 from /usr/include/gtk-3.0/gtk/gtk.h:31,
+                 from main.c:1:
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1144:14: note: declared here
+ 1144 | void         gtk_widget_override_color            (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~
+main.c: In function ‘activate’:
+main.c:634:5: warning: ‘gtk_widget_override_background_color’ is deprecated [-Wdeprecated-declarations]
+  634 |     gtk_widget_override_background_color(main_box, GTK_STATE_FLAG_NORMAL, &RGBA_DARK);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1148:14: note: declared here
+ 1148 | void         gtk_widget_override_background_color (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:641:5: warning: ‘gtk_widget_override_color’ is deprecated [-Wdeprecated-declarations]
+  641 |     gtk_widget_override_color(g_label_rate, GTK_STATE_FLAG_NORMAL, &RGBA_WHITE);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1144:14: note: declared here
+ 1144 | void         gtk_widget_override_color            (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:642:5: warning: ‘gtk_widget_override_background_color’ is deprecated [-Wdeprecated-declarations]
+  642 |     gtk_widget_override_background_color(g_label_rate, GTK_STATE_FLAG_NORMAL, &rgba_transparent);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1148:14: note: declared here
+ 1148 | void         gtk_widget_override_background_color (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:644:5: warning: ‘gtk_widget_override_color’ is deprecated [-Wdeprecated-declarations]
+  644 |     gtk_widget_override_color(g_label_avg, GTK_STATE_FLAG_NORMAL, &RGBA_WHITE);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1144:14: note: declared here
+ 1144 | void         gtk_widget_override_color            (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:645:5: warning: ‘gtk_widget_override_background_color’ is deprecated [-Wdeprecated-declarations]
+  645 |     gtk_widget_override_background_color(g_label_avg, GTK_STATE_FLAG_NORMAL, &rgba_transparent);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1148:14: note: declared here
+ 1148 | void         gtk_widget_override_background_color (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:647:5: warning: ‘gtk_widget_override_color’ is deprecated [-Wdeprecated-declarations]
+  647 |     gtk_widget_override_color(g_label_dose, GTK_STATE_FLAG_NORMAL, &RGBA_WHITE);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1144:14: note: declared here
+ 1144 | void         gtk_widget_override_color            (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:648:5: warning: ‘gtk_widget_override_background_color’ is deprecated [-Wdeprecated-declarations]
+  648 |     gtk_widget_override_background_color(g_label_dose, GTK_STATE_FLAG_NORMAL, &rgba_transparent);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1148:14: note: declared here
+ 1148 | void         gtk_widget_override_background_color (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.c:686:5: warning: ‘gtk_widget_override_background_color’ is deprecated [-Wdeprecated-declarations]
+  686 |     gtk_widget_override_background_color(g_alert_bar, GTK_STATE_FLAG_NORMAL, &RGBA_DARK);
+      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/gtk-3.0/gtk/gtkwidget.h:1148:14: note: declared here
+ 1148 | void         gtk_widget_override_background_color (GtkWidget     *widget,
+      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+make: *** [makefile:26: radionullon] Error 1

@@ -1,0 +1,154 @@
+// ============================================================================
+// test_bios.c - bare-metal-programm zur bildschirmtest-animation
+//              für den jemu x64-emulator
+//
+// wird direkt in den emulierten ram geladen und an adresse 0x0 gestartet.
+// verwendet keine standard c lib.
+// ============================================================================
+
+// --- konstanten und typen ---
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+
+// framebuffer-parameter (müssen mit emu.c übereinstimmen)
+#define fb_width  640
+#define fb_height 480
+#define fb_bpp    4 // 4 bytes per pixel (argb8888)
+#define fb_pitch  (fb_width * fb_bpp)
+
+// --- globale variablen (positionen im emulierten speicher) ---
+
+// der emulator in jemu.c verwendet ram_mem als primären speicher und
+// fb_mem für den framebuffer. wir simulieren hier die ram-adresse des framebuffers.
+// im emulator ist fb_mem ein globaler pointer, der auf ein malloc-array zeigt.
+// da dies ein *test* ist und wir keinen echten os-loader haben,
+// gehen wir davon aus, dass wir auf eine hohe adresse schreiben,
+// die der emulator intern auf fb_mem umleitet.
+// da der emu.c den framebuffer bei fb_mem hält, schreiben wir direkt auf
+// die adresse 0x3000000, die wir als start des framebuffers annehmen
+// (nach 64mb ram, was wahrscheinlich nicht richtig ist,
+// da ram_size 64mb ist, aber wir brauchen eine speicheradresse,
+// die get_memory_ptr() in fb_mem umwandelt.
+// da dies nicht direkt möglich ist, greifen wir direkt auf die speicheradresse
+// zu, die den framebuffer halten soll, im normalfall eine adresse im hohen speicherbereich.)
+//
+// da wir uns nicht auf die speicherabbildung des emulators verlassen können,
+// schreiben wir eine test-funktion, die eine simple animation darstellt,
+// die wir mit dem wissen deines emulators anpassen.
+//
+// für diesen test *nehmen wir an*, dass der emulator den $fb\_mem$
+// speicherbereich auf eine bestimmte (hohe) ram-adresse abbildet,
+// oder dass $fb\_mem$ direkt im $ram\_mem$ liegt.
+// da das nicht dokumentiert ist, ist der einfachste weg, die
+// **ausgabe** über die **sdl-funktionen** zu testen.
+
+// *** da $jemu.c$ $fb\_mem$ statisch allokiert, aber nicht mappt, müssen wir in den
+//     emulierten ram schreiben und hoffen, dass der emulator den
+//     framebuffer dort abruft, was er nicht tut. ***
+//
+// *** wir schreiben stattdessen eine funktion, die $jemu.c$ als **host-funktion**
+//     für einen *system call* verwenden könnte, um den framebuffer zu manipulieren,
+//     aber da wir einen bare-metal-test erstellen, gehen wir davon aus, dass
+//     die adresse 0x0000000000000000 auf den $fb\_mem$ zeigt, WENN der code
+//     direkt in den $ram\_mem$ geladen wird, was bei einem *bare-metal-bios*
+//     sinn macht. ***
+
+#define fb_base_addr ((uint32_t *)0x100000) // 1mb im ram, nur für testzwecke
+
+// --- interne funktionen (utility) ---
+
+// delay-funktion (einfache busy-wait-schleife)
+static void delay(uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        // asm-anweisung, um sicherzustellen, dass der compiler die schleife nicht optimiert
+        asm volatile("" : : : "memory");
+    }
+}
+
+// zeichnet ein gefülltes rechteck in den framebuffer
+static void draw_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
+    uint32_t *fb = fb_base_addr;
+    for (uint32_t j = 0; j < h; ++j) {
+        if (y + j >= fb_height) break;
+        uint32_t row_start = (y + j) * fb_width;
+        for (uint32_t i = 0; i < w; ++i) {
+            if (x + i >= fb_width) break;
+            fb[row_start + (x + i)] = color;
+        }
+    }
+}
+
+// zeichnet einen farbverlauf basierend auf der zeit/frame-nummer
+static void draw_gradient(uint32_t frame) {
+    uint32_t *fb = fb_base_addr;
+    for (uint32_t j = 0; j < fb_height; ++j) {
+        for (uint32_t i = 0; i < fb_width; ++i) {
+            // einfacher rgb-farbverlauf + animation
+            uint8_t r = (uint8_t)(i / 3) + frame;
+            uint8_t g = (uint8_t)(j / 2) + frame;
+            uint8_t b = (uint8_t)(i + j) + frame;
+
+            // argb format (a=ff für volle deckkraft)
+            uint32_t color = (0xff000000) | (r << 16) | (g << 8) | b;
+            fb[(j * fb_width) + i] = color;
+        }
+    }
+}
+
+// --- haupteinstiegspunkt (bios-schleife) ---
+
+// *achtung*: die funktion $main$ wird hier nicht verwendet,
+// da wir bare-metal booten. die cpu springt direkt zum start-rip
+// (wahrscheinlich 0x0).
+
+void start_bios() {
+    uint32_t frame_counter = 0;
+    uint32_t x_pos = 0;
+    uint32_t y_pos = 0;
+    int x_dir = 1;
+    int y_dir = 1;
+
+    // hauptschleife
+    for (;;) {
+        // 1. farbverlauf als hintergrund
+        draw_gradient(frame_counter / 100);
+
+        // 2. bewegendes quadrat
+        uint32_t rect_w = 60;
+        uint32_t rect_h = 60;
+        uint32_t rect_color = 0xffffffff; // weiß
+
+        draw_rect(x_pos, y_pos, rect_w, rect_h, rect_color);
+
+        // 3. quadrat bewegen
+        if (frame_counter % 2 == 0) { // verlangsame bewegung
+            x_pos += x_dir;
+            y_pos += y_dir;
+
+            if (x_pos + rect_w >= fb_width || x_pos == 0) {
+                x_dir = -x_dir;
+                x_pos += x_dir; // zurückspringen
+            }
+
+            if (y_pos + rect_h >= fb_height || y_pos == 0) {
+                y_dir = -y_dir;
+                y_pos += y_dir; // zurückspringen
+            }
+        }
+
+        // 4. framebuffer aktualisieren (simulierter system-call/io)
+        // in einem echten bios müsste dies ein io-befehl sein, der dem emulator
+        // signalisiert, den framebuffer zu aktualisieren.
+        // da dein emulator keine io-befehle implementiert,
+        // **müssen wir annehmen, dass die aktualisierung des framebuffers
+        // direkt in die emulationsschleife integriert ist
+        // (z.b. alle n instruktionen oder wenn der cpu-code einen $fb\_present$ call auslöst).**
+
+        // 5. warteschleife (bremse)
+        delay(100000); // passt für $640 \times 480$
+
+        frame_counter++;
+    }
+}

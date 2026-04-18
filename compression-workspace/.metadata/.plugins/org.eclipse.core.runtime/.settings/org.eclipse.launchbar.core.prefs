@@ -1,0 +1,17 @@
+LaunchTargetManager/configs/unzip=org.eclipse.launchbar.core.launchTargetType.local\:Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:jlz5 Debug,org.eclipse.launchbar.core.descriptorType.default\:jlz9 Debug,org.eclipse.launchbar.core.descriptorType.default\:jlz11 Debug,org.eclipse.launchbar.core.descriptorType.default\:jlz12 Debug,org.eclipse.launchbar.core.descriptorType.default\:jaz1,org.eclipse.launchbar.core.descriptorType.default\:jaz2,org.eclipse.launchbar.core.descriptorType.default\:jlz20 Debug,org.eclipse.launchbar.core.descriptorType.default\:lz4simple,org.eclipse.launchbar.core.descriptorType.default\:list,org.eclipse.launchbar.core.descriptorType.default\:unzip
+eclipse.preferences.version=1
+org.eclipse.launchbar.core.descriptorType.default\:jaz2/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:jaz2/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:jlz11\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:jlz11\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:jlz20\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:jlz20\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:jlz5\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:jlz5\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:list/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:lz4simple/activeLaunchMode=debug
+org.eclipse.launchbar.core.descriptorType.default\:unzip/activeLaunchMode=run

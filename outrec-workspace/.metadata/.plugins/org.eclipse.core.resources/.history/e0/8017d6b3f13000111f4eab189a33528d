@@ -1,0 +1,173 @@
+/* alsa_loop_rec_ts.c
+   Record from ALSA loopback capture device (auto-detect) at 44100 Hz, stereo, S16_LE
+   and write to a WAV file named YYMMDD-HHMMSS.wav.
+*/
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <signal.h>
+#include <alsa/asoundlib.h>
+#include <stdint.h>
+#include <unistd.h>
+
+volatile sig_atomic_t running = 1;
+void handle_sigint(int sig){ (void)sig; running = 0; }
+
+struct wav_hdr {
+  char riff[4]; uint32_t overall_size; char wave[4];
+  char fmt_chunk_marker[4]; uint32_t length_of_fmt; uint16_t format_type;
+  uint16_t channels; uint32_t sample_rate; uint32_t byterate;
+  uint16_t block_align; uint16_t bits_per_sample;
+  char data_chunk_header[4]; uint32_t data_size;
+};
+
+static void write_wav_header(FILE *f, int channels, int rate, int bits, uint32_t data_bytes) {
+  struct wav_hdr h;
+  memcpy(h.riff,"RIFF",4); h.overall_size = 36 + data_bytes;
+  memcpy(h.wave,"WAVE",4); memcpy(h.fmt_chunk_marker,"fmt ",4);
+  h.length_of_fmt = 16; h.format_type = 1; h.channels = (uint16_t)channels;
+  h.sample_rate = (uint32_t)rate; h.bits_per_sample = (uint16_t)bits;
+  h.byterate = rate * channels * bits/8;
+  h.block_align = channels * bits/8;
+  memcpy(h.data_chunk_header,"data",4); h.data_size = data_bytes;
+  fwrite(&h, sizeof(h), 1, f);
+}
+
+/* Try to find a card whose name or longname contains "Loopback".
+   If found, build device string "hw:<card>,1,0" and return malloc'd string.
+   Caller must free returned pointer. Returns NULL if not found. */
+static char *find_loopback_device(void) {
+  int card = -1;
+  int err;
+  snd_ctl_t *ctl = NULL;
+  snd_ctl_card_info_t *info = NULL;
+  snd_ctl_card_info_malloc(&info);
+
+  if ((err = snd_card_next(&card)) < 0) {
+    snd_ctl_card_info_free(info);
+    return NULL;
+  }
+  while (card >= 0) {
+    char ctlname[32];
+    snprintf(ctlname, sizeof(ctlname), "hw:%d", card);
+    if (snd_ctl_open(&ctl, ctlname, 0) >= 0) {
+      if (snd_ctl_card_info(ctl, info) >= 0) {
+        const char *name = snd_ctl_card_info_get_name(info);
+        const char *longname = snd_ctl_card_info_get_longname(info);
+        if ((name && strstr(name, "Loopback")) || (longname && strstr(longname, "Loopback"))) {
+          char *dev = malloc(32);
+          if (dev) snprintf(dev, 32, "hw:%d,1,0", card);
+          snd_ctl_close(ctl);
+          snd_ctl_card_info_free(info);
+          return dev;
+        }
+      }
+      snd_ctl_close(ctl);
+    }
+    if ((err = snd_card_next(&card)) < 0) break;
+  }
+  snd_ctl_card_info_free(info);
+  /* fallback: try literal "hw:Loopback,1,0" */
+  {
+    snd_pcm_t *h = NULL;
+    if (snd_pcm_open(&h, "hw:Loopback,1,0", SND_PCM_STREAM_CAPTURE, 0) >= 0) {
+      snd_pcm_close(h);
+      char *dev = malloc(32);
+      if (dev) snprintf(dev, 32, "hw:Loopback,1,0");
+      return dev;
+    }
+  }
+  return NULL;
+}
+
+int main(void){
+  unsigned int rate = 44100;
+  int channels = 2;
+  snd_pcm_t *handle = NULL;
+  snd_pcm_hw_params_t *hw = NULL;
+  snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
+  int err;
+
+  signal(SIGINT, handle_sigint);
+
+  char *device = find_loopback_device();
+  if (!device) {
+    fprintf(stderr, "Fehler: Keine Loopback-Karte gefunden. Bitte lade snd-aloop (sudo modprobe snd-aloop) oder konfiguriere eine Loopback-Quelle.\n");
+    return 2;
+  }
+
+  if((err = snd_pcm_open(&handle, device, SND_PCM_STREAM_CAPTURE, 0)) < 0){
+    fprintf(stderr, "Fehler: Kann ALSA device '%s' nicht öffnen: %s\n", device, snd_strerror(err));
+    free(device);
+    return 1;
+  }
+  free(device);
+
+  snd_pcm_hw_params_malloc(&hw);
+  snd_pcm_hw_params_any(handle, hw);
+  snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+  snd_pcm_hw_params_set_format(handle, hw, format);
+  snd_pcm_hw_params_set_rate_near(handle, hw, &rate, 0);
+  snd_pcm_hw_params_set_channels(handle, hw, channels);
+  snd_pcm_uframes_t period_size = 1024;
+  snd_pcm_hw_params_set_period_size_near(handle, hw, &period_size, 0);
+  if ((err = snd_pcm_hw_params(handle, hw)) < 0) {
+    fprintf(stderr, "Fehler: hw_params setzen fehlgeschlagen: %s\n", snd_strerror(err));
+    snd_pcm_hw_params_free(hw);
+    snd_pcm_close(handle);
+    return 1;
+  }
+  snd_pcm_hw_params_free(hw);
+
+  int bytes_per_sample = 2;
+  int bytes_per_frame = channels * bytes_per_sample;
+  snd_pcm_uframes_t frames = period_size;
+  size_t bufsize = frames * bytes_per_frame;
+  char *buffer = malloc(bufsize);
+  if(!buffer){ fprintf(stderr,"Fehler: malloc\n"); snd_pcm_close(handle); return 1; }
+
+  time_t t = time(NULL);
+  struct tm tm;
+  localtime_r(&t, &tm);
+  char filename[64];
+  strftime(filename, sizeof(filename), "%y%m%d-%H%M%S.wav", &tm);
+
+  FILE *f = fopen(filename, "wb");
+  if(!f){ fprintf(stderr,"Fehler: Kann Datei '%s' nicht öffnen zum Schreiben\n", filename); free(buffer); snd_pcm_close(handle); return 1; }
+
+  write_wav_header(f, channels, rate, bytes_per_sample * 8, 0);
+  uint32_t data_written = 0;
+
+  fprintf(stderr, "Aufnahme gestartet von Loopback -> %s (Druecke Ctrl+C zum Beenden)\n", filename);
+
+  while(running){
+    int r = snd_pcm_readi(handle, buffer, frames);
+    if(r == -EPIPE){
+      snd_pcm_prepare(handle);
+      continue;
+    }
+    if(r < 0){
+      fprintf(stderr, "Read error: %s\n", snd_strerror(r));
+      break;
+    }
+    if(r > 0){
+      size_t wrote = fwrite(buffer, bytes_per_frame, r, f);
+      if(wrote != (size_t)r){
+        fprintf(stderr, "Fehler beim Schreiben in Datei\n");
+        break;
+      }
+      data_written += r * bytes_per_frame;
+    }
+  }
+
+  fseek(f, 0, SEEK_SET);
+  write_wav_header(f, channels, rate, bytes_per_sample * 8, data_written);
+  fclose(f);
+  free(buffer);
+  snd_pcm_close(handle);
+
+  fprintf(stderr, "Aufnahme beendet, Datei: %s (Datenbytes: %u)\n", filename, data_written);
+  return 0;
+}

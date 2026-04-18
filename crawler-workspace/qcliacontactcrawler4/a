@@ -1,0 +1,1 @@
+QMetaObject::invokeMethod: No such method QtCrawlerBridge::notifyNewUrl(QString,QString,int,double)

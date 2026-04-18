@@ -1,0 +1,229 @@
+// main.cpp
+#include <QApplication>
+#include <QWebEngineView>
+#include <QWebEngineProfile>
+#include <QWebEngineUrlRequestInterceptor>
+#include <QWebEnginePage>
+#include <QWebEngineSettings>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QStandardPaths>
+#include <QSaveFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QUrl>
+#include <QHBoxLayout>
+#include <QWidget>
+#include <QLineEdit>
+#include <QToolBar>
+#include <QAction>
+#include <QProgressBar>
+#include <QStatusBar>
+#include <QMainWindow>
+#include <QDateTime>
+#include <QMetaObject>
+#include <QPointer>
+
+class MediaInterceptor : public QWebEngineUrlRequestInterceptor {
+    Q_OBJECT
+public:
+    explicit MediaInterceptor(QObject* parent = nullptr) : QWebEngineUrlRequestInterceptor(parent) {}
+    void interceptRequest(QWebEngineUrlRequestInfo &info) override {
+        QUrl url = info.requestUrl();
+        QString path = url.path().toLower();
+
+        // Einfache Heuristik: Endungen prüfen
+        if (path.endsWith(".mp4") || path.endsWith(".webm") ||
+            path.endsWith(".mp3") || path.endsWith(".ogg") ||
+            path.endsWith(".wav") || path.endsWith(".m4a")) {
+            emit mediaDetected(url);
+        }
+        // Hinweis: adaptive streams (HLS/DASH) haben meist keine solche Endung
+    }
+signals:
+    void mediaDetected(const QUrl &url);
+};
+
+class BrowserWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    BrowserWindow(QWidget *parent = nullptr) : QMainWindow(parent) {
+        // Profil und Interceptor
+        profile = new QWebEngineProfile(this);
+        interceptor = new MediaInterceptor(profile);
+        profile->setRequestInterceptor(interceptor);
+
+        // WebView und Page
+        view = new QWebEngineView(this);
+        view->setPage(new QWebEnginePage(profile, view));
+        view->page()->settings()->setAttribute(QWebEngineSettings::PluginsEnabled, true);
+
+        // UI: einfache Adressleiste und Toolbar
+        auto *tool = addToolBar("Navigation");
+        address = new QLineEdit(this);
+        address->setClearButtonEnabled(true);
+        QAction *goAct = new QAction("Go", this);
+        QAction *backAct = new QAction("Back", this);
+        QAction *forwardAct = new QAction("Forward", this);
+        QAction *reloadAct = new QAction("Reload", this);
+
+        tool->addAction(backAct);
+        tool->addAction(forwardAct);
+        tool->addAction(reloadAct);
+        tool->addWidget(address);
+        tool->addAction(goAct);
+
+        // Statusbar mit Progress
+        progress = new QProgressBar(this);
+        progress->setRange(0, 100);
+        statusBar()->addPermanentWidget(progress);
+
+        setCentralWidget(view);
+        resize(1200, 800);
+
+        // Network manager für direkte Downloads
+        mgr = new QNetworkAccessManager(this);
+
+        // Verbindungen
+        connect(goAct, &QAction::triggered, this, &BrowserWindow::navigateToAddress);
+        connect(address, &QLineEdit::returnPressed, this, &BrowserWindow::navigateToAddress);
+        connect(backAct, &QAction::triggered, view, &QWebEngineView::back);
+        connect(forwardAct, &QAction::triggered, view, &QWebEngineView::forward);
+        connect(reloadAct, &QAction::triggered, view, &QWebEngineView::reload);
+
+        connect(view, &QWebEngineView::urlChanged, this, &BrowserWindow::onUrlChanged);
+        connect(view, &QWebEngineView::loadProgress, progress, &QProgressBar::setValue);
+
+        // Wenn WebEngine einen Download anstößt (z.B. "Save as"), ohne direkten QWebEngineDownloadItem-Header
+        // Wir verbinden auf das Signal und empfangen den Parameter als QObject*
+        connect(profile, &QWebEngineProfile::downloadRequested, this, &BrowserWindow::onDownloadRequested);
+
+        // Wenn Interceptor ein Media erkennt, lade es per QNetworkAccessManager in ~/Downloads
+        connect(interceptor, &MediaInterceptor::mediaDetected, this, &BrowserWindow::onMediaDetected);
+
+        // Startseite setzen
+        view->load(QUrl("https://spotify.com"));
+    }
+
+private slots:
+    void navigateToAddress() {
+        QUrl url = QUrl::fromUserInput(address->text());
+        if (!url.isValid()) return;
+        view->load(url);
+    }
+
+    void onUrlChanged(const QUrl &url) {
+        address->setText(url.toString());
+    }
+
+    // Slot empfängt QObject* statt QWebEngineDownloadItem* — kein Header-Include nötig
+    void onDownloadRequested(QObject* downloadObj) {
+        if (!downloadObj) return;
+
+        // Zielverzeichnis
+        QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        QDir().mkpath(downloads);
+
+        // Vorschlag für Dateiname per QMetaObject abfragen
+        QString suggested;
+        QVariant ret;
+        bool ok = QMetaObject::invokeMethod(downloadObj, "suggestedFileName",
+                                            Qt::DirectConnection,
+                                            Q_RETURN_ARG(QVariant, ret));
+        if (ok && ret.isValid()) suggested = ret.toString();
+
+        if (suggested.isEmpty()) suggested = QString("download_%1").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+        QString path = downloads + QDir::separator() + suggested;
+
+        // setPath aufrufen
+        QMetaObject::invokeMethod(downloadObj, "setPath", Qt::DirectConnection, Q_ARG(QString, path));
+        // accept aufrufen
+        QMetaObject::invokeMethod(downloadObj, "accept", Qt::DirectConnection);
+
+        // Hinweis: wir rufen keine Methoden direkt auf, damit kein Header benötigt wird.
+    }
+
+    void onMediaDetected(const QUrl &url) {
+        // Dateiname aus URL
+        QString fileName = QFileInfo(url.path()).fileName();
+        if (fileName.isEmpty()) {
+            // Fallback: generischer Name mit Zeitstempel
+            fileName = QString("media_%1").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+        }
+
+        QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        QDir().mkpath(downloads);
+        QString outPath = downloads + QDir::separator() + fileName;
+
+        QNetworkRequest req(url);
+        // Optional: hier könnten Header gesetzt werden (User-Agent etc.)
+        QNetworkReply *reply = mgr->get(req);
+
+        // QSaveFile für atomare Speicherung
+        QSaveFile *saveFile = new QSaveFile(outPath);
+        if (!saveFile->open(QIODevice::WriteOnly)) {
+            delete saveFile;
+            reply->abort();
+            reply->deleteLater();
+            return;
+        }
+
+        // Schreibe Daten, wenn verfügbar
+        connect(reply, &QNetworkReply::readyRead, this, [reply, saveFile]() {
+            saveFile->write(reply->readAll());
+        });
+
+        // Fortschritt in Statusbar (optional)
+        connect(reply, &QNetworkReply::downloadProgress, this, [this](qint64 received, qint64 total) {
+            if (total > 0) {
+                int p = static_cast<int>((received * 100) / total);
+                progress->setValue(p);
+            }
+        });
+
+        // Fertig
+        connect(reply, &QNetworkReply::finished, this, [reply, saveFile, this]() {
+            // Wenn kein Fehler, commit; sonst löschen
+            if (reply->error() == QNetworkReply::NoError) {
+                saveFile->commit();
+            } else {
+                saveFile->cancel();
+                QFile::remove(saveFile->fileName());
+            }
+            saveFile->close();
+            reply->deleteLater();
+            saveFile->deleteLater();
+            progress->setValue(0);
+        });
+
+        // Fehlerbehandlung (zusätzlich)
+        connect(reply, QOverload<QNetworkReply::NetworkError>::of(&QNetworkReply::error),
+                this, [reply, saveFile](QNetworkReply::NetworkError) {
+            Q_UNUSED(reply);
+            saveFile->cancel();
+        });
+    }
+
+private:
+    QWebEngineView *view;
+    QLineEdit *address;
+    QProgressBar *progress;
+    QWebEngineProfile *profile;
+    MediaInterceptor *interceptor;
+    QNetworkAccessManager *mgr;
+};
+
+#include "main.moc"
+
+int main(int argc, char *argv[]) {
+    QApplication app(argc, argv);
+
+    QCoreApplication::setApplicationName("SimpleQtBrowserQt6");
+    QCoreApplication::setOrganizationName("ExampleOrg");
+
+    BrowserWindow w;
+    w.show();
+
+    return app.exec();
+}

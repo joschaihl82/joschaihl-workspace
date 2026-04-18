@@ -1,0 +1,663 @@
+/*
+ * filescanner.c
+ *
+ * Linear raw ext4 filescanner with top progress bar and bottom numbered list
+ * of deleted filenames. Single-file plain C, POSIX, no external libraries.
+ *
+ * Changes:
+ *  - Allows running without root. When not root, the program will NOT attempt
+ *    to mount the device. If the device is already mounted, it will detect
+ *    the mountpoint and use it for lstat checks. If not mounted and the user
+ *    is non-root, the scanner will run in read-only, non-mounting mode and
+ *    report candidate filenames (unverified).
+ *
+ * Features:
+ *  - Detects existing mountpoint for device via /proc/mounts; mounts read-only
+ *    under /tmp only when running as root and only if not already mounted.
+ *  - Reads ext4 superblock (if present) to obtain inode_size and block_size.
+ *  - Scans the device linearly from offset 0 to device end in fixed-size chunks
+ *    equal to inode_size; treats each chunk as a candidate inode.
+ *  - For candidate directory inodes, parses direct blocks (i_block[0..11])
+ *    and extracts directory entries using strict validation to avoid false positives.
+ *  - Reconstructs best-effort full paths from collected directory entries using
+ *    '..' parent links found in the collected entries.
+ *  - If a mountpoint is available, checks lstat() against the mounted tree and
+ *    prints the path only if lstat returns ENOENT (interpreted as deleted).
+ *  - If no mountpoint is available (non-root and not mounted), prints candidate
+ *    filenames as "unverified".
+ *  - UI: progress bar fixed at top of terminal; numbered list of found deleted
+ *    files shown at the bottom and updated live.
+ *
+ * Limitations:
+ *  - Only direct blocks are parsed (no extents, no indirect blocks, no indexed dirs).
+ *  - Linear raw scanning is heuristic and may still miss or misidentify entries.
+ *
+ * Build:
+ *   gcc -O2 -o filescanner filescanner.c
+ *
+ * Usage:
+ *   sudo ./filescanner /dev/sdXN      # with root: will mount if needed
+ *   ./filescanner image.img           # without root: will not mount; will run read-only
+ *
+ * Safety:
+ *  - Work on a copy of the device when possible.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <limits.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+
+/* --- ext4 on-disk minimal structures --- */
+#define EXT4_SUPER_OFFSET 1024
+#define EXT4_NAME_LEN 255
+
+struct ext4_super {
+    uint32_t s_inodes_count;
+    uint32_t s_blocks_count_lo;
+    uint32_t s_r_blocks_count_lo;
+    uint32_t s_free_blocks_count_lo;
+    uint32_t s_free_inodes_count;
+    uint32_t s_first_data_block;
+    uint32_t s_log_block_size;
+    uint32_t s_log_cluster_size;
+    uint32_t s_blocks_per_group;
+    uint32_t s_clusters_per_group;
+    uint32_t s_inodes_per_group;
+    uint32_t s_mtime;
+    uint32_t s_wtime;
+    uint16_t s_mnt_count;
+    uint16_t s_max_mnt_count;
+    uint16_t s_magic;
+    uint16_t s_state;
+    uint16_t s_errors;
+    uint16_t s_minor_rev_level;
+    uint32_t s_lastcheck;
+    uint32_t s_checkinterval;
+    uint32_t s_creator_os;
+    uint32_t s_rev_level;
+    uint16_t s_def_resuid;
+    uint16_t s_def_resgid;
+    uint32_t s_first_ino;
+    uint16_t s_inode_size;
+    uint16_t s_block_group_nr;
+    uint32_t s_feature_compat;
+    uint32_t s_feature_incompat;
+    uint32_t s_feature_ro_compat;
+    uint8_t  s_uuid[16];
+    char     s_volume_name[16];
+    char     s_last_mounted[64];
+} __attribute__((packed));
+
+struct ext4_inode {
+    uint16_t i_mode;
+    uint16_t i_uid;
+    uint32_t i_size_lo;
+    uint32_t i_atime;
+    uint32_t i_ctime;
+    uint32_t i_mtime;
+    uint32_t i_dtime;
+    uint16_t i_gid;
+    uint16_t i_links_count;
+    uint32_t i_blocks_lo;
+    uint32_t i_flags;
+    uint32_t i_osd1;
+    uint32_t i_block[15];
+    uint32_t i_generation;
+    uint32_t i_file_acl_lo;
+    uint32_t i_size_high;
+    uint32_t i_obso_faddr;
+    uint8_t  i_osd2[12];
+} __attribute__((packed));
+
+struct ext2_dir_entry {
+    uint32_t inode;
+    uint16_t rec_len;
+    uint8_t  name_len;
+    uint8_t  file_type;
+    char     name[]; /* not NUL-terminated */
+} __attribute__((packed));
+
+/* --- utility I/O helpers --- */
+static ssize_t pread_all(int fd, void *buf, size_t count, off_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pread(fd, (char*)buf + done, count - done, offset + done);
+        if (r < 0) return -1;
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+static uint16_t le16(const void *p) {
+    const uint8_t *b = p;
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static uint32_t le32(const void *p) {
+    const uint8_t *b = p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+/* --- terminal UI helpers --- */
+static int get_term_size(int *rows, int *cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) return -1;
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    return 0;
+}
+static void move_cursor(int row, int col) { printf("\x1b[%d;%dH", row, col); }
+static void clear_line(void) { printf("\x1b[2K"); }
+static void hide_cursor(void) { printf("\x1b[?25l"); fflush(stdout); }
+static void show_cursor(void) { printf("\x1b[?25h"); fflush(stdout); }
+
+/* time helpers */
+static double time_diff_seconds(struct timeval *start, struct timeval *end) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_usec - start->tv_usec) / 1e6;
+}
+static void format_seconds(double s, char *out, size_t outlen) {
+    if (s < 0) s = 0;
+    int hours = (int)(s / 3600);
+    int minutes = (int)((s - hours * 3600) / 60);
+    int seconds = (int)(s - hours * 3600 - minutes * 60);
+    if (hours > 99) snprintf(out, outlen, "%02dh+%02dm", hours, minutes);
+    else snprintf(out, outlen, "%02d:%02d:%02d", hours, minutes, seconds);
+}
+
+/* --- global mountpoint used for lstat checks inside scan --- */
+static char g_mountpoint[PATH_MAX] = {0};
+
+/* --- lists for collected directory entries and found deleted paths --- */
+struct dir_entry_item {
+    uint64_t parent;   /* pseudo parent inode (from offset) */
+    uint64_t child;    /* child inode number from dir entry */
+    char name[EXT4_NAME_LEN + 1];
+};
+struct dir_entry_list {
+    struct dir_entry_item *items;
+    size_t used;
+    size_t cap;
+};
+static void del_init(struct dir_entry_list *d) { d->items = NULL; d->used = d->cap = 0; }
+static void del_free(struct dir_entry_list *d) { if (d->items) { free(d->items); d->items = NULL; } d->used = d->cap = 0; }
+static int del_add(struct dir_entry_list *d, uint64_t parent, uint64_t child, const char *name) {
+    if (d->used == d->cap) {
+        size_t ncap = d->cap ? d->cap * 2 : 4096;
+        struct dir_entry_item *n = realloc(d->items, ncap * sizeof(*n));
+        if (!n) return -1;
+        d->items = n; d->cap = ncap;
+    }
+    d->items[d->used].parent = parent;
+    d->items[d->used].child = child;
+    strncpy(d->items[d->used].name, name, EXT4_NAME_LEN);
+    d->items[d->used].name[EXT4_NAME_LEN] = '\0';
+    d->used++;
+    return 0;
+}
+static const char *del_find_name(struct dir_entry_list *d, uint64_t parent, uint64_t child) {
+    for (size_t i = 0; i < d->used; ++i) {
+        if (d->items[i].parent == parent && d->items[i].child == child) return d->items[i].name;
+    }
+    return NULL;
+}
+static uint64_t del_find_parent_of_dir(struct dir_entry_list *d, uint64_t dir) {
+    for (size_t i = 0; i < d->used; ++i) {
+        if (d->items[i].parent == dir && strcmp(d->items[i].name, "..") == 0) return d->items[i].child;
+    }
+    return 0;
+}
+
+/* dynamic list of strings for found deleted paths */
+struct str_list {
+    char **items;
+    size_t used;
+    size_t cap;
+};
+static void sl_init(struct str_list *s) { s->items = NULL; s->used = s->cap = 0; }
+static void sl_free(struct str_list *s) { if (s->items) { for (size_t i = 0; i < s->used; ++i) free(s->items[i]); free(s->items); } s->items = NULL; s->used = s->cap = 0; }
+static int sl_contains(struct str_list *s, const char *str) {
+    for (size_t i = 0; i < s->used; ++i) if (strcmp(s->items[i], str) == 0) return 1;
+    return 0;
+}
+static int sl_add(struct str_list *s, const char *str) {
+    if (sl_contains(s, str)) return 0;
+    if (s->used == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 256;
+        char **n = realloc(s->items, ncap * sizeof(char*));
+        if (!n) return -1;
+        s->items = n; s->cap = ncap;
+    }
+    s->items[s->used] = strdup(str);
+    if (!s->items[s->used]) return -1;
+    s->used++;
+    return 0;
+}
+
+/* --- filename validation helpers (strict) --- */
+static bool is_printable_utf8_filename(const uint8_t *p, size_t len) {
+    if (len == 0 || len > 255) return false;
+    int printable_count = 0;
+    size_t i = 0;
+    while (i < len) {
+        uint8_t c = p[i];
+        if (c == 0) return false;
+        if (c == '/') return false;
+        if (c < 0x80) {
+            if (iscntrl(c)) return false;
+            if (isprint(c)) printable_count++;
+            i++;
+            continue;
+        }
+        size_t seq_len = 0;
+        if ((c & 0xE0) == 0xC0) seq_len = 2;
+        else if ((c & 0xF0) == 0xE0) seq_len = 3;
+        else if ((c & 0xF8) == 0xF0) seq_len = 4;
+        else return false;
+        if (i + seq_len > len) return false;
+        for (size_t k = 1; k < seq_len; ++k) if ((p[i + k] & 0xC0) != 0x80) return false;
+        printable_count++;
+        i += seq_len;
+    }
+    return printable_count > 0;
+}
+static bool validate_dir_entry(const uint8_t *block, size_t block_size, size_t offset) {
+    if (offset + 8 > block_size) return false;
+    const uint8_t *p = block + offset;
+    uint32_t inode = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    uint16_t rec_len = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
+    uint8_t name_len = p[6];
+    uint8_t file_type = p[7];
+
+    if (rec_len < 8) return false;
+    if (offset + rec_len > block_size) return false;
+    if (name_len == 0 || name_len > rec_len - 8) return false;
+    if (name_len > 255) return false;
+    if (inode == 0) return false;
+    if (file_type > 7) return false;
+
+    const uint8_t *namep = p + 8;
+    if (!is_printable_utf8_filename(namep, name_len)) return false;
+
+    size_t padding = rec_len - (8 + name_len);
+    if (padding > 0) {
+        const uint8_t *padp = namep + name_len;
+        int pad_printable = 0;
+        for (size_t i = 0; i < padding; ++i) {
+            uint8_t c = padp[i];
+            if (c == 0) { pad_printable++; continue; }
+            if (isprint(c)) pad_printable++;
+        }
+        if (pad_printable * 2 < (int)padding) return false;
+    }
+    return true;
+}
+
+/* --- path reconstruction (best-effort) --- */
+static char *reconstruct_path(struct dir_entry_list *dlist, uint64_t parent, uint64_t child, const char *name) {
+    size_t comps_cap = 16, comps_len = 0;
+    char **comps = malloc(comps_cap * sizeof(char*));
+    if (!comps) return NULL;
+    comps[comps_len++] = strdup(name);
+    uint64_t cur = parent;
+    const uint64_t ROOT_INO = 2;
+
+    while (cur != 0 && cur != ROOT_INO) {
+        uint64_t p = del_find_parent_of_dir(dlist, cur);
+        if (p == 0) break;
+        const char *nm = del_find_name(dlist, p, cur);
+        char *tmp = NULL;
+        if (!nm) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[ino:%llu]", (unsigned long long)cur);
+            tmp = strdup(buf);
+            nm = tmp;
+        }
+        if (comps_len == comps_cap) {
+            comps_cap *= 2;
+            char **n = realloc(comps, comps_cap * sizeof(char*));
+            if (!n) { free(tmp); break; }
+            comps = n;
+        }
+        comps[comps_len++] = strdup(nm);
+        if (tmp) free(tmp);
+        cur = p;
+    }
+
+    size_t total_len = 1;
+    for (size_t i = 0; i < comps_len; ++i) total_len += strlen(comps[i]) + 1;
+    char *path = malloc(total_len + 1);
+    if (!path) { for (size_t i=0;i<comps_len;++i) free(comps[i]); free(comps); return NULL; }
+    char *p = path;
+    *p++ = '/';
+    *p = '\0';
+    for (size_t i = 0; i < comps_len; ++i) {
+        const char *c = comps[comps_len - 1 - i];
+        size_t L = strlen(c);
+        memcpy(p, c, L); p += L;
+        if (i + 1 < comps_len) *p++ = '/';
+        *p = '\0';
+    }
+    for (size_t i = 0; i < comps_len; ++i) free(comps[i]);
+    free(comps);
+    return path;
+}
+
+/* --- UI printing functions --- */
+static void ui_print_progress_top(off_t processed, off_t total, struct timeval *start) {
+    int rows, cols;
+    if (get_term_size(&rows, &cols) != 0) return;
+    struct timeval now; gettimeofday(&now, NULL);
+    double elapsed = time_diff_seconds(start, &now);
+    double percent = total ? (double)processed / (double)total : 0.0;
+    double eta = 0.0;
+    if (processed > 0 && percent > 0.0) {
+        double est_total = elapsed / percent;
+        eta = est_total - elapsed;
+    }
+    int bar_width = cols - 48;
+    if (bar_width < 10) bar_width = 10;
+    int filled = (int)(percent * bar_width + 0.5);
+    if (filled > bar_width) filled = bar_width;
+    char elapsed_s[32], eta_s[32];
+    format_seconds(elapsed, elapsed_s, sizeof(elapsed_s));
+    format_seconds(eta, eta_s, sizeof(eta_s));
+
+    move_cursor(1,1);
+    clear_line();
+    printf("[");
+    for (int i = 0; i < filled; ++i) putchar('=');
+    for (int i = filled; i < bar_width; ++i) putchar(' ');
+    printf("] %6.2f%% %lld/%lld bytes el=%s ETA=%s", percent * 100.0, (long long)processed, (long long)total, elapsed_s, eta_s);
+    fflush(stdout);
+}
+
+static void ui_print_deleted_bottom(struct str_list *found) {
+    int rows, cols;
+    if (get_term_size(&rows, &cols) != 0) return;
+    int bottom_lines = rows - 2; /* top line reserved for progress, one blank */
+    if (bottom_lines < 1) bottom_lines = 1;
+
+    size_t start = 0;
+    if (found->used > (size_t)bottom_lines) start = found->used - bottom_lines;
+
+    for (int r = rows - bottom_lines + 1; r <= rows; ++r) {
+        move_cursor(r,1);
+        clear_line();
+    }
+
+    int row = rows - bottom_lines + 1;
+    for (size_t i = start; i < found->used; ++i, ++row) {
+        move_cursor(row,1);
+        printf("%4zu: %s", i + 1, found->items[i]);
+        fflush(stdout);
+    }
+}
+
+/* --- mount helpers --- */
+static int find_existing_mountpoint(const char *device, char *out_mount, size_t out_len) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return -1;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char dev[PATH_MAX], mnt[PATH_MAX], fstype[64], opts[256];
+        if (sscanf(line, "%4095s %4095s %63s %255s", dev, mnt, fstype, opts) >= 2) {
+            if (strcmp(dev, device) == 0) {
+                strncpy(out_mount, mnt, out_len - 1);
+                out_mount[out_len - 1] = '\0';
+                fclose(f);
+                return 0;
+            }
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
+static int mount_device_ro(const char *device, char *out_mount, size_t out_len, int *mounted_by_us) {
+    if (find_existing_mountpoint(device, out_mount, out_len) == 0) {
+        if (mounted_by_us) *mounted_by_us = 0;
+        return 0;
+    }
+    char tmpl[] = "/tmp/scanmnt.XXXXXX";
+    char *tmp = mkdtemp(tmpl);
+    if (!tmp) {
+        fprintf(stderr, "mkdtemp failed: %s\n", strerror(errno));
+        return -1;
+    }
+    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_DIRSYNC;
+    int rc = mount(device, tmp, "auto", flags, NULL);
+    if (rc != 0) {
+        rc = mount(device, tmp, "ext4", flags, NULL);
+        if (rc != 0) {
+            int saved = errno;
+            rmdir(tmp);
+            fprintf(stderr, "mount failed: %s\n", strerror(saved));
+            return -1;
+        }
+    }
+    strncpy(out_mount, tmp, out_len - 1);
+    out_mount[out_len - 1] = '\0';
+    if (mounted_by_us) *mounted_by_us = 1;
+    return 0;
+}
+static void unmount_and_cleanup(const char *mountpoint) {
+    if (!mountpoint || mountpoint[0] == '\0') return;
+    if (umount2(mountpoint, MNT_DETACH) != 0) {
+        umount2(mountpoint, 0);
+    }
+    rmdir(mountpoint);
+}
+
+/* --- read superblock to get inode_size and block_size --- */
+static int read_superblock(int fd, uint16_t *out_inode_size, uint32_t *out_block_size) {
+    struct ext4_super sb;
+    if (pread_all(fd, &sb, sizeof(sb), EXT4_SUPER_OFFSET) != sizeof(sb)) return -1;
+    if (le16(&sb.s_magic) != 0xEF53) return -1;
+    uint16_t inode_size = le16(&sb.s_inode_size);
+    if (inode_size == 0) inode_size = 128;
+    uint32_t log_block = le32(&sb.s_log_block_size);
+    uint32_t block_size = 1024U << log_block;
+    *out_inode_size = inode_size;
+    *out_block_size = block_size;
+    return 0;
+}
+
+/* --- linear scan: iterate offsets 0..end-inode_size step inode_size --- */
+static int linear_scan_and_collect(int fd, struct dir_entry_list *dlist, struct str_list *found, uint16_t inode_size, uint32_t block_size) {
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end == (off_t)-1) { fprintf(stderr, "lseek failed: %s\n", strerror(errno)); return -1; }
+    if (inode_size == 0) inode_size = 128;
+    if (block_size == 0) block_size = 4096;
+
+    off_t total_bytes = end;
+    off_t processed = 0;
+    struct timeval start; gettimeofday(&start, NULL);
+    ui_print_progress_top(processed, total_bytes, &start);
+
+    uint8_t *buf = malloc(inode_size);
+    if (!buf) return -1;
+
+    for (off_t off = 0; off + inode_size <= end; off += inode_size) {
+        ssize_t r = pread_all(fd, buf, inode_size, off);
+        if (r != (ssize_t)inode_size) {
+            processed = off + inode_size;
+            if ((off / inode_size) % 256 == 0) ui_print_progress_top(processed, total_bytes, &start);
+            continue;
+        }
+
+        struct ext4_inode inode;
+        memset(&inode, 0, sizeof(inode));
+        memcpy(&inode, buf, sizeof(inode) < inode_size ? sizeof(inode) : inode_size);
+
+        uint16_t mode = le16(&inode.i_mode);
+        uint16_t type = mode & 0xF000;
+        if (type == 0x4000) { /* directory */
+            uint64_t pseudo_inode = (uint64_t)(off / inode_size) + 1;
+            for (int bi = 0; bi < 12; ++bi) {
+                uint32_t blk = le32(&inode.i_block[bi]);
+                if (blk == 0) continue;
+                off_t block_off = (off_t)blk * block_size;
+                if (block_off + block_size > end) continue;
+                uint8_t *block = malloc(block_size);
+                if (!block) continue;
+                if (pread_all(fd, block, block_size, block_off) != (ssize_t)block_size) { free(block); continue; }
+                uint32_t pos = 0;
+                while (pos + 8 < block_size) {
+                    if (!validate_dir_entry(block, block_size, pos)) {
+                        pos += 4;
+                        continue;
+                    }
+                    struct ext2_dir_entry *de = (struct ext2_dir_entry *)(block + pos);
+                    uint32_t inode_no = le32(&de->inode);
+                    uint16_t rec_len = le16(&de->rec_len);
+                    uint8_t name_len = de->name_len;
+                    if (rec_len < 8) break;
+                    if (pos + rec_len > block_size) break;
+                    if (inode_no != 0 && name_len > 0 && name_len <= EXT4_NAME_LEN) {
+                        char name[EXT4_NAME_LEN + 1];
+                        memcpy(name, de->name, name_len);
+                        name[name_len] = '\0';
+                        if (del_add(dlist, pseudo_inode, (uint64_t)inode_no, name) == 0) {
+                            if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+                                char *rel = reconstruct_path(dlist, pseudo_inode, (uint64_t)inode_no, name);
+                                if (rel) {
+                                    if (g_mountpoint[0] != '\0') {
+                                        size_t mlen = strlen(g_mountpoint);
+                                        int need_slash = (mlen == 0 || g_mountpoint[mlen - 1] != '/');
+                                        size_t full_len = mlen + (need_slash ? 1 : 0) + strlen(rel) + 1;
+                                        char *full = malloc(full_len);
+                                        if (full) {
+                                            strcpy(full, g_mountpoint);
+                                            if (need_slash) strcat(full, "/");
+                                            if (rel[0] == '/') strcat(full, rel + 1); else strcat(full, rel);
+                                            struct stat st;
+                                            if (lstat(full, &st) == -1 && errno == ENOENT) {
+                                                sl_add(found, rel);
+                                                ui_print_deleted_bottom(found);
+                                            }
+                                            free(full);
+                                        }
+                                    } else {
+                                        /* no mountpoint available: add as unverified candidate */
+                                        char cand[PATH_MAX + 32];
+                                        snprintf(cand, sizeof(cand), "%s", rel);
+                                        sl_add(found, cand);
+                                        ui_print_deleted_bottom(found);
+                                    }
+                                    free(rel);
+                                }
+                            }
+                        }
+                    }
+                    pos += rec_len;
+                }
+                free(block);
+            }
+        }
+
+        processed = off + inode_size;
+        if ((off / inode_size) % 256 == 0 || processed == total_bytes) ui_print_progress_top(processed, total_bytes, &start);
+    }
+
+    ui_print_progress_top(total_bytes, total_bytes, &start);
+    printf("\n");
+    free(buf);
+    return 0;
+}
+
+/* --- main --- */
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <device-or-image>\n", argv[0]);
+        return 1;
+    }
+    const char *device = argv[1];
+
+    /* Determine mountpoint behavior:
+     * - If running as root: mount if not already mounted.
+     * - If not root: do NOT mount. If device is already mounted, use that mountpoint.
+     *   If not mounted, run in read-only, non-mounting mode and report candidates unverified.
+     */
+    char mountpoint[PATH_MAX] = {0};
+    int mounted_by_us = 0;
+    bool am_root = (geteuid() == 0);
+
+    if (am_root) {
+        if (mount_device_ro(device, mountpoint, sizeof(mountpoint), &mounted_by_us) != 0) {
+            fprintf(stderr, "Warning: could not mount device %s; continuing without mountpoint (read-only scan)\n", device);
+            mountpoint[0] = '\0';
+            mounted_by_us = 0;
+        }
+    } else {
+        /* non-root: only detect existing mountpoint, do not attempt to mount */
+        if (find_existing_mountpoint(device, mountpoint, sizeof(mountpoint)) == 0) {
+            mounted_by_us = 0;
+        } else {
+            /* not mounted and not root: proceed without mountpoint */
+            mountpoint[0] = '\0';
+            mounted_by_us = 0;
+            fprintf(stderr, "Note: running without root and device is not mounted; results will be unverified candidates.\n");
+        }
+    }
+
+    if (mountpoint[0] != '\0') {
+        strncpy(g_mountpoint, mountpoint, sizeof(g_mountpoint) - 1);
+        fprintf(stderr, "Using mountpoint: %s (mounted_by_us=%d)\n", mountpoint, mounted_by_us);
+    } else {
+        g_mountpoint[0] = '\0';
+    }
+
+    int fd = open(device, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to open %s: %s\n", device, strerror(errno));
+        if (mounted_by_us) unmount_and_cleanup(mountpoint);
+        return 3;
+    }
+
+    uint16_t inode_size = 128;
+    uint32_t block_size = 4096;
+    if (read_superblock(fd, &inode_size, &block_size) == 0) {
+        fprintf(stderr, "Superblock read: inode_size=%u block_size=%u\n", inode_size, block_size);
+    } else {
+        fprintf(stderr, "Superblock not found; using defaults inode_size=%u block_size=%u\n", inode_size, block_size);
+    }
+
+    hide_cursor();
+    printf("\n"); fflush(stdout);
+
+    struct dir_entry_list dlist;
+    del_init(&dlist);
+    struct str_list found;
+    sl_init(&found);
+
+    int rc = linear_scan_and_collect(fd, &dlist, &found, inode_size, block_size);
+    if (rc != 0) {
+        fprintf(stderr, "Scan failed or unsupported layout.\n");
+    }
+
+    /* final bottom refresh */
+    ui_print_deleted_bottom(&found);
+
+    sl_free(&found);
+    del_free(&dlist);
+    close(fd);
+
+    if (mounted_by_us) unmount_and_cleanup(mountpoint);
+
+    show_cursor();
+    return 0;
+}

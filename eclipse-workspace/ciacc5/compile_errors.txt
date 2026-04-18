@@ -1,0 +1,1493 @@
+a.s: Assembler messages:
+a.s:75: Error: junk `.952704e-310di' after expression
+a.s:75: Error: operand size mismatch for `mov'
+a.s:111: Error: junk `.952704e-310ax' after expression
+a.s:111: Error: operand size mismatch for `mov'
+a.s:125: Error: junk `.952704e-310ax' after expression
+a.s:125: Error: operand size mismatch for `mov'
+a.s:130: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:131: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:176: Error: junk `.952704e-310ax' after expression
+a.s:176: Error: operand size mismatch for `mov'
+a.s:190: Error: junk `.952704e-310ax' after expression
+a.s:196: Error: junk `p+0l' after expression
+a.s:197: Error: junk `p+0l' after expression
+a.s:234: Error: junk `.952704e-310ax' after expression
+a.s:234: Error: operand size mismatch for `mov'
+a.s:252: Error: junk `.952704e-310ax' after expression
+a.s:257: Error: junk `p+0l' after expression
+a.s:258: Error: junk `p+0l' after expression
+a.s:295: Error: junk `.952704e-310ax' after expression
+a.s:295: Error: operand size mismatch for `mov'
+a.s:309: Error: junk `.952704e-310ax' after expression
+a.s:315: Error: junk `p+0l' after expression
+a.s:316: Error: junk `p+0l' after expression
+a.s:382: Error: junk `.952704e-310di' after expression
+a.s:382: Error: operand size mismatch for `mov'
+a.s:541: Error: junk `il' after expression
+a.s:541: Error: operand size mismatch for `mov'
+a.s:708: Error: junk `.952704e-310ax' after expression
+a.s:708: Error: operand size mismatch for `mov'
+a.s:714: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:715: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:747: Error: junk `.018558e-312ax' after expression
+a.s:751: Error: junk `.000000e+00di' after expression
+a.s:751: Error: operand size mismatch for `mov'
+a.s:775: Error: junk `.018558e-312ax' after expression
+a.s:779: Error: junk `.000000e+00di' after expression
+a.s:779: Error: operand size mismatch for `mov'
+a.s:795: Error: junk `.907704e-310ax' after expression
+a.s:795: Error: operand size mismatch for `mov'
+a.s:806: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:807: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:831: Error: junk `.952704e-310di' after expression
+a.s:831: Error: operand size mismatch for `mov'
+a.s:864: Error: junk `.952704e-310ax' after expression
+a.s:864: Error: operand size mismatch for `mov'
+a.s:882: Error: junk `.952704e-310ax' after expression
+a.s:887: Error: junk `p+0l' after expression
+a.s:888: Error: junk `p+0l' after expression
+a.s:920: Error: junk `.952704e-310ax' after expression
+a.s:924: Error: junk `.000000e+00di' after expression
+a.s:924: Error: operand size mismatch for `mov'
+a.s:978: Error: junk `.018558e-312ax' after expression
+a.s:978: Error: operand size mismatch for `mov'
+a.s:1012: Error: junk `.018558e-312ax' after expression
+a.s:1035: Error: junk `.000000e+00ax' after expression
+a.s:1039: Error: junk `.000000e+00di' after expression
+a.s:1039: Error: operand size mismatch for `mov'
+a.s:1065: Error: junk `.018558e-312ax' after expression
+a.s:1065: Error: operand size mismatch for `mov'
+a.s:1091: Error: junk `.018558e-312ax' after expression
+a.s:1109: Error: junk `.000000e+00ax' after expression
+a.s:1109: Error: operand size mismatch for `mov'
+a.s:1122: Error: junk `.000000e+00ax' after expression
+a.s:1126: Error: junk `.000000e+00di' after expression
+a.s:1126: Error: operand size mismatch for `mov'
+a.s:1145: Error: junk `.952704e-310di' after expression
+a.s:1145: Error: operand size mismatch for `mov'
+a.s:1183: Error: junk `.018558e-312ax' after expression
+a.s:1197: Error: junk `.018558e-312ax' after expression
+a.s:1197: Error: operand size mismatch for `mov'
+a.s:1210: Error: junk `.000000e+00ax' after expression
+a.s:1214: Error: junk `.000000e+00di' after expression
+a.s:1214: Error: operand size mismatch for `mov'
+a.s:1296: Error: junk `.952704e-310ax' after expression
+a.s:1296: Error: operand size mismatch for `mov'
+a.s:1350: Error: junk `.952704e-310ax' after expression
+a.s:1364: Error: junk `.952704e-310ax' after expression
+a.s:1364: Error: operand size mismatch for `mov'
+a.s:1401: Error: junk `.952704e-310ax' after expression
+a.s:1401: Error: operand size mismatch for `mov'
+a.s:1464: Error: junk `.952704e-310ax' after expression
+a.s:1465: Error: junk `.952704e-310ax' after expression
+a.s:1465: Error: operand size mismatch for `mov'
+a.s:1466: Error: junk `.952704e-310ax' after expression
+a.s:1467: Error: junk `.952704e-310ax' after expression
+a.s:1467: Error: operand size mismatch for `mov'
+a.s:1509: Error: junk `.952704e-310ax' after expression
+a.s:1530: Error: junk `.952704e-310ax' after expression
+a.s:1544: Error: junk `.952704e-310ax' after expression
+a.s:1609: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1610: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1638: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1639: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1693: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1694: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1717: Error: junk `.952704e-310di' after expression
+a.s:1717: Error: operand size mismatch for `mov'
+a.s:1749: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1750: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:1768: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:1769: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:1778: Error: junk `.952704e-310di' after expression
+a.s:1778: Error: operand size mismatch for `mov'
+a.s:1780: Error: junk `.952704e-310di' after expression
+a.s:1781: Error: junk `.952704e-310di' after expression
+a.s:1781: Error: operand size mismatch for `mov'
+a.s:1831: Error: junk `.018558e-312ax' after expression
+a.s:1835: Error: junk `.000000e+00di' after expression
+a.s:1835: Error: operand size mismatch for `mov'
+a.s:1885: Error: junk `.952704e-310ax' after expression
+a.s:1914: Error: junk `.952704e-310di' after expression
+a.s:1914: Error: operand size mismatch for `mov'
+a.s:1955: Error: junk `.952704e-310ax' after expression
+a.s:1976: Error: junk `.952704e-310ax' after expression
+a.s:2015: Error: junk `.952704e-310ax' after expression
+a.s:2036: Error: junk `.952704e-310ax' after expression
+a.s:2050: Error: junk `.952704e-310ax' after expression
+a.s:2081: Error: junk `.952704e-310ax' after expression
+a.s:2082: Error: junk `.952704e-310ax' after expression
+a.s:2082: Error: operand size mismatch for `mov'
+a.s:2083: Error: junk `.952704e-310ax' after expression
+a.s:2084: Error: junk `.952704e-310ax' after expression
+a.s:2084: Error: operand size mismatch for `mov'
+a.s:2157: Error: junk `.952704e-310ax' after expression
+a.s:2158: Error: junk `.952704e-310ax' after expression
+a.s:2158: Error: operand size mismatch for `mov'
+a.s:2159: Error: junk `.952704e-310ax' after expression
+a.s:2160: Error: junk `.952704e-310ax' after expression
+a.s:2160: Error: operand size mismatch for `mov'
+a.s:2248: Error: junk `.952704e-310ax' after expression
+a.s:2249: Error: junk `.952704e-310ax' after expression
+a.s:2249: Error: operand size mismatch for `mov'
+a.s:2250: Error: junk `.952704e-310ax' after expression
+a.s:2251: Error: junk `.952704e-310ax' after expression
+a.s:2251: Error: operand size mismatch for `mov'
+a.s:2334: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2335: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2421: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2422: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2469: Error: junk `.952704e-310ax' after expression
+a.s:2475: Error: junk `p+0l' after expression
+a.s:2476: Error: junk `p+0l' after expression
+a.s:2522: Error: junk `.018558e-312ax' after expression
+a.s:2526: Error: junk `.000000e+00di' after expression
+a.s:2526: Error: operand size mismatch for `mov'
+a.s:2549: Error: junk `.952704e-310ax' after expression
+a.s:2555: Error: junk `p+0l' after expression
+a.s:2556: Error: junk `p+0l' after expression
+a.s:2647: Error: junk `.952704e-310ax' after expression
+a.s:2660: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2661: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2699: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2700: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2723: Error: junk `.952704e-310di' after expression
+a.s:2723: Error: operand size mismatch for `mov'
+a.s:2725: Error: junk `.952704e-310di' after expression
+a.s:2726: Error: junk `.952704e-310di' after expression
+a.s:2726: Error: operand size mismatch for `mov'
+a.s:2739: Error: junk `il' after expression
+a.s:2739: Error: operand size mismatch for `mov'
+a.s:2767: Error: junk `il' after expression
+a.s:2767: Error: operand size mismatch for `mov'
+a.s:2786: Error: junk `.952704e-310ax' after expression
+a.s:2838: Error: junk `.952704e-310ax' after expression
+a.s:2847: Error: junk `.000000e+00di' after expression
+a.s:2847: Error: operand size mismatch for `mov'
+a.s:2861: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2862: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2895: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:2896: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:2908: Error: junk `.952704e-310di' after expression
+a.s:2908: Error: operand size mismatch for `mov'
+a.s:2910: Error: junk `.952704e-310di' after expression
+a.s:2911: Error: junk `.952704e-310di' after expression
+a.s:2911: Error: operand size mismatch for `mov'
+a.s:2933: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2934: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:2982: Error: junk `.952704e-310ax' after expression
+a.s:3058: Error: junk `.952704e-310ax' after expression
+a.s:3129: Error: junk `.952704e-310di' after expression
+a.s:3129: Error: operand size mismatch for `mov'
+a.s:3224: Error: junk `.07ffcedeaceap-1022l' after expression
+a.s:3225: Error: junk `.07ffcedeaceap-1022l' after expression
+a.s:3240: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3241: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3264: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3265: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3280: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3281: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3304: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3305: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3320: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3321: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3344: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3345: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3414: Error: junk `.952704e-310ax' after expression
+a.s:3428: Error: junk `.000000e+00ax' after expression
+a.s:3434: Error: junk `p+0l' after expression
+a.s:3435: Error: junk `p+0l' after expression
+a.s:3647: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:3648: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:3712: Error: junk `.952704e-310ax' after expression
+a.s:3747: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3787: Error: junk `.952704e-310ax' after expression
+a.s:3793: Error: junk `p+0l' after expression
+a.s:3794: Error: junk `p+0l' after expression
+a.s:3902: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:3926: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3950: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:3974: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4079: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:4103: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4192: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:4216: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4305: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:4329: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4353: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4377: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4482: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4521: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4522: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4562: Error: junk `.907704e-310ax' after expression
+a.s:4568: Error: junk `p+0l' after expression
+a.s:4569: Error: junk `p+0l' after expression
+a.s:4622: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4623: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4697: Error: junk `.907704e-310ax' after expression
+a.s:4703: Error: junk `p+0l' after expression
+a.s:4704: Error: junk `p+0l' after expression
+a.s:4787: Error: junk `.907704e-310ax' after expression
+a.s:4793: Error: junk `p+0l' after expression
+a.s:4794: Error: junk `p+0l' after expression
+a.s:4935: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:4936: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5013: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5014: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5032: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5033: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5066: Error: junk `.952704e-310di' after expression
+a.s:5066: Error: operand size mismatch for `mov'
+a.s:5068: Error: junk `.952704e-310di' after expression
+a.s:5069: Error: junk `.952704e-310di' after expression
+a.s:5069: Error: operand size mismatch for `mov'
+a.s:5108: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5109: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5186: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5187: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5215: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5216: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5242: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5243: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5276: Error: junk `.952704e-310di' after expression
+a.s:5276: Error: operand size mismatch for `mov'
+a.s:5278: Error: junk `.952704e-310di' after expression
+a.s:5279: Error: junk `.952704e-310di' after expression
+a.s:5279: Error: operand size mismatch for `mov'
+a.s:5324: Error: junk `.952704e-310ax' after expression
+a.s:5361: Error: junk `.018558e-312ax' after expression
+a.s:5365: Error: junk `.000000e+00di' after expression
+a.s:5365: Error: operand size mismatch for `mov'
+a.s:5394: Error: junk `.952704e-310di' after expression
+a.s:5394: Error: operand size mismatch for `mov'
+a.s:5471: Error: junk `.952704e-310di' after expression
+a.s:5471: Error: operand size mismatch for `mov'
+a.s:5497: Error: junk `.907704e-310ax' after expression
+a.s:5503: Error: junk `p+0l' after expression
+a.s:5504: Error: junk `p+0l' after expression
+a.s:5538: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5544: Error: junk `p+0l' after expression
+a.s:5545: Error: junk `p+0l' after expression
+a.s:5636: Error: junk `.907704e-310ax' after expression
+a.s:5642: Error: junk `p+0l' after expression
+a.s:5643: Error: junk `p+0l' after expression
+a.s:5677: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5683: Error: junk `p+0l' after expression
+a.s:5684: Error: junk `p+0l' after expression
+a.s:5775: Error: junk `.907704e-310ax' after expression
+a.s:5781: Error: junk `p+0l' after expression
+a.s:5782: Error: junk `p+0l' after expression
+a.s:5816: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5822: Error: junk `p+0l' after expression
+a.s:5823: Error: junk `p+0l' after expression
+a.s:5914: Error: junk `.907704e-310ax' after expression
+a.s:5920: Error: junk `p+0l' after expression
+a.s:5921: Error: junk `p+0l' after expression
+a.s:5955: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:5961: Error: junk `p+0l' after expression
+a.s:5962: Error: junk `p+0l' after expression
+a.s:6053: Error: junk `.907704e-310ax' after expression
+a.s:6059: Error: junk `p+0l' after expression
+a.s:6060: Error: junk `p+0l' after expression
+a.s:6094: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6100: Error: junk `p+0l' after expression
+a.s:6101: Error: junk `p+0l' after expression
+a.s:6192: Error: junk `.907704e-310ax' after expression
+a.s:6198: Error: junk `p+0l' after expression
+a.s:6199: Error: junk `p+0l' after expression
+a.s:6233: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6239: Error: junk `p+0l' after expression
+a.s:6240: Error: junk `p+0l' after expression
+a.s:6331: Error: junk `.907704e-310ax' after expression
+a.s:6337: Error: junk `p+0l' after expression
+a.s:6338: Error: junk `p+0l' after expression
+a.s:6372: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6378: Error: junk `p+0l' after expression
+a.s:6379: Error: junk `p+0l' after expression
+a.s:6470: Error: junk `.907704e-310ax' after expression
+a.s:6476: Error: junk `p+0l' after expression
+a.s:6477: Error: junk `p+0l' after expression
+a.s:6511: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6517: Error: junk `p+0l' after expression
+a.s:6518: Error: junk `p+0l' after expression
+a.s:6609: Error: junk `.907704e-310ax' after expression
+a.s:6615: Error: junk `p+0l' after expression
+a.s:6616: Error: junk `p+0l' after expression
+a.s:6650: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6656: Error: junk `p+0l' after expression
+a.s:6657: Error: junk `p+0l' after expression
+a.s:6748: Error: junk `.907704e-310ax' after expression
+a.s:6754: Error: junk `p+0l' after expression
+a.s:6755: Error: junk `p+0l' after expression
+a.s:6789: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6795: Error: junk `p+0l' after expression
+a.s:6796: Error: junk `p+0l' after expression
+a.s:6887: Error: junk `.907704e-310ax' after expression
+a.s:6893: Error: junk `p+0l' after expression
+a.s:6894: Error: junk `p+0l' after expression
+a.s:6928: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:6934: Error: junk `p+0l' after expression
+a.s:6935: Error: junk `p+0l' after expression
+a.s:7026: Error: junk `.907704e-310ax' after expression
+a.s:7032: Error: junk `p+0l' after expression
+a.s:7033: Error: junk `p+0l' after expression
+a.s:7067: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7073: Error: junk `p+0l' after expression
+a.s:7074: Error: junk `p+0l' after expression
+a.s:7165: Error: junk `.907704e-310ax' after expression
+a.s:7171: Error: junk `p+0l' after expression
+a.s:7172: Error: junk `p+0l' after expression
+a.s:7206: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7212: Error: junk `p+0l' after expression
+a.s:7213: Error: junk `p+0l' after expression
+a.s:7304: Error: junk `.907704e-310ax' after expression
+a.s:7310: Error: junk `p+0l' after expression
+a.s:7311: Error: junk `p+0l' after expression
+a.s:7345: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7351: Error: junk `p+0l' after expression
+a.s:7352: Error: junk `p+0l' after expression
+a.s:7443: Error: junk `.907704e-310ax' after expression
+a.s:7449: Error: junk `p+0l' after expression
+a.s:7450: Error: junk `p+0l' after expression
+a.s:7484: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7490: Error: junk `p+0l' after expression
+a.s:7491: Error: junk `p+0l' after expression
+a.s:7582: Error: junk `.907704e-310ax' after expression
+a.s:7588: Error: junk `p+0l' after expression
+a.s:7589: Error: junk `p+0l' after expression
+a.s:7623: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7629: Error: junk `p+0l' after expression
+a.s:7630: Error: junk `p+0l' after expression
+a.s:7721: Error: junk `.907704e-310ax' after expression
+a.s:7727: Error: junk `p+0l' after expression
+a.s:7728: Error: junk `p+0l' after expression
+a.s:7762: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7768: Error: junk `p+0l' after expression
+a.s:7769: Error: junk `p+0l' after expression
+a.s:7860: Error: junk `.907704e-310ax' after expression
+a.s:7866: Error: junk `p+0l' after expression
+a.s:7867: Error: junk `p+0l' after expression
+a.s:7901: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:7907: Error: junk `p+0l' after expression
+a.s:7908: Error: junk `p+0l' after expression
+a.s:7999: Error: junk `.907704e-310ax' after expression
+a.s:8005: Error: junk `p+0l' after expression
+a.s:8006: Error: junk `p+0l' after expression
+a.s:8040: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8046: Error: junk `p+0l' after expression
+a.s:8047: Error: junk `p+0l' after expression
+a.s:8138: Error: junk `.907704e-310ax' after expression
+a.s:8144: Error: junk `p+0l' after expression
+a.s:8145: Error: junk `p+0l' after expression
+a.s:8179: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8185: Error: junk `p+0l' after expression
+a.s:8186: Error: junk `p+0l' after expression
+a.s:8277: Error: junk `.907704e-310ax' after expression
+a.s:8283: Error: junk `p+0l' after expression
+a.s:8284: Error: junk `p+0l' after expression
+a.s:8318: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8324: Error: junk `p+0l' after expression
+a.s:8325: Error: junk `p+0l' after expression
+a.s:8408: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:8409: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:8427: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8428: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8454: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8455: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8473: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8474: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8500: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8501: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8557: Error: junk `p+0l' after expression
+a.s:8558: Error: junk `p+0l' after expression
+a.s:8576: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8577: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8603: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8604: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8622: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8623: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8649: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8650: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8668: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8669: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8695: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8696: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8930: Error: junk `.952704e-310di' after expression
+a.s:8930: Error: operand size mismatch for `mov'
+a.s:8948: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8949: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:8999: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:9034: Error: junk `.952704e-310di' after expression
+a.s:9034: Error: operand size mismatch for `mov'
+a.s:9036: Error: junk `.952704e-310di' after expression
+a.s:9037: Error: junk `.952704e-310di' after expression
+a.s:9037: Error: operand size mismatch for `mov'
+a.s:9110: Error: junk `.952704e-310ax' after expression
+a.s:9110: Error: operand size mismatch for `mov'
+a.s:9116: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:9117: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:9344: Error: junk `.952704e-310ax' after expression
+a.s:9344: Error: operand size mismatch for `mov'
+a.s:9350: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:9351: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:9391: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:9486: Error: junk `.952704e-310ax' after expression
+a.s:9486: Error: operand size mismatch for `mov'
+a.s:9492: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:9493: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:9554: Error: junk `.952704e-310ax' after expression
+a.s:9554: Error: operand size mismatch for `mov'
+a.s:9603: Error: junk `.952704e-310ax' after expression
+a.s:9862: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:9904: Error: junk `.07ffcedeace3p-1022l' after expression
+a.s:9944: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:9958: Error: junk `p+0l' after expression
+a.s:9959: Error: junk `p+0l' after expression
+a.s:10024: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10136: Error: junk `p+0l' after expression
+a.s:10142: Error: junk `p+0l' after expression
+a.s:10143: Error: junk `p+0l' after expression
+a.s:10224: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:10275: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10329: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10340: Error: junk `.952704e-310di' after expression
+a.s:10340: Error: operand size mismatch for `mov'
+a.s:10404: Error: junk `.952704e-310ax' after expression
+a.s:10410: Error: junk `p+0l' after expression
+a.s:10411: Error: junk `p+0l' after expression
+a.s:10430: Error: junk `.952704e-310di' after expression
+a.s:10430: Error: operand size mismatch for `mov'
+a.s:10432: Error: junk `.952704e-310di' after expression
+a.s:10433: Error: junk `.952704e-310di' after expression
+a.s:10433: Error: operand size mismatch for `mov'
+a.s:10502: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10541: Error: junk `.952704e-310ax' after expression
+a.s:10541: Error: operand size mismatch for `mov'
+a.s:10547: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10548: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10680: Error: junk `.952704e-310ax' after expression
+a.s:10680: Error: operand size mismatch for `mov'
+a.s:10686: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10687: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10779: Error: junk `.018558e-312di' after expression
+a.s:10779: Error: operand size mismatch for `mov'
+a.s:10781: Error: junk `.018558e-312di' after expression
+a.s:10782: Error: junk `.018558e-312di' after expression
+a.s:10782: Error: operand size mismatch for `mov'
+a.s:10818: Error: junk `.907704e-310ax' after expression
+a.s:10818: Error: operand size mismatch for `mov'
+a.s:10824: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10825: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10873: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:10874: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:11021: Error: junk `.952704e-310ax' after expression
+a.s:11021: Error: operand size mismatch for `mov'
+a.s:11025: Error: junk `.952704e-310di' after expression
+a.s:11025: Error: operand size mismatch for `mov'
+a.s:11051: Error: junk `.952704e-310ax' after expression
+a.s:11051: Error: operand size mismatch for `mov'
+a.s:11055: Error: junk `.952704e-310di' after expression
+a.s:11055: Error: operand size mismatch for `mov'
+a.s:11397: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:11576: Error: junk `.018558e-312ax' after expression
+a.s:11576: Error: operand size mismatch for `mov'
+a.s:11594: Error: junk `.018558e-312ax' after expression
+a.s:11602: Error: junk `.000000e+00di' after expression
+a.s:11602: Error: operand size mismatch for `mov'
+a.s:11634: Error: junk `.952704e-310ax' after expression
+a.s:11638: Error: junk `.000000e+00di' after expression
+a.s:11638: Error: operand size mismatch for `mov'
+a.s:11737: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:11883: Error: junk `.952704e-310di' after expression
+a.s:11883: Error: operand size mismatch for `mov'
+a.s:11981: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:12114: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:12348: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:12471: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:12715: Error: junk `.07ffcedeacefp-1022l' after expression
+a.s:12908: Error: junk `.952704e-310ax' after expression
+a.s:12908: Error: operand size mismatch for `mov'
+a.s:12914: Error: junk `.056016fc663a1p-1022l' after expression
+a.s:12915: Error: junk `.056016fc663a1p-1022l' after expression
+a.s:12950: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:12956: Error: junk `p+0l' after expression
+a.s:12957: Error: junk `p+0l' after expression
+a.s:13022: Error: junk `.952704e-310ax' after expression
+a.s:13022: Error: operand size mismatch for `mov'
+a.s:13033: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13034: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13112: Error: junk `.672091e-310ax' after expression
+a.s:13112: Error: operand size mismatch for `mov'
+a.s:13118: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13119: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13198: Error: junk `.952704e-310ax' after expression
+a.s:13198: Error: operand size mismatch for `mov'
+a.s:13209: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13210: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13263: Error: junk `.952704e-310ax' after expression
+a.s:13263: Error: operand size mismatch for `mov'
+a.s:13269: Error: junk `.056016fc663a1p-1022l' after expression
+a.s:13270: Error: junk `.056016fc663a1p-1022l' after expression
+a.s:13305: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13311: Error: junk `p+0l' after expression
+a.s:13312: Error: junk `p+0l' after expression
+a.s:13391: Error: junk `.672091e-310ax' after expression
+a.s:13391: Error: operand size mismatch for `mov'
+a.s:13402: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13403: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13466: Error: junk `.672091e-310ax' after expression
+a.s:13466: Error: operand size mismatch for `mov'
+a.s:13472: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13473: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13507: Error: junk `.018558e-312ax' after expression
+a.s:13507: Error: operand size mismatch for `mov'
+a.s:13511: Error: junk `.952704e-310di' after expression
+a.s:13511: Error: operand size mismatch for `mov'
+a.s:13564: Error: junk `.952704e-310ax' after expression
+a.s:13564: Error: operand size mismatch for `mov'
+a.s:13570: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13571: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13836: Error: junk `.952704e-310di' after expression
+a.s:13836: Error: operand size mismatch for `mov'
+a.s:13890: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13901: Error: junk `.952704e-310di' after expression
+a.s:13901: Error: operand size mismatch for `mov'
+a.s:13918: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13924: Error: junk `p+0l' after expression
+a.s:13925: Error: junk `p+0l' after expression
+a.s:13958: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13959: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:13997: Error: junk `.952704e-310di' after expression
+a.s:13997: Error: operand size mismatch for `mov'
+a.s:13999: Error: junk `.952704e-310di' after expression
+a.s:14000: Error: junk `.952704e-310di' after expression
+a.s:14000: Error: operand size mismatch for `mov'
+a.s:14026: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14067: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:14083: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14102: Error: junk `il' after expression
+a.s:14102: Error: operand size mismatch for `mov'
+a.s:14126: Error: junk `il' after expression
+a.s:14126: Error: operand size mismatch for `mov'
+a.s:14177: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14273: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14279: Error: junk `p+0l' after expression
+a.s:14280: Error: junk `p+0l' after expression
+a.s:14313: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14314: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14497: Error: junk `.952704e-310ax' after expression
+a.s:14497: Error: operand size mismatch for `mov'
+a.s:14610: Error: junk `il' after expression
+a.s:14610: Error: operand size mismatch for `mov'
+a.s:14644: Error: junk `.952704e-310ax' after expression
+a.s:14644: Error: operand size mismatch for `mov'
+a.s:14648: Error: junk `.952704e-310di' after expression
+a.s:14648: Error: operand size mismatch for `mov'
+a.s:14682: Error: junk `.952704e-310ax' after expression
+a.s:14682: Error: operand size mismatch for `mov'
+a.s:14686: Error: junk `.952704e-310di' after expression
+a.s:14686: Error: operand size mismatch for `mov'
+a.s:14766: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14767: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14829: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:14830: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15147: Error: junk `.672128e-310di' after expression
+a.s:15147: Error: operand size mismatch for `mov'
+a.s:15169: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15188: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15197: Error: junk `.952704e-310di' after expression
+a.s:15197: Error: operand size mismatch for `mov'
+a.s:15199: Error: junk `.952704e-310di' after expression
+a.s:15200: Error: junk `.952704e-310di' after expression
+a.s:15200: Error: operand size mismatch for `mov'
+a.s:15274: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15275: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15374: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15415: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15432: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:15457: Error: junk `p+0l' after expression
+a.s:15458: Error: junk `p+0l' after expression
+a.s:15542: Error: junk `.672091e-310di' after expression
+a.s:15542: Error: operand size mismatch for `mov'
+a.s:15561: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15562: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15615: Error: junk `.952704e-310di' after expression
+a.s:15615: Error: operand size mismatch for `mov'
+a.s:15617: Error: junk `.952704e-310di' after expression
+a.s:15618: Error: junk `.952704e-310di' after expression
+a.s:15618: Error: operand size mismatch for `mov'
+a.s:15637: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15672: Error: junk `.952704e-310ax' after expression
+a.s:15672: Error: operand size mismatch for `mov'
+a.s:15678: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15679: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15779: Error: junk `.952704e-310ax' after expression
+a.s:15779: Error: operand size mismatch for `mov'
+a.s:15783: Error: junk `.952704e-310di' after expression
+a.s:15783: Error: operand size mismatch for `mov'
+a.s:15839: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15840: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15869: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:15990: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16037: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16094: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16124: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16198: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16233: Error: junk `.952704e-310ax' after expression
+a.s:16233: Error: operand size mismatch for `mov'
+a.s:16239: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16240: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16324: Error: junk `.952704e-310ax' after expression
+a.s:16324: Error: operand size mismatch for `mov'
+a.s:16328: Error: junk `.952704e-310di' after expression
+a.s:16328: Error: operand size mismatch for `mov'
+a.s:16381: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16382: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16503: Error: junk `.952704e-310di' after expression
+a.s:16503: Error: operand size mismatch for `mov'
+a.s:16623: Error: junk `.07ffcedeacfap-1022l' after expression
+a.s:16624: Error: junk `.07ffcedeacfap-1022l' after expression
+a.s:16721: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16722: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16801: Error: junk `.952704e-310ax' after expression
+a.s:16801: Error: operand size mismatch for `mov'
+a.s:16807: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16808: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16836: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16837: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:16999: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17000: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17026: Error: junk `.952704e-310ax' after expression
+a.s:17026: Error: operand size mismatch for `mov'
+a.s:17032: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17033: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17162: Error: junk `.952704e-310di' after expression
+a.s:17162: Error: operand size mismatch for `mov'
+a.s:17287: Error: junk `.952704e-310di' after expression
+a.s:17287: Error: operand size mismatch for `mov'
+a.s:17309: Error: junk `.952704e-310di' after expression
+a.s:17309: Error: operand size mismatch for `mov'
+a.s:17348: Error: junk `.952704e-310di' after expression
+a.s:17348: Error: operand size mismatch for `mov'
+a.s:17429: Error: junk `.952704e-310di' after expression
+a.s:17429: Error: operand size mismatch for `mov'
+a.s:17451: Error: junk `.952704e-310di' after expression
+a.s:17451: Error: operand size mismatch for `mov'
+a.s:17490: Error: junk `.952704e-310di' after expression
+a.s:17490: Error: operand size mismatch for `mov'
+a.s:17614: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17615: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17721: Error: junk `.952704e-310di' after expression
+a.s:17721: Error: operand size mismatch for `mov'
+a.s:17752: Error: junk `il' after expression
+a.s:17752: Error: operand size mismatch for `mov'
+a.s:17767: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17785: Error: junk `.952704e-310di' after expression
+a.s:17785: Error: operand size mismatch for `mov'
+a.s:17835: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:17851: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17877: Error: junk `.952704e-310di' after expression
+a.s:17877: Error: operand size mismatch for `mov'
+a.s:17908: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17909: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:17982: Error: junk `.952704e-310di' after expression
+a.s:17982: Error: operand size mismatch for `mov'
+a.s:18013: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18014: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18136: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18137: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18215: Error: junk `.952704e-310ax' after expression
+a.s:18215: Error: operand size mismatch for `mov'
+a.s:18221: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18222: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18241: Error: junk `.952704e-310di' after expression
+a.s:18241: Error: operand size mismatch for `mov'
+a.s:18273: Error: junk `p+0l' after expression
+a.s:18274: Error: junk `p+0l' after expression
+a.s:18407: Error: junk `il' after expression
+a.s:18407: Error: operand size mismatch for `mov'
+a.s:18437: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:18448: Error: junk `il' after expression
+a.s:18448: Error: operand size mismatch for `mov'
+a.s:18485: Error: junk `p+0l' after expression
+a.s:18491: Error: junk `p+0l' after expression
+a.s:18492: Error: junk `p+0l' after expression
+a.s:18507: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18508: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18534: Error: junk `.056016fc66c3cp-1022l' after expression
+a.s:18553: Error: junk `il' after expression
+a.s:18553: Error: operand size mismatch for `mov'
+a.s:18586: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18587: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18650: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18651: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18728: Error: junk `.018558e-312di' after expression
+a.s:18728: Error: operand size mismatch for `mov'
+a.s:18730: Error: junk `.018558e-312di' after expression
+a.s:18731: Error: junk `.018558e-312di' after expression
+a.s:18731: Error: operand size mismatch for `mov'
+a.s:18753: Error: junk `.907704e-310ax' after expression
+a.s:18753: Error: operand size mismatch for `mov'
+a.s:18757: Error: junk `.952704e-310di' after expression
+a.s:18757: Error: operand size mismatch for `mov'
+a.s:18772: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18778: Error: junk `p+0l' after expression
+a.s:18779: Error: junk `p+0l' after expression
+a.s:18817: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18836: Error: junk `.952704e-310di' after expression
+a.s:18836: Error: operand size mismatch for `mov'
+a.s:18896: Error: junk `.952704e-310ax' after expression
+a.s:18896: Error: operand size mismatch for `mov'
+a.s:18902: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18903: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:18939: Error: junk `.952704e-310di' after expression
+a.s:18939: Error: operand size mismatch for `mov'
+a.s:19026: Error: junk `.952704e-310ax' after expression
+a.s:19030: Error: junk `.000000e+00di' after expression
+a.s:19030: Error: operand size mismatch for `mov'
+a.s:19078: Error: junk `.061126e-39ax' after expression
+a.s:19078: Error: operand size mismatch for `mov'
+a.s:19098: Error: junk `.952704e-310di' after expression
+a.s:19098: Error: operand size mismatch for `mov'
+a.s:19242: Error: junk `.952704e-310ax' after expression
+a.s:19242: Error: operand size mismatch for `mov'
+a.s:19248: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:19249: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:19881: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:19887: Error: junk `p+0l' after expression
+a.s:19888: Error: junk `p+0l' after expression
+a.s:19938: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:19944: Error: junk `p+0l' after expression
+a.s:19945: Error: junk `p+0l' after expression
+a.s:19995: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:20001: Error: junk `p+0l' after expression
+a.s:20002: Error: junk `p+0l' after expression
+a.s:20174: Error: junk `.056016fc66744p-1022l' after expression
+a.s:20238: Error: junk `p+0l' after expression
+a.s:20244: Error: junk `p+0l' after expression
+a.s:20245: Error: junk `p+0l' after expression
+a.s:20350: Error: junk `.07ffcedeace5p-1022l' after expression
+a.s:20698: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:20755: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:20832: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:20909: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:20986: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21110: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:21167: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21274: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:21331: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21444: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:21501: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21558: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21615: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21738: Error: junk `.672091e-310ax' after expression
+a.s:21738: Error: operand size mismatch for `mov'
+a.s:21744: Error: junk `.0000000000002p-1022l' after expression
+a.s:21745: Error: junk `.0000000000002p-1022l' after expression
+a.s:21770: Error: junk `.952704e-310ax' after expression
+a.s:21770: Error: operand size mismatch for `mov'
+a.s:21776: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21777: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21818: Error: junk `.952704e-310ax' after expression
+a.s:21818: Error: operand size mismatch for `mov'
+a.s:21824: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21825: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21873: Error: junk `.018558e-312ax' after expression
+a.s:21877: Error: junk `.000000e+00di' after expression
+a.s:21877: Error: operand size mismatch for `mov'
+a.s:21892: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:21917: Error: junk `.907704e-310ax' after expression
+a.s:21917: Error: operand size mismatch for `mov'
+a.s:21923: Error: junk `.07ffcedeacf1p-1022l' after expression
+a.s:21924: Error: junk `.07ffcedeacf1p-1022l' after expression
+a.s:22082: Error: junk `.056016fc66744p-1022l' after expression
+a.s:22107: Error: junk `.907704e-310ax' after expression
+a.s:22107: Error: operand size mismatch for `mov'
+a.s:22113: Error: junk `.07ffcedeacedp-1022l' after expression
+a.s:22114: Error: junk `.07ffcedeacedp-1022l' after expression
+a.s:22283: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22318: Error: junk `.952704e-310ax' after expression
+a.s:22318: Error: operand size mismatch for `mov'
+a.s:22324: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22325: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22342: Error: junk `.952704e-310ax' after expression
+a.s:22342: Error: operand size mismatch for `mov'
+a.s:22348: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22349: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22385: Error: junk `.018558e-312ax' after expression
+a.s:22385: Error: operand size mismatch for `mov'
+a.s:22399: Error: junk `.018558e-312ax' after expression
+a.s:22399: Error: operand size mismatch for `mov'
+a.s:22407: Error: junk `.952704e-310di' after expression
+a.s:22407: Error: operand size mismatch for `mov'
+a.s:22461: Error: junk `.07ffcedeacedp-1022l' after expression
+a.s:22496: Error: junk `.952704e-310ax' after expression
+a.s:22496: Error: operand size mismatch for `mov'
+a.s:22502: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22503: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22520: Error: junk `.952704e-310ax' after expression
+a.s:22520: Error: operand size mismatch for `mov'
+a.s:22526: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22527: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22563: Error: junk `.018558e-312ax' after expression
+a.s:22563: Error: operand size mismatch for `mov'
+a.s:22577: Error: junk `.018558e-312ax' after expression
+a.s:22577: Error: operand size mismatch for `mov'
+a.s:22585: Error: junk `.952704e-310di' after expression
+a.s:22585: Error: operand size mismatch for `mov'
+a.s:22689: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:22724: Error: junk `.952704e-310ax' after expression
+a.s:22724: Error: operand size mismatch for `mov'
+a.s:22730: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22731: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22748: Error: junk `.952704e-310ax' after expression
+a.s:22748: Error: operand size mismatch for `mov'
+a.s:22754: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22755: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22791: Error: junk `.018558e-312ax' after expression
+a.s:22791: Error: operand size mismatch for `mov'
+a.s:22805: Error: junk `.018558e-312ax' after expression
+a.s:22805: Error: operand size mismatch for `mov'
+a.s:22813: Error: junk `.952704e-310di' after expression
+a.s:22813: Error: operand size mismatch for `mov'
+a.s:22867: Error: junk `.07ffcedeacedp-1022l' after expression
+a.s:22902: Error: junk `.952704e-310ax' after expression
+a.s:22902: Error: operand size mismatch for `mov'
+a.s:22908: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22909: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22926: Error: junk `.952704e-310ax' after expression
+a.s:22926: Error: operand size mismatch for `mov'
+a.s:22932: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22933: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:22969: Error: junk `.018558e-312ax' after expression
+a.s:22969: Error: operand size mismatch for `mov'
+a.s:22983: Error: junk `.018558e-312ax' after expression
+a.s:22983: Error: operand size mismatch for `mov'
+a.s:22992: Error: junk `.000000e+00di' after expression
+a.s:22992: Error: operand size mismatch for `mov'
+a.s:23101: Error: junk `.056019cd52c5p-1022l' after expression
+a.s:23134: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23169: Error: junk `.952704e-310ax' after expression
+a.s:23169: Error: operand size mismatch for `mov'
+a.s:23175: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23176: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23205: Error: junk `.018558e-312ax' after expression
+a.s:23205: Error: operand size mismatch for `mov'
+a.s:23213: Error: junk `.952704e-310di' after expression
+a.s:23213: Error: operand size mismatch for `mov'
+a.s:23279: Error: junk `.07ffcedeacf1p-1022l' after expression
+a.s:23331: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23374: Error: junk `.952704e-310ax' after expression
+a.s:23374: Error: operand size mismatch for `mov'
+a.s:23380: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23381: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23406: Error: junk `.952704e-310ax' after expression
+a.s:23406: Error: operand size mismatch for `mov'
+a.s:23412: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23413: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23461: Error: junk `.952704e-310ax' after expression
+a.s:23461: Error: operand size mismatch for `mov'
+a.s:23467: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23468: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23578: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23640: Error: junk `.952704e-310ax' after expression
+a.s:23719: Error: junk `.952704e-310ax' after expression
+a.s:23750: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:23809: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:23902: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:24082: Error: junk `.07ffcedead01p-1022l' after expression
+a.s:24140: Error: junk `.018558e-312ax' after expression
+a.s:24144: Error: junk `.000000e+00di' after expression
+a.s:24144: Error: operand size mismatch for `mov'
+a.s:24167: Error: junk `.952704e-310ax' after expression
+a.s:24167: Error: operand size mismatch for `mov'
+a.s:24173: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24174: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24361: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24394: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24395: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24442: Error: junk `.952704e-310ax' after expression
+a.s:24442: Error: operand size mismatch for `mov'
+a.s:24448: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24449: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24534: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24535: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24610: Error: junk `.952704e-310ax' after expression
+a.s:24610: Error: operand size mismatch for `mov'
+a.s:24731: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24764: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24765: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24812: Error: junk `.952704e-310ax' after expression
+a.s:24812: Error: operand size mismatch for `mov'
+a.s:24818: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24819: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24874: Error: junk `.952704e-310ax' after expression
+a.s:24874: Error: operand size mismatch for `mov'
+a.s:24880: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24881: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24974: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:24975: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25017: Error: junk `.952704e-310ax' after expression
+a.s:25017: Error: operand size mismatch for `mov'
+a.s:25138: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25197: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25322: Error: junk `.056019cd6cp-1022l' after expression
+a.s:25547: Error: junk `.952704e-310di' after expression
+a.s:25547: Error: operand size mismatch for `mov'
+a.s:25549: Error: junk `.952704e-310di' after expression
+a.s:25550: Error: junk `.952704e-310di' after expression
+a.s:25550: Error: operand size mismatch for `mov'
+a.s:25553: Error: junk `.952704e-310di' after expression
+a.s:25553: Error: operand size mismatch for `mov'
+a.s:25579: Error: junk `.952704e-310ax' after expression
+a.s:25579: Error: operand size mismatch for `mov'
+a.s:25583: Error: junk `.952704e-310di' after expression
+a.s:25583: Error: operand size mismatch for `mov'
+a.s:25667: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25668: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25800: Error: junk `.952704e-310ax' after expression
+a.s:25800: Error: operand size mismatch for `mov'
+a.s:25804: Error: junk `.952704e-310di' after expression
+a.s:25804: Error: operand size mismatch for `mov'
+a.s:25819: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25836: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:25861: Error: junk `.907704e-310ax' after expression
+a.s:25861: Error: operand size mismatch for `mov'
+a.s:25867: Error: junk `.07ffcedeacf1p-1022l' after expression
+a.s:25868: Error: junk `.07ffcedeacf1p-1022l' after expression
+a.s:25963: Error: junk `.952704e-310di' after expression
+a.s:25963: Error: operand size mismatch for `mov'
+a.s:25993: Error: junk `.000000e+00ax' after expression
+a.s:25993: Error: operand size mismatch for `mov'
+a.s:25998: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:25999: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26079: Error: junk `.952704e-310ax' after expression
+a.s:26296: Error: junk `.952704e-310ax' after expression
+a.s:26296: Error: operand size mismatch for `mov'
+a.s:26306: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26307: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26332: Error: junk `.672091e-310di' after expression
+a.s:26332: Error: operand size mismatch for `mov'
+a.s:26334: Error: junk `.672091e-310di' after expression
+a.s:26335: Error: junk `.672091e-310di' after expression
+a.s:26335: Error: operand size mismatch for `mov'
+a.s:26453: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26666: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26685: Error: junk `.952704e-310di' after expression
+a.s:26685: Error: operand size mismatch for `mov'
+a.s:26715: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26811: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:26944: Error: junk `.952704e-310ax' after expression
+a.s:26944: Error: operand size mismatch for `mov'
+a.s:26948: Error: junk `.952704e-310di' after expression
+a.s:26948: Error: operand size mismatch for `mov'
+a.s:27002: Error: junk `.952704e-310ax' after expression
+a.s:27002: Error: operand size mismatch for `mov'
+a.s:27163: Error: junk `.881167e-313ax' after expression
+a.s:27163: Error: operand size mismatch for `mov'
+a.s:27276: Error: junk `il' after expression
+a.s:27276: Error: operand size mismatch for `mov'
+a.s:27289: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:27290: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:27347: Error: junk `il' after expression
+a.s:27347: Error: operand size mismatch for `mov'
+a.s:27358: Error: junk `il' after expression
+a.s:27358: Error: operand size mismatch for `mov'
+a.s:27369: Error: junk `il' after expression
+a.s:27369: Error: operand size mismatch for `mov'
+a.s:27380: Error: junk `il' after expression
+a.s:27380: Error: operand size mismatch for `mov'
+a.s:27453: Error: junk `.907704e-310ax' after expression
+a.s:27561: Error: junk `.952704e-310ax' after expression
+a.s:27578: Error: junk `.952704e-310ax' after expression
+a.s:27578: Error: operand size mismatch for `mov'
+a.s:27591: Error: junk `.952704e-310ax' after expression
+a.s:27616: Error: junk `.952704e-310ax' after expression
+a.s:27616: Error: operand size mismatch for `mov'
+a.s:27652: Error: junk `.952704e-310ax' after expression
+a.s:27727: Error: junk `.952704e-310ax' after expression
+a.s:27727: Error: operand size mismatch for `mov'
+a.s:27733: Error: junk `.056019cd7063p-1022l' after expression
+a.s:27734: Error: junk `.056019cd7063p-1022l' after expression
+a.s:27779: Error: junk `.952704e-310ax' after expression
+a.s:27779: Error: operand size mismatch for `mov'
+a.s:27785: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:27786: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:27803: Error: junk `.952704e-310ax' after expression
+a.s:27820: Error: junk `.952704e-310ax' after expression
+a.s:27820: Error: operand size mismatch for `mov'
+a.s:27833: Error: junk `.952704e-310ax' after expression
+a.s:27848: Error: junk `.952704e-310ax' after expression
+a.s:27865: Error: junk `.952704e-310ax' after expression
+a.s:27865: Error: operand size mismatch for `mov'
+a.s:27871: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:27872: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:27899: Error: junk `.952704e-310ax' after expression
+a.s:27899: Error: operand size mismatch for `mov'
+a.s:27935: Error: junk `.952704e-310ax' after expression
+a.s:27950: Error: junk `.952704e-310ax' after expression
+a.s:27967: Error: junk `.952704e-310ax' after expression
+a.s:27967: Error: operand size mismatch for `mov'
+a.s:27973: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:27974: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:27993: Error: junk `.952704e-310ax' after expression
+a.s:27993: Error: operand size mismatch for `mov'
+a.s:28006: Error: junk `.952704e-310ax' after expression
+a.s:28021: Error: junk `.952704e-310ax' after expression
+a.s:28040: Error: junk `.952704e-310ax' after expression
+a.s:28040: Error: operand size mismatch for `mov'
+a.s:28239: Error: junk `.952704e-310ax' after expression
+a.s:28239: Error: operand size mismatch for `mov'
+a.s:28362: Error: junk `.018558e-312di' after expression
+a.s:28362: Error: operand size mismatch for `mov'
+a.s:28364: Error: junk `.018558e-312di' after expression
+a.s:28365: Error: junk `.018558e-312di' after expression
+a.s:28365: Error: operand size mismatch for `mov'
+a.s:28368: Error: junk `.952704e-310di' after expression
+a.s:28368: Error: operand size mismatch for `mov'
+a.s:28409: Error: junk `.952704e-310ax' after expression
+a.s:28424: Error: junk `.952704e-310ax' after expression
+a.s:28446: Error: junk `.952704e-310ax' after expression
+a.s:28494: Error: junk `.952704e-310ax' after expression
+a.s:28509: Error: junk `.018558e-312di' after expression
+a.s:28509: Error: operand size mismatch for `mov'
+a.s:28511: Error: junk `.018558e-312di' after expression
+a.s:28512: Error: junk `.018558e-312di' after expression
+a.s:28512: Error: operand size mismatch for `mov'
+a.s:28515: Error: junk `.952704e-310di' after expression
+a.s:28515: Error: operand size mismatch for `mov'
+a.s:28556: Error: junk `.952704e-310ax' after expression
+a.s:28571: Error: junk `.952704e-310ax' after expression
+a.s:28593: Error: junk `.952704e-310ax' after expression
+a.s:28649: Error: junk `.952704e-310ax' after expression
+a.s:28671: Error: junk `.952704e-310ax' after expression
+a.s:28727: Error: junk `.952704e-310ax' after expression
+a.s:28756: Error: junk `.952704e-310ax' after expression
+a.s:28756: Error: operand size mismatch for `mov'
+a.s:28762: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:28763: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:28815: Error: junk `.952704e-310ax' after expression
+a.s:28828: Error: junk `.952704e-310di' after expression
+a.s:28828: Error: operand size mismatch for `mov'
+a.s:28850: Error: junk `.018558e-312di' after expression
+a.s:28850: Error: operand size mismatch for `mov'
+a.s:28854: Error: junk `.018558e-312di' after expression
+a.s:28854: Error: operand size mismatch for `mov'
+a.s:28858: Error: junk `.952704e-310di' after expression
+a.s:28858: Error: operand size mismatch for `mov'
+a.s:28871: Error: junk `.952704e-310di' after expression
+a.s:28871: Error: operand size mismatch for `mov'
+a.s:28890: Error: junk `.018558e-312di' after expression
+a.s:28890: Error: operand size mismatch for `mov'
+a.s:28894: Error: junk `.952704e-310di' after expression
+a.s:28894: Error: operand size mismatch for `mov'
+a.s:28966: Error: junk `.952704e-310ax' after expression
+a.s:28966: Error: operand size mismatch for `mov'
+a.s:28972: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:28973: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:29016: Error: junk `.952704e-310ax' after expression
+a.s:29016: Error: operand size mismatch for `mov'
+a.s:29029: Error: junk `.952704e-310ax' after expression
+a.s:29067: Error: junk `.952704e-310ax' after expression
+a.s:29067: Error: operand size mismatch for `mov'
+a.s:29081: Error: junk `.952704e-310ax' after expression
+a.s:29122: Error: junk `.952704e-310ax' after expression
+a.s:29122: Error: operand size mismatch for `mov'
+a.s:29128: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:29129: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:29160: Error: junk `.952704e-310ax' after expression
+a.s:29235: Error: junk `.952704e-310ax' after expression
+a.s:29248: Error: junk `.952704e-310di' after expression
+a.s:29248: Error: operand size mismatch for `mov'
+a.s:29261: Error: junk `.952704e-310di' after expression
+a.s:29261: Error: operand size mismatch for `mov'
+a.s:29290: Error: junk `.952704e-310ax' after expression
+a.s:29290: Error: operand size mismatch for `mov'
+a.s:29296: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:29297: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:29338: Error: junk `.952704e-310ax' after expression
+a.s:29338: Error: operand size mismatch for `mov'
+a.s:29352: Error: junk `.952704e-310ax' after expression
+a.s:29379: Error: junk `.952704e-310ax' after expression
+a.s:29394: Error: junk `.018558e-312di' after expression
+a.s:29394: Error: operand size mismatch for `mov'
+a.s:29396: Error: junk `.018558e-312di' after expression
+a.s:29397: Error: junk `.018558e-312di' after expression
+a.s:29397: Error: operand size mismatch for `mov'
+a.s:29400: Error: junk `.952704e-310di' after expression
+a.s:29400: Error: operand size mismatch for `mov'
+a.s:29413: Error: junk `.952704e-310di' after expression
+a.s:29413: Error: operand size mismatch for `mov'
+a.s:29432: Error: junk `.018558e-312di' after expression
+a.s:29432: Error: operand size mismatch for `mov'
+a.s:29436: Error: junk `.952704e-310di' after expression
+a.s:29436: Error: operand size mismatch for `mov'
+a.s:29449: Error: junk `.952704e-310di' after expression
+a.s:29449: Error: operand size mismatch for `mov'
+a.s:29471: Error: junk `.018558e-312di' after expression
+a.s:29471: Error: operand size mismatch for `mov'
+a.s:29475: Error: junk `.018558e-312di' after expression
+a.s:29475: Error: operand size mismatch for `mov'
+a.s:29479: Error: junk `.952704e-310di' after expression
+a.s:29479: Error: operand size mismatch for `mov'
+a.s:29501: Error: junk `.952704e-310ax' after expression
+a.s:29522: Error: junk `.952704e-310ax' after expression
+a.s:29563: Error: junk `.952704e-310ax' after expression
+a.s:29578: Error: junk `.952704e-310ax' after expression
+a.s:29600: Error: junk `.952704e-310ax' after expression
+a.s:29648: Error: junk `.952704e-310ax' after expression
+a.s:29670: Error: junk `.952704e-310ax' after expression
+a.s:29692: Error: junk `.952704e-310ax' after expression
+a.s:29705: Error: junk `.952704e-310di' after expression
+a.s:29705: Error: operand size mismatch for `mov'
+a.s:29718: Error: junk `.952704e-310di' after expression
+a.s:29718: Error: operand size mismatch for `mov'
+a.s:29733: Error: junk `.018558e-312di' after expression
+a.s:29733: Error: operand size mismatch for `mov'
+a.s:29735: Error: junk `.018558e-312di' after expression
+a.s:29736: Error: junk `.018558e-312di' after expression
+a.s:29736: Error: operand size mismatch for `mov'
+a.s:29739: Error: junk `.952704e-310di' after expression
+a.s:29739: Error: operand size mismatch for `mov'
+a.s:29752: Error: junk `.952704e-310di' after expression
+a.s:29752: Error: operand size mismatch for `mov'
+a.s:29774: Error: junk `.018558e-312di' after expression
+a.s:29774: Error: operand size mismatch for `mov'
+a.s:29778: Error: junk `.018558e-312di' after expression
+a.s:29778: Error: operand size mismatch for `mov'
+a.s:29782: Error: junk `.952704e-310di' after expression
+a.s:29782: Error: operand size mismatch for `mov'
+a.s:29795: Error: junk `.952704e-310di' after expression
+a.s:29795: Error: operand size mismatch for `mov'
+a.s:29817: Error: junk `.018558e-312di' after expression
+a.s:29817: Error: operand size mismatch for `mov'
+a.s:29821: Error: junk `.018558e-312di' after expression
+a.s:29821: Error: operand size mismatch for `mov'
+a.s:29825: Error: junk `.952704e-310di' after expression
+a.s:29825: Error: operand size mismatch for `mov'
+a.s:29907: Error: junk `.952704e-310ax' after expression
+a.s:29981: Error: junk `.952704e-310ax' after expression
+a.s:29996: Error: junk `.952704e-310ax' after expression
+a.s:30018: Error: junk `.470328e-323ax' after expression
+a.s:30075: Error: junk `.952704e-310ax' after expression
+a.s:30157: Error: junk `.952704e-310ax' after expression
+a.s:30179: Error: junk `.952704e-310ax' after expression
+a.s:30201: Error: junk `.952704e-310ax' after expression
+a.s:30214: Error: junk `.952704e-310di' after expression
+a.s:30214: Error: operand size mismatch for `mov'
+a.s:30227: Error: junk `.952704e-310di' after expression
+a.s:30227: Error: operand size mismatch for `mov'
+a.s:30293: Error: junk `.952704e-310ax' after expression
+a.s:30309: Error: junk `.952704e-310ax' after expression
+a.s:30324: Error: junk `.952704e-310ax' after expression
+a.s:30339: Error: junk `.952704e-310ax' after expression
+a.s:30354: Error: junk `.952704e-310ax' after expression
+a.s:30381: Error: junk `.952704e-310ax' after expression
+a.s:30408: Error: junk `.952704e-310ax' after expression
+a.s:30447: Error: junk `.952704e-310ax' after expression
+a.s:30881: Error: junk `.952704e-310ax' after expression
+a.s:30881: Error: operand size mismatch for `mov'
+a.s:30917: Error: junk `.952704e-310ax' after expression
+a.s:30932: Error: junk `.952704e-310ax' after expression
+a.s:30957: Error: junk `.952704e-310ax' after expression
+a.s:30957: Error: operand size mismatch for `mov'
+a.s:30993: Error: junk `.952704e-310ax' after expression
+a.s:31008: Error: junk `.952704e-310ax' after expression
+a.s:31023: Error: junk `.952704e-310ax' after expression
+a.s:31040: Error: junk `.952704e-310ax' after expression
+a.s:31040: Error: operand size mismatch for `mov'
+a.s:31053: Error: junk `.952704e-310ax' after expression
+a.s:31079: Error: junk `.952704e-310di' after expression
+a.s:31079: Error: operand size mismatch for `mov'
+a.s:31093: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31094: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31133: Error: junk `.952704e-310ax' after expression
+a.s:31141: Error: junk `.952704e-310di' after expression
+a.s:31141: Error: operand size mismatch for `mov'
+a.s:31143: Error: junk `.952704e-310di' after expression
+a.s:31144: Error: junk `.952704e-310di' after expression
+a.s:31144: Error: operand size mismatch for `mov'
+a.s:31156: Error: junk `.952704e-310di' after expression
+a.s:31156: Error: operand size mismatch for `mov'
+a.s:31165: Error: junk `.952704e-310di' after expression
+a.s:31165: Error: operand size mismatch for `mov'
+a.s:31179: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31180: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31212: Error: junk `.952704e-310ax' after expression
+a.s:31212: Error: operand size mismatch for `mov'
+a.s:31231: Error: junk `.952704e-310di' after expression
+a.s:31231: Error: operand size mismatch for `mov'
+a.s:31240: Error: junk `.952704e-310di' after expression
+a.s:31240: Error: operand size mismatch for `mov'
+a.s:31253: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31254: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31289: Error: junk `.018558e-312ax' after expression
+a.s:31289: Error: operand size mismatch for `mov'
+a.s:31293: Error: junk `.952704e-310di' after expression
+a.s:31293: Error: operand size mismatch for `mov'
+a.s:31328: Error: junk `.952704e-310ax' after expression
+a.s:31328: Error: operand size mismatch for `mov'
+a.s:31362: Error: junk `.952704e-310ax' after expression
+a.s:31362: Error: operand size mismatch for `mov'
+a.s:31370: Error: junk `.952704e-310di' after expression
+a.s:31370: Error: operand size mismatch for `mov'
+a.s:31390: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31391: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:31416: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:31417: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:31472: Error: junk `.952704e-310ax' after expression
+a.s:31472: Error: operand size mismatch for `mov'
+a.s:31496: Error: junk `.952704e-310ax' after expression
+a.s:31515: Error: junk `.952704e-310di' after expression
+a.s:31515: Error: operand size mismatch for `mov'
+a.s:31540: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:31541: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:31596: Error: junk `.952704e-310ax' after expression
+a.s:31596: Error: operand size mismatch for `mov'
+a.s:31620: Error: junk `.952704e-310ax' after expression
+a.s:31639: Error: junk `.952704e-310di' after expression
+a.s:31639: Error: operand size mismatch for `mov'
+a.s:31664: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:31665: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:31720: Error: junk `.952704e-310ax' after expression
+a.s:31720: Error: operand size mismatch for `mov'
+a.s:31744: Error: junk `.952704e-310ax' after expression
+a.s:31763: Error: junk `.952704e-310di' after expression
+a.s:31763: Error: operand size mismatch for `mov'
+a.s:31790: Error: junk `.952704e-310di' after expression
+a.s:31790: Error: operand size mismatch for `mov'
+a.s:31792: Error: junk `.952704e-310di' after expression
+a.s:31793: Error: junk `.952704e-310di' after expression
+a.s:31793: Error: operand size mismatch for `mov'
+a.s:31803: Error: junk `.952704e-310di' after expression
+a.s:31803: Error: operand size mismatch for `mov'
+a.s:31805: Error: junk `.952704e-310di' after expression
+a.s:31806: Error: junk `.952704e-310di' after expression
+a.s:31806: Error: operand size mismatch for `mov'
+a.s:31821: Error: junk `.952704e-310di' after expression
+a.s:31821: Error: operand size mismatch for `mov'
+a.s:31838: Error: junk `.018558e-312ax' after expression
+a.s:31838: Error: operand size mismatch for `mov'
+a.s:31842: Error: junk `.952704e-310di' after expression
+a.s:31842: Error: operand size mismatch for `mov'
+a.s:31883: Error: junk `.952704e-310ax' after expression
+a.s:31898: Error: junk `.952704e-310ax' after expression
+a.s:31913: Error: junk `.952704e-310ax' after expression
+a.s:32340: Error: junk `.952704e-310ax' after expression
+a.s:32340: Error: operand size mismatch for `mov'
+a.s:32387: Error: junk `.952704e-310ax' after expression
+a.s:32387: Error: operand size mismatch for `mov'
+a.s:32400: Error: junk `.952704e-310ax' after expression
+a.s:32440: Error: junk `.952704e-310ax' after expression
+a.s:32470: Error: junk `.018558e-312ax' after expression
+a.s:32474: Error: junk `.000000e+00di' after expression
+a.s:32474: Error: operand size mismatch for `mov'
+a.s:32488: Error: junk `.952704e-310di' after expression
+a.s:32488: Error: operand size mismatch for `mov'
+a.s:32502: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:32503: Error: junk `.07ffcedeacf9p-1022l' after expression
+a.s:32537: Error: junk `.952704e-310ax' after expression
+a.s:32552: Error: junk `.952704e-310ax' after expression
+a.s:32571: Error: junk `.952704e-310di' after expression
+a.s:32571: Error: operand size mismatch for `mov'
+a.s:32586: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:32587: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:32604: Error: junk `.952704e-310ax' after expression
+a.s:32619: Error: junk `.952704e-310ax' after expression
+a.s:32638: Error: junk `.952704e-310di' after expression
+a.s:32638: Error: operand size mismatch for `mov'
+a.s:32653: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:32654: Error: junk `.07f28dd76302p-1022l' after expression
+a.s:32671: Error: junk `.952704e-310ax' after expression
+a.s:32686: Error: junk `.952704e-310ax' after expression
+a.s:32705: Error: junk `.952704e-310di' after expression
+a.s:32705: Error: operand size mismatch for `mov'
+a.s:32744: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:32745: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:32850: Error: junk `.952704e-310ax' after expression
+a.s:32865: Error: junk `.952704e-310ax' after expression
+a.s:32900: Error: junk `.952704e-310ax' after expression
+a.s:32923: Error: junk `.952704e-310ax' after expression
+a.s:32940: Error: junk `.952704e-310ax' after expression
+a.s:32957: Error: junk `.952704e-310ax' after expression
+a.s:32989: Error: junk `.952704e-310ax' after expression
+a.s:33068: Error: junk `.952704e-310ax' after expression
+a.s:33109: Error: junk `.952704e-310ax' after expression
+a.s:33156: Error: junk `.952704e-310ax' after expression
+a.s:33191: Error: junk `.952704e-310ax' after expression
+a.s:33213: Error: junk `.952704e-310ax' after expression
+a.s:33228: Error: junk `.952704e-310ax' after expression
+a.s:33243: Error: junk `.952704e-310ax' after expression
+a.s:33258: Error: junk `.952704e-310ax' after expression
+a.s:33275: Error: junk `.952704e-310ax' after expression
+a.s:33290: Error: junk `.952704e-310ax' after expression
+a.s:33305: Error: junk `.952704e-310ax' after expression
+a.s:33320: Error: junk `.952704e-310ax' after expression
+a.s:33337: Error: junk `.952704e-310ax' after expression
+a.s:33352: Error: junk `.952704e-310ax' after expression
+a.s:33367: Error: junk `.952704e-310ax' after expression
+a.s:33382: Error: junk `.952704e-310ax' after expression
+a.s:33431: Error: junk `.952704e-310ax' after expression
+a.s:33466: Error: junk `.952704e-310ax' after expression
+a.s:33488: Error: junk `.952704e-310ax' after expression
+a.s:33503: Error: junk `.952704e-310ax' after expression
+a.s:33518: Error: junk `.952704e-310ax' after expression
+a.s:33533: Error: junk `.952704e-310ax' after expression
+a.s:33550: Error: junk `.952704e-310ax' after expression
+a.s:33565: Error: junk `.952704e-310ax' after expression
+a.s:33580: Error: junk `.952704e-310ax' after expression
+a.s:33595: Error: junk `.952704e-310ax' after expression
+a.s:33612: Error: junk `.952704e-310ax' after expression
+a.s:33627: Error: junk `.952704e-310ax' after expression
+a.s:33642: Error: junk `.952704e-310ax' after expression
+a.s:33657: Error: junk `.952704e-310ax' after expression
+a.s:33696: Error: junk `.952704e-310di' after expression
+a.s:33696: Error: operand size mismatch for `mov'
+a.s:33769: Error: junk `.952704e-310ax' after expression
+a.s:33774: Error: junk `p+0l' after expression
+a.s:33775: Error: junk `p+0l' after expression
+a.s:33836: Error: junk `.952704e-310ax' after expression
+a.s:33855: Error: junk `.952704e-310di' after expression
+a.s:33855: Error: operand size mismatch for `mov'
+a.s:33893: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:33894: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34053: Error: junk `.952704e-310di' after expression
+a.s:34053: Error: operand size mismatch for `mov'
+a.s:34067: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34068: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34107: Error: junk `.952704e-310ax' after expression
+a.s:34115: Error: junk `.952704e-310di' after expression
+a.s:34115: Error: operand size mismatch for `mov'
+a.s:34117: Error: junk `.952704e-310di' after expression
+a.s:34118: Error: junk `.952704e-310di' after expression
+a.s:34118: Error: operand size mismatch for `mov'
+a.s:34135: Error: junk `.952704e-310ax' after expression
+a.s:34150: Error: junk `.952704e-310ax' after expression
+a.s:34165: Error: junk `.952704e-310ax' after expression
+a.s:34180: Error: junk `.952704e-310ax' after expression
+a.s:34195: Error: junk `.952704e-310ax' after expression
+a.s:34228: Error: junk `.952704e-310ax' after expression
+a.s:34228: Error: operand size mismatch for `mov'
+a.s:34272: Error: junk `.952704e-310ax' after expression
+a.s:34287: Error: junk `.952704e-310ax' after expression
+a.s:34302: Error: junk `.952704e-310ax' after expression
+a.s:34317: Error: junk `.952704e-310ax' after expression
+a.s:34340: Error: junk `.952704e-310ax' after expression
+a.s:34340: Error: operand size mismatch for `mov'
+a.s:34346: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34347: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34364: Error: junk `.952704e-310ax' after expression
+a.s:34397: Error: junk `.952704e-310ax' after expression
+a.s:34420: Error: junk `.952704e-310ax' after expression
+a.s:34435: Error: junk `.952704e-310ax' after expression
+a.s:34452: Error: junk `.952704e-310ax' after expression
+a.s:34467: Error: junk `.952704e-310ax' after expression
+a.s:34484: Error: junk `.952704e-310ax' after expression
+a.s:34552: Error: junk `.952704e-310ax' after expression
+a.s:34552: Error: operand size mismatch for `mov'
+a.s:34558: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34559: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:34596: Error: junk `.952704e-310ax' after expression
+a.s:34613: Error: junk `.952704e-310ax' after expression
+a.s:34613: Error: operand size mismatch for `mov'
+a.s:34626: Error: junk `.952704e-310ax' after expression
+a.s:34641: Error: junk `.952704e-310ax' after expression
+a.s:34658: Error: junk `.018558e-312ax' after expression
+a.s:34658: Error: operand size mismatch for `mov'
+a.s:34676: Error: junk `.952704e-310ax' after expression
+a.s:34691: Error: junk `.952704e-310ax' after expression
+a.s:34708: Error: junk `.018558e-312ax' after expression
+a.s:34708: Error: operand size mismatch for `mov'
+a.s:34726: Error: junk `.952704e-310ax' after expression
+a.s:34752: Error: junk `.952704e-310ax' after expression
+a.s:34769: Error: junk `.018558e-312ax' after expression
+a.s:34769: Error: operand size mismatch for `mov'
+a.s:34787: Error: junk `.952704e-310ax' after expression
+a.s:34802: Error: junk `.952704e-310ax' after expression
+a.s:34881: Error: junk `.952704e-310ax' after expression
+a.s:34908: Error: junk `.952704e-310ax' after expression
+a.s:34931: Error: junk `.952704e-310ax' after expression
+a.s:34948: Error: junk `.952704e-310ax' after expression
+a.s:34965: Error: junk `.952704e-310ax' after expression
+a.s:34997: Error: junk `.952704e-310ax' after expression
+a.s:35012: Error: junk `.018558e-312di' after expression
+a.s:35012: Error: operand size mismatch for `mov'
+a.s:35014: Error: junk `.018558e-312di' after expression
+a.s:35015: Error: junk `.018558e-312di' after expression
+a.s:35015: Error: operand size mismatch for `mov'
+a.s:35018: Error: junk `.952704e-310di' after expression
+a.s:35018: Error: operand size mismatch for `mov'
+a.s:35059: Error: junk `.952704e-310ax' after expression
+a.s:35074: Error: junk `.952704e-310ax' after expression
+a.s:35096: Error: junk `.952704e-310ax' after expression
+a.s:35137: Error: junk `.952704e-310ax' after expression
+a.s:35152: Error: junk `.952704e-310ax' after expression
+a.s:35174: Error: junk `.952704e-310ax' after expression
+a.s:35189: Error: junk `.952704e-310ax' after expression
+a.s:35211: Error: junk `.952704e-310ax' after expression
+a.s:35233: Error: junk `.952704e-310ax' after expression
+a.s:35248: Error: junk `.952704e-310ax' after expression
+a.s:35270: Error: junk `.952704e-310ax' after expression
+a.s:35285: Error: junk `.018558e-312di' after expression
+a.s:35285: Error: operand size mismatch for `mov'
+a.s:35287: Error: junk `.018558e-312di' after expression
+a.s:35288: Error: junk `.018558e-312di' after expression
+a.s:35288: Error: operand size mismatch for `mov'
+a.s:35291: Error: junk `.952704e-310di' after expression
+a.s:35291: Error: operand size mismatch for `mov'
+a.s:35332: Error: junk `.952704e-310ax' after expression
+a.s:35347: Error: junk `.952704e-310ax' after expression
+a.s:35369: Error: junk `.952704e-310ax' after expression
+a.s:35410: Error: junk `.952704e-310ax' after expression
+a.s:35425: Error: junk `.952704e-310ax' after expression
+a.s:35447: Error: junk `.952704e-310ax' after expression
+a.s:35462: Error: junk `.952704e-310ax' after expression
+a.s:35484: Error: junk `.952704e-310ax' after expression
+a.s:35506: Error: junk `.952704e-310ax' after expression
+a.s:35521: Error: junk `.952704e-310ax' after expression
+a.s:35543: Error: junk `.952704e-310ax' after expression
+a.s:35616: Error: junk `.952704e-310ax' after expression
+a.s:35631: Error: junk `.952704e-310ax' after expression
+a.s:35646: Error: junk `.952704e-310ax' after expression
+a.s:35646: Error: operand size mismatch for `mov'
+a.s:35679: Error: junk `.952704e-310ax' after expression
+a.s:35696: Error: junk `.952704e-310ax' after expression
+a.s:35713: Error: junk `.952704e-310ax' after expression
+a.s:35730: Error: junk `.952704e-310ax' after expression
+a.s:35745: Error: junk `.952704e-310ax' after expression
+a.s:35762: Error: junk `.952704e-310ax' after expression
+a.s:35777: Error: junk `.952704e-310ax' after expression
+a.s:35792: Error: junk `.952704e-310ax' after expression
+a.s:35809: Error: junk `.952704e-310ax' after expression
+a.s:35824: Error: junk `.952704e-310ax' after expression
+a.s:35839: Error: junk `.952704e-310ax' after expression
+a.s:35856: Error: junk `.952704e-310ax' after expression
+a.s:35871: Error: junk `.952704e-310ax' after expression
+a.s:35886: Error: junk `.952704e-310ax' after expression
+a.s:35903: Error: junk `.952704e-310ax' after expression
+a.s:35918: Error: junk `.952704e-310ax' after expression
+a.s:35933: Error: junk `.952704e-310ax' after expression
+a.s:35970: Error: junk `.952704e-310ax' after expression
+a.s:36031: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:36032: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:36189: Error: junk `.952704e-310ax' after expression
+a.s:36204: Error: junk `.952704e-310ax' after expression
+a.s:36219: Error: junk `.952704e-310ax' after expression
+a.s:36233: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:36239: Error: junk `p+0l' after expression
+a.s:36240: Error: junk `p+0l' after expression
+a.s:36275: Error: junk `.952704e-310ax' after expression
+a.s:36275: Error: operand size mismatch for `mov'
+a.s:36322: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:36323: Error: junk `.07ffcedead2cp-1022l' after expression
+a.s:36350: Error: junk `.952704e-310ax' after expression
+a.s:36350: Error: operand size mismatch for `mov'
+a.s:36386: Error: junk `.952704e-310ax' after expression
+a.s:36401: Error: junk `.952704e-310ax' after expression
+a.s:36426: Error: junk `.952704e-310ax' after expression
+a.s:36426: Error: operand size mismatch for `mov'
+a.s:36462: Error: junk `.952704e-310ax' after expression
+a.s:36479: Error: junk `.952704e-310ax' after expression
+a.s:36479: Error: operand size mismatch for `mov'
+a.s:36492: Error: junk `.952704e-310ax' after expression

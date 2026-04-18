@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Copy Project &apos;pc-dialer&apos;" description="Copy Project &apos;pc-dialer&apos;" destination="/wrk/bluetooth-workspace" element="/pc-dialer" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="pc-dialer2" stamp="1772874456501"/>
+</session>

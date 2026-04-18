@@ -1,0 +1,222 @@
+// main.cpp
+#include <QApplication>
+#include <QWebEngineView>
+#include <QWebEngineProfile>
+#include <QWebEngineUrlRequestInterceptor>
+#include <QWebEnginePage>
+#include <QWebEngineSettings>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QStandardPaths>
+#include <QSaveFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QUrl>
+#include <QHBoxLayout>
+#include <QWidget>
+#include <QLineEdit>
+#include <QToolBar>
+#include <QAction>
+#include <QProgressBar>
+#include <QStatusBar>
+#include <QMainWindow>
+#include <QDateTime>
+#include <QMetaObject>
+#include <QPointer>
+#include <QFile>
+#include <QDebug>
+
+class MediaInterceptor : public QWebEngineUrlRequestInterceptor {
+    Q_OBJECT
+public:
+    explicit MediaInterceptor(QObject* parent = nullptr) : QWebEngineUrlRequestInterceptor(parent) {}
+    void interceptRequest(QWebEngineUrlRequestInfo &info) override {
+        QUrl url = info.requestUrl();
+        QString path = url.path().toLower();
+
+        if (path.endsWith(".mp4") || path.endsWith(".webm") ||
+            path.endsWith(".mp3") || path.endsWith(".ogg") ||
+            path.endsWith(".wav") || path.endsWith(".m4a")) {
+            emit mediaDetected(url);
+        }
+    }
+signals:
+    void mediaDetected(const QUrl &url);
+};
+
+class BrowserWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    BrowserWindow(QWidget *parent = nullptr) : QMainWindow(parent) {
+        profile = new QWebEngineProfile(this);
+        interceptor = new MediaInterceptor(profile);
+        profile->setUrlRequestInterceptor(interceptor);
+
+        view = new QWebEngineView(this);
+        view->setPage(new QWebEnginePage(profile, view));
+
+        // Autoplay erlauben (wichtig für Play-Buttons)
+        view->page()->settings()->setAttribute(QWebEngineSettings::PlaybackRequiresUserGesture, false);
+
+        // Hinweis: QWebEngineSettings::WebAudioEnabled ist in manchen Qt6-Versionen nicht vorhanden.
+        // WebAudio ist in aktuellen WebEngine-Builds in der Regel standardmäßig aktiv.
+
+        auto *tool = addToolBar("Navigation");
+        address = new QLineEdit(this);
+        address->setClearButtonEnabled(true);
+        QAction *goAct = new QAction("Go", this);
+        QAction *backAct = new QAction("Back", this);
+        QAction *forwardAct = new QAction("Forward", this);
+        QAction *reloadAct = new QAction("Reload", this);
+
+        tool->addAction(backAct);
+        tool->addAction(forwardAct);
+        tool->addAction(reloadAct);
+        tool->addWidget(address);
+        tool->addAction(goAct);
+
+        progress = new QProgressBar(this);
+        progress->setRange(0, 100);
+        statusBar()->addPermanentWidget(progress);
+
+        setCentralWidget(view);
+        resize(1200, 800);
+
+        mgr = new QNetworkAccessManager(this);
+
+        connect(goAct, &QAction::triggered, this, &BrowserWindow::navigateToAddress);
+        connect(address, &QLineEdit::returnPressed, this, &BrowserWindow::navigateToAddress);
+        connect(backAct, &QAction::triggered, view, &QWebEngineView::back);
+        connect(forwardAct, &QAction::triggered, view, &QWebEngineView::forward);
+        connect(reloadAct, &QAction::triggered, view, &QWebEngineView::reload);
+
+        connect(view, &QWebEngineView::urlChanged, this, &BrowserWindow::onUrlChanged);
+        connect(view, &QWebEngineView::loadProgress, progress, &QProgressBar::setValue);
+
+        connect(profile, &QWebEngineProfile::downloadRequested, this, &BrowserWindow::onDownloadRequested);
+        connect(interceptor, &MediaInterceptor::mediaDetected, this, &BrowserWindow::onMediaDetected);
+
+        // Webplayer laden
+        view->load(QUrl("https://open.spotify.com"));
+    }
+
+private slots:
+    void navigateToAddress() {
+        QUrl url = QUrl::fromUserInput(address->text());
+        if (!url.isValid()) return;
+        view->load(url);
+    }
+
+    void onUrlChanged(const QUrl &url) {
+        address->setText(url.toString());
+    }
+
+    void onDownloadRequested(QObject* downloadObj) {
+        if (!downloadObj) return;
+
+        QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        QDir().mkpath(downloads);
+
+        QString suggested;
+        bool ok = QMetaObject::invokeMethod(downloadObj, "suggestedFileName",
+                                            Qt::DirectConnection,
+                                            Q_RETURN_ARG(QString, suggested));
+        if (!ok) suggested.clear();
+
+        if (suggested.isEmpty()) suggested = QString("download_%1").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+        QString path = downloads + QDir::separator() + suggested;
+
+        QMetaObject::invokeMethod(downloadObj, "setPath", Qt::DirectConnection, Q_ARG(QString, path));
+        QMetaObject::invokeMethod(downloadObj, "accept", Qt::DirectConnection);
+    }
+
+    void onMediaDetected(const QUrl &url) {
+        QString fileName = QFileInfo(url.path()).fileName();
+        if (fileName.isEmpty()) {
+            fileName = QString("media_%1").arg(QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss"));
+        }
+
+        QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+        QDir().mkpath(downloads);
+        QString outPath = downloads + QDir::separator() + fileName;
+
+        QNetworkRequest req(url);
+        QNetworkReply *reply = mgr->get(req);
+
+        QSaveFile *saveFile = new QSaveFile(outPath);
+        if (!saveFile->open(QIODevice::WriteOnly)) {
+            delete saveFile;
+            reply->abort();
+            reply->deleteLater();
+            return;
+        }
+
+        connect(reply, &QNetworkReply::readyRead, this, [reply, saveFile]() {
+            saveFile->write(reply->readAll());
+        });
+
+        connect(reply, &QNetworkReply::downloadProgress, this, [this](qint64 received, qint64 total) {
+            if (total > 0) {
+                int p = static_cast<int>((received * 100) / total);
+                progress->setValue(p);
+            }
+        });
+
+        connect(reply, &QNetworkReply::finished, this, [reply, saveFile, this]() {
+            if (reply->error() == QNetworkReply::NoError) {
+                if (!saveFile->commit()) {
+                    QFile::remove(saveFile->fileName());
+                }
+            } else {
+                QFile::remove(saveFile->fileName());
+            }
+            reply->deleteLater();
+            saveFile->deleteLater();
+            progress->setValue(0);
+        });
+
+        connect(reply, &QNetworkReply::errorOccurred, this, [reply, saveFile](QNetworkReply::NetworkError) {
+            Q_UNUSED(reply);
+            QFile::remove(saveFile->fileName());
+        });
+    }
+
+private:
+    QWebEngineView *view;
+    QLineEdit *address;
+    QProgressBar *progress;
+    QWebEngineProfile *profile;
+    MediaInterceptor *interceptor;
+    QNetworkAccessManager *mgr;
+};
+
+#include "main.moc"
+
+int main(int argc, char *argv[]) {
+    // Chromium-Flags setzen BEVOR QApplication erstellt wird
+    QByteArray flags = "--autoplay-policy=no-user-gesture-required "
+                       "--enable-features=AudioServiceOutOfProcess "
+                       "--enable-experimental-web-platform-features";
+
+    QByteArray widevinePath = qgetenv("WIDEVINE_PATH");
+    if (!widevinePath.isEmpty()) {
+        flags += " --enable-widevine-cdm";
+        flags += " --widevine-path=";
+        flags += widevinePath;
+    }
+
+    qputenv("QTWEBENGINE_CHROMIUM_FLAGS", flags);
+
+    QApplication app(argc, argv);
+
+    QCoreApplication::setApplicationName("SimpleQtBrowserQt6");
+    QCoreApplication::setOrganizationName("ExampleOrg");
+
+    BrowserWindow w;
+    w.show();
+
+    qDebug() << "QTWEBENGINE_CHROMIUM_FLAGS =" << qgetenv("QTWEBENGINE_CHROMIUM_FLAGS");
+
+    return app.exec();
+}

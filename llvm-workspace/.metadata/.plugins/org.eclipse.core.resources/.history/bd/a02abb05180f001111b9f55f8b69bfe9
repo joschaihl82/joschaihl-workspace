@@ -1,0 +1,250 @@
+// unused-optimizer1.cpp
+// Remove functions that are never called anywhere in the same C file.
+// Writes modified files as filename.clean.c
+
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/Tooling.h>
+#include <clang/Frontend/FrontendActions.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Lex/Lexer.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/raw_ostream.h>
+
+#include <set>
+#include <map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+using namespace clang;
+using namespace clang::tooling;
+using namespace llvm;
+
+static cl::OptionCategory ToolCategory("remove-unused-in-file options");
+static cl::opt<std::string> OutputSuffix("suffix",
+    cl::desc("Suffix for cleaned files"),
+    cl::value_desc("suffix"),
+    cl::init(".clean.c"),
+    cl::cat(ToolCategory));
+
+// Per-file info collected during traversal of a single TU
+struct FuncRange {
+  unsigned startOffset;
+  unsigned endOffset; // exclusive
+  std::string name;
+};
+
+class PerFileCollector : public RecursiveASTVisitor<PerFileCollector> {
+  ASTContext &Ctx;
+  SourceManager &SM;
+  LangOptions LO;
+
+public:
+  // Functions defined in this TU and written in this file
+  std::map<const FunctionDecl*, FuncRange> defsInFile;
+  // Functions called from this file (call sites)
+  std::set<const FunctionDecl*> calledInFile;
+  // Functions whose address is taken in this file
+  std::set<const FunctionDecl*> addrTakenInFile;
+  // The filename for this TU (empty if not a file-backed TU)
+  std::string fileName;
+
+  PerFileCollector(ASTContext &Context)
+    : Ctx(Context), SM(Context.getSourceManager()), LO(Context.getLangOpts()) {
+    // No-op; kept for future checks if needed.
+  }
+
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    if (!FD->isThisDeclarationADefinition()) return true;
+    SourceLocation B = FD->getSourceRange().getBegin();
+    SourceLocation E = FD->getSourceRange().getEnd();
+
+    if (!B.isValid() || !E.isValid()) return true;
+    if (!SM.isWrittenInSameFile(B, E)) return true;
+
+    // Only consider functions whose definition is in a real file (not macro-generated)
+    FileID fid = SM.getFileID(B);
+    if (fid.isInvalid()) return true;
+    fileName = SM.getFilename(B).str();
+
+    // Extend end to end of token (to include trailing '}')
+    SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+    if (!realEnd.isValid()) return true;
+
+    unsigned start = SM.getFileOffset(B);
+    unsigned end = SM.getFileOffset(realEnd);
+    FuncRange fr{start, end, FD->getNameAsString()};
+    defsInFile[FD] = fr;
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) {
+    if (FunctionDecl *Callee = CE->getDirectCallee()) {
+      calledInFile.insert(Callee);
+    }
+    return true;
+  }
+
+  bool VisitUnaryOperator(UnaryOperator *UO) {
+    if (UO->getOpcode() == UO_AddrOf) {
+      Expr *sub = UO->getSubExpr()->IgnoreParenImpCasts();
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(sub)) {
+        if (FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+          addrTakenInFile.insert(FD);
+        }
+      }
+    }
+    return true;
+  }
+
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    // Conservative: if a function decl is used in a pointer context, mark address taken
+    if (ValueDecl *VD = DRE->getDecl()) {
+      if (FunctionDecl *FD = dyn_cast<FunctionDecl>(VD)) {
+        QualType QT = DRE->getType();
+        if (QT->isPointerType() || QT->isFunctionPointerType()) {
+          addrTakenInFile.insert(FD);
+        }
+      }
+    }
+    return true;
+  }
+};
+
+// ASTConsumer that runs per-TU and writes cleaned file for that TU
+class PerFileConsumer : public ASTConsumer {
+  ASTContext *Ctx;
+public:
+  PerFileConsumer(ASTContext *C) : Ctx(C) {}
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    PerFileCollector V(Context);
+    V.TraverseDecl(Context.getTranslationUnitDecl());
+
+    // If no fileName (e.g., header-only TU or virtual), skip
+    if (V.fileName.empty()) {
+      llvm::outs() << "Skipping TU with no file backing\n";
+      return;
+    }
+
+    // Build set of functions defined in this file
+    std::vector<const FunctionDecl*> defs;
+    for (auto &p : V.defsInFile) defs.push_back(p.first);
+
+    // Determine removable functions:
+    // - defined in this file
+    // - not called anywhere in this file (no entry in calledInFile)
+    // - address not taken in this file
+    // - not annotated with Used/Constructor/Destructor
+    // - declared static (file-scope) to avoid removing externally visible functions
+    std::vector<FuncRange> removableRanges;
+    for (const FunctionDecl *FD : defs) {
+      if (V.addrTakenInFile.count(FD)) continue;
+      if (V.calledInFile.count(FD)) continue;
+      if (FD->hasAttr<UsedAttr>() || FD->hasAttr<ConstructorAttr>() || FD->hasAttr<DestructorAttr>()) continue;
+      if (FD->getStorageClass() != SC_Static) continue;
+      auto it = V.defsInFile.find(FD);
+      if (it == V.defsInFile.end()) continue;
+      removableRanges.push_back(it->second);
+    }
+
+    if (removableRanges.empty()) {
+      llvm::outs() << "No removable functions in file: " << V.fileName << "\n";
+      return;
+    }
+
+    // Read file content
+    std::ifstream fin(V.fileName, std::ios::binary);
+    if (!fin) {
+      llvm::errs() << "Cannot open file: " << V.fileName << "\n";
+      return;
+    }
+    std::stringstream ss;
+    ss << fin.rdbuf();
+    std::string content = ss.str();
+    fin.close();
+
+    // Convert FuncRange to offset pairs and merge
+    std::vector<std::pair<unsigned,unsigned>> ranges;
+    for (auto &fr : removableRanges) {
+      unsigned s = fr.startOffset;
+      unsigned e = fr.endOffset;
+      if (s >= content.size()) continue;
+      e = std::min(e, (unsigned)content.size());
+      ranges.emplace_back(s, e);
+    }
+    if (ranges.empty()) {
+      llvm::outs() << "No valid ranges to remove in file: " << V.fileName << "\n";
+      return;
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<unsigned,unsigned>> merged;
+    auto cur = ranges[0];
+    for (size_t i = 1; i < ranges.size(); ++i) {
+      if (ranges[i].first <= cur.second) {
+        cur.second = std::max(cur.second, ranges[i].second);
+      } else {
+        merged.push_back(cur);
+        cur = ranges[i];
+      }
+    }
+    merged.push_back(cur);
+
+    // Remove ranges from content (descending order)
+    std::sort(merged.begin(), merged.end(), [](auto &a, auto &b){ return a.first > b.first; });
+    std::string newContent = content;
+    for (auto &r : merged) {
+      unsigned s = r.first;
+      unsigned e = r.second;
+      if (s >= e || s >= newContent.size()) continue;
+      unsigned safeEnd = std::min(e, (unsigned)newContent.size());
+      newContent.erase(s, safeEnd - s);
+    }
+
+    // Write cleaned file
+    std::string outFile = V.fileName + OutputSuffix;
+    std::ofstream fout(outFile, std::ios::binary);
+    if (!fout) {
+      llvm::errs() << "Cannot write output file: " << outFile << "\n";
+      return;
+    }
+    fout << newContent;
+    fout.close();
+
+    llvm::outs() << "Wrote cleaned file: " << outFile << " (removed " << merged.size() << " ranges)\n";
+  }
+};
+
+class PerFileAction : public ASTFrontendAction {
+public:
+  PerFileAction() {}
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef) override {
+    return std::make_unique<PerFileConsumer>(&CI.getASTContext());
+  }
+};
+
+int main(int argc, const char **argv) {
+  auto ExpectedParser = CommonOptionsParser::create(argc, argv, ToolCategory);
+  if (!ExpectedParser) {
+    llvm::errs() << "Error parsing command line: " << llvm::toString(ExpectedParser.takeError()) << "\n";
+    return 1;
+  }
+  CommonOptionsParser &OptionsParser = *ExpectedParser;
+  ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
+
+  int res = Tool.run(newFrontendActionFactory<PerFileAction>().get());
+  if (res != 0) {
+    llvm::errs() << "Error running tool over translation units\n";
+    return res;
+  }
+
+  llvm::outs() << "Done. Review the .clean.c files before replacing originals.\n";
+  return 0;
+}

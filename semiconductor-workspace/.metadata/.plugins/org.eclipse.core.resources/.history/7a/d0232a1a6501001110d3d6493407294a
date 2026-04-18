@@ -1,0 +1,347 @@
+#include <SDL2/SDL.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char** argv) {
+    const int NX = 400;
+    const int NY = 200;
+    const int SCALE = 3;
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    SDL_Window* window = SDL_CreateWindow(
+        "LBM Wasserleitungen mit Wellenkanten",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        NX * SCALE, NY * SCALE, SDL_WINDOW_SHOWN
+    );
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    SDL_Renderer* renderer = SDL_CreateRenderer(
+        window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
+    );
+    if (!renderer) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    /* D2Q9 */
+    const int Q = 9;
+    int ex[9] = {0, 1, 0, -1, 0, 1, -1, -1, 1};
+    int ey[9] = {0, 0, 1, 0, -1, 1, 1, -1, -1};
+    double w[9] = {
+        4.0/9.0,
+        1.0/9.0, 1.0/9.0, 1.0/9.0, 1.0/9.0,
+        1.0/36.0, 1.0/36.0, 1.0/36.0, 1.0/36.0
+    };
+
+    const double tau = 0.8;
+    const double omega = 1.0 / tau;
+
+    size_t total_cells = (size_t)NX * (size_t)NY;
+    size_t total_f = total_cells * (size_t)Q;
+
+    double* f = (double*)malloc(total_f * sizeof(double));
+    double* f_next = (double*)malloc(total_f * sizeof(double));
+    int* is_solid = (int*)malloc(total_cells * sizeof(int));
+    if (!f || !f_next || !is_solid) {
+        fprintf(stderr, "malloc failed\n");
+        free(f);
+        free(f_next);
+        free(is_solid);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    #define IDX(x,y,k) (((y) * NX + (x)) * Q + (k))
+    #define SOLID_IDX(x,y) ((y) * NX + (x))
+
+    /* Leitungen */
+    int top_y1 = 20;
+    int top_y2 = 80;
+
+    int mid_y1 = 90;
+    int mid_y2 = 130;
+
+    int bot_y1 = 140;
+    int bot_y2 = 160;
+
+    /* Wände/Fluid */
+    {
+        int x, y;
+        for (y = 0; y < NY; ++y) {
+            for (x = 0; x < NX; ++x) {
+                int fluid = 0;
+                if (y >= top_y1 && y <= top_y2) fluid = 1;
+                if (y >= mid_y1 && y <= mid_y2) fluid = 1;
+                if (y >= bot_y1 && y <= bot_y2) fluid = 1;
+                is_solid[SOLID_IDX(x,y)] = fluid ? 0 : 1;
+            }
+        }
+    }
+
+    /* Initialisierung */
+    {
+        int x, y, k;
+        for (y = 0; y < NY; ++y) {
+            for (x = 0; x < NX; ++x) {
+                double rho0 = 1.0;
+                double ux0 = 0.0;
+                double uy0 = 0.0;
+                double u2 = ux0*ux0 + uy0*uy0;
+                for (k = 0; k < Q; ++k) {
+                    double eu = ex[k]*ux0 + ey[k]*uy0;
+                    double feq = w[k] * rho0 * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*u2);
+                    f[IDX(x,y,k)] = feq;
+                }
+            }
+        }
+        memset(f_next, 0, total_f * sizeof(double));
+    }
+
+    int running = 1;
+    SDL_Event e;
+    int step = 0;
+
+    while (running) {
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) running = 0;
+            if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE)
+                running = 0;
+        }
+
+        /* Kollisions- und Streaming-Schritt */
+        {
+            int x, y, k;
+            for (y = 0; y < NY; ++y) {
+                for (x = 0; x < NX; ++x) {
+                    if (is_solid[SOLID_IDX(x,y)]) {
+                        for (k = 0; k < Q; ++k) {
+                            f_next[IDX(x,y,k)] = 0.0;
+                        }
+                        continue;
+                    }
+
+                    double rho = 0.0;
+                    double ux = 0.0;
+                    double uy = 0.0;
+
+                    for (k = 0; k < Q; ++k) {
+                        double fk = f[IDX(x,y,k)];
+                        rho += fk;
+                        ux += fk * ex[k];
+                        uy += fk * ey[k];
+                    }
+                    ux /= rho;
+                    uy /= rho;
+
+                    /* Einlass links */
+                    if (x == 0) {
+                        if (y >= top_y1 && y <= top_y2) {
+                            ux = 0.02;
+                            uy = 0.0;
+                        }
+                        if (y >= mid_y1 && y <= mid_y2) {
+                            ux = 0.05;
+                            uy = 0.0;
+                        }
+                        if (y >= bot_y1 && y <= bot_y2) {
+                            ux = 0.09;
+                            uy = 0.0;
+                        }
+                        rho = 1.0;
+                    }
+
+                    double u2 = ux*ux + uy*uy;
+                    for (k = 0; k < Q; ++k) {
+                        double eu = ex[k]*ux + ey[k]*uy;
+                        double feq = w[k] * rho * (1.0 + 3.0*eu + 4.5*eu*eu - 1.5*u2);
+                        double fk = f[IDX(x,y,k)];
+                        double f_post = fk - omega * (fk - feq);
+
+                        int xn = x + ex[k];
+                        int yn = y + ey[k];
+
+                        if (xn < 0) xn = 0;
+                        if (xn >= NX) xn = NX - 1;
+                        if (yn < 0) yn = 0;
+                        if (yn >= NY) yn = NY - 1;
+
+                        f_next[IDX(xn, yn, k)] += f_post;
+                    }
+                }
+            }
+        }
+
+        /* Bounce-Back */
+        {
+            int x, y;
+            for (y = 0; y < NY; ++y) {
+                for (x = 0; x < NX; ++x) {
+                    if (!is_solid[SOLID_IDX(x,y)]) continue;
+
+                    double ftemp[9];
+                    int k;
+                    for (k = 0; k < Q; ++k) {
+                        ftemp[k] = f_next[IDX(x,y,k)];
+                    }
+
+                    f_next[IDX(x,y,1)] = ftemp[3];
+                    f_next[IDX(x,y,3)] = ftemp[1];
+                    f_next[IDX(x,y,2)] = ftemp[4];
+                    f_next[IDX(x,y,4)] = ftemp[2];
+                    f_next[IDX(x,y,5)] = ftemp[7];
+                    f_next[IDX(x,y,7)] = ftemp[5];
+                    f_next[IDX(x,y,6)] = ftemp[8];
+                    f_next[IDX(x,y,8)] = ftemp[6];
+                }
+            }
+        }
+
+        /* Swap */
+        {
+            double* tmp = f;
+            f = f_next;
+            f_next = tmp;
+            memset(f_next, 0, total_f * sizeof(double));
+        }
+
+        /* Visualisierung */
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        {
+            int x, y, k;
+            for (y = 0; y < NY; ++y) {
+                for (x = 0; x < NX; ++x) {
+                    if (is_solid[SOLID_IDX(x,y)]) {
+                        /* Leitungswände dunkler */
+                        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+                    } else {
+                        double rho = 0.0;
+                        double ux = 0.0;
+                        double uy = 0.0;
+                        for (k = 0; k < Q; ++k) {
+                            double fk = f[IDX(x,y,k)];
+                            rho += fk;
+                            ux += fk * ex[k];
+                            uy += fk * ey[k];
+                        }
+                        ux /= rho;
+                        uy /= rho;
+                        double speed = sqrt(ux*ux + uy*uy);
+
+                        /* Wasserfarbe */
+                        double s = speed * 20.0;
+                        if (s > 1.0) s = 1.0;
+                        if (s < 0.0) s = 0.0;
+
+                        Uint8 r = (Uint8)(80.0 + 100.0 * s);
+                        Uint8 g = (Uint8)(120.0 + 120.0 * s);
+                        Uint8 b = (Uint8)(200.0 + 55.0 * s);
+
+                        SDL_SetRenderDrawColor(renderer, r, g, b, 255);
+                    }
+
+                    SDL_Rect rect;
+                    rect.x = x * SCALE;
+                    rect.y = y * SCALE;
+                    rect.w = SCALE;
+                    rect.h = SCALE;
+                    SDL_RenderFillRect(renderer, &rect);
+                }
+            }
+        }
+
+        /* Wellenkanten: sin(flussgeschwindigkeit)*Stauchung */
+        {
+            double t = step * 0.05; /* Zeit für Animation */
+            double base_freq = 0.03; /* Wellenlänge */
+
+            int pipes_y1[3] = { top_y1, mid_y1, bot_y1 };
+            int pipes_y2[3] = { top_y2, mid_y2, bot_y2 };
+
+            int p;
+            for (p = 0; p < 3; ++p) {
+                int y1 = pipes_y1[p];
+                int y2 = pipes_y2[p];
+                int y_mid = (y1 + y2) / 2;
+
+                int x;
+                for (x = 0; x < NX; ++x) {
+                    /* lokale Geschwindigkeit in der Mitte der Leitung */
+                    double rho = 0.0, ux = 0.0, uy = 0.0;
+                    int k;
+                    for (k = 0; k < Q; ++k) {
+                        double fk = f[IDX(x,y_mid,k)];
+                        rho += fk;
+                        ux += fk * ex[k];
+                        uy += fk * ey[k];
+                    }
+                    ux /= rho;
+                    uy /= rho;
+                    double speed = sqrt(ux*ux + uy*uy);
+
+                    /* Stauchung über Geschwindigkeit */
+                    double stretch = 1.0 + 10.0 * speed; /* je schneller, desto „wilder“ */
+                    double phase = base_freq * (double)x * stretch + t * (0.5 + 5.0 * speed);
+
+                    double amp = 2.0 + 6.0 * speed; /* Amplitude hängt auch von speed ab */
+
+                    int y_top_wave = y1 + (int)(amp * sin(phase));
+                    int y_bot_wave = y2 - (int)(amp * sin(phase));
+
+                    /* Farbe für Wellenkante: helles Cyan */
+                    SDL_SetRenderDrawColor(renderer, 0, 255, 255, 255);
+
+                    SDL_RenderDrawPoint(
+                        renderer,
+                        x * SCALE,
+                        y_top_wave * SCALE
+                    );
+                    SDL_RenderDrawPoint(
+                        renderer,
+                        x * SCALE,
+                        y_bot_wave * SCALE
+                    );
+
+                    /* etwas dicker machen */
+                    SDL_RenderDrawPoint(
+                        renderer,
+                        x * SCALE,
+                        y_top_wave * SCALE + 1
+                    );
+                    SDL_RenderDrawPoint(
+                        renderer,
+                        x * SCALE,
+                        y_bot_wave * SCALE - 1
+                    );
+                }
+            }
+        }
+
+        SDL_RenderPresent(renderer);
+        step++;
+        /* SDL_Delay(5); */
+    }
+
+    free(f);
+    free(f_next);
+    free(is_solid);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}

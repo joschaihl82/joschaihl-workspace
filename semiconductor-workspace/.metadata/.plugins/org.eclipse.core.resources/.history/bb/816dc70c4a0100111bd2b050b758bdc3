@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_QtPaintClone_FILE /dat/semiconductor-workspace/paintbrush/build/cmake.run.linux.x86_64.Local/QtPaintClone)
+set(__QT_DEPLOY_TARGET_QtPaintClone_TYPE EXECUTABLE)

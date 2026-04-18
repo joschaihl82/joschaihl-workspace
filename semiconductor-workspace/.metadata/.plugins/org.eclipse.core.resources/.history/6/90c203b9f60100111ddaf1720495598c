@@ -1,0 +1,400 @@
+/*
+ * main.c
+ *
+ * GLUT/OpenGL CAD demo — Fixed: grid and ruler tick alignment; zoom from cursor.
+ *
+ * Compile:
+ *   gcc main.c -o cad -lGL -lGLU -lglut -lm
+ *
+ * Run:
+ *   ./cad
+ *
+ * Controls:
+ *   + or =    : zoom in (centered at cursor if inside content area, otherwise center)
+ *   -         : zoom out (same center behavior)
+ *   Mouse wheel up/down (buttons 3/4) : zoom in/out at mouse
+ *   Left click: add point at mouse world position
+ *   Esc       : quit
+ *
+ * Notes:
+ *  - World units are millimeters (mm).
+ *  - px_per_mm defaults to 96 DPI -> 96/25.4 px/mm (~3.7795).
+ *  - Cursor is hidden and a crosshair is drawn at the mouse position inside the content area.
+ *  - Rulers and grid use the same origin and step calculation so ticks and grid intersections align exactly.
+ */
+
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/glut.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* Configuration */
+#define RULER_THICKNESS 28
+#define STATUS_HEIGHT 20
+#define MAX_POINTS 8192
+
+/* Global state */
+static int win_w = 1200, win_h = 800;
+static double px_per_mm = 96.0 / 25.4; /* default px/mm (≈96 DPI) */
+
+static double zoom_factor = 1.0; /* 1.0 = 100% */
+static double pan_x = 0.0; /* world center x (mm) */
+static double pan_y = 0.0; /* world center y (mm) */
+
+static int mouse_x = 0, mouse_y = 0; /* last mouse position (window coords) */
+
+static double points_x[MAX_POINTS];
+static double points_y[MAX_POINTS];
+static int points_count = 0;
+
+/* Helpers */
+static double choose_mm_step(double pxmm) {
+    const double target_px = 12.0;
+    if (pxmm <= 0.0) return 1.0;
+    double seq[] = {1.0,2.0,5.0,10.0,20.0,50.0,100.0,200.0,500.0,1000.0};
+    for (size_t i=0;i<sizeof(seq)/sizeof(seq[0]);++i) {
+        if (seq[i] * pxmm >= target_px) return seq[i];
+    }
+    double mm = 1000.0;
+    while (mm * pxmm < target_px) mm *= 2.0;
+    return mm;
+}
+
+/* Content area (drawing area) */
+static void get_content_rect(int *x0, int *y0, int *cw, int *ch) {
+    if (x0) *x0 = RULER_THICKNESS;
+    if (y0) *y0 = RULER_THICKNESS;
+    if (cw) *cw = win_w - RULER_THICKNESS;
+    if (ch) *ch = win_h - RULER_THICKNESS - STATUS_HEIGHT;
+}
+
+/* World (mm) -> Screen (px) using content area center as origin */
+static void world_to_screen(double wx, double wy, int *sx, int *sy) {
+    int cx, cy, cw, ch;
+    get_content_rect(&cx, &cy, &cw, &ch);
+    double origin_x = cx + cw / 2.0;
+    double origin_y = cy + ch / 2.0;
+    double zx = (wx - pan_x) * zoom_factor;
+    double zy = (wy - pan_y) * zoom_factor;
+    if (sx) *sx = (int)round(origin_x + zx);
+    if (sy) *sy = (int)round(origin_y + zy);
+}
+
+/* Screen -> World (mm) using content area center as origin */
+static void screen_to_world(int sx, int sy, double *wx, double *wy) {
+    int cx, cy, cw, ch;
+    get_content_rect(&cx, &cy, &cw, &ch);
+    double origin_x = cx + cw / 2.0;
+    double origin_y = cy + ch / 2.0;
+    if (wx) *wx = (double)(sx - origin_x) / zoom_factor + pan_x;
+    if (wy) *wy = (double)(sy - origin_y) / zoom_factor + pan_y;
+}
+
+/* Adjust zoom so that a screen point remains on the same world coordinate */
+static void adjust_zoom_at(double new_zoom, int screen_x, int screen_y) {
+    if (new_zoom <= 0.0) return;
+    double wx_before, wy_before;
+    screen_to_world(screen_x, screen_y, &wx_before, &wy_before);
+    zoom_factor = new_zoom;
+    pan_x = wx_before - (double)screen_x / zoom_factor;
+    pan_y = wy_before - (double)screen_y / zoom_factor;
+}
+static void zoom_in_at(int sx, int sy) {
+    double factor = 1.15;
+    double new_zoom = zoom_factor * factor;
+    if (new_zoom > 100.0) new_zoom = 100.0;
+    adjust_zoom_at(new_zoom, sx, sy);
+}
+static void zoom_out_at(int sx, int sy) {
+    double factor = 1.15;
+    double new_zoom = zoom_factor / factor;
+    if (new_zoom < 0.01) new_zoom = 0.01;
+    adjust_zoom_at(new_zoom, sx, sy);
+}
+
+/* Draw text using GLUT bitmap font at pixel coordinates (x,y) baseline */
+static void draw_text_bitmap(int x, int y, const char *s) {
+    glRasterPos2i(x, y);
+    for (const char *p = s; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *p);
+}
+
+/* Draw crosshair at mouse position */
+static void draw_crosshair(int mx, int my) {
+    glColor3ub(0,0,0);
+    glLineWidth(1.0f);
+    glBegin(GL_LINES);
+      glVertex2i(mx - 10, my);
+      glVertex2i(mx + 10, my);
+      glVertex2i(mx, my - 10);
+      glVertex2i(mx, my + 10);
+    glEnd();
+}
+
+/* Draw rulers and ticks. Uses the exact same origin and step as the grid. */
+static void draw_rulers_and_ticks() {
+    double pxmm = px_per_mm * zoom_factor;
+    if (pxmm <= 0.0) pxmm = (96.0/25.4) * zoom_factor;
+
+    int cx, cy, cw, ch;
+    get_content_rect(&cx, &cy, &cw, &ch);
+    int origin_sx = cx + cw / 2;
+    int origin_sy = cy + ch / 2;
+
+    /* Ruler backgrounds */
+    glColor3ub(240,240,240);
+    glBegin(GL_QUADS);
+      glVertex2i(0,0); glVertex2i(win_w,0); glVertex2i(win_w,RULER_THICKNESS); glVertex2i(0,RULER_THICKNESS);
+      glVertex2i(0,0); glVertex2i(RULER_THICKNESS,0); glVertex2i(RULER_THICKNESS,win_h); glVertex2i(0,win_h);
+    glEnd();
+
+    /* Separators */
+    glColor3ub(160,160,160);
+    glBegin(GL_LINES);
+      glVertex2i(0, RULER_THICKNESS-1); glVertex2i(win_w, RULER_THICKNESS-1);
+      glVertex2i(RULER_THICKNESS-1, 0); glVertex2i(RULER_THICKNESS-1, win_h);
+    glEnd();
+
+    double step_mm = choose_mm_step(pxmm);
+    double major_mm = (step_mm > 10.0) ? step_mm : 10.0;
+
+    /* Visible extents in mm relative to world origin (pan_x/pan_y are world coords at content center) */
+    /* Compute world coords at content corners */
+    double wx_left_top, wy_left_top, wx_right_bottom, wy_right_bottom;
+    screen_to_world(cx, cy, &wx_left_top, &wy_left_top);
+    screen_to_world(cx + cw, cy + ch, &wx_right_bottom, &wy_right_bottom);
+
+    /* Determine integer k range for step_mm multiples */
+    /* We'll iterate k such that world_x = k * step_mm (k integer) */
+    int kx_min = (int)floor(wx_left_top / step_mm) - 1;
+    int kx_max = (int)ceil(wx_right_bottom / step_mm) + 1;
+    int ky_min = (int)floor(wy_left_top / step_mm) - 1;
+    int ky_max = (int)ceil(wy_right_bottom / step_mm) + 1;
+
+    /* Top ruler ticks (horizontal) */
+    glColor3ub(0,0,0);
+    for (int k = kx_min; k <= kx_max; ++k) {
+        double world_x = k * step_mm;
+        int sx, sy;
+        world_to_screen(world_x, pan_y, &sx, &sy); /* sy unused; world_to_screen gives correct sx */
+        if (sx < cx - 2 || sx > cx + cw + 2) continue;
+        if (fmod(fabs(world_x), major_mm) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(sx, RULER_THICKNESS-1);
+              glVertex2i(sx, RULER_THICKNESS-1 - 12);
+            glEnd();
+            int cm = (int)round(fabs(world_x) / 10.0);
+            char buf[32];
+            if (fabs(world_x) < 0.5) snprintf(buf, sizeof(buf), "0");
+            else snprintf(buf, sizeof(buf), "%dcm", cm);
+            draw_text_bitmap(sx - 12, RULER_THICKNESS - 14, buf);
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(sx, RULER_THICKNESS-1);
+              glVertex2i(sx, RULER_THICKNESS-1 - 6);
+            glEnd();
+        }
+    }
+
+    /* Left ruler ticks (vertical) */
+    for (int k = ky_min; k <= ky_max; ++k) {
+        double world_y = k * step_mm;
+        int sx, sy;
+        world_to_screen(pan_x, world_y, &sx, &sy);
+        if (sy < cy - 2 || sy > cy + ch + 2) continue;
+        if (fmod(fabs(world_y), major_mm) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS-1, sy);
+              glVertex2i(RULER_THICKNESS-1 - 12, sy);
+            glEnd();
+            int cm = (int)round(fabs(world_y) / 10.0);
+            char buf[32];
+            if (fabs(world_y) < 0.5) snprintf(buf, sizeof(buf), "0");
+            else snprintf(buf, sizeof(buf), "%dcm", cm);
+            draw_text_bitmap(4, sy + 4, buf);
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS-1, sy);
+              glVertex2i(RULER_THICKNESS-1 - 6, sy);
+            glEnd();
+        }
+    }
+
+    /* Corner label */
+    draw_text_bitmap(6, RULER_THICKNESS - 6, "mm / cm");
+}
+
+/* Display callback */
+static void display_cb(void) {
+    glClearColor(1.0f,1.0f,1.0f,1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0.0, win_w, win_h, 0.0);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    /* Grid (background) */
+    double pxmm = px_per_mm * zoom_factor;
+    if (pxmm <= 0.0) pxmm = (96.0/25.4) * zoom_factor;
+    double step_mm = choose_mm_step(pxmm);
+    double major_mm = (step_mm > 10.0) ? step_mm : 10.0;
+
+    int cx, cy, cw, ch;
+    get_content_rect(&cx, &cy, &cw, &ch);
+
+    /* Compute visible world bounds using content corners */
+    double wx0, wy0, wx1, wy1;
+    screen_to_world(cx, cy, &wx0, &wy0);
+    screen_to_world(cx + cw, cy + ch, &wx1, &wy1);
+
+    /* Align start/end to step_mm multiples */
+    int kx_min = (int)floor(wx0 / step_mm) - 1;
+    int kx_max = (int)ceil(wx1 / step_mm) + 1;
+    int ky_min = (int)floor(wy0 / step_mm) - 1;
+    int ky_max = (int)ceil(wy1 / step_mm) + 1;
+
+    /* Draw vertical grid lines */
+    glLineWidth(1.0f);
+    for (int k = kx_min; k <= kx_max; ++k) {
+        double world_x = k * step_mm;
+        int sx0, sy0, sx1, sy1;
+        world_to_screen(world_x, wy0, &sx0, &sy0);
+        world_to_screen(world_x, wy1, &sx1, &sy1);
+        if (fmod(fabs(world_x), major_mm) < 1e-9) glColor3ub(192,192,192);
+        else glColor3ub(224,224,224);
+        glBegin(GL_LINES); glVertex2i(sx0, sy0); glVertex2i(sx1, sy1); glEnd();
+    }
+
+    /* Draw horizontal grid lines */
+    for (int k = ky_min; k <= ky_max; ++k) {
+        double world_y = k * step_mm;
+        int sx0, sy0, sx1, sy1;
+        world_to_screen(wx0, world_y, &sx0, &sy0);
+        world_to_screen(wx1, world_y, &sx1, &sy1);
+        if (fmod(fabs(world_y), major_mm) < 1e-9) glColor3ub(192,192,192);
+        else glColor3ub(224,224,224);
+        glBegin(GL_LINES); glVertex2i(sx0, sy0); glVertex2i(sx1, sy1); glEnd();
+    }
+
+    /* Draw points (above grid, below rulers) */
+    glColor3ub(0,0,0);
+    for (int i=0;i<points_count;++i) {
+        int sx, sy; world_to_screen(points_x[i], points_y[i], &sx, &sy);
+        int r = (int)fmax(2.0, 3.0 * zoom_factor);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2i(sx, sy);
+        for (int a=0;a<=20;++a) {
+            double ang = a * (2.0*M_PI/20.0);
+            glVertex2f(sx + cos(ang)*r, sy + sin(ang)*r);
+        }
+        glEnd();
+    }
+
+    /* Draw rulers on top (foreground) */
+    draw_rulers_and_ticks();
+
+    /* Bottom status bar */
+    int status_y = win_h - STATUS_HEIGHT;
+    glColor3ub(248,248,248);
+    glBegin(GL_QUADS);
+      glVertex2i(0, status_y); glVertex2i(win_w, status_y); glVertex2i(win_w, win_h); glVertex2i(0, win_h);
+    glEnd();
+    glColor3ub(192,192,192);
+    glBegin(GL_LINES); glVertex2i(0, status_y); glVertex2i(win_w, status_y); glEnd();
+    char status[128];
+    snprintf(status, sizeof(status), "Zoom: %.1f%%   Points: %d", zoom_factor*100.0, points_count);
+    glColor3ub(0,0,0);
+    draw_text_bitmap(8, status_y + STATUS_HEIGHT - 6, status);
+
+    /* Crosshair only inside content area */
+    if (mouse_x >= cx && mouse_x <= cx + cw && mouse_y >= cy && mouse_y <= cy + ch) {
+        draw_crosshair(mouse_x, mouse_y);
+    }
+
+    glutSwapBuffers();
+}
+
+/* Reshape */
+static void reshape_cb(int w, int h) {
+    win_w = w; win_h = h;
+    glViewport(0,0,w,h);
+    glutPostRedisplay();
+}
+
+/* Mouse button */
+static void mouse_cb(int button, int state, int x, int y) {
+    mouse_x = x; mouse_y = y;
+    if (state != GLUT_DOWN) return;
+    if (button == GLUT_LEFT_BUTTON) {
+        double wx, wy; screen_to_world(x, y, &wx, &wy);
+        if (points_count < MAX_POINTS) { points_x[points_count] = wx; points_y[points_count] = wy; points_count++; }
+        glutPostRedisplay();
+    } else if (button == 3) { /* wheel up */
+        /* zoom centered at cursor if inside content area, else center */
+        int cx, cy, cw, ch; get_content_rect(&cx, &cy, &cw, &ch);
+        int zx = x, zy = y;
+        if (!(x >= cx && x <= cx + cw && y >= cy && y <= cy + ch)) { zx = cx + cw/2; zy = cy + ch/2; }
+        zoom_in_at(zx, zy);
+        glutPostRedisplay();
+    } else if (button == 4) { /* wheel down */
+        int cx, cy, cw, ch; get_content_rect(&cx, &cy, &cw, &ch);
+        int zx = x, zy = y;
+        if (!(x >= cx && x <= cx + cw && y >= cy && y <= cy + ch)) { zx = cx + cw/2; zy = cy + ch/2; }
+        zoom_out_at(zx, zy);
+        glutPostRedisplay();
+    }
+}
+
+/* Motion */
+static void motion_cb(int x, int y) { mouse_x = x; mouse_y = y; glutPostRedisplay(); }
+static void passive_motion_cb(int x, int y) { mouse_x = x; mouse_y = y; glutPostRedisplay(); }
+
+/* Keyboard: zoom centered at cursor if inside content area (requirement 1) */
+static void keyboard_cb(unsigned char key, int x, int y) {
+    (void)x; (void)y;
+    int cx, cy, cw, ch; get_content_rect(&cx, &cy, &cw, &ch);
+    int zx = mouse_x, zy = mouse_y;
+    if (!(mouse_x >= cx && mouse_x <= cx + cw && mouse_y >= cy && mouse_y <= cy + ch)) {
+        zx = cx + cw/2;
+        zy = cy + ch/2;
+    }
+    if (key == 27) exit(0);
+    else if (key == '+' || key == '=') { zoom_in_at(zx, zy); glutPostRedisplay(); }
+    else if (key == '-') { zoom_out_at(zx, zy); glutPostRedisplay(); }
+}
+
+/* Hide system cursor and draw our own crosshair */
+static void hide_system_cursor() { glutSetCursor(GLUT_CURSOR_NONE); }
+
+/* Init GL */
+static void init_gl() {
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+/* main */
+int main(int argc, char **argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(win_w, win_h);
+    glutCreateWindow("GLUT CAD - Grid aligned to rulers; Cursor-centered Zoom");
+
+    init_gl();
+    hide_system_cursor();
+
+    glutDisplayFunc(display_cb);
+    glutReshapeFunc(reshape_cb);
+    glutMouseFunc(mouse_cb);
+    glutMotionFunc(motion_cb);
+    glutPassiveMotionFunc(passive_motion_cb);
+    glutKeyboardFunc(keyboard_cb);
+
+    glutMainLoop();
+    return 0;
+}

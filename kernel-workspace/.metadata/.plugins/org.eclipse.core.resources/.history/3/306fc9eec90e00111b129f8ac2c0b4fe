@@ -1,0 +1,37 @@
+# 3.5 rule: mod prefix, obj/nam/dir postfix
+mod_obj := exectrace1.o
+mod_nam := exectrace1
+mod_dir := /lib/modules/$(shell uname -r)/extra
+obj-m := $(mod_obj)
+
+# 3.5 rule: mak prefix, bin/knd/cur/flg postfix
+mak_bin := make
+mak_knd := /lib/modules/$(shell uname -r)/build
+mak_cur := $(shell pwd)
+mak_flg := v=1
+
+.phony: all clean cln_all load unload msg
+
+all:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) modules $(mak_flg)
+
+clean:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) clean
+
+cln_all: clean
+	rm -f .*.cmd *.o *.mod *.mod.c modules.order Module.symvers
+
+load: all
+	sudo mkdir -p $(mod_dir)
+	sudo cp $(mod_nam).ko $(mod_dir)
+	sudo depmod -a
+	sudo modprobe $(mod_nam) || (dmesg | tail -n 10 && exit 1)
+
+unload:
+	sudo modprobe -r $(mod_nam)
+	sudo rm -f $(mod_dir)/$(mod_nam).ko
+	sudo depmod -a
+
+# 3.5 rule: log prefix, msg postfix
+log_msg:
+	sudo dmesg -w

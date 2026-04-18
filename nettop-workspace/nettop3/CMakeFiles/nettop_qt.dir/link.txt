@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/nettop_qt.dir/nettop_qt_autogen/mocs_compilation.cpp.o CMakeFiles/nettop_qt.dir/nettop.cpp.o -o nettop_qt  /usr/lib/x86_64-linux-gnu/libQt5Widgets.so.5.15.8 -lpcap /usr/lib/x86_64-linux-gnu/libQt5Gui.so.5.15.8 /usr/lib/x86_64-linux-gnu/libQt5Core.so.5.15.8 

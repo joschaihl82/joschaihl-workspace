@@ -1,0 +1,2 @@
+#define zipbak1_VERSION_MAJOR @zipbak1_VERSION_MAJOR@
+#define zipbak1_VERSION_MINOR @zipbak1_VERSION_MINOR@

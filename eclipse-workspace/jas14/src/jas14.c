@@ -1,0 +1,876 @@
+/* asm.c - Table-driven x86_64 assembler (single file)
+ *
+ * Minimal, extendable, x86_64-only assembler driven by an ISA table.
+ *
+ * Supported:
+ *  - mov r64, imm64
+ *  - mov r64, r64
+ *  - mov r64, [mem]
+ *  - mov [mem], r64
+ *  - add r64, r64
+ *  - sub r64, r64
+ *  - call label
+ *  - jmp label
+ *  - ret
+ *
+ * Produces relocatable ELF64 object with .text, .rela.text, .symtab, .strtab, .shstrtab
+ *
+ * Build:
+ *   gcc -std=c11 -O2 -o asm asm.c
+ *
+ * Usage:
+ *   ./asm input.s output.o
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h>
+
+/* ----------------------------- ISA table (x86_64 only) ----------------------------- */
+
+typedef enum { FORM_NONE=0, FORM_R_R, FORM_R_IMM, FORM_R_M, FORM_M_R, FORM_REL } isa_form;
+typedef enum { RELOC_NONE=0, RELOC_PC32, RELOC_ABS64 } reloc_kind;
+
+/* Flags for encoding behavior */
+enum {
+    ISA_FLAG_NONE = 0,
+    ISA_FLAG_REX_W = 1<<0,    /* require REX.W (64-bit operand) */
+    ISA_FLAG_USE_OPC_PLUS_REG = 1<<1, /* opcode is B8+rd style */
+    ISA_FLAG_TWO_BYTE = 1<<2, /* 0x0F prefix */
+};
+
+typedef struct {
+    const char *mnemonic;
+    isa_form form;
+    uint8_t opcode[4];   /* up to 4 bytes (e.g., 0x0F,0xAF) */
+    int opcode_len;
+    int needs_modrm;     /* 1 if ModR/M required */
+    int imm_bytes;       /* 0,4,8 */
+    reloc_kind reloc;    /* relocation type for imm/symbol */
+    int flags;           /* encoding flags */
+    int allow_rip;       /* allow RIP-relative memory operand */
+} isa_entry;
+
+/* Minimal x64-only table. Extend by adding entries. */
+static isa_entry isa_table[] = {
+    /* mnemonic, form, opcode[], len, modrm, imm_bytes, reloc, flags, allow_rip */
+    {"mov", FORM_R_IMM, {0xB8,0,0,0}, 1, 0, 8, RELOC_ABS64, ISA_FLAG_REX_W | ISA_FLAG_USE_OPC_PLUS_REG, 0},
+    {"mov", FORM_R_R,   {0x8B,0,0,0}, 1, 1, 0, RELOC_NONE, ISA_FLAG_REX_W, 1},
+    {"mov", FORM_M_R,   {0x89,0,0,0}, 1, 1, 0, RELOC_NONE, ISA_FLAG_REX_W, 1},
+    {"add", FORM_R_R,   {0x03,0,0,0}, 1, 1, 0, RELOC_NONE, ISA_FLAG_REX_W, 0},
+    {"sub", FORM_R_R,   {0x2B,0,0,0}, 1, 1, 0, RELOC_NONE, ISA_FLAG_REX_W, 0},
+    {"call",FORM_REL,   {0xE8,0,0,0}, 1, 0, 4, RELOC_PC32, 0, 0},
+    {"jmp", FORM_REL,   {0xE9,0,0,0}, 1, 0, 4, RELOC_PC32, 0, 0},
+    {"ret", FORM_NONE,  {0xC3,0,0,0}, 1, 0, 0, RELOC_NONE, 0, 0},
+    {NULL, 0, {0},0,0,0,0,0,0}
+};
+
+/* ----------------------------- Lexer ----------------------------- */
+
+typedef enum {
+    T_EOF, T_EOL,
+    T_IDENT, T_IMM,
+    T_LBRACK, T_RBRACK,
+    T_PLUS, T_MINUS, T_STAR, T_COMMA, T_COLON,
+    T_LPAREN, T_RPAREN,
+    T_UNKNOWN
+} TokenType;
+
+typedef struct {
+    TokenType type;
+    char text[128];
+    int line;
+} Token;
+
+typedef struct {
+    FILE *f;
+    int peek;
+    int line;
+} Lexer;
+
+static void lexer_init(Lexer *lx, FILE *f) {
+    lx->f = f;
+    lx->peek = fgetc(f);
+    lx->line = 1;
+}
+
+static int lexer_get(Lexer *lx) {
+    int c = lx->peek;
+    lx->peek = fgetc(lx->f);
+    if (c == '\n') lx->line++;
+    return c;
+}
+
+static void lexer_skip_ws_comments(Lexer *lx) {
+    int c = lx->peek;
+    while (c != EOF) {
+        if (isspace(c)) { lexer_get(lx); c = lx->peek; continue; }
+        if (c == '#') {
+            while (c != EOF && c != '\n') c = lexer_get(lx);
+            continue;
+        }
+        break;
+    }
+}
+
+static Token lexer_next(Lexer *lx) {
+    lexer_skip_ws_comments(lx);
+    Token t; t.text[0]=0; t.line = lx->line;
+    int c = lx->peek;
+    if (c == EOF) { t.type = T_EOF; return t; }
+    if (c == '\n') { lexer_get(lx); t.type = T_EOL; return t; }
+    if (isalpha(c) || c=='_' || c=='.') {
+        int i=0;
+        while (isalnum(lx->peek) || lx->peek=='_' || lx->peek=='.') {
+            if (i < (int)sizeof(t.text)-1) t.text[i++] = tolower(lexer_get(lx));
+            else lexer_get(lx);
+        }
+        t.text[i]=0; t.type = T_IDENT; return t;
+    }
+    if (c == '$' || isdigit(c)) {
+        int i=0;
+        if (lx->peek == '$') lexer_get(lx);
+        if (lx->peek == '0') {
+            if (i < (int)sizeof(t.text)-1) t.text[i++] = lexer_get(lx);
+            if (lx->peek == 'x' || lx->peek == 'X') {
+                if (i < (int)sizeof(t.text)-1) t.text[i++] = lexer_get(lx);
+                while (isxdigit(lx->peek)) {
+                    if (i < (int)sizeof(t.text)-1) t.text[i++] = lexer_get(lx);
+                    else lexer_get(lx);
+                }
+            } else {
+                while (isdigit(lx->peek)) {
+                    if (i < (int)sizeof(t.text)-1) t.text[i++] = lexer_get(lx);
+                    else lexer_get(lx);
+                }
+            }
+        } else {
+            while (isxdigit(lx->peek)) {
+                if (i < (int)sizeof(t.text)-1) t.text[i++] = lexer_get(lx);
+                else lexer_get(lx);
+            }
+        }
+        t.text[i]=0; t.type = T_IMM; return t;
+    }
+    switch (c) {
+        case '[': lexer_get(lx); t.type = T_LBRACK; return t;
+        case ']': lexer_get(lx); t.type = T_RBRACK; return t;
+        case '+': lexer_get(lx); t.type = T_PLUS; return t;
+        case '-': lexer_get(lx); t.type = T_MINUS; return t;
+        case '*': lexer_get(lx); t.type = T_STAR; return t;
+        case ',': lexer_get(lx); t.type = T_COMMA; return t;
+        case ':': lexer_get(lx); t.type = T_COLON; return t;
+        case '(' : lexer_get(lx); t.type = T_LPAREN; return t;
+        case ')' : lexer_get(lx); t.type = T_RPAREN; return t;
+        default:
+            lexer_get(lx);
+            t.type = T_UNKNOWN;
+            return t;
+    }
+}
+
+/* ----------------------------- Parser ----------------------------- */
+
+typedef enum { OP_REG, OP_IMM, OP_MEM, OP_LABEL } OperandKind;
+
+typedef struct {
+    OperandKind kind;
+    int reg;            /* 0..15 */
+    uint64_t imm;
+    char sym[64];       /* symbol name if imm is symbol or label */
+    int base;           /* reg or -1 */
+    int index;          /* reg or -1 */
+    int scale;          /* 1,2,4,8 */
+    int64_t disp;
+    int disp_is_sym;
+    char disp_sym[64];
+} Operand;
+
+typedef enum { INST_NONE, INST_MOV, INST_ADD, INST_SUB, INST_CALL, INST_JMP, INST_RET, INST_DIR_GLOBAL } InstKind;
+
+typedef struct Instr {
+    InstKind kind;
+    Operand dst;
+    Operand src;
+    char label_def[64]; /* if this instruction defines a label */
+    int line;
+    struct Instr *next;
+} Instr;
+
+typedef struct {
+    Lexer lx;
+    Token cur;
+} Parser;
+
+static void parser_init(Parser *p, FILE *f) { lexer_init(&p->lx,f); p->cur = lexer_next(&p->lx); }
+static void parser_next(Parser *p) { p->cur = lexer_next(&p->lx); }
+static int is_tok(Parser *p, TokenType t) { return p->cur.type == t; }
+static void expect_eol(Parser *p) {
+    while (!is_tok(p, T_EOL) && !is_tok(p, T_EOF)) parser_next(p);
+    if (is_tok(p, T_EOL)) parser_next(p);
+}
+
+static int reg_code_from_name(const char *s) {
+    if (!s) return -1;
+    if (strcmp(s,"rax")==0) return 0;
+    if (strcmp(s,"rcx")==0) return 1;
+    if (strcmp(s,"rdx")==0) return 2;
+    if (strcmp(s,"rbx")==0) return 3;
+    if (strcmp(s,"rsp")==0) return 4;
+    if (strcmp(s,"rbp")==0) return 5;
+    if (strcmp(s,"rsi")==0) return 6;
+    if (strcmp(s,"rdi")==0) return 7;
+    if (s[0]=='r') {
+        int v = atoi(s+1);
+        if (v >= 8 && v <= 15) return v;
+    }
+    return -1;
+}
+
+static uint64_t parse_imm_text(const char *s) {
+    if (!s) return 0;
+    if (s[0]=='0' && (s[1]=='x' || s[1]=='X')) return strtoull(s,NULL,16);
+    return strtoull(s,NULL,0);
+}
+
+/* parse memory operand: [base + index*scale + disp] */
+static Operand parse_mem(Parser *p) {
+    Operand op; memset(&op,0,sizeof(op));
+    op.kind = OP_MEM;
+    op.base = op.index = -1;
+    op.scale = 1;
+    op.disp = 0;
+    op.disp_is_sym = 0;
+    parser_next(p); /* consume '[' */
+    while (!is_tok(p, T_RBRACK) && !is_tok(p, T_EOF)) {
+        if (is_tok(p, T_IDENT)) {
+            int rc = reg_code_from_name(p->cur.text);
+            if (rc >= 0) {
+                if (op.base == -1) op.base = rc;
+                else if (op.index == -1) op.index = rc;
+                parser_next(p);
+            } else {
+                strncpy(op.disp_sym, p->cur.text, sizeof(op.disp_sym)-1);
+                op.disp_is_sym = 1;
+                parser_next(p);
+            }
+        } else if (is_tok(p, T_STAR)) {
+            parser_next(p);
+            if (is_tok(p, T_IMM)) {
+                op.scale = (int)parse_imm_text(p->cur.text);
+                parser_next(p);
+            }
+        } else if (is_tok(p, T_IMM)) {
+            op.disp = (int64_t)parse_imm_text(p->cur.text);
+            parser_next(p);
+        } else if (is_tok(p, T_PLUS) || is_tok(p, T_COMMA)) {
+            parser_next(p);
+        } else if (is_tok(p, T_MINUS)) {
+            parser_next(p);
+            if (is_tok(p, T_IMM)) {
+                op.disp = - (int64_t)parse_imm_text(p->cur.text);
+                parser_next(p);
+            }
+        } else {
+            parser_next(p);
+        }
+    }
+    if (is_tok(p, T_RBRACK)) parser_next(p);
+    return op;
+}
+
+static Operand parse_operand(Parser *p) {
+    Operand op; memset(&op,0,sizeof(op));
+    op.kind = OP_IMM; op.reg = -1;
+    if (is_tok(p, T_IDENT)) {
+        int rc = reg_code_from_name(p->cur.text);
+        if (rc >= 0) {
+            op.kind = OP_REG; op.reg = rc;
+            parser_next(p);
+            return op;
+        } else {
+            op.kind = OP_LABEL;
+            strncpy(op.sym, p->cur.text, sizeof(op.sym)-1);
+            parser_next(p);
+            return op;
+        }
+    } else if (is_tok(p, T_IMM)) {
+        op.kind = OP_IMM;
+        op.imm = parse_imm_text(p->cur.text);
+        parser_next(p);
+        return op;
+    } else if (is_tok(p, T_LBRACK)) {
+        op = parse_mem(p);
+        return op;
+    }
+    parser_next(p);
+    return op;
+}
+
+static Instr *parse_one(Parser *p) {
+    while (is_tok(p, T_EOL)) parser_next(p);
+    if (is_tok(p, T_EOF)) return NULL;
+    if (!is_tok(p, T_IDENT)) { expect_eol(p); return parse_one(p); }
+    char id[128]; strncpy(id, p->cur.text, sizeof(id)-1);
+    parser_next(p);
+
+    if (is_tok(p, T_COLON)) {
+        Instr *ins = calloc(1,sizeof(Instr));
+        strncpy(ins->label_def, id, sizeof(ins->label_def)-1);
+        parser_next(p);
+        expect_eol(p);
+        return ins;
+    }
+
+    if (strcmp(id,"global")==0) {
+        Instr *ins = calloc(1,sizeof(Instr));
+        ins->kind = INST_DIR_GLOBAL;
+        if (is_tok(p, T_IDENT)) {
+            strncpy(ins->dst.sym, p->cur.text, sizeof(ins->dst.sym)-1);
+            parser_next(p);
+        }
+        expect_eol(p);
+        return ins;
+    }
+
+    Instr *ins = calloc(1,sizeof(Instr));
+    ins->line = p->cur.line;
+    ins->next = NULL;
+
+    if (strcmp(id,"ret")==0 || strcmp(id,"retn")==0) {
+        ins->kind = INST_RET;
+        expect_eol(p);
+        return ins;
+    }
+
+    Operand op1 = parse_operand(p);
+    if (is_tok(p, T_COMMA)) parser_next(p);
+    Operand op2; memset(&op2,0,sizeof(op2));
+    if (!is_tok(p, T_EOL) && !is_tok(p, T_EOF)) op2 = parse_operand(p);
+
+    if (strcmp(id,"mov")==0) ins->kind = INST_MOV;
+    else if (strcmp(id,"add")==0) ins->kind = INST_ADD;
+    else if (strcmp(id,"sub")==0) ins->kind = INST_SUB;
+    else if (strcmp(id,"call")==0) ins->kind = INST_CALL;
+    else if (strcmp(id,"jmp")==0) ins->kind = INST_JMP;
+    else { free(ins); expect_eol(p); return parse_one(p); }
+
+    ins->dst = op1; ins->src = op2;
+    expect_eol(p);
+    return ins;
+}
+
+static Instr *parse_all(Parser *p, FILE *f) {
+    parser_init(p,f);
+    Instr *head = NULL, *tail = NULL;
+    for (;;) {
+        Instr *i = parse_one(p);
+        if (!i) break;
+        if (!head) head = tail = i; else { tail->next = i; tail = i; }
+    }
+    return head;
+}
+
+/* ----------------------------- Symbol table & placeholders ----------------------------- */
+
+typedef struct Sym {
+    char name[64];
+    uint64_t value;
+    int defined;
+    int is_global;
+    struct Sym *next;
+} Sym;
+
+static Sym *symtab = NULL;
+
+static Sym *sym_find(const char *name) {
+    for (Sym *s = symtab; s; s = s->next) if (strcmp(s->name,name)==0) return s;
+    return NULL;
+}
+
+static Sym *sym_ensure(const char *name) {
+    Sym *s = sym_find(name);
+    if (s) return s;
+    s = calloc(1,sizeof(Sym));
+    if (!s) { perror("calloc"); exit(1); }
+    strncpy(s->name,name,sizeof(s->name)-1);
+    s->defined = 0; s->value = 0; s->is_global = 0;
+    s->next = symtab; symtab = s;
+    return s;
+}
+
+typedef struct Placeholder {
+    uint64_t offset;      /* offset in .text where relocation applies */
+    char sym[64];         /* symbol name */
+    reloc_kind reloc;
+    int64_t addend;
+    struct Placeholder *next;
+} Placeholder;
+
+static Placeholder *placeholders = NULL;
+
+static void add_placeholder(uint64_t off, const char *sym, reloc_kind r, int64_t addend) {
+    Placeholder *p = calloc(1,sizeof(Placeholder));
+    if (!p) { perror("calloc"); exit(1); }
+    p->offset = off;
+    strncpy(p->sym, sym, sizeof(p->sym)-1);
+    p->reloc = r;
+    p->addend = addend;
+    p->next = placeholders;
+    placeholders = p;
+}
+
+/* ----------------------------- Codegen helpers ----------------------------- */
+
+typedef struct { uint8_t *data; size_t len, cap; } Buf;
+
+static void buf_init(Buf *b) { b->cap = 512; b->len = 0; b->data = malloc(b->cap); if (!b->data) { perror("malloc"); exit(1); } }
+static void buf_putu8(Buf *b, uint8_t v) { if (b->len+1 > b->cap) { b->cap *= 2; b->data = realloc(b->data, b->cap); if (!b->data) { perror("realloc"); exit(1); } } b->data[b->len++] = v; }
+static void buf_putmem(Buf *b, const void *p, size_t n) { if (b->len+n > b->cap) { while (b->len+n > b->cap) b->cap *= 2; b->data = realloc(b->data, b->cap); if (!b->data) { perror("realloc"); exit(1); } } memcpy(b->data + b->len, p, n); b->len += n; }
+static void buf_putu32_le(Buf *b, uint32_t v) { buf_putu8(b, v & 0xFF); buf_putu8(b, (v>>8)&0xFF); buf_putu8(b, (v>>16)&0xFF); buf_putu8(b, (v>>24)&0xFF); }
+static void buf_putu64_le(Buf *b, uint64_t v) { for (int i=0;i<8;i++) buf_putu8(b, (v >> (8*i)) & 0xFF); }
+
+/* Emit REX prefix: 0x40 | W<<3 | R<<2 | X<<1 | B */
+static void emit_rex(Buf *b, int W, int R, int X, int B) {
+    uint8_t rex = 0x40;
+    if (W) rex |= 0x08;
+    if (R) rex |= 0x04;
+    if (X) rex |= 0x02;
+    if (B) rex |= 0x01;
+    buf_putu8(b, rex);
+}
+
+/* ModR/M for reg, rm (register-direct mod=3) */
+static void emit_modrm_reg_reg(Buf *b, int reg, int rm) {
+    uint8_t modrm = (3<<6) | ((reg & 7) << 3) | (rm & 7);
+    buf_putu8(b, modrm);
+}
+
+/* Emit ModR/M + SIB + displacement for memory operand */
+static void emit_modrm_mem(Buf *b, int reg, Operand *mem) {
+    int base = mem->base;
+    int index = mem->index;
+    int scale = mem->scale;
+    int need_sib = (index != -1) || (base == 4);
+    if (!need_sib && mem->disp == 0 && !mem->disp_is_sym) {
+        uint8_t modrm = (0<<6) | ((reg & 7) << 3) | (base & 7);
+        buf_putu8(b, modrm);
+        if (base == 5) { /* [rbp] with mod=00 -> disp32=0 */
+            buf_putu32_le(b, 0);
+        }
+        return;
+    }
+    if (!need_sib) {
+        if (mem->disp_is_sym) {
+            uint8_t modrm = (2<<6) | ((reg & 7) << 3) | (base & 7);
+            buf_putu8(b, modrm);
+            uint64_t off = b->len;
+            buf_putu32_le(b, 0);
+            add_placeholder(off, mem->disp_sym, RELOC_ABS64, 0);
+            return;
+        } else {
+            if (mem->disp >= -128 && mem->disp <= 127) {
+                uint8_t modrm = (1<<6) | ((reg & 7) << 3) | (base & 7);
+                buf_putu8(b, modrm);
+                buf_putu8(b, (uint8_t)mem->disp);
+                return;
+            } else {
+                uint8_t modrm = (2<<6) | ((reg & 7) << 3) | (base & 7);
+                buf_putu8(b, modrm);
+                buf_putu32_le(b, (uint32_t)mem->disp);
+                return;
+            }
+        }
+    } else {
+        int sib_index = (index == -1) ? 4 : (index & 7);
+        int sib_scale = (scale==1)?0: (scale==2)?1: (scale==4)?2: (scale==8)?3:0;
+        if (mem->disp_is_sym) {
+            uint8_t modrm = (2<<6) | ((reg & 7) << 3) | 4;
+            buf_putu8(b, modrm);
+            uint8_t sib = (sib_scale<<6) | ((sib_index & 7)<<3) | (base & 7);
+            buf_putu8(b, sib);
+            uint64_t off = b->len;
+            buf_putu32_le(b, 0);
+            add_placeholder(off, mem->disp_sym, RELOC_ABS64, 0);
+            return;
+        } else if (mem->disp == 0 && base != 5) {
+            uint8_t modrm = (0<<6) | ((reg & 7) << 3) | 4;
+            buf_putu8(b, modrm);
+            uint8_t sib = (sib_scale<<6) | ((sib_index & 7)<<3) | (base & 7);
+            buf_putu8(b, sib);
+            return;
+        } else if (mem->disp >= -128 && mem->disp <= 127) {
+            uint8_t modrm = (1<<6) | ((reg & 7) << 3) | 4;
+            buf_putu8(b, modrm);
+            uint8_t sib = (sib_scale<<6) | ((sib_index & 7)<<3) | (base & 7);
+            buf_putu8(b, sib);
+            buf_putu8(b, (uint8_t)mem->disp);
+            return;
+        } else {
+            uint8_t modrm = (2<<6) | ((reg & 7) << 3) | 4;
+            buf_putu8(b, modrm);
+            uint8_t sib = (sib_scale<<6) | ((sib_index & 7)<<3) | (base & 7);
+            buf_putu8(b, sib);
+            buf_putu32_le(b, (uint32_t)mem->disp);
+            return;
+        }
+    }
+}
+
+/* ----------------------------- Table-driven encoding selection ----------------------------- */
+
+/* Find matching isa_entry by mnemonic and form */
+static isa_entry *isa_lookup(const char *mn, isa_form form) {
+    for (isa_entry *e = isa_table; e->mnemonic; ++e) {
+        if (strcmp(e->mnemonic, mn) == 0 && e->form == form) return e;
+    }
+    return NULL;
+}
+
+/* ----------------------------- Instruction encoding (table-driven) ----------------------------- */
+
+static void encode_instr(Buf *text, Instr *ins) {
+    if (ins->label_def[0]) return;
+    if (ins->kind == INST_RET) {
+        isa_entry *e = isa_lookup("ret", FORM_NONE);
+        if (!e) return;
+        for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+        return;
+    }
+    if (ins->kind == INST_MOV) {
+        /* Determine form */
+        if (ins->dst.kind==OP_REG && ins->src.kind==OP_IMM) {
+            isa_entry *e = isa_lookup("mov", FORM_R_IMM);
+            if (!e) return;
+            int rd = ins->dst.reg;
+            int rex_b = (rd >> 3) & 1;
+            if (e->flags & ISA_FLAG_REX_W) emit_rex(text, 1, 0, 0, rex_b);
+            if (e->flags & ISA_FLAG_USE_OPC_PLUS_REG) {
+                buf_putu8(text, e->opcode[0] + (rd & 7));
+            } else {
+                for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            }
+            if (ins->src.sym[0]) {
+                uint64_t off = text->len;
+                buf_putu64_le(text, 0);
+                add_placeholder(off, ins->src.sym, e->reloc, 0);
+            } else {
+                buf_putu64_le(text, ins->src.imm);
+            }
+            return;
+        } else if (ins->dst.kind==OP_REG && ins->src.kind==OP_REG) {
+            isa_entry *e = isa_lookup("mov", FORM_R_R);
+            if (!e) return;
+            int dst = ins->dst.reg, src = ins->src.reg;
+            int rex_r = (dst >> 3) & 1, rex_b = (src >> 3) & 1;
+            if (e->flags & ISA_FLAG_REX_W) emit_rex(text, 1, rex_r, 0, rex_b);
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            emit_modrm_reg_reg(text, dst, src);
+            return;
+        } else if (ins->dst.kind==OP_REG && ins->src.kind==OP_MEM) {
+            isa_entry *e = isa_lookup("mov", FORM_R_R); /* use 0x8B form (r64, r/m64) */
+            if (!e) return;
+            int dst = ins->dst.reg;
+            int rex_r = (dst >> 3) & 1;
+            int rex_b = (ins->src.base != -1) ? ((ins->src.base >> 3) & 1) : 0;
+            int rex_x = (ins->src.index != -1) ? ((ins->src.index >> 3) & 1) : 0;
+            if (e->flags & ISA_FLAG_REX_W) emit_rex(text, 1, rex_r, rex_x, rex_b);
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            emit_modrm_mem(text, dst, &ins->src);
+            return;
+        } else if (ins->dst.kind==OP_MEM && ins->src.kind==OP_REG) {
+            isa_entry *e = isa_lookup("mov", FORM_M_R);
+            if (!e) return;
+            int src = ins->src.reg;
+            int rex_r = (src >> 3) & 1;
+            int rex_b = (ins->dst.base != -1) ? ((ins->dst.base >> 3) & 1) : 0;
+            int rex_x = (ins->dst.index != -1) ? ((ins->dst.index >> 3) & 1) : 0;
+            if (e->flags & ISA_FLAG_REX_W) emit_rex(text, 1, rex_r, rex_x, rex_b);
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            emit_modrm_mem(text, src, &ins->dst);
+            return;
+        }
+    } else if (ins->kind == INST_ADD || ins->kind == INST_SUB) {
+        if (ins->dst.kind==OP_REG && ins->src.kind==OP_REG) {
+            isa_entry *e = isa_lookup((ins->kind==INST_ADD)?"add":"sub", FORM_R_R);
+            if (!e) return;
+            int dst = ins->dst.reg, src = ins->src.reg;
+            int rex_r = (dst >> 3) & 1, rex_b = (src >> 3) & 1;
+            if (e->flags & ISA_FLAG_REX_W) emit_rex(text, 1, rex_r, 0, rex_b);
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            emit_modrm_reg_reg(text, dst, src);
+            return;
+        }
+    } else if (ins->kind == INST_CALL || ins->kind == INST_JMP) {
+        isa_entry *e = isa_lookup((ins->kind==INST_CALL)?"call":"jmp", FORM_REL);
+        if (!e) return;
+        if (ins->dst.kind==OP_LABEL) {
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            uint64_t off = text->len;
+            buf_putu32_le(text, 0);
+            add_placeholder(off, ins->dst.sym, e->reloc, -4);
+            return;
+        } else if (ins->dst.kind==OP_IMM) {
+            for (int i=0;i<e->opcode_len;i++) buf_putu8(text, e->opcode[i]);
+            buf_putu32_le(text, (uint32_t)ins->dst.imm);
+            return;
+        }
+    }
+    /* unsupported form: ignore */
+}
+
+/* ----------------------------- Two-pass assembly and ELF writer ----------------------------- */
+
+/* PASS 1: encode and record labels */
+static void pass1_encode(Instr *head, Buf *text) {
+    buf_init(text);
+    for (Instr *it = head; it; it = it->next) {
+        if (it->label_def[0]) {
+            Sym *s = sym_ensure(it->label_def);
+            s->defined = 1;
+            s->value = text->len;
+            continue;
+        }
+        if (it->kind == INST_DIR_GLOBAL) {
+            Sym *s = sym_ensure(it->dst.sym);
+            s->is_global = 1;
+            continue;
+        }
+        encode_instr(text, it);
+    }
+}
+
+/* Build symbol array (null + all symbols) */
+typedef struct { Sym **arr; size_t n; } SymArray;
+static SymArray build_symarray(void) {
+    size_t total = 1;
+    for (Sym *s = symtab; s; s = s->next) total++;
+    Sym **arr = calloc(total, sizeof(Sym*));
+    if (!arr) { perror("calloc"); exit(1); }
+    arr[0] = NULL;
+    size_t idx = 1;
+    for (Sym *s = symtab; s; s = s->next) arr[idx++] = s;
+    SymArray sa = {arr, total};
+    return sa;
+}
+
+/* Write ELF64 relocatable object (.o) with .text, .rela.text, .shstrtab, .strtab, .symtab */
+static int write_elf(const char *path, Buf *text) {
+    SymArray sa = build_symarray();
+    /* build strtab */
+    size_t strtab_size = 1;
+    for (size_t i=1;i<sa.n;i++) strtab_size += strlen(sa.arr[i]->name) + 1;
+    char *strtab = malloc(strtab_size);
+    if (!strtab) { perror("malloc"); return 0; }
+    strtab[0] = 0;
+    size_t pos = 1;
+    for (size_t i=1;i<sa.n;i++) { strcpy(&strtab[pos], sa.arr[i]->name); pos += strlen(sa.arr[i]->name) + 1; }
+
+    /* count rela entries */
+    size_t rela_count = 0;
+    for (Placeholder *p = placeholders; p; p = p->next) rela_count++;
+    size_t rela_bytes = rela_count * 24;
+
+    const char shstr[] = "\0.shstrtab\0.text\0.rela.text\0.strtab\0.symtab";
+    size_t shstr_size = sizeof(shstr)-1;
+
+    size_t ehdr_size = 64;
+    int shnum = 6; /* null, .text, .rela.text, .shstrtab, .strtab, .symtab */
+    size_t shdrs_total = shnum * 64;
+
+    size_t offset = ehdr_size;
+    size_t text_offset = offset; offset += text->len; offset = (offset + 7) & ~7;
+    size_t rela_offset = offset; offset += rela_bytes; offset = (offset + 7) & ~7;
+    size_t shstr_offset = offset; offset += shstr_size; offset = (offset + 7) & ~7;
+    size_t strtab_offset = offset; offset += strtab_size; offset = (offset + 7) & ~7;
+    size_t symtab_offset = offset; size_t symtab_bytes = sa.n * 24; offset += symtab_bytes; offset = (offset + 7) & ~7;
+    size_t shoff = offset;
+    (void)shoff; /* silence unused warning if any */
+
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("fopen"); free(strtab); free(sa.arr); return 0; }
+
+    /* ELF header */
+    uint8_t e_ident[16] = {0x7f,'E','L','F',2,1,1,0};
+    fwrite(e_ident,1,16,f);
+    uint16_t e_type = 1; fwrite(&e_type,2,1,f); /* ET_REL */
+    uint16_t e_machine = 0x3E; fwrite(&e_machine,2,1,f); /* EM_X86_64 */
+    uint32_t e_version = 1; fwrite(&e_version,4,1,f);
+    uint64_t e_entry = 0; fwrite(&e_entry,8,1,f);
+    uint64_t e_phoff = 0; fwrite(&e_phoff,8,1,f);
+    uint64_t e_shoff = shoff; fwrite(&e_shoff,8,1,f);
+    uint32_t e_flags = 0; fwrite(&e_flags,4,1,f);
+    uint16_t e_ehsize = 64; fwrite(&e_ehsize,2,1,f);
+    uint16_t e_phentsize = 0; fwrite(&e_phentsize,2,1,f);
+    uint16_t e_phnum = 0; fwrite(&e_phnum,2,1,f);
+    uint16_t e_shentsize = 64; fwrite(&e_shentsize,2,1,f);
+    uint16_t e_shnum = shnum; fwrite(&e_shnum,2,1,f);
+    uint16_t e_shstrndx = 3; fwrite(&e_shstrndx,2,1,f);
+
+    /* write .text */
+    fseek(f, text_offset, SEEK_SET);
+    fwrite(text->data,1,text->len,f);
+
+    /* write .rela.text */
+    fseek(f, rela_offset, SEEK_SET);
+    for (Placeholder *p = placeholders; p; p = p->next) {
+        int idx = 0;
+        for (size_t i=1;i<sa.n;i++) {
+            if (strcmp(sa.arr[i]->name, p->sym) == 0) { idx = (int)i; break; }
+        }
+        uint64_t r_offset = p->offset;
+        uint64_t r_info = ((uint64_t)idx << 32) | ( (p->reloc==RELOC_PC32) ? 2 : 1 ); /* 2=R_X86_64_PC32,1=R_X86_64_64 */
+        int64_t addend = p->addend;
+        fwrite(&r_offset,8,1,f);
+        fwrite(&r_info,8,1,f);
+        fwrite(&addend,8,1,f);
+    }
+
+    /* write .shstrtab */
+    fseek(f, shstr_offset, SEEK_SET);
+    fwrite(shstr,1,shstr_size,f);
+
+    /* write .strtab */
+    fseek(f, strtab_offset, SEEK_SET);
+    fwrite(strtab,1,strtab_size,f);
+
+    /* write .symtab */
+    fseek(f, symtab_offset, SEEK_SET);
+    /* null symbol */
+    uint32_t st_name = 0; uint8_t st_info = 0; uint8_t st_other = 0; uint16_t st_shndx = 0; uint64_t st_value = 0; uint64_t st_size = 0;
+    fwrite(&st_name,4,1,f); fwrite(&st_info,1,1,f); fwrite(&st_other,1,1,f); fwrite(&st_shndx,2,1,f); fwrite(&st_value,8,1,f); fwrite(&st_size,8,1,f);
+    /* other symbols */
+    for (size_t i=1;i<sa.n;i++) {
+        size_t off = 1;
+        for (size_t j=1;j<i;j++) off += strlen(sa.arr[j]->name) + 1;
+        uint32_t name_off = (uint32_t)off;
+        uint8_t info = (sa.arr[i]->is_global ? (1<<4) : 0) | 2; /* STB_GLOBAL<<4 | STT_FUNC */
+        uint8_t other = 0;
+        uint16_t shndx = sa.arr[i]->defined ? 1 : 0;
+        uint64_t value = sa.arr[i]->value;
+        uint64_t size = 0;
+        fwrite(&name_off,4,1,f);
+        fwrite(&info,1,1,f);
+        fwrite(&other,1,1,f);
+        fwrite(&shndx,2,1,f);
+        fwrite(&value,8,1,f);
+        fwrite(&size,8,1,f);
+    }
+
+    /* write section headers */
+    fseek(f, shoff, SEEK_SET);
+    /* section 0: null */
+    uint8_t zero[64]; memset(zero,0,64); fwrite(zero,1,64,f);
+
+    /* section 1: .text */
+    memset(zero,0,64);
+    const char *p = shstr; int pos = 0; int sh_name_text = 0;
+    while (*p) { if (strcmp(p,".text")==0) { sh_name_text = pos; break; } pos += strlen(p)+1; p += strlen(p)+1; }
+    uint32_t sh_name = sh_name_text; fwrite(&sh_name,4,1,f);
+    uint32_t sh_type = 1; fwrite(&sh_type,4,1,f); /* SHT_PROGBITS */
+    uint64_t sh_flags = 0; fwrite(&sh_flags,8,1,f);
+    uint64_t sh_addr = 0; fwrite(&sh_addr,8,1,f);
+    uint64_t sh_offset64 = text_offset; fwrite(&sh_offset64,8,1,f);
+    uint64_t sh_size64 = text->len; fwrite(&sh_size64,8,1,f);
+    uint32_t sh_link = 0; fwrite(&sh_link,4,1,f);
+    uint32_t sh_info = 0; fwrite(&sh_info,4,1,f);
+    uint64_t sh_addralign = 16; fwrite(&sh_addralign,8,1,f);
+    uint64_t sh_entsize = 0; fwrite(&sh_entsize,8,1,f);
+
+    /* section 2: .rela.text */
+    p = shstr; pos = 0; int sh_name_rela = 0;
+    while (*p) { if (strcmp(p,".rela.text")==0) { sh_name_rela = pos; break; } pos += strlen(p)+1; p += strlen(p)+1; }
+    sh_name = sh_name_rela; fwrite(&sh_name,4,1,f);
+    sh_type = 4; fwrite(&sh_type,4,1,f); /* SHT_RELA */
+    sh_flags = 0; fwrite(&sh_flags,8,1,f);
+    sh_addr = 0; fwrite(&sh_addr,8,1,f);
+    sh_offset64 = rela_offset; fwrite(&sh_offset64,8,1,f);
+    sh_size64 = rela_bytes; fwrite(&sh_size64,8,1,f);
+    sh_link = 5; fwrite(&sh_link,4,1,f); /* link to symtab (index 5) */
+    sh_info = 1; fwrite(&sh_info,4,1,f);
+    sh_addralign = 8; fwrite(&sh_addralign,8,1,f);
+    sh_entsize = 24; fwrite(&sh_entsize,8,1,f);
+
+    /* section 3: .shstrtab */
+    p = shstr; pos = 0; int sh_name_shstr = 0;
+    while (*p) { if (strcmp(p,".shstrtab")==0) { sh_name_shstr = pos; break; } pos += strlen(p)+1; p += strlen(p)+1; }
+    sh_name = sh_name_shstr; fwrite(&sh_name,4,1,f);
+    sh_type = 3; fwrite(&sh_type,4,1,f); /* SHT_STRTAB */
+    sh_flags = 0; fwrite(&sh_flags,8,1,f);
+    sh_addr = 0; fwrite(&sh_addr,8,1,f);
+    sh_offset64 = shstr_offset; fwrite(&sh_offset64,8,1,f);
+    sh_size64 = shstr_size; fwrite(&sh_size64,8,1,f);
+    sh_link = 0; fwrite(&sh_link,4,1,f);
+    sh_info = 0; fwrite(&sh_info,4,1,f);
+    sh_addralign = 1; fwrite(&sh_addralign,8,1,f);
+    sh_entsize = 0; fwrite(&sh_entsize,8,1,f);
+
+    /* section 4: .strtab */
+    p = shstr; pos = 0; int sh_name_strtab = 0;
+    while (*p) { if (strcmp(p,".strtab")==0) { sh_name_strtab = pos; break; } pos += strlen(p)+1; p += strlen(p)+1; }
+    sh_name = sh_name_strtab; fwrite(&sh_name,4,1,f);
+    sh_type = 3; fwrite(&sh_type,4,1,f);
+    sh_flags = 0; fwrite(&sh_flags,8,1,f);
+    sh_addr = 0; fwrite(&sh_addr,8,1,f);
+    sh_offset64 = strtab_offset; fwrite(&sh_offset64,8,1,f);
+    sh_size64 = strtab_size; fwrite(&sh_size64,8,1,f);
+    sh_link = 0; fwrite(&sh_link,4,1,f);
+    sh_info = 0; fwrite(&sh_info,4,1,f);
+    sh_addralign = 1; fwrite(&sh_addralign,8,1,f);
+    sh_entsize = 0; fwrite(&sh_entsize,8,1,f);
+
+    /* section 5: .symtab */
+    p = shstr; pos = 0; int sh_name_symtab = 0;
+    while (*p) { if (strcmp(p,".symtab")==0) { sh_name_symtab = pos; break; } pos += strlen(p)+1; p += strlen(p)+1; }
+    sh_name = sh_name_symtab; fwrite(&sh_name,4,1,f);
+    sh_type = 2; fwrite(&sh_type,4,1,f); /* SHT_SYMTAB */
+    sh_flags = 0; fwrite(&sh_flags,8,1,f);
+    sh_addr = 0; fwrite(&sh_addr,8,1,f);
+    sh_offset64 = symtab_offset; fwrite(&sh_offset64,8,1,f);
+    sh_size64 = symtab_bytes; fwrite(&sh_size64,8,1,f);
+    sh_link = 4; fwrite(&sh_link,4,1,f); /* link to .strtab index */
+    sh_info = 1; fwrite(&sh_info,4,1,f);
+    sh_addralign = 8; fwrite(&sh_addralign,8,1,f);
+    sh_entsize = 24; fwrite(&sh_entsize,8,1,f);
+
+    fclose(f);
+    free(strtab);
+    free(sa.arr);
+    return 1;
+}
+
+/* Public assemble function */
+static int assemble_and_write(const char *outpath, Instr *head) {
+    Buf text;
+    pass1_encode(head, &text);
+    /* ensure symbols for placeholders exist */
+    for (Placeholder *p = placeholders; p; p = p->next) sym_ensure(p->sym);
+    /* write ELF */
+    return write_elf(outpath, &text);
+}
+
+/* ----------------------------- Main ----------------------------- */
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s input.s output.o\n", argv[0]);
+        return 1;
+    }
+    const char *inpath = argv[1];
+    const char *outpath = argv[2];
+    FILE *in = fopen(inpath, "r");
+    if (!in) { perror("fopen"); return 1; }
+
+    Parser parser;
+    Instr *list = parse_all(&parser, in);
+    fclose(in);
+
+    if (!assemble_and_write(outpath, list)) {
+        fprintf(stderr, "Failed to write object\n");
+        return 1;
+    }
+    printf("Wrote %s\n", outpath);
+    return 0;
+}

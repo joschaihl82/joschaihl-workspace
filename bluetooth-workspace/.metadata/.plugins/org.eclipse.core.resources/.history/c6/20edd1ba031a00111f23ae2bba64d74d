@@ -1,0 +1,415 @@
+// main.cpp
+// Qt6 single-file: Tray + Auto Agent + ALSA <-> SCO bridge + Dialer (RFCOMM ATD)
+// Build instructions in the message above. Run as root.
+
+#include <QApplication>
+#include <QSystemTrayIcon>
+#include <QMenu>
+#include <QAction>
+#include <QIcon>
+#include <QSoundEffect>
+#include <QDBusConnection>
+#include <QDBusInterface>
+#include <QDBusMessage>
+#include <QDBusVariant>
+#include <QDBusObjectPath>
+#include <QDBusAbstractAdaptor>
+#include <QThread>
+#include <QMutex>
+#include <QWidget>
+#include <QGridLayout>
+#include <QPushButton>
+#include <QLineEdit>
+#include <QLabel>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QDebug>
+#include <QTimer>
+#include <alsa/asoundlib.h>
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/sco.h>
+#include <bluetooth/rfcomm.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <signal.h>
+
+static const char *ALSA_DEVICE = "default";
+static const unsigned SAMPLE_RATE = 8000;
+static const int CHANNELS = 1;
+static const int FRAME_BYTES = 2; // S16_LE
+
+// Helper: convert BlueZ device object path to BDADDR string
+static QString devicePathToBdaddr(const QString &path) {
+    int idx = path.indexOf("dev_");
+    if (idx < 0) return QString();
+    QString tail = path.mid(idx + 4);
+    return tail.replace('_', ':');
+}
+
+// ----------------- BlueZ Agent (auto accept) -----------------
+class AgentAdaptor : public QDBusAbstractAdaptor {
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "org.bluez.Agent1")
+public:
+    AgentAdaptor(QObject *parent) : QDBusAbstractAdaptor(parent) {}
+public slots:
+    void Release() { qDebug() << "Agent Release"; }
+    QDBusVariant RequestPinCode(const QDBusMessage &msg) {
+        Q_UNUSED(msg);
+        return QDBusVariant(QString("0000"));
+    }
+    void DisplayPinCode(const QString &device, const QString &pincode) {
+        Q_UNUSED(device); Q_UNUSED(pincode);
+        qDebug() << "DisplayPinCode" << device << pincode;
+    }
+    void RequestConfirmation(const QDBusMessage &msg, unsigned long long passkey) {
+        Q_UNUSED(passkey);
+        QDBusConnection::systemBus().send(msg.createReply());
+        qDebug() << "RequestConfirmation auto-accepted";
+    }
+    void RequestAuthorization(const QDBusMessage &msg, const QString &device) {
+        Q_UNUSED(device);
+        QDBusConnection::systemBus().send(msg.createReply());
+    }
+    void AuthorizeService(const QDBusMessage &msg, const QString &device, const QString &uuid) {
+        Q_UNUSED(device); Q_UNUSED(uuid);
+        QDBusConnection::systemBus().send(msg.createReply());
+    }
+    void Cancel() { qDebug() << "Pairing canceled"; }
+};
+
+// ----------------- Audio Bridge (ALSA <-> SCO) -----------------
+class AudioBridge : public QThread {
+    Q_OBJECT
+public:
+    AudioBridge(const QString &bdaddr, QObject *parent = nullptr)
+        : QThread(parent), m_bdaddr(bdaddr), m_stop(false) {}
+    void stopBridge() {
+        QMutexLocker lk(&m_mutex);
+        m_stop = true;
+    }
+signals:
+    void errorOccured(const QString &msg);
+protected:
+    void run() override {
+        snd_pcm_t *cap = nullptr, *play = nullptr;
+        if (openAlsa(&cap, SND_PCM_STREAM_CAPTURE) < 0) {
+            emit errorOccured("ALSA capture open failed");
+            return;
+        }
+        if (openAlsa(&play, SND_PCM_STREAM_PLAYBACK) < 0) {
+            emit errorOccured("ALSA playback open failed");
+            snd_pcm_close(cap);
+            return;
+        }
+        int sco = openScoSocket(m_bdaddr);
+        if (sco < 0) {
+            emit errorOccured("SCO socket open/connect failed");
+            snd_pcm_close(cap); snd_pcm_close(play);
+            return;
+        }
+
+        const int BUF_FRAMES = 256;
+        int16_t buf[BUF_FRAMES];
+        ssize_t r, w;
+        fd_set rfds;
+        struct timeval tv;
+
+        while (true) {
+            {
+                QMutexLocker lk(&m_mutex);
+                if (m_stop) break;
+            }
+            snd_pcm_sframes_t frames = snd_pcm_readi(cap, buf, BUF_FRAMES);
+            if (frames < 0) frames = snd_pcm_recover(cap, frames, 1);
+            if (frames > 0) {
+                w = write(sco, buf, frames * FRAME_BYTES);
+                if (w <= 0) { emit errorOccured("SCO write failed"); break; }
+            }
+            FD_ZERO(&rfds);
+            FD_SET(sco, &rfds);
+            tv.tv_sec = 0; tv.tv_usec = 10000;
+            int sel = select(sco + 1, &rfds, nullptr, nullptr, &tv);
+            if (sel > 0 && FD_ISSET(sco, &rfds)) {
+                r = read(sco, buf, sizeof(buf));
+                if (r <= 0) { emit errorOccured("SCO read failed or closed"); break; }
+                snd_pcm_sframes_t wrote = snd_pcm_writei(play, buf, r / FRAME_BYTES);
+                if (wrote < 0) snd_pcm_recover(play, wrote, 1);
+            }
+            msleep(5);
+        }
+        close(sco);
+        snd_pcm_close(cap);
+        snd_pcm_close(play);
+    }
+private:
+    QString m_bdaddr;
+    QMutex m_mutex;
+    bool m_stop;
+
+    int openScoSocket(const QString &bdaddr) {
+        bdaddr_t bd;
+        if (str2ba(bdaddr.toUtf8().constData(), &bd) < 0) {
+            qWarning() << "Invalid bdaddr" << bdaddr;
+            return -1;
+        }
+        int s = socket(AF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO);
+        if (s < 0) { qWarning() << "socket() failed:" << strerror(errno); return -1; }
+        struct sockaddr_sco addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sco_family = AF_BLUETOOTH;
+        bacpy(&addr.sco_bdaddr, &bd);
+        if (connect(s, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            qWarning() << "connect(sco) failed:" << strerror(errno);
+            close(s); return -1;
+        }
+        return s;
+    }
+
+    int openAlsa(snd_pcm_t **handle, snd_pcm_stream_t stream) {
+        snd_pcm_hw_params_t *params;
+        int rc = snd_pcm_open(handle, ALSA_DEVICE, stream, 0);
+        if (rc < 0) { qWarning() << "snd_pcm_open error:" << snd_strerror(rc); return -1; }
+        snd_pcm_hw_params_malloc(&params);
+        snd_pcm_hw_params_any(*handle, params);
+        snd_pcm_hw_params_set_access(*handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(*handle, params, SND_PCM_FORMAT_S16_LE);
+        snd_pcm_hw_params_set_channels(*handle, params, CHANNELS);
+        unsigned int rate = SAMPLE_RATE;
+        snd_pcm_hw_params_set_rate_near(*handle, params, &rate, 0);
+        snd_pcm_hw_params(*handle, params);
+        snd_pcm_hw_params_free(params);
+        snd_pcm_prepare(*handle);
+        return 0;
+    }
+};
+
+// ----------------- Dialer Widget -----------------
+class DialerWidget : public QWidget {
+    Q_OBJECT
+public:
+    DialerWidget(QWidget *parent = nullptr) : QWidget(parent), m_rfcommSock(-1) {
+        QVBoxLayout *v = new QVBoxLayout(this);
+        m_display = new QLineEdit();
+        m_display->setReadOnly(true);
+        m_display->setPlaceholderText("Nummer eingeben");
+        v->addWidget(m_display);
+
+        QGridLayout *grid = new QGridLayout();
+        QString keys[12] = {"1","2","3","4","5","6","7","8","9","*","0","#"};
+        int r=0,c=0;
+        for (int i=0;i<12;i++){
+            QPushButton *b = new QPushButton(keys[i]);
+            b->setFixedSize(60,60);
+            connect(b,&QPushButton::clicked,this,[this,keys,i](){ m_display->insert(keys[i]); });
+            grid->addWidget(b,r,c);
+            c++; if(c==3){ c=0; r++; }
+        }
+        v->addLayout(grid);
+
+        QHBoxLayout *h = new QHBoxLayout();
+        m_call = new QPushButton("Wählen");
+        m_hang = new QPushButton("Auflegen");
+        m_call->setStyleSheet("background-color: #4CAF50; color: white; font-weight:bold;");
+        m_hang->setStyleSheet("background-color: #f44336; color: white; font-weight:bold;");
+        h->addWidget(m_call);
+        h->addWidget(m_hang);
+        v->addLayout(h);
+
+        connect(m_call, &QPushButton::clicked, this, &DialerWidget::onCallClicked);
+        connect(m_hang, &QPushButton::clicked, this, &DialerWidget::onHangClicked);
+    }
+
+    void setTargetBdaddr(const QString &bd) { m_target = bd; }
+
+signals:
+    void showMessage(const QString &title, const QString &msg);
+
+private slots:
+    void onCallClicked() {
+        QString num = m_display->text().trimmed();
+        if (num.isEmpty()) { emit showMessage("Wählen", "Keine Nummer eingegeben"); return; }
+        if (m_target.isEmpty()) { emit showMessage("Wählen", "Kein verbundenes Gerät"); return; }
+        // Try RFCOMM connect to channel 1 and send ATD<number>;
+        if (openRfcomm(m_target) < 0) { emit showMessage("Wählen", "RFCOMM connect failed"); return; }
+        QString at = QString("ATD%1;\r").arg(num);
+        ssize_t s = write(m_rfcommSock, at.toUtf8().constData(), at.toUtf8().size());
+        if (s <= 0) emit showMessage("Wählen", "Senden des AT-Befehls fehlgeschlagen");
+        else emit showMessage("Wählen", QString("Wähle %1").arg(num));
+    }
+
+    void onHangClicked() {
+        if (m_rfcommSock < 0) { emit showMessage("Auflegen", "Nicht verbunden"); return; }
+        QString at = QString("ATH\r");
+        ssize_t s = write(m_rfcommSock, at.toUtf8().constData(), at.toUtf8().size());
+        if (s <= 0) emit showMessage("Auflegen", "Senden fehlgeschlagen");
+        else emit showMessage("Auflegen", "Aufgelegt");
+        // close RFCOMM socket (phone will hang up)
+        close(m_rfcommSock); m_rfcommSock = -1;
+    }
+
+private:
+    QLineEdit *m_display;
+    QPushButton *m_call;
+    QPushButton *m_hang;
+    QString m_target;
+    int m_rfcommSock;
+
+    int openRfcomm(const QString &bdaddr) {
+        if (m_rfcommSock >= 0) return 0; // already open
+        bdaddr_t bd;
+        if (str2ba(bdaddr.toUtf8().constData(), &bd) < 0) return -1;
+        int s = socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+        if (s < 0) return -1;
+        struct sockaddr_rc addr = { 0 };
+        addr.rc_family = AF_BLUETOOTH;
+        bacpy(&addr.rc_bdaddr, &bd);
+        addr.rc_channel = (uint8_t)1; // common default; may vary
+        if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            close(s); return -1;
+        }
+        m_rfcommSock = s;
+        return 0;
+    }
+};
+
+// ----------------- Main controller: Tray, Agent, BlueZ monitoring -----------------
+class BtHeadsetApp : public QObject {
+    Q_OBJECT
+public:
+    BtHeadsetApp(QSystemTrayIcon *trayIcon, QWidget *dialerWidget, QObject *parent = nullptr)
+        : QObject(parent), m_tray(trayIcon), m_bridge(nullptr), m_dialer(dialerWidget) {
+        m_beep = new QSoundEffect(this);
+        m_beep->setSource(QUrl::fromLocalFile("/usr/share/sounds/freedesktop/stereo/complete.oga"));
+        m_beep->setVolume(0.9);
+
+        QObject *agentObj = new QObject(this);
+        m_agent = new AgentAdaptor(agentObj);
+        QDBusConnection::systemBus().registerObject("/com/example/AutoAgent", agentObj, QDBusConnection::ExportAdaptors);
+
+        QDBusInterface mgr("org.bluez", "/org/bluez", "org.bluez.AgentManager1", QDBusConnection::systemBus());
+        if (mgr.isValid()) {
+            mgr.call("RegisterAgent", QDBusObjectPath("/com/example/AutoAgent"), QString("NoInputNoOutput"));
+            mgr.call("RequestDefaultAgent", QDBusObjectPath("/com/example/AutoAgent"));
+        } else qWarning() << "AgentManager1 not available";
+
+        QDBusInterface adapterProps("org.bluez", "/org/bluez/hci0", "org.freedesktop.DBus.Properties", QDBusConnection::systemBus());
+        if (adapterProps.isValid()) {
+            adapterProps.call("Set", "org.bluez.Adapter1", "Discoverable", QVariant::fromValue(QDBusVariant(true)));
+            adapterProps.call("Set", "org.bluez.Adapter1", "Pairable", QVariant::fromValue(QDBusVariant(true)));
+            adapterProps.call("Set", "org.bluez.Adapter1", "DiscoverableTimeout", QVariant::fromValue(QDBusVariant(0u)));
+        } else qWarning() << "Adapter props not available";
+
+        QDBusConnection::systemBus().connect("org.bluez", "/", "org.freedesktop.DBus.ObjectManager",
+                                            "InterfacesAdded", this, SLOT(onInterfacesAdded(QDBusObjectPath,QVariantMap)));
+        QDBusConnection::systemBus().connect("org.bluez", "/", "org.freedesktop.DBus.Properties",
+                                            "PropertiesChanged", this, SLOT(onPropertiesChanged(QString,QVariantMap,QStringList)));
+
+        QAction *quit = new QAction("Quit", this);
+        connect(quit, &QAction::triggered, qApp, &QCoreApplication::quit);
+        QMenu *menu = new QMenu();
+        menu->addAction(quit);
+        m_tray->setContextMenu(menu);
+        m_tray->show();
+
+        // connect dialer messages
+        DialerWidget *dw = qobject_cast<DialerWidget*>(m_dialer);
+        if (dw) connect(dw, &DialerWidget::showMessage, this, &BtHeadsetApp::showTrayMessage);
+    }
+
+public slots:
+    void onInterfacesAdded(const QDBusObjectPath &objPath, const QVariantMap &interfaces) {
+        Q_UNUSED(interfaces);
+        QString path = objPath.path();
+        if (path.contains("/dev_")) {
+            QString bd = devicePathToBdaddr(path);
+            qDebug() << "Device discovered:" << bd << "path:" << path;
+            QDBusInterface devProps("org.bluez", path, "org.freedesktop.DBus.Properties", QDBusConnection::systemBus());
+            if (devProps.isValid()) devProps.call("Set", "org.bluez.Device1", "Trusted", QVariant::fromValue(QDBusVariant(true)));
+        }
+    }
+
+    void onPropertiesChanged(const QString &iface, const QVariantMap &changed, const QStringList &invalid) {
+        Q_UNUSED(invalid);
+        if (iface == "org.bluez.Device1") {
+            if (changed.contains("Connected")) {
+                bool connected = changed.value("Connected").toBool();
+                QDBusInterface om("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", QDBusConnection::systemBus());
+                QDBusReply<QVariantMap> reply = om.call("GetManagedObjects");
+                if (!reply.isValid()) return;
+                QVariantMap objs = reply.value();
+                for (auto it = objs.begin(); it != objs.end(); ++it) {
+                    QString path = it.key();
+                    QVariantMap ifs = qdbus_cast<QVariantMap>(it.value());
+                    if (ifs.contains("org.bluez.Device1")) {
+                        QVariantMap devProps = qdbus_cast<QVariantMap>(ifs.value("org.bluez.Device1"));
+                        if (devProps.contains("Connected") && devProps.value("Connected").toBool()) {
+                            QString bd = devicePathToBdaddr(path);
+                            qDebug() << "Device connected:" << bd << "path:" << path;
+                            onDeviceConnected(bd, path);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void onDeviceConnected(const QString &bdaddr, const QString &path) {
+        Q_UNUSED(path);
+        if (m_beep) m_beep->play();
+        m_tray->showMessage("Bluetooth Headset", QString("Device connected: %1").arg(bdaddr));
+        // set dialer target
+        DialerWidget *dw = qobject_cast<DialerWidget*>(m_dialer);
+        if (dw) dw->setTargetBdaddr(bdaddr);
+        // start audio bridge
+        if (m_bridge) return;
+        m_bridge = new AudioBridge(bdaddr, this);
+        connect(m_bridge, &AudioBridge::errorOccured, this, &BtHeadsetApp::onBridgeError);
+        m_bridge->start();
+    }
+
+    void onBridgeError(const QString &msg) {
+        qWarning() << "Bridge error:" << msg;
+        m_tray->showMessage("Bluetooth Headset", QString("Audio bridge error: %1").arg(msg));
+        if (m_bridge) {
+            m_bridge->stopBridge();
+            m_bridge->wait();
+            delete m_bridge;
+            m_bridge = nullptr;
+        }
+    }
+
+    void showTrayMessage(const QString &title, const QString &msg) {
+        m_tray->showMessage(title, msg);
+    }
+
+private:
+    QSystemTrayIcon *m_tray;
+    AgentAdaptor *m_agent;
+    QSoundEffect *m_beep;
+    AudioBridge *m_bridge;
+    QWidget *m_dialer;
+};
+
+// ----------------- main -----------------
+int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+    QApplication app(argc, argv);
+    if (!QSystemTrayIcon::isSystemTrayAvailable()) qFatal("System tray not available");
+
+    QSystemTrayIcon tray;
+    tray.setIcon(QIcon::fromTheme("audio-headset"));
+    tray.setToolTip("Qt Bluetooth Headset (AutoPair + Dialer + ALSA<->SCO)");
+
+    // Create dialer window (floating)
+    DialerWidget *dialer = new DialerWidget();
+    dialer->setWindowTitle("Wählen");
+    dialer->setWindowFlags(Qt::Window | Qt::WindowStaysOnTopHint);
+    dialer->show();
+
+    BtHeadsetApp controller(&tray, dialer);
+    return app.exec();
+}
+
+#include "main.moc"

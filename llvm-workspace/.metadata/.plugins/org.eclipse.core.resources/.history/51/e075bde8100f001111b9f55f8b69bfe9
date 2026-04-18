@@ -1,0 +1,81 @@
+cmake_minimum_required(VERSION 3.13)
+project(remove_unused_static_funcs_to_c LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Prefer the packaged LLVM/Clang if provided by the user
+if(NOT DEFINED LLVM_DIR)
+  # allow user to pass -DLLVM_DIR=/path/to/llvm/cmake
+  message(STATUS "LLVM_DIR not set; you can pass -DLLVM_DIR=/path/to/llvm/cmake")
+endif()
+
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "LLVM include dirs: ${LLVM_INCLUDE_DIRS}")
+
+# Try to find Clang CMake package. If it is broken (missing static libs),
+# fall back to linking libclang-cpp (shared C++ API).
+set(USE_LIBCLANG_CPP OFF)
+find_package(Clang QUIET CONFIG)
+
+if(Clang_FOUND)
+  message(STATUS "Found Clang package")
+  # Test whether the expected library files exist by checking one imported target
+  # If clangBasic target exists, assume package is usable.
+  if(TARGET clangBasic)
+    message(STATUS "Clang imported targets available")
+    set(CLANG_LINK_TARGETS clangTooling clangBasic clangAST clangFrontend clangLex clangRewrite)
+  else()
+    message(WARNING "Clang package found but clangBasic target is missing; falling back to libclang-cpp")
+    set(USE_LIBCLANG_CPP ON)
+  endif()
+else()
+  message(WARNING "Clang package not found via CMake; falling back to libclang-cpp")
+  set(USE_LIBCLANG_CPP ON)
+endif()
+
+# Try to locate libclang-cpp if needed
+if(USE_LIBCLANG_CPP)
+  find_library(LIBCLANG_CPP NAMES clang-cpp libclang-cpp
+               PATHS
+                 /usr/lib
+                 /usr/lib64
+                 /usr/lib/llvm-20/lib
+                 /usr/lib/llvm-*/lib
+                 /usr/local/lib
+               NO_DEFAULT_PATH)
+  if(LIBCLANG_CPP)
+    message(STATUS "Found libclang-cpp: ${LIBCLANG_CPP}")
+  else()
+    message(FATAL_ERROR "libclang-cpp not found. Either install libclang-dev / clang-dev for your distribution or provide a working Clang CMake package. You can also set LLVM_DIR to your LLVM installation's cmake directory.")
+  endif()
+endif()
+
+# Include LLVM headers and definitions
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+
+# Source file
+set(SRC remove_unused_static_funcs_to_c.cpp)
+
+add_executable(${PROJECT_NAME} ${SRC})
+
+# Include Clang headers if Clang package provided
+if(Clang_FOUND AND NOT USE_LIBCLANG_CPP)
+  # Clang provides CLANG_INCLUDE_DIRS variable in many installs; fall back to LLVM includes otherwise
+  if(DEFINED CLANG_INCLUDE_DIRS)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${CLANG_INCLUDE_DIRS})
+  endif()
+  # Link against the Clang component targets
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${CLANG_LINK_TARGETS} LLVM::LLVM)
+else()
+  # Link against libclang-cpp and LLVM
+  target_include_directories(${PROJECT_NAME} PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBCLANG_CPP} LLVM::LLVM)
+endif()
+
+# Helpful messages
+message(STATUS "To configure: cmake -DLLVM_DIR=/path/to/llvm/cmake -S . -B build")
+message(STATUS "Then: cmake --build build -- -j")

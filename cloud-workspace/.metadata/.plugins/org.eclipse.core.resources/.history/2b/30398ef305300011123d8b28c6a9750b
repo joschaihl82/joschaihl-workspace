@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQTKEYCHAIN_AVAILABLE=1 -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORKAUTH_LIB -DQT_NETWORK_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local/google_drive_sync_demo_autogen/include -I/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetworkAuth -O3 -DNDEBUG -std=gnu++17 -fPIE -Wall -Wextra -Wpedantic -o CMakeFiles/google_drive_sync_demo.dir/google_drive_sync_demo_autogen/mocs_compilation.cpp.o -c /home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local/google_drive_sync_demo_autogen/mocs_compilation.cpp",
+  "file": "/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local/google_drive_sync_demo_autogen/mocs_compilation.cpp",
+  "output": "CMakeFiles/google_drive_sync_demo.dir/google_drive_sync_demo_autogen/mocs_compilation.cpp.o"
+},
+{
+  "directory": "/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQTKEYCHAIN_AVAILABLE=1 -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORKAUTH_LIB -DQT_NETWORK_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local/google_drive_sync_demo_autogen/include -I/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetworkAuth -O3 -DNDEBUG -std=gnu++17 -fPIE -Wall -Wextra -Wpedantic -o CMakeFiles/google_drive_sync_demo.dir/main.cpp.o -c /home/joscha/cloud-workspace/google-drive/main.cpp",
+  "file": "/home/joscha/cloud-workspace/google-drive/main.cpp",
+  "output": "CMakeFiles/google_drive_sync_demo.dir/main.cpp.o"
+}
+]

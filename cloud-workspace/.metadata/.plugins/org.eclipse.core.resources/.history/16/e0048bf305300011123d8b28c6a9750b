@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_google_drive_sync_demo_FILE /home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local/google_drive_sync_demo)
+set(__QT_DEPLOY_TARGET_google_drive_sync_demo_TYPE EXECUTABLE)

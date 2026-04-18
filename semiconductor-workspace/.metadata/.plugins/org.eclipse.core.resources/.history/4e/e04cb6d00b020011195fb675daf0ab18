@@ -1,0 +1,1000 @@
+/*
+ * main.c
+ *
+ * GLUT/OpenGL CAD demo — komplette Datei
+ * - GLEW initialisiert sicher (glewExperimental = GL_TRUE)
+ * - Robuste Shader-Wrapper mit ausführlichen Fehlermeldungen
+ * - GPU-Grid-Shader (Fallback auf CPU, falls Shader nicht verfügbar)
+ * - Toolbar mit Icons, sofortige Tooltips (gelb mit schwarzem Rand)
+ * - Diagonales linkes Lineal, Pan, Zoom (animiert vom Content-Center)
+ * - zoom_to_centered / zoom_in_centered / zoom_out_centered implementiert
+ *
+ * Compile:
+ *   gcc main.c -o cad -lGLEW -lGL -lGLU -lglut -lm
+ *
+ * Hinweis: Bei Problemen mit Shadern prüfe die Konsolenausgabe (GL/GLEW/Shader-Logs).
+ */
+
+#include <GL/glew.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/glut.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+/* Layout */
+#define RULER_THICKNESS 28
+#define TOOLBAR_HEIGHT 40
+#define STATUS_HEIGHT 20
+#define MAX_POINTS 8192
+
+/* Units */
+typedef struct { const char *name; double mm_per_unit; } UnitDef;
+static UnitDef units[] = {
+    {"nm", 1e-6}, {"µm", 1e-3}, {"mm", 1.0}, {"cm", 10.0}, {"dm", 100.0}, {"m", 1000.0}
+};
+static const int UNIT_COUNT = sizeof(units)/sizeof(units[0]);
+
+/* Numeric magnitude target range */
+static const double MAG_MIN = 0.1;
+static const double MAG_MAX = 100.0;
+
+/* Window / world state */
+static int win_w = 1200, win_h = 800;
+static double px_per_mm = 96.0 / 25.4;
+static double zoom_factor = 1.0;
+static double pan_x = 0.0, pan_y = 0.0;
+static int mouse_x = 0, mouse_y = 0;
+
+/* Points */
+static double points_x[MAX_POINTS], points_y[MAX_POINTS];
+static int points_count = 0;
+
+/* Unit selection */
+static int manual_unit_index = 2; /* mm */
+static int auto_unit_enabled = 1;
+static int current_unit_index = 2;
+
+/* Panning */
+static int panning = 0;
+static int pan_last_x = 0, pan_last_y = 0;
+
+/* Animation for zoom */
+static int zoom_animating = 0;
+static double zoom_start = 1.0;
+static double zoom_target = 1.0;
+static double anim_duration = 0.20;
+static double anim_start_time = 0.0;
+static double anim_world_cx = 0.0, anim_world_cy = 0.0;
+
+/* Toolbar buttons */
+enum { BTN_CENTER = 0, BTN_PLUS = 1, BTN_MINUS = 2, BTN_RESET = 3, BTN_GRID = 4, BTN_SNAP = 5, BTN_COUNT = 6 };
+static int hover_button = -1;
+static int pressed_button = -1;
+
+/* Grid / snap toggles */
+static int grid_visible = 1;
+static int snap_enabled = 0;
+
+/* Tooltip state (immediate) */
+static int tooltip_visible = 0;
+static char tooltip_text[128] = "";
+
+/* Shader program for grid rendering */
+static GLuint grid_prog = 0;
+static GLint uni_viewport_origin = -1;
+static GLint uni_viewport_size = -1;
+static GLint uni_pan = -1;
+static GLint uni_zoom = -1;
+static GLint uni_px_per_mm = -1;
+static GLint uni_step_mm = -1;
+static GLint uni_major_units = -1;
+static GLint uni_grid_visible = -1;
+static GLint uni_color_bg = -1;
+static GLint uni_color_minor = -1;
+static GLint uni_color_major = -1;
+
+/* Timing helper */
+static double now_seconds() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Forward declarations */
+static void timer_handler(int unused);
+
+/* Easing */
+static double ease_out_quad(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    return 1.0 - (1.0 - t) * (1.0 - t);
+}
+
+/* Helpers */
+static double nice_multiplier_for_px(double px_per_unit, double target_px) {
+    double seq[] = {1.0,2.0,5.0,10.0,20.0,50.0,100.0,200.0,500.0,1000.0,2000.0,5000.0};
+    for (size_t i=0;i<sizeof(seq)/sizeof(seq[0]);++i) if (seq[i]*px_per_unit >= target_px) return seq[i];
+    double v = 10000.0; while (v * px_per_unit < target_px) v *= 2.0; return v;
+}
+static double nice_multiplier_for_px_generic(double px_per_unit, double target_px) { return nice_multiplier_for_px(px_per_unit,target_px); }
+
+static void get_content_rect(int *x0, int *y0, int *cw, int *ch) {
+    if (x0) *x0 = RULER_THICKNESS;
+    if (y0) *y0 = TOOLBAR_HEIGHT + RULER_THICKNESS;
+    if (cw) *cw = win_w - RULER_THICKNESS;
+    if (ch) *ch = win_h - (TOOLBAR_HEIGHT + RULER_THICKNESS) - STATUS_HEIGHT;
+}
+static void get_content_center_screen(int *cx, int *cy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    if (cx) *cx = x0 + cw/2;
+    if (cy) *cy = y0 + ch/2;
+}
+
+static void world_to_screen(double wx, double wy, int *sx, int *sy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    double ox = x0 + cw/2.0, oy = y0 + ch/2.0;
+    double zx = (wx - pan_x) * zoom_factor, zy = (wy - pan_y) * zoom_factor;
+    if (sx) *sx = (int)round(ox + zx);
+    if (sy) *sy = (int)round(oy + zy);
+}
+static void screen_to_world(int sx, int sy, double *wx, double *wy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    double ox = x0 + cw/2.0, oy = y0 + ch/2.0;
+    if (wx) *wx = (double)(sx - ox) / zoom_factor + pan_x;
+    if (wy) *wy = (double)(sy - oy) / zoom_factor + pan_y;
+}
+
+/* Ensure zoom safe */
+static void ensure_zoom_safe() {
+    if (zoom_factor < 1e-12) zoom_factor = 1e-12;
+}
+
+/* --- Robust shader compile/link wrappers with detailed logs --- */
+
+static GLuint compile_shader_safe(GLenum type, const char *src) {
+    if (!src) {
+        fprintf(stderr, "compile_shader_safe: NULL source\n");
+        return 0;
+    }
+    GLuint s = glCreateShader(type);
+    if (s == 0) {
+        fprintf(stderr, "compile_shader_safe: glCreateShader returned 0 (no function pointer?).\n");
+        return 0;
+    }
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        GLint loglen = 0;
+        glGetShaderiv(s, GL_INFO_LOG_LENGTH, &loglen);
+        if (loglen > 1) {
+            char *log = (char*)malloc((size_t)loglen);
+            glGetShaderInfoLog(s, loglen, NULL, log);
+            fprintf(stderr, "Shader compile error (type %u):\n%s\n", (unsigned)type, log);
+            free(log);
+        } else {
+            fprintf(stderr, "Shader compile failed (type %u), no log available.\n", (unsigned)type);
+        }
+        glDeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+
+static GLuint link_program_safe(GLuint vs, GLuint fs) {
+    if (vs == 0 || fs == 0) {
+        fprintf(stderr, "link_program_safe: invalid shader handles vs=%u fs=%u\n", (unsigned)vs, (unsigned)fs);
+        return 0;
+    }
+    GLuint p = glCreateProgram();
+    if (p == 0) {
+        fprintf(stderr, "link_program_safe: glCreateProgram returned 0.\n");
+        return 0;
+    }
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    GLint ok = 0;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint loglen = 0;
+        glGetProgramiv(p, GL_INFO_LOG_LENGTH, &loglen);
+        if (loglen > 1) {
+            char *log = (char*)malloc((size_t)loglen);
+            glGetProgramInfoLog(p, loglen, NULL, log);
+            fprintf(stderr, "Program link error:\n%s\n", log);
+            free(log);
+        } else {
+            fprintf(stderr, "Program link failed, no log available.\n");
+        }
+        glDeleteProgram(p);
+        return 0;
+    }
+    return p;
+}
+
+/* Simple shader sources (GLSL 1.20 for compatibility) */
+static const char *grid_vs_src =
+"#version 120\n"
+"attribute vec2 aPos;\n"
+"void main() {\n"
+"  gl_Position = vec4(aPos, 0.0, 1.0);\n"
+"}\n";
+
+static const char *grid_fs_src =
+"#version 120\n"
+"uniform vec2 u_viewport_origin;\n"
+"uniform vec2 u_viewport_size;\n"
+"uniform vec2 u_pan;\n"
+"uniform float u_zoom;\n"
+"uniform float u_px_per_mm;\n"
+"uniform float u_step_mm;\n"
+"uniform float u_major_units;\n"
+"uniform int u_grid_visible;\n"
+"uniform vec3 u_color_bg;\n"
+"uniform vec3 u_color_minor;\n"
+"uniform vec3 u_color_major;\n"
+"float aa(float d, float w) { return smoothstep(w, 0.0, d); }\n"
+"void main() {\n"
+"  if (u_grid_visible == 0) { gl_FragColor = vec4(u_color_bg, 1.0); return; }\n"
+"  vec2 sc = gl_FragCoord.xy;\n"
+"  vec2 local = sc - u_viewport_origin;\n"
+"  vec2 center = u_viewport_size * 0.5;\n"
+"  vec2 world = (local - center) / u_zoom + u_pan;\n"
+"  float fx = mod(world.x, u_step_mm) / u_step_mm;\n"
+"  float fy = mod(world.y, u_step_mm) / u_step_mm;\n"
+"  float dx = min(abs(fx), 1.0 - abs(fx)) * u_step_mm * u_zoom;\n"
+"  float dy = min(abs(fy), 1.0 - abs(fy)) * u_step_mm * u_zoom;\n"
+"  float units_x = world.x / (u_step_mm);\n"
+"  float units_y = world.y / (u_step_mm);\n"
+"  float rx = mod(abs(units_x), u_major_units);\n"
+"  float ry = mod(abs(units_y), u_major_units);\n"
+"  int is_major_x = (rx < 1e-3 || abs(rx - u_major_units) < 1e-3) ? 1 : 0;\n"
+"  int is_major_y = (ry < 1e-3 || abs(ry - u_major_units) < 1e-3) ? 1 : 0;\n"
+"  float a_x = aa(dx, 1.0);\n"
+"  float a_y = aa(dy, 1.0);\n"
+"  vec3 col = u_color_bg;\n"
+"  if (a_x > 0.0) { if (is_major_x == 1) col = mix(col, u_color_major, a_x); else col = mix(col, u_color_minor, a_x); }\n"
+"  if (a_y > 0.0) { if (is_major_y == 1) col = mix(col, u_color_major, a_y); else col = mix(col, u_color_minor, a_y); }\n"
+"  gl_FragColor = vec4(col, 1.0);\n"
+"}\n";
+
+/* Initialize grid shader */
+static void init_grid_shader() {
+    GLuint vs = compile_shader_safe(GL_VERTEX_SHADER, grid_vs_src);
+    GLuint fs = compile_shader_safe(GL_FRAGMENT_SHADER, grid_fs_src);
+    if (!vs || !fs) {
+        fprintf(stderr, "init_grid_shader: shader compile failed, skipping GPU grid (using CPU fallback).\n");
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        grid_prog = 0;
+        return;
+    }
+    grid_prog = link_program_safe(vs, fs);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    if (!grid_prog) {
+        fprintf(stderr, "init_grid_shader: program link failed, skipping GPU grid.\n");
+        return;
+    }
+    uni_viewport_origin = glGetUniformLocation(grid_prog, "u_viewport_origin");
+    uni_viewport_size = glGetUniformLocation(grid_prog, "u_viewport_size");
+    uni_pan = glGetUniformLocation(grid_prog, "u_pan");
+    uni_zoom = glGetUniformLocation(grid_prog, "u_zoom");
+    uni_px_per_mm = glGetUniformLocation(grid_prog, "u_px_per_mm");
+    uni_step_mm = glGetUniformLocation(grid_prog, "u_step_mm");
+    uni_major_units = glGetUniformLocation(grid_prog, "u_major_units");
+    uni_grid_visible = glGetUniformLocation(grid_prog, "u_grid_visible");
+    uni_color_bg = glGetUniformLocation(grid_prog, "u_color_bg");
+    uni_color_minor = glGetUniformLocation(grid_prog, "u_color_minor");
+    uni_color_major = glGetUniformLocation(grid_prog, "u_color_major");
+    fprintf(stderr, "init_grid_shader: GPU grid shader compiled and linked successfully.\n");
+}
+
+/* --- Zoom helpers: zoom_to_centered, zoom_in_centered, zoom_out_centered --- */
+
+/* Apply a new zoom value while keeping the content center fixed.
+   If animate==1, start an animated transition from current zoom to new_zoom.
+   If animate==0, apply immediately (no animation).
+*/
+static void zoom_to_centered(double new_zoom, int animate) {
+    if (!(new_zoom > 0.0)) return; /* guard */
+    /* clamp to reasonable range */
+    if (new_zoom < 1e-9) new_zoom = 1e-9;
+    if (new_zoom > 1e12) new_zoom = 1e12;
+
+    /* compute world coordinate at content center BEFORE changing zoom */
+    int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+    double world_cx_before, world_cy_before;
+    screen_to_world(ccx, ccy, &world_cx_before, &world_cy_before);
+
+    if (animate) {
+        /* start animated transition: preserve world_cx_before as anchor */
+        zoom_animating = 1;
+        zoom_start = zoom_factor;
+        zoom_target = new_zoom;
+        if (anim_duration <= 0.0) anim_duration = 0.20;
+        anim_start_time = now_seconds();
+        anim_world_cx = world_cx_before;
+        anim_world_cy = world_cy_before;
+        /* schedule timer */
+        glutTimerFunc(16, timer_handler, 0);
+    } else {
+        /* immediate apply: set zoom and adjust pan so content center maps to same world point */
+        zoom_factor = new_zoom;
+        ensure_zoom_safe();
+        pan_x = world_cx_before - (double)ccx / zoom_factor;
+        pan_y = world_cy_before - (double)ccy / zoom_factor;
+    }
+}
+
+/* Zoom in centered (animated) */
+static void zoom_in_centered() {
+    double factor = 1.15;
+    double new_zoom = zoom_factor * factor;
+    if (new_zoom > 1e12) new_zoom = 1e12;
+    zoom_to_centered(new_zoom, 1);
+}
+
+/* Zoom out centered (animated) */
+static void zoom_out_centered() {
+    double factor = 1.15;
+    double new_zoom = zoom_factor / factor;
+    if (new_zoom < 1e-12) new_zoom = 1e-12;
+    zoom_to_centered(new_zoom, 1);
+}
+
+/* Timer handler for zoom animation */
+static void timer_handler(int unused) {
+    (void)unused;
+    if (!zoom_animating) return;
+    double tnow = now_seconds();
+    double t = (tnow - anim_start_time) / anim_duration;
+    if (t >= 1.0) {
+        zoom_factor = zoom_target;
+        zoom_animating = 0;
+        ensure_zoom_safe();
+        int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+        pan_x = anim_world_cx - (double)ccx / zoom_factor;
+        pan_y = anim_world_cy - (double)ccy / zoom_factor;
+        glutPostRedisplay();
+        return;
+    }
+    double e = ease_out_quad(t);
+    zoom_factor = zoom_start + (zoom_target - zoom_start) * e;
+    ensure_zoom_safe();
+    int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+    pan_x = anim_world_cx - (double)ccx / zoom_factor;
+    pan_y = anim_world_cy - (double)ccy / zoom_factor;
+    glutPostRedisplay();
+    glutTimerFunc(16, timer_handler, 0);
+}
+
+/* --- UI drawing: icons, toolbar, rulers, shader invocation --- */
+
+/* Draw text helper */
+static void draw_text_bitmap(int x, int y, const char *s) {
+    glRasterPos2i(x,y);
+    for (const char *p=s; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *p);
+}
+
+/* Icon drawing functions */
+static void draw_icon_center(int cx, int cy, int w, int h) {
+    int cxp = cx + w/2;
+    int cyp = cy + h/2;
+    glColor3ub(0,0,0);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+      glVertex2i(cxp - 6, cyp); glVertex2i(cxp + 6, cyp);
+      glVertex2i(cxp, cyp - 6); glVertex2i(cxp, cyp + 6);
+    glEnd();
+}
+static void draw_icon_plus(int cx, int cy, int w, int h) { draw_icon_center(cx,cy,w,h); }
+static void draw_icon_minus(int cx, int cy, int w, int h) {
+    int cxp = cx + w/2;
+    int cyp = cy + h/2;
+    glColor3ub(0,0,0);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+      glVertex2i(cxp - 6, cyp); glVertex2i(cxp + 6, cyp);
+    glEnd();
+}
+static void draw_icon_reset(int cx, int cy, int w, int h) {
+    int cxp = cx + w/2;
+    int cyp = cy + h/2;
+    glColor3ub(0,0,0);
+    glLineWidth(2.0f);
+    glBegin(GL_LINE_STRIP);
+    for (int i=0;i<=20;++i) {
+        double a = (M_PI*1.5) + (double)i/20.0 * (M_PI*1.2);
+        double r = 8.0;
+        glVertex2f(cxp + cos(a)*r, cyp + sin(a)*r);
+    }
+    glEnd();
+    glBegin(GL_TRIANGLES);
+      glVertex2i(cxp + 8, cyp + 2);
+      glVertex2i(cxp + 12, cyp + 6);
+      glVertex2i(cxp + 6, cyp + 6);
+    glEnd();
+}
+static void draw_icon_grid(int cx, int cy, int w, int h) {
+    int left = cx + (w-14)/2;
+    int top = cy + (h-14)/2;
+    glColor3ub(0,0,0);
+    glLineWidth(1.0f);
+    for (int i=0;i<4;++i) {
+        int x = left + i*4;
+        glBegin(GL_LINES); glVertex2i(x, top); glVertex2i(x, top+14); glEnd();
+        int y = top + i*4;
+        glBegin(GL_LINES); glVertex2i(left, y); glVertex2i(left+14, y); glEnd();
+    }
+}
+static void draw_icon_snap(int cx, int cy, int w, int h) {
+    int cxp = cx + w/2;
+    int cyp = cy + h/2;
+    glColor3ub(0,0,0);
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+      glVertex2i(cxp - 6, cyp - 6); glVertex2i(cxp - 6, cyp + 2);
+      glVertex2i(cxp + 6, cyp - 6); glVertex2i(cxp + 6, cyp + 2);
+    glEnd();
+    glBegin(GL_LINES);
+      glVertex2i(cxp - 6, cyp + 2); glVertex2i(cxp + 6, cyp + 2);
+    glEnd();
+}
+
+/* Button geometry helper */
+static void compute_button_rects(int rects[BTN_COUNT][4]) {
+    int left = 8;
+    int top = 6;
+    int btn_h = TOOLBAR_HEIGHT - 12;
+    int spacing = 8;
+    int x = left;
+    rects[BTN_CENTER][0] = x; rects[BTN_CENTER][1] = top; rects[BTN_CENTER][2] = x + 80; rects[BTN_CENTER][3] = top + btn_h;
+    x += 80 + spacing;
+    rects[BTN_PLUS][0] = x; rects[BTN_PLUS][1] = top; rects[BTN_PLUS][2] = x + 36; rects[BTN_PLUS][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_MINUS][0] = x; rects[BTN_MINUS][1] = top; rects[BTN_MINUS][2] = x + 36; rects[BTN_MINUS][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_RESET][0] = x; rects[BTN_RESET][1] = top; rects[BTN_RESET][2] = x + 60; rects[BTN_RESET][3] = top + btn_h;
+    x += 60 + spacing;
+    rects[BTN_GRID][0] = x; rects[BTN_GRID][1] = top; rects[BTN_GRID][2] = x + 48; rects[BTN_GRID][3] = top + btn_h;
+    x += 48 + spacing;
+    rects[BTN_SNAP][0] = x; rects[BTN_SNAP][1] = top; rects[BTN_SNAP][2] = x + 48; rects[BTN_SNAP][3] = top + btn_h;
+}
+
+/* Draw 3D-like button background */
+static void draw_button_rect_bg(int x0, int y0, int x1, int y1, int hovered, int pressed) {
+    unsigned char base_r = hovered ? 220 : 200;
+    unsigned char base_g = hovered ? 230 : 210;
+    unsigned char base_b = hovered ? 255 : 230;
+    if (pressed) { base_r = (unsigned char)fmax(0, base_r - 30); base_g = (unsigned char)fmax(0, base_g - 30); base_b = (unsigned char)fmax(0, base_b - 30); }
+
+    glColor3ub(base_r, base_g, base_b);
+    glBegin(GL_QUADS);
+      glVertex2i(x0, y0);
+      glVertex2i(x1, y0);
+      glVertex2i(x1, y1);
+      glVertex2i(x0, y1);
+    glEnd();
+
+    glLineWidth(1.0f);
+    glColor3ub(255,255,255);
+    glBegin(GL_LINES);
+      glVertex2i(x0, y1-1); glVertex2i(x0, y0);
+      glVertex2i(x0, y0); glVertex2i(x1-1, y0);
+    glEnd();
+    glColor3ub(120,120,120);
+    glBegin(GL_LINES);
+      glVertex2i(x1-1, y0); glVertex2i(x1-1, y1-1);
+      glVertex2i(x1-1, y1-1); glVertex2i(x0, y1-1);
+    glEnd();
+    glColor3ub(160,160,160);
+    glBegin(GL_LINE_LOOP);
+      glVertex2i(x0+1, y0+1);
+      glVertex2i(x1-1, y0+1);
+      glVertex2i(x1-1, y1-1);
+      glVertex2i(x0+1, y1-1);
+    glEnd();
+}
+
+/* Draw toolbar and icons; tooltip immediate (yellow bg, black border) */
+static void draw_toolbar() {
+    glColor3ub(245,245,250);
+    glBegin(GL_QUADS);
+      glVertex2i(0,0); glVertex2i(win_w,0); glVertex2i(win_w,TOOLBAR_HEIGHT); glVertex2i(0,TOOLBAR_HEIGHT);
+    glEnd();
+    glColor3ub(180,180,180);
+    glBegin(GL_LINES);
+      glVertex2i(0,TOOLBAR_HEIGHT-1); glVertex2i(win_w,TOOLBAR_HEIGHT-1);
+    glEnd();
+
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+    for (int i=0;i<BTN_COUNT;++i) {
+        int hovered = (hover_button == i);
+        int pressed = (pressed_button == i);
+        draw_button_rect_bg(rects[i][0], rects[i][1], rects[i][2], rects[i][3], hovered, pressed);
+        int bx = rects[i][0], by = rects[i][1], bw = rects[i][2]-rects[i][0], bh = rects[i][3]-rects[i][1];
+        if (i == BTN_CENTER) draw_icon_center(bx, by, bw, bh);
+        else if (i == BTN_PLUS) draw_icon_plus(bx, by, bw, bh);
+        else if (i == BTN_MINUS) draw_icon_minus(bx, by, bw, bh);
+        else if (i == BTN_RESET) draw_icon_reset(bx, by, bw, bh);
+        else if (i == BTN_GRID) draw_icon_grid(bx, by, bw, bh);
+        else if (i == BTN_SNAP) draw_icon_snap(bx, by, bw, bh);
+    }
+
+    /* tooltip immediate: yellow background, black border outside text */
+    if (tooltip_visible && tooltip_text[0]) {
+        int tw = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)tooltip_text) + 12;
+        int th = 20;
+        int tx = mouse_x + 12;
+        int ty = mouse_y + 12;
+        if (tx + tw > win_w) tx = win_w - tw - 8;
+        if (ty + th > win_h) ty = win_h - th - 8;
+        glColor3ub(255, 255, 160);
+        glBegin(GL_QUADS);
+          glVertex2i(tx, ty);
+          glVertex2i(tx + tw, ty);
+          glVertex2i(tx + tw, ty + th);
+          glVertex2i(tx, ty + th);
+        glEnd();
+        glLineWidth(2.0f);
+        glColor3ub(0,0,0);
+        glBegin(GL_LINE_LOOP);
+          glVertex2i(tx-1, ty-1);
+          glVertex2i(tx + tw+1, ty-1);
+          glVertex2i(tx + tw+1, ty + th+1);
+          glVertex2i(tx-1, ty + th+1);
+        glEnd();
+        glColor3ub(0,0,0);
+        draw_text_bitmap(tx + 6, ty + 14, tooltip_text);
+    }
+}
+
+/* Auto unit selection (magnitude-targeted) */
+static int select_unit_index_auto(double min_px_per_unit) {
+    int best = 0;
+    double best_score = -1.0;
+    double geom_mean = sqrt(MAG_MIN * MAG_MAX);
+    for (int i = UNIT_COUNT-1; i >= 0; --i) {
+        double px_per_unit = px_per_mm * zoom_factor * units[i].mm_per_unit;
+        double mult = nice_multiplier_for_px_generic(px_per_unit, min_px_per_unit);
+        double eff_px = mult * px_per_unit;
+        double step_units = mult;
+        double target_px = min_px_per_unit * 1.8;
+        double pixel_score = 1.0 / (1.0 + fabs(eff_px - target_px));
+        double mag_score;
+        if (step_units >= MAG_MIN && step_units <= MAG_MAX) mag_score = 1.0;
+        else {
+            double log_dist = fabs(log10(fmax(step_units, 1e-30)) - log10(geom_mean));
+            mag_score = 1.0 / (1.0 + log_dist);
+        }
+        double score = pixel_score * 0.75 + mag_score * 0.25;
+        if (score > best_score) { best_score = score; best = i; }
+    }
+    return best;
+}
+
+/* Snap to grid */
+static void snap_to_grid(double *wx, double *wy) {
+    if (!snap_enabled) return;
+    UnitDef u;
+    if (auto_unit_enabled) u = units[current_unit_index]; else u = units[manual_unit_index];
+    double px_per_unit = px_per_mm * zoom_factor * u.mm_per_unit;
+    if (px_per_unit <= 0.0) px_per_unit = (96.0/25.4) * zoom_factor * u.mm_per_unit;
+    double MIN_PX_PER_UNIT = 40.0;
+    double step_units = nice_multiplier_for_px_generic(px_per_unit, MIN_PX_PER_UNIT);
+    double step_mm = step_units * u.mm_per_unit;
+    if (step_mm <= 0.0) return;
+    *wx = round((*wx) / step_mm) * step_mm;
+    *wy = round((*wy) / step_mm) * step_mm;
+}
+
+/* Draw rulers and invoke shader for grid */
+static void draw_rulers_and_ticks_and_invoke_shader() {
+    const double MIN_PX_PER_UNIT = 40.0;
+    if (auto_unit_enabled) current_unit_index = select_unit_index_auto(MIN_PX_PER_UNIT);
+    else current_unit_index = manual_unit_index;
+    UnitDef u = units[current_unit_index];
+
+    double px_per_unit = px_per_mm * zoom_factor * u.mm_per_unit;
+    if (px_per_unit <= 0.0) px_per_unit = (96.0/25.4) * zoom_factor * u.mm_per_unit;
+    double step_units = nice_multiplier_for_px_generic(px_per_unit, MIN_PX_PER_UNIT);
+    double step_mm = step_units * u.mm_per_unit;
+    double major_units = (step_units >= 10.0) ? step_units : 10.0;
+
+    int cx,cy,cw,ch; get_content_rect(&cx,&cy,&cw,&ch);
+
+    /* GPU grid if available */
+    if (grid_prog && grid_visible) {
+        glUseProgram(grid_prog);
+        glUniform2f(uni_viewport_origin, (GLfloat)cx, (GLfloat)cy);
+        glUniform2f(uni_viewport_size, (GLfloat)cw, (GLfloat)ch);
+        glUniform2f(uni_pan, (GLfloat)pan_x, (GLfloat)pan_y);
+        glUniform1f(uni_zoom, (GLfloat)zoom_factor);
+        glUniform1f(uni_px_per_mm, (GLfloat)px_per_mm);
+        glUniform1f(uni_step_mm, (GLfloat)step_mm);
+        glUniform1f(uni_major_units, (GLfloat)major_units);
+        glUniform1i(uni_grid_visible, grid_visible ? 1 : 0);
+        glUniform3f(uni_color_bg, 1.0f, 1.0f, 1.0f);
+        glUniform3f(uni_color_minor, 0.88f, 0.88f, 0.88f);
+        glUniform3f(uni_color_major, 0.75f, 0.75f, 0.75f);
+
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(cx, win_h - (cy + ch), cw, ch);
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        glOrtho(0, win_w, win_h, 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+
+        glBegin(GL_QUADS);
+          glVertex2f((GLfloat)cx, (GLfloat)cy);
+          glVertex2f((GLfloat)(cx + cw), (GLfloat)cy);
+          glVertex2f((GLfloat)(cx + cw), (GLfloat)(cy + ch));
+          glVertex2f((GLfloat)cx, (GLfloat)(cy + ch));
+        glEnd();
+
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION); glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+
+        glDisable(GL_SCISSOR_TEST);
+        glUseProgram(0);
+    } else {
+        /* CPU fallback grid (simple, coarse) */
+        glLineWidth(1.0f);
+        glColor3ub(224,224,224);
+        for (int k = -100; k <= 100; ++k) {
+            double wx = k * step_mm;
+            int sx0, sy0, sx1, sy1;
+            world_to_screen(wx, -1e6, &sx0, &sy0);
+            world_to_screen(wx, 1e6, &sx1, &sy1);
+            glBegin(GL_LINES); glVertex2i(sx0, sy0); glVertex2i(sx1, sy1); glEnd();
+        }
+    }
+
+    /* Draw top ruler ticks and left ruler ticks (labels only) */
+    int cx0 = cx, cy0 = cy, cw0 = cw, ch0 = ch;
+    double wx0, wy0, wx1, wy1;
+    screen_to_world(cx0, cy0, &wx0, &wy0);
+    screen_to_world(cx0 + cw0, cy0 + ch0, &wx1, &wy1);
+    int kx_min = (int)floor(wx0 / step_mm) - 1;
+    int kx_max = (int)ceil(wx1 / step_mm) + 1;
+    int ky_min = (int)floor(wy0 / step_mm) - 1;
+    int ky_max = (int)ceil(wy1 / step_mm) + 1;
+
+    glColor3ub(0,0,0);
+    int last_label_right = -100000;
+    for (int k = kx_min; k <= kx_max; ++k) {
+        double world_x = k * step_mm;
+        int sx, sy;
+        world_to_screen(world_x, pan_y, &sx, &sy);
+        if (sx < cx0 - 2 || sx > cx0 + cw0 + 2) continue;
+        double units_at_x = world_x / u.mm_per_unit;
+        double rem = fmod(fabs(units_at_x), major_units);
+        if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1 - 12);
+            glEnd();
+            char buf[64];
+            double absval = fabs(units_at_x);
+            if (absval > 1e6 || (absval > 0 && absval < 1e-3)) snprintf(buf, sizeof(buf), "%.3e", units_at_x);
+            else {
+                if (strcmp(u.name,"nm")==0 || strcmp(u.name,"µm")==0) snprintf(buf, sizeof(buf), "%lld", (long long)llround(units_at_x));
+                else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.3f", units_at_x);
+                    char *p = tmp + strlen(tmp) - 1;
+                    while (p > tmp && *p == '0') { *p = '\0'; --p; }
+                    if (p > tmp && *p == '.') *p = '\0';
+                    snprintf(buf, sizeof(buf), "%s", tmp);
+                }
+            }
+            int label_w = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)buf);
+            int label_left = sx - label_w/2;
+            int label_right = label_left + label_w;
+            int margin = 4;
+            if (label_left >= cx0 + margin && label_right <= cx0 + cw0 - margin && label_left > last_label_right + margin) {
+                draw_text_bitmap(label_left, TOOLBAR_HEIGHT + RULER_THICKNESS - 14, buf);
+                last_label_right = label_right;
+            }
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1 - 6);
+            glEnd();
+        }
+    }
+
+    int last_label_bottom = -100000;
+    for (int k = ky_min; k <= ky_max; ++k) {
+        double world_y = k * step_mm;
+        int sx, sy;
+        world_to_screen(pan_x, world_y, &sx, &sy);
+        if (sy < cy0 - 2 || sy > cy0 + ch0 + 2) continue;
+        if (sy < TOOLBAR_HEIGHT + RULER_THICKNESS + 8) continue;
+        double units_at_y = world_y / u.mm_per_unit;
+        double rem = fmod(fabs(units_at_y), major_units);
+        if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS - 1, sy);
+              glVertex2i(RULER_THICKNESS - 1 - 12, sy);
+            glEnd();
+            char buf[64];
+            double absval = fabs(units_at_y);
+            if (absval > 1e6 || (absval > 0 && absval < 1e-3)) snprintf(buf, sizeof(buf), "%.3e", units_at_y);
+            else {
+                if (strcmp(u.name,"nm")==0 || strcmp(u.name,"µm")==0) snprintf(buf, sizeof(buf), "%lld", (long long)llround(units_at_y));
+                else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.3f", units_at_y);
+                    char *p = tmp + strlen(tmp) - 1;
+                    while (p > tmp && *p == '0') { *p = '\0'; --p; }
+                    if (p > tmp && *p == '.') *p = '\0';
+                    snprintf(buf, sizeof(buf), "%s", tmp);
+                }
+            }
+            int label_h = 12;
+            int label_top = sy - label_h/2;
+            int label_bottom = label_top + label_h;
+            int margin = 4;
+            if (label_top >= cy0 + margin && label_bottom <= cy0 + ch0 - margin && label_top > last_label_bottom + margin) {
+                draw_text_bitmap(4, sy + 4, buf);
+                last_label_bottom = label_bottom;
+            }
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS - 1, sy);
+              glVertex2i(RULER_THICKNESS - 1 - 6, sy);
+            glEnd();
+        }
+    }
+
+    char corner[64];
+    if (auto_unit_enabled) snprintf(corner,sizeof(corner),"auto (%s)", units[current_unit_index].name);
+    else snprintf(corner,sizeof(corner),"%s (manual)", units[manual_unit_index].name);
+    draw_text_bitmap(6, TOOLBAR_HEIGHT + RULER_THICKNESS - 6, corner);
+}
+
+/* Display callback */
+static void display_cb(void) {
+    glClearColor(1,1,1,1); glClear(GL_COLOR_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluOrtho2D(0,win_w,win_h,0);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+    draw_toolbar();
+    draw_rulers_and_ticks_and_invoke_shader();
+
+    /* points */
+    glColor3ub(0,0,0);
+    for (int i=0;i<points_count;++i) {
+        int sx,sy; world_to_screen(points_x[i], points_y[i], &sx, &sy);
+        int r = (int)fmax(2.0, 3.0 * zoom_factor);
+        glBegin(GL_TRIANGLE_FAN); glVertex2i(sx,sy);
+        for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+        glEnd();
+    }
+
+    /* status bar */
+    int status_y = win_h - STATUS_HEIGHT;
+    glColor3ub(248,248,248); glBegin(GL_QUADS); glVertex2i(0,status_y); glVertex2i(win_w,status_y); glVertex2i(win_w,win_h); glVertex2i(0,win_h); glEnd();
+    glColor3ub(192,192,192); glBegin(GL_LINES); glVertex2i(0,status_y); glVertex2i(win_w,status_y); glEnd();
+    char status[256];
+    if (auto_unit_enabled) snprintf(status,sizeof(status),"Unit: auto (%s)   Zoom: %.2f%%   Points: %d   (press 'u' to manual, 'a' to toggle auto)", units[current_unit_index].name, zoom_factor*100.0, points_count);
+    else snprintf(status,sizeof(status),"Unit: manual (%s)   Zoom: %.2f%%   Points: %d   (press 'u' to cycle, 'a' to toggle auto)", units[manual_unit_index].name, zoom_factor*100.0, points_count);
+    glColor3ub(0,0,0); draw_text_bitmap(8, status_y + STATUS_HEIGHT - 6, status);
+
+    /* crosshair inside content */
+    int cx,cy,cw,ch; get_content_rect(&cx,&cy,&cw,&ch);
+    if (mouse_x >= cx && mouse_x <= cx+cw && mouse_y >= cy && mouse_y <= cy+ch) {
+        glColor3ub(0,0,0);
+        glLineWidth(1.0f);
+        glBegin(GL_LINES);
+          glVertex2i(mouse_x - 10, mouse_y); glVertex2i(mouse_x + 10, mouse_y);
+          glVertex2i(mouse_x, mouse_y - 10); glVertex2i(mouse_x, mouse_y + 10);
+        glEnd();
+    }
+
+    glutSwapBuffers();
+}
+
+/* Reshape */
+static void reshape_cb(int w, int h) { win_w = w; win_h = h; glViewport(0,0,w,h); glutPostRedisplay(); }
+
+/* Helper: point in rect */
+static int point_in_rect(int x, int y, int rect[4]) {
+    return (x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]);
+}
+
+/* Mouse handling */
+static void mouse_cb(int button, int state, int x, int y) {
+    mouse_x = x; mouse_y = y;
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+
+    if (y < TOOLBAR_HEIGHT) {
+        if (button == GLUT_LEFT_BUTTON) {
+            if (state == GLUT_DOWN) {
+                hover_button = -1;
+                for (int i=0;i<BTN_COUNT;++i) if (point_in_rect(x,y,rects[i])) { pressed_button = i; hover_button = i; tooltip_visible = 1; break; }
+            } else {
+                for (int i=0;i<BTN_COUNT;++i) {
+                    if (pressed_button == i && point_in_rect(x,y,rects[i])) {
+                        if (i == BTN_CENTER) { pan_x = 0.0; pan_y = 0.0; glutPostRedisplay(); }
+                        else if (i == BTN_PLUS) { zoom_in_centered(); }
+                        else if (i == BTN_MINUS) { zoom_out_centered(); }
+                        else if (i == BTN_RESET) { zoom_factor = 1.0; pan_x = 0.0; pan_y = 0.0; glutPostRedisplay(); }
+                        else if (i == BTN_GRID) { grid_visible = !grid_visible; glutPostRedisplay(); }
+                        else if (i == BTN_SNAP) { snap_enabled = !snap_enabled; glutPostRedisplay(); }
+                    }
+                }
+                pressed_button = -1;
+                hover_button = -1;
+                tooltip_visible = 0;
+            }
+        }
+        return;
+    }
+
+    int cx,cy,cw,ch; get_content_rect(&cx,&cy,&cw,&ch);
+    if (button == GLUT_LEFT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            if (x >= cx && x <= cx+cw && y >= cy && y <= cy+ch) { panning = 1; pan_last_x = x; pan_last_y = y; glutSetCursor(GLUT_CURSOR_NONE); }
+            else { panning = 0; glutSetCursor(GLUT_CURSOR_LEFT_ARROW); }
+        } else { panning = 0; glutSetCursor(GLUT_CURSOR_LEFT_ARROW); }
+    } else if (button == GLUT_RIGHT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            double wx,wy; screen_to_world(x,y,&wx,&wy);
+            snap_to_grid(&wx, &wy);
+            if (points_count < MAX_POINTS) { points_x[points_count]=wx; points_y[points_count]=wy; points_count++; }
+            glutPostRedisplay();
+        }
+    } else if (button == 3) { /* wheel up */
+        double factor = 1.15; double new_zoom = zoom_factor * factor; if (new_zoom > 1e12) new_zoom = 1e12;
+        zoom_to_centered(new_zoom, 1);
+    } else if (button == 4) { /* wheel down */
+        double factor = 1.15; double new_zoom = zoom_factor / factor; if (new_zoom < 1e-12) new_zoom = 1e-12;
+        zoom_to_centered(new_zoom, 1);
+    }
+}
+
+/* Motion while pressed: pan; update hover for toolbar and cursor */
+static void motion_cb(int x, int y) {
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+    mouse_x = x; mouse_y = y;
+
+    if (y < TOOLBAR_HEIGHT) {
+        hover_button = -1;
+        for (int i=0;i<BTN_COUNT;++i) if (point_in_rect(x,y,rects[i])) { hover_button = i; tooltip_visible = 1; break; }
+        glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+        glutPostRedisplay();
+        return;
+    } else {
+        hover_button = -1;
+        tooltip_visible = 0;
+    }
+
+    glutSetCursor(GLUT_CURSOR_NONE);
+
+    if (panning) {
+        int dx = x - pan_last_x, dy = y - pan_last_y;
+        pan_x -= (double)dx / zoom_factor;
+        pan_y -= (double)dy / zoom_factor;
+        pan_last_x = x; pan_last_y = y;
+        glutPostRedisplay();
+    } else glutPostRedisplay();
+}
+
+/* Passive motion: update hover and cursor; immediate tooltip */
+static void passive_motion_cb(int x, int y) {
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+    mouse_x = x; mouse_y = y;
+    if (y < TOOLBAR_HEIGHT) {
+        int new_hover = -1;
+        for (int i=0;i<BTN_COUNT;++i) if (point_in_rect(x,y,rects[i])) { new_hover = i; break; }
+        if (new_hover != hover_button) {
+            hover_button = new_hover;
+            tooltip_visible = (hover_button != -1);
+            if (tooltip_visible) {
+                switch (hover_button) {
+                    case BTN_CENTER: snprintf(tooltip_text, sizeof(tooltip_text), "Center: Ansicht auf Weltursprung zentrieren"); break;
+                    case BTN_PLUS: snprintf(tooltip_text, sizeof(tooltip_text), "Zoom In: Hereinzoomen (animiert)"); break;
+                    case BTN_MINUS: snprintf(tooltip_text, sizeof(tooltip_text), "Zoom Out: Herauszoomen (animiert)"); break;
+                    case BTN_RESET: snprintf(tooltip_text, sizeof(tooltip_text), "Reset: Ansicht auf Standard zurücksetzen"); break;
+                    case BTN_GRID: snprintf(tooltip_text, sizeof(tooltip_text), "Grid: Raster ein/aus schalten"); break;
+                    case BTN_SNAP: snprintf(tooltip_text, sizeof(tooltip_text), "Snap: Punkte am Raster ausrichten"); break;
+                    default: tooltip_text[0] = '\0'; break;
+                }
+            } else tooltip_text[0] = '\0';
+        }
+        glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+    } else {
+        hover_button = -1;
+        tooltip_visible = 0;
+        tooltip_text[0] = '\0';
+        glutSetCursor(GLUT_CURSOR_NONE);
+    }
+    glutPostRedisplay();
+}
+
+/* Keyboard */
+static void keyboard_cb(unsigned char key, int x, int y) {
+    (void)x; (void)y;
+    if (key == 27) exit(0);
+    else if (key == '+' || key == '=') { double factor = 1.15; double new_zoom = zoom_factor * factor; if (new_zoom > 1e12) new_zoom = 1e12; zoom_to_centered(new_zoom, 1); }
+    else if (key == '-') { double factor = 1.15; double new_zoom = zoom_factor / factor; if (new_zoom < 1e-12) new_zoom = 1e-12; zoom_to_centered(new_zoom, 1); }
+    else if (key == 'u' || key == 'U') { manual_unit_index = (manual_unit_index+1)%UNIT_COUNT; auto_unit_enabled = 0; current_unit_index = manual_unit_index; glutPostRedisplay(); }
+    else if (key == 'a' || key == 'A') { auto_unit_enabled = !auto_unit_enabled; if (!auto_unit_enabled) current_unit_index = manual_unit_index; glutPostRedisplay(); }
+}
+
+/* Init GL and shader, with robust GLEW init and diagnostics */
+static void init_gl_and_shaders() {
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* Initialize GLEW safely */
+    glewExperimental = GL_TRUE;
+    GLenum glewErr = glewInit();
+    if (glewErr != GLEW_OK) {
+        fprintf(stderr, "ERROR: glewInit failed: %s\n", glewGetErrorString(glewErr));
+        fprintf(stderr, "Continuing without GPU grid shader (CPU fallback will be used).\n");
+        grid_prog = 0;
+    } else {
+        /* Print GL info for debugging */
+        const GLubyte *vendor = glGetString(GL_VENDOR);
+        const GLubyte *renderer = glGetString(GL_RENDERER);
+        const GLubyte *version = glGetString(GL_VERSION);
+        const GLubyte *glslver = glGetString(GL_SHADING_LANGUAGE_VERSION);
+        fprintf(stderr, "GL_VENDOR:   %s\n", vendor ? (const char*)vendor : "NULL");
+        fprintf(stderr, "GL_RENDERER: %s\n", renderer ? (const char*)renderer : "NULL");
+        fprintf(stderr, "GL_VERSION:  %s\n", version ? (const char*)version : "NULL");
+        fprintf(stderr, "GLSL:        %s\n", glslver ? (const char*)glslver : "NULL");
+
+        /* Try to compile/link shader */
+        init_grid_shader();
+        if (!grid_prog) {
+            fprintf(stderr, "GPU grid shader not available; using CPU fallback.\n");
+        }
+    }
+}
+
+/* main */
+int main(int argc, char **argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(win_w, win_h);
+    glutCreateWindow("GLUT CAD - Robust Shader Wrappers + Zoom Centered");
+
+    /* Initialize GL and shaders (includes glewInit and diagnostics) */
+    init_gl_and_shaders();
+
+    /* Register callbacks */
+    glutDisplayFunc(display_cb);
+    glutReshapeFunc(reshape_cb);
+    glutMouseFunc(mouse_cb);
+    glutMotionFunc(motion_cb);
+    glutPassiveMotionFunc(passive_motion_cb);
+    glutKeyboardFunc(keyboard_cb);
+
+    int screen_width = glutGet(GLUT_SCREEN_WIDTH);
+    int screen_height = glutGet(GLUT_SCREEN_HEIGHT);
+
+    glutReshapeWindow(screen_width, screen_height);
+    glutPositionWindow(0, 0);
+
+    /* Start fullscreen for convenience */
+    //glutFullScreen();
+
+    glutMainLoop();
+    return 0;
+}

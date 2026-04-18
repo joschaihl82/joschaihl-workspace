@@ -1,0 +1,12 @@
+config/exectrace1/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/exectrace1/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/exectrace1/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/exectrace1/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/exectrace1/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchMode=run
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/exectrace2/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/stdbuild.build.container=/exectrace2/build/make.run.linux.x86_64.Local
+eclipse.preferences.version=1

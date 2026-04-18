@@ -1,0 +1,426 @@
+/****************************************************************************
+** Meta object code from reading C++ file 'main.cpp'
+**
+** Created by: The Qt Meta Object Compiler version 69 (Qt 6.9.2)
+**
+** WARNING! All changes made in this file will be lost!
+*****************************************************************************/
+
+#include <QtCore/qmetatype.h>
+
+#include <QtCore/qtmochelpers.h>
+
+#include <memory>
+
+
+#include <QtCore/qxptype_traits.h>
+#if !defined(Q_MOC_OUTPUT_REVISION)
+#error "The header file 'main.cpp' doesn't include <QObject>."
+#elif Q_MOC_OUTPUT_REVISION != 69
+#error "This file was generated using the moc from 6.9.2. It"
+#error "cannot be used with the include files from this version of Qt."
+#error "(The moc has changed too much.)"
+#endif
+
+#ifndef Q_CONSTINIT
+#define Q_CONSTINIT
+#endif
+
+QT_WARNING_PUSH
+QT_WARNING_DISABLE_DEPRECATED
+QT_WARNING_DISABLE_GCC("-Wuseless-cast")
+namespace {
+struct qt_meta_tag_ZN11OAuthHelperE_t {};
+} // unnamed namespace
+
+template <> constexpr inline auto OAuthHelper::qt_create_metaobjectdata<qt_meta_tag_ZN11OAuthHelperE_t>()
+{
+    namespace QMC = QtMocConstants;
+    QtMocHelpers::StringRefStorage qt_stringData {
+        "OAuthHelper",
+        "ready",
+        "",
+        "onGranted"
+    };
+
+    QtMocHelpers::UintData qt_methods {
+        // Signal 'ready'
+        QtMocHelpers::SignalData<void()>(1, 2, QMC::AccessPublic, QMetaType::Void),
+        // Slot 'onGranted'
+        QtMocHelpers::SlotData<void()>(3, 2, QMC::AccessPrivate, QMetaType::Void),
+    };
+    QtMocHelpers::UintData qt_properties {
+    };
+    QtMocHelpers::UintData qt_enums {
+    };
+    return QtMocHelpers::metaObjectData<OAuthHelper, qt_meta_tag_ZN11OAuthHelperE_t>(QMC::MetaObjectFlag{}, qt_stringData,
+            qt_methods, qt_properties, qt_enums);
+}
+Q_CONSTINIT const QMetaObject OAuthHelper::staticMetaObject = { {
+    QMetaObject::SuperData::link<QObject::staticMetaObject>(),
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11OAuthHelperE_t>.stringdata,
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11OAuthHelperE_t>.data,
+    qt_static_metacall,
+    nullptr,
+    qt_staticMetaObjectRelocatingContent<qt_meta_tag_ZN11OAuthHelperE_t>.metaTypes,
+    nullptr
+} };
+
+void OAuthHelper::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, void **_a)
+{
+    auto *_t = static_cast<OAuthHelper *>(_o);
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        switch (_id) {
+        case 0: _t->ready(); break;
+        case 1: _t->onGranted(); break;
+        default: ;
+        }
+    }
+    if (_c == QMetaObject::IndexOfMethod) {
+        if (QtMocHelpers::indexOfMethod<void (OAuthHelper::*)()>(_a, &OAuthHelper::ready, 0))
+            return;
+    }
+}
+
+const QMetaObject *OAuthHelper::metaObject() const
+{
+    return QObject::d_ptr->metaObject ? QObject::d_ptr->dynamicMetaObject() : &staticMetaObject;
+}
+
+void *OAuthHelper::qt_metacast(const char *_clname)
+{
+    if (!_clname) return nullptr;
+    if (!strcmp(_clname, qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11OAuthHelperE_t>.strings))
+        return static_cast<void*>(this);
+    return QObject::qt_metacast(_clname);
+}
+
+int OAuthHelper::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
+{
+    _id = QObject::qt_metacall(_c, _id, _a);
+    if (_id < 0)
+        return _id;
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        if (_id < 2)
+            qt_static_metacall(this, _c, _id, _a);
+        _id -= 2;
+    }
+    if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
+        if (_id < 2)
+            *reinterpret_cast<QMetaType *>(_a[0]) = QMetaType();
+        _id -= 2;
+    }
+    return _id;
+}
+
+// SIGNAL 0
+void OAuthHelper::ready()
+{
+    QMetaObject::activate(this, &staticMetaObject, 0, nullptr);
+}
+namespace {
+struct qt_meta_tag_ZN12NotifyWindowE_t {};
+} // unnamed namespace
+
+template <> constexpr inline auto NotifyWindow::qt_create_metaobjectdata<qt_meta_tag_ZN12NotifyWindowE_t>()
+{
+    namespace QMC = QtMocConstants;
+    QtMocHelpers::StringRefStorage qt_stringData {
+        "NotifyWindow",
+        "onJobStarted",
+        "",
+        "file",
+        "dir",
+        "onJobProgress",
+        "percent",
+        "onJobFinished"
+    };
+
+    QtMocHelpers::UintData qt_methods {
+        // Slot 'onJobStarted'
+        QtMocHelpers::SlotData<void(const QString &, const QString &)>(1, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 },
+        }}),
+        // Slot 'onJobProgress'
+        QtMocHelpers::SlotData<void(const QString &, const QString &, int)>(5, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 }, { QMetaType::Int, 6 },
+        }}),
+        // Slot 'onJobFinished'
+        QtMocHelpers::SlotData<void(const QString &, const QString &)>(7, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 },
+        }}),
+    };
+    QtMocHelpers::UintData qt_properties {
+    };
+    QtMocHelpers::UintData qt_enums {
+    };
+    return QtMocHelpers::metaObjectData<NotifyWindow, qt_meta_tag_ZN12NotifyWindowE_t>(QMC::MetaObjectFlag{}, qt_stringData,
+            qt_methods, qt_properties, qt_enums);
+}
+Q_CONSTINIT const QMetaObject NotifyWindow::staticMetaObject = { {
+    QMetaObject::SuperData::link<QDialog::staticMetaObject>(),
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN12NotifyWindowE_t>.stringdata,
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN12NotifyWindowE_t>.data,
+    qt_static_metacall,
+    nullptr,
+    qt_staticMetaObjectRelocatingContent<qt_meta_tag_ZN12NotifyWindowE_t>.metaTypes,
+    nullptr
+} };
+
+void NotifyWindow::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, void **_a)
+{
+    auto *_t = static_cast<NotifyWindow *>(_o);
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        switch (_id) {
+        case 0: _t->onJobStarted((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
+        case 1: _t->onJobProgress((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2])),(*reinterpret_cast< std::add_pointer_t<int>>(_a[3]))); break;
+        case 2: _t->onJobFinished((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
+        default: ;
+        }
+    }
+}
+
+const QMetaObject *NotifyWindow::metaObject() const
+{
+    return QObject::d_ptr->metaObject ? QObject::d_ptr->dynamicMetaObject() : &staticMetaObject;
+}
+
+void *NotifyWindow::qt_metacast(const char *_clname)
+{
+    if (!_clname) return nullptr;
+    if (!strcmp(_clname, qt_staticMetaObjectStaticContent<qt_meta_tag_ZN12NotifyWindowE_t>.strings))
+        return static_cast<void*>(this);
+    return QDialog::qt_metacast(_clname);
+}
+
+int NotifyWindow::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
+{
+    _id = QDialog::qt_metacall(_c, _id, _a);
+    if (_id < 0)
+        return _id;
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        if (_id < 3)
+            qt_static_metacall(this, _c, _id, _a);
+        _id -= 3;
+    }
+    if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
+        if (_id < 3)
+            *reinterpret_cast<QMetaType *>(_a[0]) = QMetaType();
+        _id -= 3;
+    }
+    return _id;
+}
+namespace {
+struct qt_meta_tag_ZN18NetworkRetryHelperE_t {};
+} // unnamed namespace
+
+template <> constexpr inline auto NetworkRetryHelper::qt_create_metaobjectdata<qt_meta_tag_ZN18NetworkRetryHelperE_t>()
+{
+    namespace QMC = QtMocConstants;
+    QtMocHelpers::StringRefStorage qt_stringData {
+        "NetworkRetryHelper"
+    };
+
+    QtMocHelpers::UintData qt_methods {
+    };
+    QtMocHelpers::UintData qt_properties {
+    };
+    QtMocHelpers::UintData qt_enums {
+    };
+    return QtMocHelpers::metaObjectData<NetworkRetryHelper, qt_meta_tag_ZN18NetworkRetryHelperE_t>(QMC::MetaObjectFlag{}, qt_stringData,
+            qt_methods, qt_properties, qt_enums);
+}
+Q_CONSTINIT const QMetaObject NetworkRetryHelper::staticMetaObject = { {
+    QMetaObject::SuperData::link<QObject::staticMetaObject>(),
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN18NetworkRetryHelperE_t>.stringdata,
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN18NetworkRetryHelperE_t>.data,
+    qt_static_metacall,
+    nullptr,
+    qt_staticMetaObjectRelocatingContent<qt_meta_tag_ZN18NetworkRetryHelperE_t>.metaTypes,
+    nullptr
+} };
+
+void NetworkRetryHelper::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, void **_a)
+{
+    auto *_t = static_cast<NetworkRetryHelper *>(_o);
+    (void)_t;
+    (void)_c;
+    (void)_id;
+    (void)_a;
+}
+
+const QMetaObject *NetworkRetryHelper::metaObject() const
+{
+    return QObject::d_ptr->metaObject ? QObject::d_ptr->dynamicMetaObject() : &staticMetaObject;
+}
+
+void *NetworkRetryHelper::qt_metacast(const char *_clname)
+{
+    if (!_clname) return nullptr;
+    if (!strcmp(_clname, qt_staticMetaObjectStaticContent<qt_meta_tag_ZN18NetworkRetryHelperE_t>.strings))
+        return static_cast<void*>(this);
+    return QObject::qt_metacast(_clname);
+}
+
+int NetworkRetryHelper::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
+{
+    _id = QObject::qt_metacall(_c, _id, _a);
+    return _id;
+}
+namespace {
+struct qt_meta_tag_ZN11SyncManagerE_t {};
+} // unnamed namespace
+
+template <> constexpr inline auto SyncManager::qt_create_metaobjectdata<qt_meta_tag_ZN11SyncManagerE_t>()
+{
+    namespace QMC = QtMocConstants;
+    QtMocHelpers::StringRefStorage qt_stringData {
+        "SyncManager",
+        "jobStarted",
+        "",
+        "file",
+        "direction",
+        "jobProgress",
+        "percent",
+        "jobFinished",
+        "initialScan",
+        "onDirectoryChanged",
+        "path",
+        "pollRemote",
+        "decideSyncForFile",
+        "localPath",
+        "remoteMeta",
+        "enqueueUpload",
+        "filePath",
+        "enqueueDownload",
+        "fileId",
+        "localTarget"
+    };
+
+    QtMocHelpers::UintData qt_methods {
+        // Signal 'jobStarted'
+        QtMocHelpers::SignalData<void(const QString &, const QString &)>(1, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 },
+        }}),
+        // Signal 'jobProgress'
+        QtMocHelpers::SignalData<void(const QString &, const QString &, int)>(5, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 }, { QMetaType::Int, 6 },
+        }}),
+        // Signal 'jobFinished'
+        QtMocHelpers::SignalData<void(const QString &, const QString &)>(7, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 3 }, { QMetaType::QString, 4 },
+        }}),
+        // Slot 'initialScan'
+        QtMocHelpers::SlotData<void()>(8, 2, QMC::AccessPublic, QMetaType::Void),
+        // Slot 'onDirectoryChanged'
+        QtMocHelpers::SlotData<void(const QString &)>(9, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 10 },
+        }}),
+        // Slot 'pollRemote'
+        QtMocHelpers::SlotData<void()>(11, 2, QMC::AccessPublic, QMetaType::Void),
+        // Slot 'decideSyncForFile'
+        QtMocHelpers::SlotData<void(const QString &, const QJsonObject &)>(12, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 13 }, { QMetaType::QJsonObject, 14 },
+        }}),
+        // Slot 'enqueueUpload'
+        QtMocHelpers::SlotData<void(const QString &)>(15, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 16 },
+        }}),
+        // Slot 'enqueueDownload'
+        QtMocHelpers::SlotData<void(const QString &, const QString &)>(17, 2, QMC::AccessPublic, QMetaType::Void, {{
+            { QMetaType::QString, 18 }, { QMetaType::QString, 19 },
+        }}),
+    };
+    QtMocHelpers::UintData qt_properties {
+    };
+    QtMocHelpers::UintData qt_enums {
+    };
+    return QtMocHelpers::metaObjectData<SyncManager, qt_meta_tag_ZN11SyncManagerE_t>(QMC::MetaObjectFlag{}, qt_stringData,
+            qt_methods, qt_properties, qt_enums);
+}
+Q_CONSTINIT const QMetaObject SyncManager::staticMetaObject = { {
+    QMetaObject::SuperData::link<QObject::staticMetaObject>(),
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11SyncManagerE_t>.stringdata,
+    qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11SyncManagerE_t>.data,
+    qt_static_metacall,
+    nullptr,
+    qt_staticMetaObjectRelocatingContent<qt_meta_tag_ZN11SyncManagerE_t>.metaTypes,
+    nullptr
+} };
+
+void SyncManager::qt_static_metacall(QObject *_o, QMetaObject::Call _c, int _id, void **_a)
+{
+    auto *_t = static_cast<SyncManager *>(_o);
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        switch (_id) {
+        case 0: _t->jobStarted((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
+        case 1: _t->jobProgress((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2])),(*reinterpret_cast< std::add_pointer_t<int>>(_a[3]))); break;
+        case 2: _t->jobFinished((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
+        case 3: _t->initialScan(); break;
+        case 4: _t->onDirectoryChanged((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1]))); break;
+        case 5: _t->pollRemote(); break;
+        case 6: _t->decideSyncForFile((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QJsonObject>>(_a[2]))); break;
+        case 7: _t->enqueueUpload((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1]))); break;
+        case 8: _t->enqueueDownload((*reinterpret_cast< std::add_pointer_t<QString>>(_a[1])),(*reinterpret_cast< std::add_pointer_t<QString>>(_a[2]))); break;
+        default: ;
+        }
+    }
+    if (_c == QMetaObject::IndexOfMethod) {
+        if (QtMocHelpers::indexOfMethod<void (SyncManager::*)(const QString & , const QString & )>(_a, &SyncManager::jobStarted, 0))
+            return;
+        if (QtMocHelpers::indexOfMethod<void (SyncManager::*)(const QString & , const QString & , int )>(_a, &SyncManager::jobProgress, 1))
+            return;
+        if (QtMocHelpers::indexOfMethod<void (SyncManager::*)(const QString & , const QString & )>(_a, &SyncManager::jobFinished, 2))
+            return;
+    }
+}
+
+const QMetaObject *SyncManager::metaObject() const
+{
+    return QObject::d_ptr->metaObject ? QObject::d_ptr->dynamicMetaObject() : &staticMetaObject;
+}
+
+void *SyncManager::qt_metacast(const char *_clname)
+{
+    if (!_clname) return nullptr;
+    if (!strcmp(_clname, qt_staticMetaObjectStaticContent<qt_meta_tag_ZN11SyncManagerE_t>.strings))
+        return static_cast<void*>(this);
+    return QObject::qt_metacast(_clname);
+}
+
+int SyncManager::qt_metacall(QMetaObject::Call _c, int _id, void **_a)
+{
+    _id = QObject::qt_metacall(_c, _id, _a);
+    if (_id < 0)
+        return _id;
+    if (_c == QMetaObject::InvokeMetaMethod) {
+        if (_id < 9)
+            qt_static_metacall(this, _c, _id, _a);
+        _id -= 9;
+    }
+    if (_c == QMetaObject::RegisterMethodArgumentMetaType) {
+        if (_id < 9)
+            *reinterpret_cast<QMetaType *>(_a[0]) = QMetaType();
+        _id -= 9;
+    }
+    return _id;
+}
+
+// SIGNAL 0
+void SyncManager::jobStarted(const QString & _t1, const QString & _t2)
+{
+    QMetaObject::activate<void>(this, &staticMetaObject, 0, nullptr, _t1, _t2);
+}
+
+// SIGNAL 1
+void SyncManager::jobProgress(const QString & _t1, const QString & _t2, int _t3)
+{
+    QMetaObject::activate<void>(this, &staticMetaObject, 1, nullptr, _t1, _t2, _t3);
+}
+
+// SIGNAL 2
+void SyncManager::jobFinished(const QString & _t1, const QString & _t2)
+{
+    QMetaObject::activate<void>(this, &staticMetaObject, 2, nullptr, _t1, _t2);
+}
+QT_WARNING_POP

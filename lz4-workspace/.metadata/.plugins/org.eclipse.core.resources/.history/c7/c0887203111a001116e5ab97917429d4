@@ -1,0 +1,54 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(lz4_packer LANGUAGES CXX)
+
+# Option to force disable lz4 detection
+option(USE_SYSTEM_LZ4 "Try to find and link system liblz4" ON)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Find Qt6 Widgets
+find_package(Qt6 COMPONENTS Widgets REQUIRED)
+
+# Source
+set(SRC ${CMAKE_CURRENT_SOURCE_DIR}/packer_lz4.cpp)
+
+# Create executable target
+add_executable(${PROJECT_NAME} ${SRC})
+
+# Link Qt
+target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Widgets)
+
+# Try to find lz4 headers and library (optional)
+if(USE_SYSTEM_LZ4)
+  find_path(LZ4FRAME_INCLUDE_DIR NAMES lz4frame.h)
+  find_library(LZ4_LIBRARY NAMES lz4)
+
+  if(LZ4FRAME_INCLUDE_DIR AND LZ4_LIBRARY)
+    message(STATUS "Found liblz4: include=${LZ4FRAME_INCLUDE_DIR} lib=${LZ4_LIBRARY}")
+    target_include_directories(${PROJECT_NAME} PRIVATE ${LZ4FRAME_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${LZ4_LIBRARY})
+    # Define macro so the single-file source can enable LZ4 Frame API code paths
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_LZ4_FRAME=1)
+  else()
+    message(STATUS "liblz4 not found; building without LZ4 Frame API. Fallback to lz4 CLI will be used.")
+  endif()
+else()
+  message(STATUS "USE_SYSTEM_LZ4=OFF; skipping liblz4 detection.")
+endif()
+
+# Platform specific tweaks
+if(WIN32)
+  # Enable high DPI awareness on Windows
+  target_compile_definitions(${PROJECT_NAME} PRIVATE QT_DISABLE_DEPRECATED_BEFORE=0)
+endif()
+
+# Installation (optional)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+
+# Helpful packaging variables
+set(CPACK_PACKAGE_NAME "${PROJECT_NAME}")
+set(CPACK_PACKAGE_VENDOR "ExampleOrg")
+include(CPack)

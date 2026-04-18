@@ -1,0 +1,578 @@
+/*
+ torwebserv.c
+ Foreground per-user Tor hidden service helper + embedded HTTP server
+ - No command-line arguments; convention over configuration
+ - Tries to bind 127.0.0.1:8080; if occupied, attempts to SIGTERM the owner, waits, retries,
+   and falls back to an ephemeral port if necessary.
+ - Writes torrc with the chosen port, starts tor detached, serves ~/www on the chosen port.
+ - On Ctrl+C, terminates Tor, poller, and any child connection handlers, then exits.
+ Compile: cc -std=c11 -Wall -Wextra -O2 -o torwebserv torwebserv.c
+*/
+
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/sendfile.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <ctype.h>
+
+static volatile sig_atomic_t running = 1;
+static pid_t tor_pid = -1;
+static pid_t poller_pid = -1;
+
+static void handle_sig(int sig) {
+    (void)sig;
+    running = 0;
+}
+
+/* --- Utilities --- */
+
+static int file_exists_and_nonempty(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    return st.st_size > 0;
+}
+static int is_executable(const char *path) { return access(path, X_OK) == 0; }
+
+static char *find_in_path(const char *name) {
+    if (strchr(name, '/')) {
+        if (is_executable(name)) return strdup(name);
+        return NULL;
+    }
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/bin:/bin:/usr/local/bin";
+    char *p = strdup(path);
+    if (!p) return NULL;
+    char *save = p;
+    char *token;
+    while ((token = strsep(&p, ":")) != NULL) {
+        if (token[0] == '\0') continue;
+        char candidate[PATH_MAX];
+        snprintf(candidate, sizeof(candidate), "%s/%s", token, name);
+        if (is_executable(candidate)) {
+            free(save);
+            return strdup(candidate);
+        }
+    }
+    free(save);
+    return NULL;
+}
+
+static int mkdir_p(const char *path, mode_t mode) {
+    char tmp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len == 0 || len >= sizeof(tmp)) return -1;
+    strncpy(tmp, path, sizeof(tmp));
+    tmp[sizeof(tmp)-1] = '\0';
+    if (tmp[len - 1] == '/') tmp[len - 1] = '\0';
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, mode) != 0 && errno != EEXIST) return -1;
+    return 0;
+}
+
+static int write_text_file(const char *path, const char *content, mode_t mode) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    if (fputs(content, f) == EOF) { fclose(f); return -1; }
+    fclose(f);
+    chmod(path, mode);
+    return 0;
+}
+
+static void web_log(const char *logpath, const char *fmt, ...) {
+    FILE *f = fopen(logpath, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    char timestr[64];
+    strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(f, "[%s] ", timestr);
+    vfprintf(f, fmt, ap);
+    fprintf(f, "\n");
+    va_end(ap);
+    fclose(f);
+}
+
+/* --- Find and optionally kill process holding a TCP port (Linux /proc) --- */
+
+static char *find_socket_inode_for_port(int port) {
+    FILE *f = fopen("/proc/net/tcp", "r");
+    if (!f) return NULL;
+    char line[512];
+    fgets(line, sizeof(line), f); /* skip header */
+    while (fgets(line, sizeof(line), f)) {
+        char local[64], rem[64], st[8], inode[64];
+        if (sscanf(line, "%*d: %63s %63s %7s %*s %*s %*s %*s %*s %63s", local, rem, st, inode) >= 4) {
+            char *colon = strchr(local, ':');
+            if (!colon) continue;
+            int p = (int)strtol(colon+1, NULL, 16);
+            if (p == port) {
+                char *res = strdup(inode);
+                fclose(f);
+                return res;
+            }
+        }
+    }
+    fclose(f);
+    return NULL;
+}
+
+static pid_t find_pid_by_inode(const char *inode) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return -1;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (!isdigit((unsigned char)de->d_name[0])) continue;
+        char fd_dir[PATH_MAX];
+        snprintf(fd_dir, sizeof(fd_dir), "/proc/%s/fd", de->d_name);
+        DIR *df = opendir(fd_dir);
+        if (!df) continue;
+        struct dirent *fde;
+        while ((fde = readdir(df)) != NULL) {
+            if (fde->d_name[0] == '.') continue;
+            char linkpath[PATH_MAX];
+            snprintf(linkpath, sizeof(linkpath), "%s/%s", fd_dir, fde->d_name);
+            char target[PATH_MAX];
+            ssize_t n = readlink(linkpath, target, sizeof(target)-1);
+            if (n > 0) {
+                target[n] = '\0';
+                char want[64];
+                snprintf(want, sizeof(want), "socket:[%s]", inode);
+                if (strcmp(target, want) == 0) {
+                    pid_t pid = (pid_t)atoi(de->d_name);
+                    closedir(df);
+                    closedir(proc);
+                    return pid;
+                }
+            }
+        }
+        closedir(df);
+    }
+    closedir(proc);
+    return -1;
+}
+
+static int find_and_term_port_owner(int port) {
+    char *inode = find_socket_inode_for_port(port);
+    if (!inode) return -1;
+    pid_t pid = find_pid_by_inode(inode);
+    free(inode);
+    if (pid <= 0) return -1;
+    if (kill(pid, SIGTERM) != 0) return -1;
+    return (int)pid;
+}
+
+/* --- Bind helpers: try fixed port then fallback to ephemeral --- */
+
+static int bind_addr_port(const char *addr, int port, int *out_port) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return -1;
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, addr, &sa.sin_addr) != 1) { close(s); return -1; }
+    if (bind(s, (struct sockaddr*)&sa, sizeof(sa)) != 0) { close(s); return -1; }
+    if (out_port) {
+        struct sockaddr_in bound;
+        socklen_t len = sizeof(bound);
+        if (getsockname(s, (struct sockaddr*)&bound, &len) == 0) {
+            *out_port = ntohs(bound.sin_port);
+        } else *out_port = port;
+    }
+    return s;
+}
+
+/* --- spawn tor detached (return pid) --- */
+
+static pid_t spawn_detached_tor_and_getpid(char *const argv[]) {
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (setsid() < 0) { /* ignore */ }
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDIN_FILENO);
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            if (devnull > 2) close(devnull);
+        }
+        execvp(argv[0], argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+/* --- MIME and request handling (minimal) --- */
+
+static const char *mime_type_for(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext) return "application/octet-stream";
+    if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) return "text/html; charset=utf-8";
+    if (strcasecmp(ext, ".css") == 0) return "text/css; charset=utf-8";
+    if (strcasecmp(ext, ".js") == 0) return "application/javascript; charset=utf-8";
+    if (strcasecmp(ext, ".png") == 0) return "image/png";
+    if (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, ".gif") == 0) return "image/gif";
+    if (strcasecmp(ext, ".svg") == 0) return "image/svg+xml";
+    if (strcasecmp(ext, ".txt") == 0) return "text/plain; charset=utf-8";
+    return "application/octet-stream";
+}
+
+static void build_fs_path(const char *docroot, const char *reqpath, char *out, size_t outlen) {
+    if (!reqpath || reqpath[0] != '/') {
+        snprintf(out, outlen, "%s/index.html", docroot);
+        return;
+    }
+    char path[PATH_MAX];
+    strncpy(path, reqpath, sizeof(path)-1);
+    path[sizeof(path)-1] = '\0';
+    char *q = strchr(path, '?'); if (q) *q = '\0';
+    char tmp[PATH_MAX]; char *dst = tmp; char *p = path;
+    while (*p && (dst - tmp) < (int)sizeof(tmp)-1) {
+        if (p[0] == '/') { *dst++ = '/'; while (p[1] == '/') p++; p++; continue; }
+        char seg[PATH_MAX]; int i = 0;
+        while (*p && *p != '/' && i < (int)sizeof(seg)-1) seg[i++] = *p++;
+        seg[i] = '\0';
+        if (strcmp(seg, "..") == 0) {
+            if (dst > tmp+1) { dst--; while (dst > tmp && *dst != '/') dst--; }
+            continue;
+        }
+        int j = 0;
+        while (seg[j] && (dst - tmp) < (int)sizeof(tmp)-1) *dst++ = seg[j++];
+    }
+    if (dst == tmp) *dst++ = '/';
+    *dst = '\0';
+    if (dst > tmp && dst[-1] == '/') strncat(tmp, "index.html", sizeof(tmp)-strlen(tmp)-1);
+    snprintf(out, outlen, "%s%s", docroot, tmp);
+}
+
+static void handle_connection(int client_fd, const char *docroot, const char *web_log_path, const char *client_ip) {
+    char buf[8192];
+    ssize_t n = recv(client_fd, buf, sizeof(buf)-1, 0);
+    if (n <= 0) { close(client_fd); _exit(0); }
+    buf[n] = '\0';
+    char method[16], path[PATH_MAX], proto[32];
+    if (sscanf(buf, "%15s %4095s %31s", method, path, proto) != 3) { close(client_fd); _exit(0); }
+    if (strcmp(method, "GET") != 0) {
+        const char *resp = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        send(client_fd, resp, strlen(resp), 0);
+        web_log(web_log_path, "%s \"%s %s %s\" 405", client_ip, method, path, proto);
+        close(client_fd); _exit(0);
+    }
+    char fs_path[PATH_MAX];
+    build_fs_path(docroot, path, fs_path, sizeof(fs_path));
+    struct stat st;
+    if (stat(fs_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        const char *notfound = "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        send(client_fd, notfound, strlen(notfound), 0);
+        web_log(web_log_path, "%s \"%s %s %s\" 404 %s", client_ip, method, path, proto, fs_path);
+        close(client_fd); _exit(0);
+    }
+    int fd = open(fs_path, O_RDONLY);
+    if (fd < 0) {
+        const char *err = "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+        send(client_fd, err, strlen(err), 0);
+        web_log(web_log_path, "%s \"%s %s %s\" 500 open_failed %s", client_ip, method, path, proto, fs_path);
+        close(client_fd); _exit(0);
+    }
+    const char *ctype = mime_type_for(fs_path);
+    char header[512];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %lld\r\n"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              ctype, (long long)st.st_size);
+    send(client_fd, header, header_len, 0);
+#if defined(__linux__)
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        ssize_t sent = sendfile(client_fd, fd, &offset, st.st_size - offset);
+        if (sent <= 0) break;
+    }
+#else
+    ssize_t r;
+    while ((r = read(fd, buf, sizeof(buf))) > 0) {
+        ssize_t w = 0;
+        while (w < r) {
+            ssize_t s = send(client_fd, buf + w, r - w, 0);
+            if (s <= 0) break;
+            w += s;
+        }
+        if (r <= 0) break;
+    }
+#endif
+    close(fd);
+    web_log(web_log_path, "%s \"%s %s %s\" 200 %lld %s", client_ip, method, path, proto, (long long)st.st_size, fs_path);
+    close(client_fd);
+    _exit(0);
+}
+
+static void run_webserver(int srv_fd, const char *docroot, const char *web_log_path) {
+    web_log(web_log_path, "webserver started, docroot=%s", docroot);
+    signal(SIGCHLD, SIG_IGN);
+    while (running) {
+        struct sockaddr_in cli;
+        socklen_t cli_len = sizeof(cli);
+        int c = accept(srv_fd, (struct sockaddr*)&cli, &cli_len);
+        if (c < 0) {
+            if (errno == EINTR) continue;
+            web_log(web_log_path, "accept failed: %s", strerror(errno));
+            continue;
+        }
+        char cip[INET_ADDRSTRLEN] = "unknown";
+        inet_ntop(AF_INET, &cli.sin_addr, cip, sizeof(cip));
+        pid_t pid = fork();
+        if (pid < 0) {
+            web_log(web_log_path, "fork failed for connection: %s", strerror(errno));
+            close(c);
+            continue;
+        }
+        if (pid == 0) {
+            close(srv_fd);
+            handle_connection(c, docroot, web_log_path, cip);
+        } else {
+            close(c);
+        }
+    }
+    web_log(web_log_path, "webserver stopping (running flag cleared)");
+}
+
+/* --- Main: no args, convention over configuration --- */
+
+int main(void) {
+    const char *HOME = getenv("HOME");
+    if (!HOME) { fprintf(stderr, "HOME not set\n"); return 1; }
+
+    char BASE[PATH_MAX], DATADIR[PATH_MAX], HSDIR[PATH_MAX], TORRC[PATH_MAX];
+    char DOCROOT[PATH_MAX], TOR_LOG[PATH_MAX], WEB_LOG[PATH_MAX];
+
+    const char *TARGET_HOST = "127.0.0.1";
+    const int DEFAULT_PORT = 8080;
+    const char *SOCKS_PORT = "9050";
+    const int WAIT_SECS = 60;
+
+    snprintf(BASE, sizeof(BASE), "%s/.local/onion", HOME);
+    snprintf(DATADIR, sizeof(DATADIR), "%s/data", BASE);
+    snprintf(HSDIR, sizeof(HSDIR), "%s/hs", BASE);
+    snprintf(TORRC, sizeof(TORRC), "%s/torrc", BASE);
+    snprintf(DOCROOT, sizeof(DOCROOT), "%s/www", HOME);
+    snprintf(TOR_LOG, sizeof(TOR_LOG), "%s/tor.log", BASE);
+    snprintf(WEB_LOG, sizeof(WEB_LOG), "%s/web.log", BASE);
+
+    /* Ensure tor exists */
+    char *tor_path = find_in_path("tor");
+    if (!tor_path) {
+        fprintf(stderr, "tor binary not found in PATH. Install Tor or add it to PATH.\n");
+        return 1;
+    }
+
+    /* Create directories */
+    if (mkdir_p(DATADIR, 0700) != 0) web_log(WEB_LOG, "mkdir %s failed: %s", DATADIR, strerror(errno));
+    if (mkdir_p(HSDIR, 0700) != 0) web_log(WEB_LOG, "mkdir %s failed: %s", HSDIR, strerror(errno));
+    if (mkdir_p(DOCROOT, 0755) != 0) web_log(WEB_LOG, "mkdir %s failed: %s", DOCROOT, strerror(errno));
+    chmod(DATADIR, 0700);
+    chmod(HSDIR, 0700);
+
+    /* Create minimal index if missing */
+    char index_path[PATH_MAX];
+    snprintf(index_path, sizeof(index_path), "%s/index.html", DOCROOT);
+    if (!file_exists_and_nonempty(index_path)) {
+        const char *index_html =
+            "<!doctype html>\n"
+            "<html>\n"
+            "<head><meta charset=\"utf-8\"><title>Hidden Service</title></head>\n"
+            "<body><h1>Hello from Josh Ricky's .onion (user mode)</h1></body>\n"
+            "</html>\n";
+        if (write_text_file(index_path, index_html, 0644) != 0)
+            web_log(WEB_LOG, "Failed to write %s: %s", index_path, strerror(errno));
+    }
+
+    /* Attempt to bind to DEFAULT_PORT; if occupied, try to find and SIGTERM owner, wait, retry.
+       If still occupied, fall back to ephemeral port. */
+    int srv = -1;
+    int chosen_port = DEFAULT_PORT;
+    srv = bind_addr_port(TARGET_HOST, DEFAULT_PORT, &chosen_port);
+    if (srv < 0) {
+        if (errno == EADDRINUSE) {
+            web_log(WEB_LOG, "port %d in use; attempting to identify owner", DEFAULT_PORT);
+            int owner = find_and_term_port_owner(DEFAULT_PORT);
+            if (owner > 0) {
+                web_log(WEB_LOG, "sent SIGTERM to pid %d owning port %d; waiting up to 5s", owner, DEFAULT_PORT);
+                int waited = 0;
+                while (waited < 5) {
+                    char procpath[64];
+                    snprintf(procpath, sizeof(procpath), "/proc/%d", owner);
+                    if (access(procpath, F_OK) != 0) break;
+                    sleep(1);
+                    waited++;
+                }
+                srv = bind_addr_port(TARGET_HOST, DEFAULT_PORT, &chosen_port);
+            } else {
+                web_log(WEB_LOG, "could not determine owner of port %d or failed to signal it", DEFAULT_PORT);
+            }
+        }
+    }
+    if (srv < 0) {
+        web_log(WEB_LOG, "falling back to ephemeral port");
+        srv = bind_addr_port(TARGET_HOST, 0, &chosen_port);
+        if (srv < 0) {
+            web_log(WEB_LOG, "failed to bind ephemeral port: %s", strerror(errno));
+            fprintf(stderr, "Failed to bind any port on %s: %s\n", TARGET_HOST, strerror(errno));
+            free(tor_path);
+            return 1;
+        }
+    }
+
+    /* Now we have srv and chosen_port. Write torrc using chosen_port and start tor. */
+    char torrc_content[4096];
+    snprintf(torrc_content, sizeof(torrc_content),
+             "SocksPort %s\n"
+             "DataDirectory %s\n"
+             "HiddenServiceDir %s\n"
+             "HiddenServicePort 80 %s:%d\n"
+             "Log notice file %s\n",
+             SOCKS_PORT, DATADIR, HSDIR, TARGET_HOST, chosen_port, TOR_LOG);
+    if (write_text_file(TORRC, torrc_content, 0644) != 0)
+        web_log(WEB_LOG, "Failed to write %s: %s", TORRC, strerror(errno));
+
+    /* Start Tor detached and capture pid */
+    char *tor_argv[] = { tor_path, "-f", TORRC, NULL };
+    tor_pid = spawn_detached_tor_and_getpid(tor_argv);
+    if (tor_pid <= 0) {
+        fprintf(stderr, "Failed to start tor\n");
+        free(tor_path);
+        close(srv);
+        return 1;
+    }
+    free(tor_path);
+
+    /* Start listening on the already-bound socket */
+    if (listen(srv, 64) != 0) {
+        web_log(WEB_LOG, "listen failed: %s", strerror(errno));
+        close(srv);
+        return 1;
+    }
+
+    /* Keep stderr appended to web log for convenience; keep stdout on terminal */
+    int fd = open(WEB_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        dup2(fd, STDERR_FILENO);
+        if (fd > 2) close(fd);
+    }
+
+    /* Install signal handlers */
+    struct sigaction sa;
+    sa.sa_handler = handle_sig;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    web_log(WEB_LOG, "started, listening on %s:%d, docroot=%s (foreground, no args)", TARGET_HOST, chosen_port, DOCROOT);
+    printf("Webserver listening on %s:%d, docroot=%s\n", TARGET_HOST, chosen_port, DOCROOT);
+
+    /* Poll hostname in a child so accept loop remains responsive */
+    char hostname_path[PATH_MAX];
+    snprintf(hostname_path, sizeof(hostname_path), "%s/hostname", HSDIR);
+    poller_pid = fork();
+    if (poller_pid == 0) {
+        for (int i = 0; i < WAIT_SECS && running; ++i) {
+            if (file_exists_and_nonempty(hostname_path)) {
+                FILE *hf = fopen(hostname_path, "r");
+                if (hf) {
+                    char hostname[512];
+                    if (fgets(hostname, sizeof(hostname), hf)) {
+                        size_t ln = strlen(hostname);
+                        if (ln && hostname[ln-1] == '\n') hostname[ln-1] = '\0';
+                        web_log(WEB_LOG, "Hidden service hostname: %s", hostname);
+                        web_log(WEB_LOG, "Local test command: curl --socks5-hostname 127.0.0.1:%s http://%s/", SOCKS_PORT, hostname);
+                        printf("Hidden service hostname:\n%s\n", hostname);
+                        printf("Local test command (run on this host):\n");
+                        printf("curl --socks5-hostname 127.0.0.1:%s http://%s/\n\n", SOCKS_PORT, hostname);
+                    }
+                    fclose(hf);
+                }
+                _exit(0);
+            }
+            sleep(1);
+        }
+        web_log(WEB_LOG, "Timed out waiting for %s (look at %s for Tor logs)", hostname_path, TOR_LOG);
+        fprintf(stderr, "Timed out waiting for %s (look at %s for Tor logs)\n", hostname_path, TOR_LOG);
+        _exit(0);
+    }
+
+    /* Run accept loop until running==0 */
+    run_webserver(srv, DOCROOT, WEB_LOG);
+
+    /* --- Shutdown sequence after Ctrl+C --- */
+    web_log(WEB_LOG, "shutdown requested; terminating children");
+
+    /* 1) Ask Tor to stop: Tor child called setsid(), so kill its process group to include any Tor children */
+    if (tor_pid > 0) {
+        web_log(WEB_LOG, "sending SIGTERM to tor pid %d and its process group", (int)tor_pid);
+        /* try process group first */
+        if (killpg(tor_pid, SIGTERM) != 0) {
+            /* fallback to single pid */
+            kill(tor_pid, SIGTERM);
+        }
+    }
+
+    /* 2) Terminate poller if still running */
+    if (poller_pid > 0) {
+        web_log(WEB_LOG, "sending SIGTERM to poller pid %d", (int)poller_pid);
+        kill(poller_pid, SIGTERM);
+    }
+
+    /* 3) Terminate any remaining child connection handlers (children of this process) */
+    web_log(WEB_LOG, "sending SIGTERM to remaining child processes");
+    /* send to our process group (this process and its children) */
+    pid_t mypg = getpgrp();
+    if (mypg > 0) {
+        killpg(mypg, SIGTERM);
+    }
+
+    /* 4) Reap children */
+    int status;
+    while (waitpid(-1, &status, WNOHANG) > 0) { /* reap quickly */ }
+
+    /* give children a moment to exit politely, then force-kill lingering ones */
+    sleep(1);
+    while (waitpid(-1, &status, WNOHANG) > 0) { /* reap again */ }
+    /* final sweep: kill any remaining children */
+    killpg(mypg, SIGKILL);
+    while (waitpid(-1, &status, 0) > 0) { /* wait until all gone */ }
+
+    web_log(WEB_LOG, "shutdown complete");
+    close(srv);
+    return 0;
+}

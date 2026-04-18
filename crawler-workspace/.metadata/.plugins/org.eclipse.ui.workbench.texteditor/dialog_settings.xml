@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<section name="java.lang.Class">
+		<item key="selection" value="seed"/>
+		<item key="wrap" value="true"/>
+		<item key="casesensitive" value="false"/>
+		<item key="wholeword" value="false"/>
+		<item key="incremental" value="false"/>
+		<item key="isRegEx" value="false"/>
+		<item key="replaceBarOpen" value="false"/>
+		<list key="findhistory">
+			<item value="usleep"/>
+			<item value="cmpr"/>
+			<item value="strcasestr"/>
+			<item value="sleep_polite"/>
+			<item value="null"/>
+			<item value="seed"/>
+			<item value="port"/>
+			<item value="sleep_seconds_interruptible"/>
+			<item value="sl"/>
+			<item value="sleep"/>
+			<item value="nano"/>
+			<item value="fprintf"/>
+			<item value=".h"/>
+		</list>
+		<list key="replacehistory">
+			<item value="strcasecmp"/>
+			<item value="NULL"/>
+		</list>
+	</section>
+	<section name="org.eclipse.ui.texteditor.FindReplaceDialog_dialogBounds">
+		<item key="DIALOG_X_ORIGIN" value="782"/>
+		<item key="DIALOG_Y_ORIGIN" value="210"/>
+		<item key="DIALOG_WIDTH" value="363"/>
+		<item key="DIALOG_HEIGHT" value="451"/>
+		<item key="DIALOG_FONT_NAME" value="1|Noto Sans|10.5|0|GTK|1|"/>
+	</section>
+</section>

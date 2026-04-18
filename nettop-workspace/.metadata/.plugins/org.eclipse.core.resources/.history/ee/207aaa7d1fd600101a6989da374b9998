@@ -1,0 +1,940 @@
+// nettop.cpp
+//
+// Single-file Qt5 + OpenGL (QOpenGLWidget) application that visualizes
+// live TCP/UDP connections. This version embeds a libpcap-based capture
+// thread (Option B) so the UI can capture packets directly instead of
+// only tailing netdump.log.
+//
+// Build notes:
+// - Requires Qt5 (Widgets, OpenGL) and libpcap.
+// - Link with: -lpcap `pkg-config --cflags --libs Qt5Widgets Qt5Gui Qt5Core`
+// - Example CMake: link Qt5::Widgets Qt5::OpenGL and add pcap to target_link_libraries.
+//
+// Security/privileges:
+// - Live capture typically requires root or CAP_NET_RAW/CAP_NET_ADMIN.
+// - You can run the binary with sudo or grant capabilities to the executable.
+//
+// This is a prototype: production code should add robust error handling,
+// more complete protocol parsing, and careful resource management.
+
+#include <pcap.h> // libpcap for live capture (Option B)
+#include <QApplication>
+#include <QMainWindow>
+#include <QOpenGLWidget>
+#include <QOpenGLFunctions>
+#include <QPainterPath>
+#include <QThread>
+#include <QFile>
+#include <QTextStream>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QTimer>
+#include <QDateTime>
+#include <QPainter>
+#include <QPaintEvent>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QListWidget>
+#include <QSplitter>
+#include <QRandomGenerator>
+#include <QStyleOption>
+#include <QWheelEvent>
+#include <QMouseEvent>
+#include <QElapsedTimer>
+#include <QMetaType>
+#include <cmath>
+#include <map>
+#include <unordered_map>
+#include <tuple>
+#include <vector>
+#include <atomic>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <net/ethernet.h>
+
+// ----------------------------- Data structures -----------------------------
+
+struct ConnectionEvent {
+    qint64 ts_us = 0;      // microsecond timestamp
+    QString proto;         // "TCP" or "UDP"
+    QString src_ip;
+    int src_port = 0;
+    QString dst_ip;
+    int dst_port = 0;
+    QString proc;          // process name if available (best-effort)
+    QString event;         // "connect", "data", "close"
+    int len = 0;           // bytes for data events
+    QJsonObject meta;      // optional metadata (SNI, host, etc.)
+};
+Q_DECLARE_METATYPE(ConnectionEvent)
+
+// ----------------------------- Utilities ----------------------------------
+
+static qint64 now_us() {
+    return QDateTime::currentDateTimeUtc().toMSecsSinceEpoch() * 1000LL;
+}
+
+static QString edgeKey(const ConnectionEvent &ev) {
+    return QString("%1:%2->%3:%4/%5").arg(ev.src_ip).arg(ev.src_port).arg(ev.dst_ip).arg(ev.dst_port).arg(ev.proto);
+}
+
+static QColor colorForIp(const QString &ip) {
+    // deterministic color from IP string
+    uint32_t h = 2166136261u;
+    for (QChar c : ip) {
+        h ^= (uint32_t)c.unicode();
+        h *= 16777619u;
+    }
+    int hue = int(h % 360);
+    return QColor::fromHsl(hue, 200, 160);
+}
+
+// ----------------------------- Node / Edge --------------------------------
+
+struct Node {
+    QString ip;
+    QString label;         // hostname or ip
+    QString proc;          // process name (if local)
+    bool isServer = false; // heuristic
+    QPointF pos;           // layout position
+    QPointF vel;           // layout velocity
+    QColor color;
+    qint64 last_seen_us = 0;
+    int aggregated_bytes = 0;
+};
+
+struct Edge {
+    QString key;           // unique key
+    QString src_ip;
+    int src_port;
+    QString dst_ip;
+    int dst_port;
+    QString proto;
+    qint64 first_seen_us = 0;
+    qint64 last_seen_us = 0;
+    int bytes = 0;
+    bool active = true;
+    float anim_offset = 0.0f;
+};
+
+// ----------------------------- CaptureThread ------------------------------
+// Uses libpcap to capture packets and emits ConnectionEvent objects.
+// It also optionally appends JSON lines to netdump.log for compatibility.
+
+class CaptureThread : public QThread {
+    Q_OBJECT
+public:
+    CaptureThread(const QString &dev = QString(), const QString &bpf = QString(), QObject *parent = nullptr)
+        : QThread(parent), m_dev(dev), m_bpf(bpf), m_handle(nullptr), m_stop(false), m_outFile(nullptr) {}
+
+    ~CaptureThread() override {
+        stopCapture();
+    }
+
+    // Start capture; if pathForLog is non-empty, append JSON lines to that file.
+    void setLogPath(const QString &pathForLog) {
+        m_logPath = pathForLog;
+    }
+
+    void stopCapture() {
+        m_stop.store(true);
+        if (m_handle) {
+            // pcap_breakloop is safe to call from another thread
+            pcap_breakloop(m_handle);
+        }
+        wait(1000);
+        if (m_outFile) {
+            fclose(m_outFile);
+            m_outFile = nullptr;
+        }
+    }
+
+signals:
+    void newEvent(const ConnectionEvent &ev);
+
+protected:
+    void run() override {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        const char *devc = nullptr;
+        if (!m_dev.isEmpty()) devc = m_dev.toUtf8().constData();
+        else {
+            // choose default device
+            devc = pcap_lookupdev(errbuf);
+            if (!devc) {
+                qWarning("pcap_lookupdev failed: %s", errbuf);
+                return;
+            }
+        }
+
+        m_handle = pcap_open_live(devc, 65535, 1, 1000, errbuf);
+        if (!m_handle) {
+            qWarning("pcap_open_live failed: %s", errbuf);
+            return;
+        }
+
+        if (!m_bpf.isEmpty()) {
+            struct bpf_program fp;
+            if (pcap_compile(m_handle, &fp, m_bpf.toUtf8().constData(), 1, PCAP_NETMASK_UNKNOWN) == 0) {
+                if (pcap_setfilter(m_handle, &fp) != 0) {
+                    qWarning("pcap_setfilter failed: %s", pcap_geterr(m_handle));
+                }
+                pcap_freecode(&fp);
+            } else {
+                qWarning("pcap_compile failed: %s", pcap_geterr(m_handle));
+            }
+        }
+
+        if (!m_logPath.isEmpty()) {
+            m_outFile = fopen(m_logPath.toUtf8().constData(), "a");
+            if (!m_outFile) {
+                qWarning("Failed to open log file %s for append", m_logPath.toUtf8().constData());
+            }
+        }
+
+        // Run capture loop; callback will call instance->handlePacket
+        // We use pcap_dispatch in a loop to allow checking m_stop flag more responsively.
+        while (!m_stop.load()) {
+            int rc = pcap_dispatch(m_handle, 100, &CaptureThread::pcapCallback, reinterpret_cast<u_char*>(this));
+            if (rc < 0) {
+                qWarning("pcap_dispatch error: %s", pcap_geterr(m_handle));
+                break;
+            }
+            // small sleep to avoid tight loop if no packets
+            msleep(10);
+        }
+
+        if (m_outFile) {
+            fclose(m_outFile);
+            m_outFile = nullptr;
+        }
+        pcap_close(m_handle);
+        m_handle = nullptr;
+    }
+
+private:
+    static void pcapCallback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+        CaptureThread *self = reinterpret_cast<CaptureThread*>(user);
+        if (!self) return;
+        self->handlePacket(h, bytes);
+    }
+
+    void handlePacket(const struct pcap_pkthdr *h, const u_char *bytes) {
+        if (!h || !bytes) return;
+        // Minimal parsing: Ethernet -> IPv4 -> TCP/UDP
+        if (h->caplen < sizeof(struct ether_header)) return;
+        const struct ether_header *eth = reinterpret_cast<const struct ether_header*>(bytes);
+        uint16_t eth_type = ntohs(eth->ether_type);
+        if (eth_type != ETHERTYPE_IP) return; // only IPv4 for now
+
+        size_t ip_off = sizeof(struct ether_header);
+        if (h->caplen < ip_off + sizeof(struct ip)) return;
+        const struct ip *ip = reinterpret_cast<const struct ip*>(bytes + ip_off);
+        int ihl = ip->ip_hl * 4;
+        if (ihl < 20) return;
+        if (h->caplen < ip_off + ihl) return;
+
+        QString src_ip = QString::fromUtf8(inet_ntoa(ip->ip_src));
+        QString dst_ip = QString::fromUtf8(inet_ntoa(ip->ip_dst));
+        QString proto = (ip->ip_p == IPPROTO_TCP) ? "TCP" : (ip->ip_p == IPPROTO_UDP) ? "UDP" : "IP";
+        int sport = 0, dport = 0;
+        QString event = "data";
+        int payload_len = 0;
+
+        if (ip->ip_p == IPPROTO_TCP) {
+            size_t tcp_off = ip_off + ihl;
+            if (h->caplen < tcp_off + sizeof(struct tcphdr)) return;
+            const struct tcphdr *tcp = reinterpret_cast<const struct tcphdr*>(bytes + tcp_off);
+            sport = ntohs(tcp->th_sport);
+            dport = ntohs(tcp->th_dport);
+            int thlen = tcp->th_off * 4;
+            if (thlen < 20) thlen = 20;
+            size_t payload_off = tcp_off + thlen;
+            if (h->caplen > payload_off) payload_len = h->caplen - payload_off;
+            // detect SYN/FIN for connect/close events
+            bool syn = (tcp->th_flags & TH_SYN);
+            bool fin = (tcp->th_flags & TH_FIN);
+            if (syn && !fin) event = "connect";
+            else if (fin) event = "close";
+        } else if (ip->ip_p == IPPROTO_UDP) {
+            size_t udp_off = ip_off + ihl;
+            if (h->caplen < udp_off + sizeof(struct udphdr)) return;
+            const struct udphdr *udp = reinterpret_cast<const struct udphdr*>(bytes + udp_off);
+            sport = ntohs(udp->uh_sport);
+            dport = ntohs(udp->uh_dport);
+            size_t payload_off = udp_off + sizeof(struct udphdr);
+            if (h->caplen > payload_off) payload_len = h->caplen - payload_off;
+            event = "data";
+        } else {
+            // other IP proto: treat as data
+            payload_len = h->caplen - (ip_off + ihl);
+        }
+
+        ConnectionEvent ev;
+        ev.ts_us = qint64(h->ts.tv_sec) * 1000000LL + qint64(h->ts.tv_usec);
+        ev.proto = proto;
+        ev.src_ip = src_ip;
+        ev.dst_ip = dst_ip;
+        ev.src_port = sport;
+        ev.dst_port = dport;
+        ev.event = event;
+        ev.len = payload_len;
+        // proc lookup not implemented here; left as "-" placeholder
+        ev.proc = "-";
+
+        // Emit signal to consumers (queued connection to model)
+        emit newEvent(ev);
+
+        // Optionally append JSON to netdump.log for compatibility
+        if (m_outFile) {
+            QJsonObject o;
+            double ts = double(ev.ts_us) / 1e6;
+            o["ts"] = ts;
+            o["proto"] = ev.proto;
+            o["src_ip"] = ev.src_ip;
+            o["src_port"] = ev.src_port;
+            o["dst_ip"] = ev.dst_ip;
+            o["dst_port"] = ev.dst_port;
+            o["proc"] = ev.proc;
+            o["event"] = ev.event;
+            o["len"] = ev.len;
+            QJsonDocument doc(o);
+            QByteArray line = doc.toJson(QJsonDocument::Compact);
+            line.append('\n');
+            fwrite(line.constData(), 1, line.size(), m_outFile);
+            fflush(m_outFile);
+        }
+    }
+
+private:
+    QString m_dev;
+    QString m_bpf;
+    pcap_t *m_handle;
+    std::atomic<bool> m_stop;
+    QString m_logPath;
+    FILE *m_outFile;
+};
+
+// ----------------------------- GraphModel --------------------------------
+// Maintains nodes and edges, provides thread-safe updates and a simple layout.
+
+class GraphModel : public QObject {
+    Q_OBJECT
+public:
+    GraphModel(QObject *parent = nullptr)
+        : QObject(parent) {
+        m_layoutTimer = new QTimer(this);
+        connect(m_layoutTimer, &QTimer::timeout, this, &GraphModel::layoutStep);
+        m_layoutTimer->start(50); // 20 Hz layout
+    }
+
+    ~GraphModel() {}
+
+public slots:
+    void onNewEvent(const ConnectionEvent &ev) {
+        QMutexLocker lk(&m_mutex);
+        qint64 now = ev.ts_us ? ev.ts_us : now_us();
+
+        // Ensure nodes exist
+        if (!m_nodes.count(ev.src_ip)) {
+            Node n;
+            n.ip = ev.src_ip;
+            n.label = ev.src_ip;
+            n.proc = (ev.proc.isEmpty() ? "-" : ev.proc);
+            n.isServer = (ev.src_port <= 1024); // heuristic
+            n.pos = randomPoint();
+            n.color = colorForIp(ev.src_ip);
+            n.last_seen_us = now;
+            m_nodes[ev.src_ip] = n;
+        } else {
+            m_nodes[ev.src_ip].last_seen_us = now;
+            if (!ev.proc.isEmpty() && m_nodes[ev.src_ip].proc == "-") m_nodes[ev.src_ip].proc = ev.proc;
+        }
+
+        if (!m_nodes.count(ev.dst_ip)) {
+            Node n;
+            n.ip = ev.dst_ip;
+            n.label = ev.dst_ip;
+            n.proc = "-";
+            n.isServer = (ev.dst_port <= 1024);
+            n.pos = randomPoint();
+            n.color = colorForIp(ev.dst_ip);
+            n.last_seen_us = now;
+            m_nodes[ev.dst_ip] = n;
+        } else {
+            m_nodes[ev.dst_ip].last_seen_us = now;
+        }
+
+        // Edge key
+        QString ek = edgeKey(ev);
+        if (!m_edges.count(ek)) {
+            Edge e;
+            e.key = ek;
+            e.src_ip = ev.src_ip;
+            e.src_port = ev.src_port;
+            e.dst_ip = ev.dst_ip;
+            e.dst_port = ev.dst_port;
+            e.proto = ev.proto;
+            e.first_seen_us = now;
+            e.last_seen_us = now;
+            e.bytes = (ev.event == "data") ? ev.len : 0;
+            e.active = (ev.event != "close");
+            e.anim_offset = QRandomGenerator::global()->bounded(1000) / 1000.0f;
+            m_edges[ek] = e;
+        } else {
+            Edge &e = m_edges[ek];
+            e.last_seen_us = now;
+            if (ev.event == "data") e.bytes += ev.len;
+            if (ev.event == "close") e.active = false;
+        }
+
+        // update node aggregated bytes
+        m_nodes[ev.src_ip].aggregated_bytes += ev.len;
+        m_nodes[ev.dst_ip].aggregated_bytes += ev.len;
+
+        m_dirty = true;
+        emit graphUpdated();
+    }
+
+signals:
+    void graphUpdated();
+    void layoutUpdated();
+
+public:
+    void snapshot(std::vector<Node> &nodes_out, std::vector<Edge> &edges_out) {
+        QMutexLocker lk(&m_mutex);
+        nodes_out.clear();
+        edges_out.clear();
+        nodes_out.reserve(m_nodes.size());
+        edges_out.reserve(m_edges.size());
+        for (auto &kv : m_nodes) nodes_out.push_back(kv.second);
+        for (auto &kv : m_edges) edges_out.push_back(kv.second);
+    }
+
+public slots:
+    void layoutStep() {
+        QMutexLocker lk(&m_mutex);
+        if (m_nodes.empty()) return;
+
+        const float repulse_k = 40000.0f;
+        const float spring_k = 0.02f;
+        const float damping = 0.85f;
+        const float max_disp = 50.0f;
+
+        std::unordered_map<QString, std::vector<QString>> adj;
+        for (auto &kv : m_edges) {
+            const Edge &e = kv.second;
+            if (!m_nodes.count(e.src_ip) || !m_nodes.count(e.dst_ip)) continue;
+            adj[e.src_ip].push_back(e.dst_ip);
+            adj[e.dst_ip].push_back(e.src_ip);
+        }
+
+        for (auto it1 = m_nodes.begin(); it1 != m_nodes.end(); ++it1) {
+            Node &n1 = it1->second;
+            QPointF force(0,0);
+            for (auto it2 = m_nodes.begin(); it2 != m_nodes.end(); ++it2) {
+                if (it1 == it2) continue;
+                Node &n2 = it2->second;
+                QPointF delta = n1.pos - n2.pos;
+                double dist2 = std::max(1.0, double(delta.x()*delta.x() + delta.y()*delta.y()));
+                double f = repulse_k / dist2;
+                force += delta / sqrt(dist2) * f;
+            }
+            auto aiter = adj.find(n1.ip);
+            if (aiter != adj.end()) {
+                for (const QString &nbr : aiter->second) {
+                    Node &n2 = m_nodes[nbr];
+                    QPointF delta = n2.pos - n1.pos;
+                    double dist = std::max(1.0, sqrt(delta.x()*delta.x() + delta.y()*delta.y()));
+                    QPointF f = delta * (spring_k * (dist - 150.0));
+                    force += f;
+                }
+            }
+            n1.vel = (n1.vel + force * 0.001) * damping;
+        }
+
+        for (auto &kv : m_nodes) {
+            Node &n = kv.second;
+            QPointF disp = n.vel;
+            double len = sqrt(disp.x()*disp.x() + disp.y()*disp.y());
+            if (len > max_disp) {
+                disp *= (max_disp / len);
+            }
+            n.pos += disp;
+            if (n.pos.x() < -2000) n.pos.setX(-2000);
+            if (n.pos.x() > 2000) n.pos.setX(2000);
+            if (n.pos.y() < -2000) n.pos.setY(-2000);
+            if (n.pos.y() > 2000) n.pos.setY(2000);
+        }
+
+        emit layoutUpdated();
+    }
+
+    void garbageCollect(qint64 stale_us = 5 * 60 * 1000000LL) {
+        QMutexLocker lk(&m_mutex);
+        qint64 now = now_us();
+        std::vector<QString> toRemoveNodes;
+        std::vector<QString> toRemoveEdges;
+        for (auto &kv : m_nodes) {
+            if (now - kv.second.last_seen_us > stale_us) toRemoveNodes.push_back(kv.first);
+        }
+        for (auto &kv : m_edges) {
+            if (now - kv.second.last_seen_us > stale_us) toRemoveEdges.push_back(kv.first);
+        }
+        for (auto &k : toRemoveEdges) m_edges.erase(k);
+        for (auto &k : toRemoveNodes) m_nodes.erase(k);
+        if (!toRemoveNodes.empty() || !toRemoveEdges.empty()) emit graphUpdated();
+    }
+
+private:
+    QPointF randomPoint() {
+        float x = QRandomGenerator::global()->bounded(-800, 800);
+        float y = QRandomGenerator::global()->bounded(-400, 400);
+        return QPointF(x, y);
+    }
+
+    QMutex m_mutex;
+    std::map<QString, Node> m_nodes;
+    std::map<QString, Edge> m_edges;
+    bool m_dirty = false;
+    QTimer *m_layoutTimer;
+};
+
+// ----------------------------- GLWidget -----------------------------------
+// Renders nodes and edges. Uses QOpenGLWidget with QPainter for simplicity.
+
+class GLWidget : public QOpenGLWidget, protected QOpenGLFunctions {
+    Q_OBJECT
+public:
+    GLWidget(GraphModel *model, QWidget *parent = nullptr)
+        : QOpenGLWidget(parent), m_model(model), m_zoom(1.0f), m_pan(0,0) {
+        setFocusPolicy(Qt::StrongFocus);
+        setMouseTracking(true);
+        connect(m_model, &GraphModel::graphUpdated, this, &GLWidget::onModelUpdated, Qt::QueuedConnection);
+        connect(m_model, &GraphModel::layoutUpdated, this, &GLWidget::onModelUpdated, Qt::QueuedConnection);
+        m_animTimer = new QTimer(this);
+        connect(m_animTimer, &QTimer::timeout, this, &GLWidget::onAnimTick);
+        m_animTimer->start(30); // ~33 FPS
+        m_lastTick.start();
+    }
+
+protected:
+    void initializeGL() override {
+        initializeOpenGLFunctions();
+        glClearColor(0.06f, 0.06f, 0.07f, 1.0f);
+    }
+
+    void resizeGL(int w, int h) override {
+        m_viewportSize = QSize(w, h);
+    }
+
+    void paintGL() override {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        std::vector<Node> nodes;
+        std::vector<Edge> edges;
+        m_model->snapshot(nodes, edges);
+
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.fillRect(rect(), QColor(14,14,16));
+
+        p.save();
+        p.translate(width()/2 + m_pan.x(), height()/2 + m_pan.y());
+        p.scale(m_zoom, m_zoom);
+
+        for (const Edge &e : edges) {
+            const Node *src = findNode(nodes, e.src_ip);
+            const Node *dst = findNode(nodes, e.dst_ip);
+            if (!src || !dst) continue;
+            QPointF a = src->pos;
+            QPointF b = dst->pos;
+
+            float thickness = 1.0f + std::min(12.0f, float(e.bytes) / 2000.0f);
+            QColor col = QColor(180,180,200, 160);
+            if (!e.active) col.setAlpha(80);
+
+            float speed = 0.5f + std::min(5.0f, float(e.bytes) / 5000.0f);
+            float offset = fmod((m_globalAnim + e.anim_offset) * speed, 1.0f);
+
+            QPen pen(col, thickness / m_zoom, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            QVector<qreal> dashes;
+            dashes << 8 << 8;
+            pen.setDashPattern(dashes);
+            pen.setDashOffset(offset * 16.0);
+            p.setPen(pen);
+            p.drawLine(a, b);
+
+            drawArrowhead(p, a, b, thickness, col);
+            drawPortLabel(p, a, e.src_port, QColor(80,80,90,200));
+            drawPortLabel(p, b, e.dst_port, QColor(80,80,90,200));
+        }
+
+        for (const Node &n : nodes) {
+            drawNode(p, n);
+        }
+
+        p.restore();
+        drawHUD(p, nodes, edges);
+    }
+
+    void wheelEvent(QWheelEvent *ev) override {
+        float delta = ev->angleDelta().y() / 120.0f;
+        float factor = std::pow(1.15f, delta);
+        QPointF cursor = ev->position();
+        QPointF before = screenToWorld(cursor);
+        m_zoom *= factor;
+        if (m_zoom < 0.1f) m_zoom = 0.1f;
+        if (m_zoom > 8.0f) m_zoom = 8.0f;
+        QPointF after = screenToWorld(cursor);
+        m_pan += (after - before) * m_zoom;
+        update();
+    }
+
+    void mousePressEvent(QMouseEvent *ev) override {
+        if (ev->button() == Qt::LeftButton) {
+            m_dragging = true;
+            m_lastMouse = ev->pos();
+        }
+    }
+
+    void mouseMoveEvent(QMouseEvent *ev) override {
+        if (m_dragging) {
+            QPoint delta = ev->pos() - m_lastMouse;
+            m_lastMouse = ev->pos();
+            m_pan += delta;
+            update();
+        } else {
+            QPointF world = screenToWorld(ev->pos());
+            std::vector<Node> nodes;
+            std::vector<Edge> edges;
+            m_model->snapshot(nodes, edges);
+            float bestDist = 20.0f / m_zoom;
+            QString hoverIp = "";
+            for (const Node &n : nodes) {
+                float d = std::hypot(float(world.x() - n.pos.x()), float(world.y() - n.pos.y()));
+                if (d < bestDist) {
+                    bestDist = d;
+                    hoverIp = n.ip;
+                }
+            }
+            if (hoverIp != m_hoveredNode) {
+                m_hoveredNode = hoverIp;
+                update();
+            }
+        }
+    }
+
+    void mouseReleaseEvent(QMouseEvent *ev) override {
+        if (ev->button() == Qt::LeftButton) {
+            m_dragging = false;
+        }
+    }
+
+    void leaveEvent(QEvent *ev) override {
+        Q_UNUSED(ev);
+        m_hoveredNode.clear();
+        update();
+    }
+
+private slots:
+    void onModelUpdated() { update(); }
+    void onAnimTick() {
+        qint64 dt = m_lastTick.elapsed();
+        m_lastTick.restart();
+        m_globalAnim += dt / 1000.0f;
+        update();
+    }
+
+private:
+    const Node* findNode(const std::vector<Node> &nodes, const QString &ip) const {
+        for (const Node &n : nodes) if (n.ip == ip) return &n;
+        return nullptr;
+    }
+
+    void drawNode(QPainter &p, const Node &n) {
+        float baseW = 120.0f;
+        float baseH = 48.0f;
+        float extra = std::min(200.0f, float(n.aggregated_bytes) / 200.0f);
+        QRectF r(n.pos.x() - (baseW + extra)/2, n.pos.y() - baseH/2, baseW + extra, baseH);
+
+        QColor fill = n.color;
+        fill.setAlpha(220);
+        QColor border = fill.darker(120);
+        if (n.ip == m_hoveredNode) {
+            fill = fill.lighter(120);
+            border = border.lighter(120);
+        }
+
+        QPainterPath path;
+        path.addRoundedRect(r, 8.0, 8.0);
+        p.setPen(QPen(border, 1.5 / m_zoom));
+        p.setBrush(fill);
+        p.drawPath(path);
+
+        QPointF arrowCenter(r.right() - 18, r.center().y());
+        drawArrowGlyph(p, arrowCenter, 12.0f, QColor(255,255,255,200));
+
+        p.setPen(QPen(QColor(240,240,240), 1));
+        QFont f = p.font();
+        f.setBold(true);
+        f.setPointSizeF(10.0f / m_zoom);
+        p.setFont(f);
+        QRectF labelRect = r.adjusted(8, 6, -36, -baseH/2 + 18);
+        p.drawText(labelRect, Qt::AlignLeft | Qt::AlignVCenter, n.label);
+
+        QFont f2 = p.font();
+        f2.setBold(false);
+        f2.setPointSizeF(8.0f / m_zoom);
+        p.setFont(f2);
+        QRectF procRect = r.adjusted(8, baseH/2 - 22, -36, -6);
+        p.setPen(QPen(QColor(200,200,210), 1));
+        p.drawText(procRect, Qt::AlignLeft | Qt::AlignVCenter, n.proc);
+
+        QColor dot = QColor(255,255,255,180);
+        if (n.ip == m_hoveredNode) dot = QColor(255,200,80,220);
+        p.setBrush(dot);
+        p.setPen(Qt::NoPen);
+        p.drawEllipse(QPointF(r.left() + 10, r.center().y()), 4.0f / m_zoom, 4.0f / m_zoom);
+    }
+
+    void drawArrowGlyph(QPainter &p, const QPointF &center, float size, const QColor &col) {
+        QPolygonF poly;
+        poly << QPointF(center.x() - size*0.6, center.y() - size*0.6)
+             << QPointF(center.x() - size*0.6, center.y() + size*0.6)
+             << QPointF(center.x() + size*0.6, center.y());
+        p.setBrush(col);
+        p.setPen(Qt::NoPen);
+        p.drawPolygon(poly);
+    }
+
+    void drawArrowhead(QPainter &p, const QPointF &a, const QPointF &b, float thickness, const QColor &col) {
+        QPointF dir = b - a;
+        double len = std::hypot(dir.x(), dir.y());
+        if (len < 1.0) return;
+        dir /= len;
+        QPointF perp(-dir.y(), dir.x());
+        float size = 8.0f + thickness * 1.5f;
+        QPointF tip = b - dir * 6.0f;
+        QPolygonF tri;
+        tri << tip + dir * size
+            << tip + perp * (size*0.5f)
+            << tip - perp * (size*0.5f);
+        p.setBrush(col);
+        p.setPen(Qt::NoPen);
+        p.drawPolygon(tri);
+    }
+
+    void drawPortLabel(QPainter &p, const QPointF &pos, int port, const QColor &bg) {
+        QString txt = QString::number(port);
+        QFont f = p.font();
+        f.setPointSizeF(7.0f / m_zoom);
+        p.setFont(f);
+        QFontMetricsF fm(f);
+        QRectF r(0,0,fm.horizontalAdvance(txt)+8, fm.height()+4);
+        r.moveCenter(pos + QPointF(0, -12.0f / m_zoom));
+        p.setPen(Qt::NoPen);
+        QColor b = bg;
+        b.setAlpha(200);
+        p.setBrush(b);
+        p.drawRoundedRect(r, 6.0f / m_zoom, 6.0f / m_zoom);
+        p.setPen(QPen(QColor(240,240,240), 1));
+        p.drawText(r, Qt::AlignCenter, txt);
+    }
+
+    void drawHUD(QPainter &p, const std::vector<Node> &nodes, const std::vector<Edge> &edges) {
+        int w = width();
+        int h = height();
+        QRectF panel(w - 260, 10, 250, 180);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(20,20,24,200));
+        p.drawRoundedRect(panel, 6, 6);
+        p.setPen(QPen(QColor(220,220,230), 1));
+        QFont f = p.font();
+        f.setPointSize(10);
+        f.setBold(true);
+        p.setFont(f);
+        p.drawText(panel.adjusted(8,6,-8,0), Qt::AlignTop | Qt::AlignLeft, "Top talkers");
+
+        std::vector<Node> copy = nodes;
+        std::sort(copy.begin(), copy.end(), [](const Node &a, const Node &b){
+            return a.aggregated_bytes > b.aggregated_bytes;
+        });
+        QFont f2 = p.font();
+        f2.setBold(false);
+        f2.setPointSize(9);
+        p.setFont(f2);
+        int y = 30;
+        int idx = 0;
+        for (const Node &n : copy) {
+            if (idx++ >= 6) break;
+            QString line = QString("%1  %2 B").arg(n.label.left(18)).arg(n.aggregated_bytes);
+            p.drawText(panel.left() + 12, panel.top() + y, line);
+            y += 22;
+        }
+
+        QRectF panel2(w - 260, h - 90, 250, 80);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(20,20,24,200));
+        p.drawRoundedRect(panel2, 6, 6);
+        p.setPen(QPen(QColor(200,200,210), 1));
+        QFont f3 = p.font();
+        f3.setPointSize(9);
+        f3.setBold(true);
+        p.setFont(f3);
+        QString s = QString("Nodes: %1  Edges: %2").arg(nodes.size()).arg(edges.size());
+        p.drawText(panel2.adjusted(8,8,-8,-8), Qt::AlignLeft | Qt::AlignTop, s);
+    }
+
+    QPointF screenToWorld(const QPointF &screen) const {
+        QPointF centered = screen - QPointF(width()/2 + m_pan.x(), height()/2 + m_pan.y());
+        return centered / m_zoom;
+    }
+
+    GraphModel *m_model;
+    QTimer *m_animTimer;
+    QElapsedTimer m_lastTick;
+    float m_globalAnim = 0.0f;
+    QSize m_viewportSize;
+    float m_zoom;
+    QPointF m_pan;
+    bool m_dragging = false;
+    QPoint m_lastMouse;
+    QString m_hoveredNode;
+};
+
+// ----------------------------- MainWindow ---------------------------------
+
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(const QString &dev, const QString &bpf, const QString &logPath, QWidget *parent = nullptr)
+        : QMainWindow(parent) {
+        setWindowTitle("nettop - network topography and connections (embedded capture)");
+        resize(1200, 800);
+
+        m_model = new GraphModel(this);
+        m_gl = new GLWidget(m_model, this);
+
+        QWidget *topBar = new QWidget(this);
+        QHBoxLayout *topLayout = new QHBoxLayout(topBar);
+        topLayout->setContentsMargins(6,6,6,6);
+        QLabel *filterLabel = new QLabel("Filter (BPF):", topBar);
+        m_filterEdit = new QLineEdit(bpf, topBar);
+        QPushButton *applyBtn = new QPushButton("Apply", topBar);
+        topLayout->addWidget(filterLabel);
+        topLayout->addWidget(m_filterEdit);
+        topLayout->addWidget(applyBtn);
+        topLayout->addStretch();
+
+        QWidget *rightPanel = new QWidget(this);
+        QVBoxLayout *rpLayout = new QVBoxLayout(rightPanel);
+        rpLayout->setContentsMargins(6,6,6,6);
+        QLabel *tailLabel = new QLabel("Recent events", rightPanel);
+        m_tailList = new QListWidget(rightPanel);
+        rpLayout->addWidget(tailLabel);
+        rpLayout->addWidget(m_tailList);
+
+        QSplitter *split = new QSplitter(this);
+        split->addWidget(m_gl);
+        split->addWidget(rightPanel);
+        split->setStretchFactor(0, 4);
+        split->setStretchFactor(1, 1);
+
+        QWidget *central = new QWidget(this);
+        QVBoxLayout *mainLayout = new QVBoxLayout(central);
+        mainLayout->setContentsMargins(0,0,0,0);
+        mainLayout->addWidget(topBar);
+        mainLayout->addWidget(split);
+        setCentralWidget(central);
+
+        // Capture thread (embedded libpcap)
+        m_capture = new CaptureThread(dev, bpf, this);
+        if (!logPath.isEmpty()) {
+            m_capture->setLogPath(logPath);
+        }
+        // connect capture -> model
+        qRegisterMetaType<ConnectionEvent>("ConnectionEvent");
+        connect(m_capture, &CaptureThread::newEvent, m_model, &GraphModel::onNewEvent, Qt::QueuedConnection);
+        connect(m_capture, &CaptureThread::newEvent, this, &MainWindow::onNewEvent, Qt::QueuedConnection);
+        m_capture->start();
+
+        // Periodic GC
+        QTimer *gc = new QTimer(this);
+        connect(gc, &QTimer::timeout, [this](){ m_model->garbageCollect(3 * 60 * 1000000LL); });
+        gc->start(60 * 1000);
+
+        connect(applyBtn, &QPushButton::clicked, this, &MainWindow::onApplyFilter);
+    }
+
+    ~MainWindow() override {
+        if (m_capture) {
+            m_capture->stopCapture();
+            m_capture->wait(1000);
+        }
+    }
+
+private slots:
+    void onNewEvent(const ConnectionEvent &ev) {
+        QString s = QString("[%1] %2 %3:%4 -> %5:%6 %7 %8B")
+            .arg(QDateTime::fromMSecsSinceEpoch(ev.ts_us/1000).toString("hh:mm:ss"))
+            .arg(ev.proto)
+            .arg(ev.src_ip).arg(ev.src_port)
+            .arg(ev.dst_ip).arg(ev.dst_port)
+            .arg(ev.event)
+            .arg(ev.len);
+        m_tailList->insertItem(0, s);
+        while (m_tailList->count() > 200) delete m_tailList->takeItem(m_tailList->count()-1);
+    }
+
+    void onApplyFilter() {
+        QString f = m_filterEdit->text().trimmed();
+        // Restart capture with new filter: stop current capture and start a new one
+        if (m_capture) {
+            m_capture->stopCapture();
+            m_capture->wait(500);
+            delete m_capture;
+            m_capture = nullptr;
+        }
+        m_capture = new CaptureThread(QString(), f, this);
+        // keep same log path if any (not stored here)
+        qRegisterMetaType<ConnectionEvent>("ConnectionEvent");
+        connect(m_capture, &CaptureThread::newEvent, m_model, &GraphModel::onNewEvent, Qt::QueuedConnection);
+        connect(m_capture, &CaptureThread::newEvent, this, &MainWindow::onNewEvent, Qt::QueuedConnection);
+        m_capture->start();
+        statusBar()->showMessage(QString("Capture restarted with filter: %1").arg(f), 3000);
+    }
+
+private:
+    GraphModel *m_model;
+    GLWidget *m_gl;
+    CaptureThread *m_capture;
+    QLineEdit *m_filterEdit;
+    QListWidget *m_tailList;
+};
+
+// ----------------------------- main --------------------------------------
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+
+    // Simple CLI: optional device, optional BPF filter, optional log path
+    QString dev;
+    QString bpf;
+    QString logPath;
+    if (argc >= 2) dev = QString::fromUtf8(argv[1]);
+    if (argc >= 3) bpf = QString::fromUtf8(argv[2]);
+    if (argc >= 4) logPath = QString::fromUtf8(argv[3]);
+
+    MainWindow w(dev, bpf, logPath);
+    w.show();
+    return app.exec();
+}
+
+#include "nettop.moc"

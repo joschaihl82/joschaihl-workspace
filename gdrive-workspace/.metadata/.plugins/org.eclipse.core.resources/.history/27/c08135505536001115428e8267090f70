@@ -1,0 +1,2 @@
+#define gdrive4_VERSION_MAJOR @gdrive4_VERSION_MAJOR@
+#define gdrive4_VERSION_MINOR @gdrive4_VERSION_MINOR@

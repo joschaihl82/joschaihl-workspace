@@ -1,0 +1,9 @@
+
+static void bla() {
+
+}
+
+int main() {
+	bla();
+	return H1;
+}

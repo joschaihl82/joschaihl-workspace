@@ -1,0 +1,517 @@
+// main.cpp
+// Qt6 GUI Zip Archiver using libzip with per-file progress and ETA.
+// Build with CMakeLists.txt above.
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QFileDialog>
+#include <QPushButton>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QTableView>
+#include <QHeaderView>
+#include <QStandardItemModel>
+#include <QStyledItemDelegate>
+#include <QProgressBar>
+#include <QLabel>
+#include <QThread>
+#include <QTimer>
+#include <QDateTime>
+#include <QMutex>
+#include <QMetaObject>
+#include <QDebug>
+#include <QMessageBox>
+
+#include <zip.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <errno.h>
+
+#include <vector>
+#include <string>
+#include <memory>
+#include <atomic>
+#include <inttypes.h>
+
+/* ---------------------------
+   Utility: time helper
+   --------------------------- */
+static double now_seconds() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* ---------------------------
+   Progress delegate (renders progress bar in table cell)
+   --------------------------- */
+class ProgressDelegate : public QStyledItemDelegate {
+public:
+    ProgressDelegate(QObject *parent = nullptr) : QStyledItemDelegate(parent) {}
+    QWidget *createEditor(QWidget*, const QStyleOptionViewItem&, const QModelIndex&) const override {
+        return nullptr; // read-only
+    }
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        if (index.column() == 2) { // progress column
+            int val = index.data().toInt();
+            QStyleOptionProgressBar opt;
+            opt.rect = option.rect;
+            opt.minimum = 0;
+            opt.maximum = 100;
+            opt.progress = val;
+            opt.text = QString("%1%").arg(val);
+            opt.textVisible = true;
+            QApplication::style()->drawControl(QStyle::CE_ProgressBar, &opt, painter);
+        } else {
+            QStyledItemDelegate::paint(painter, option, index);
+        }
+    }
+};
+
+/* ---------------------------
+   File list structure used by worker
+   --------------------------- */
+struct FileEntry {
+    QString fullPath;   // source path
+    QString storedName; // name inside zip (relative)
+    uint64_t size;
+};
+
+using FileList = std::vector<FileEntry>;
+
+/* ---------------------------
+   ArchiverWorker: runs in background thread
+   Emits signals to update UI
+   --------------------------- */
+class ArchiverWorker : public QObject {
+    Q_OBJECT
+public:
+    ArchiverWorker(const QString &inputPath, const QString &outputDir, int rowIndex)
+        : m_inputPath(inputPath), m_outputDir(outputDir), m_row(rowIndex) {}
+
+signals:
+    void progressUpdated(int row, double overallPct, int fileIndex, double filePct, qint64 etaSeconds);
+    void finished(int row, bool ok, const QString &message);
+
+public slots:
+    void process() {
+        // Determine if input is file or directory
+        struct stat st;
+        if (stat(m_inputPath.toUtf8().constData(), &st) != 0) {
+            emit finished(m_row, false, QString("stat failed: %1").arg(strerror(errno)));
+            return;
+        }
+        if (S_ISREG(st.st_mode)) {
+            // single file -> create zip with same basename
+            QString base = QFileInfo(m_inputPath).fileName();
+            QString zipname = m_outputDir + "/" + base + ".zip";
+            FileList fl;
+            fl.push_back({m_inputPath, base, (uint64_t)st.st_size});
+            if (!createZipFromList(zipname, fl)) {
+                emit finished(m_row, false, QString("Failed to create %1").arg(zipname));
+            } else {
+                emit finished(m_row, true, QString("Created %1").arg(zipname));
+            }
+        } else if (S_ISDIR(st.st_mode)) {
+            // directory: iterate immediate children and create one zip per child
+            DIR *d = opendir(m_inputPath.toUtf8().constData());
+            if (!d) {
+                emit finished(m_row, false, QString("opendir failed: %1").arg(strerror(errno)));
+                return;
+            }
+            struct dirent *ent;
+            bool any = false;
+            while ((ent = readdir(d)) != nullptr) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                any = true;
+                QString child = m_inputPath + "/" + QString::fromUtf8(ent->d_name);
+                struct stat st2;
+                if (stat(child.toUtf8().constData(), &st2) != 0) {
+                    qWarning() << "stat failed on" << child;
+                    continue;
+                }
+                QString zipname = m_outputDir + "/" + QString::fromUtf8(ent->d_name) + ".zip";
+                if (S_ISREG(st2.st_mode)) {
+                    FileList fl;
+                    fl.push_back({child, QString::fromUtf8(ent->d_name), (uint64_t)st2.st_size});
+                    emit progressUpdated(m_row, 0.0, 0, 0.0, -1);
+                    if (!createZipFromList(zipname, fl)) {
+                        emit finished(m_row, false, QString("Failed to create %1").arg(zipname));
+                        closedir(d);
+                        return;
+                    }
+                } else if (S_ISDIR(st2.st_mode)) {
+                    // collect files recursively under child
+                    FileList fl;
+                    if (!collectFilesRecursive(child, child.length(), fl)) {
+                        emit finished(m_row, false, QString("Failed to scan %1").arg(child));
+                        closedir(d);
+                        return;
+                    }
+                    emit progressUpdated(m_row, 0.0, 0, 0.0, -1);
+                    if (!createZipFromList(zipname, fl)) {
+                        emit finished(m_row, false, QString("Failed to create %1").arg(zipname));
+                        closedir(d);
+                        return;
+                    }
+                } else {
+                    // skip
+                }
+            }
+            closedir(d);
+            if (!any) {
+                emit finished(m_row, false, QString("Input directory is empty"));
+            } else {
+                emit finished(m_row, true, QString("All done"));
+            }
+        } else {
+            emit finished(m_row, false, QString("Input path is neither file nor directory"));
+        }
+    }
+
+private:
+    QString m_inputPath;
+    QString m_outputDir;
+    int m_row;
+
+    /* Recursively collect files under dirpath into fl.
+       baseLen is length of dirpath used to build stored names. */
+    bool collectFilesRecursive(const QString &dirpath, size_t baseLen, FileList &fl) {
+        DIR *d = opendir(dirpath.toUtf8().constData());
+        if (!d) return false;
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+            QString full = dirpath + "/" + QString::fromUtf8(ent->d_name);
+            struct stat st;
+            if (stat(full.toUtf8().constData(), &st) != 0) {
+                closedir(d);
+                return false;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (!collectFilesRecursive(full, baseLen, fl)) {
+                    closedir(d);
+                    return false;
+                }
+            } else if (S_ISREG(st.st_mode)) {
+                // build stored name relative to baseLen
+                QByteArray ba = full.toUtf8();
+                const char *p = ba.constData() + baseLen;
+                if (*p == '/') ++p;
+                QString stored = QString::fromUtf8(p);
+                fl.push_back({full, stored, (uint64_t)st.st_size});
+            }
+        }
+        closedir(d);
+        return true;
+    }
+
+    /* Create zip from a prepared FileList. Registers libzip progress callback.
+       Emits progressUpdated signals as compression proceeds. */
+    bool createZipFromList(const QString &zipPath, const FileList &flist) {
+        // open zip
+        int errorp = 0;
+        zip_t *za = zip_open(zipPath.toUtf8().constData(), ZIP_CREATE | ZIP_TRUNCATE, &errorp);
+        if (!za) {
+            char buf[256];
+            zip_error_to_str(buf, sizeof(buf), errorp, errno);
+            qWarning() << "zip_open failed:" << buf;
+            return false;
+        }
+
+        // add files
+        for (size_t i = 0; i < flist.size(); ++i) {
+            zip_source_t *zs = zip_source_file(za, flist[i].fullPath.toUtf8().constData(), 0, 0);
+            if (!zs) {
+                qWarning() << "zip_source_file failed for" << flist[i].fullPath << zip_strerror(za);
+                zip_discard(za);
+                return false;
+            }
+            zip_int64_t idx = zip_file_add(za, flist[i].storedName.toUtf8().constData(), zs, ZIP_FL_ENC_UTF_8);
+            if (idx < 0) {
+                qWarning() << "zip_file_add failed for" << flist[i].storedName << zip_strerror(za);
+                zip_source_free(zs);
+                zip_discard(za);
+                return false;
+            }
+            zip_set_file_compression(za, idx, ZIP_CM_DEFLATE, 6);
+        }
+
+        // prepare prefix sums
+        std::vector<uint64_t> cum;
+        cum.reserve(flist.size());
+        uint64_t total = 0;
+        for (const auto &fe : flist) { total += fe.size; cum.push_back(total); }
+
+        // userdata for callback
+        struct CBData {
+            ArchiverWorker *worker;
+            std::vector<uint64_t> *cum;
+            std::vector<FileEntry> *files; // not owned; used only for names
+            uint64_t total;
+            double start_time;
+            int row;
+        };
+
+        CBData *cb = new CBData();
+        cb->worker = this;
+        cb->cum = new std::vector<uint64_t>(cum);
+        cb->files = new std::vector<FileEntry>();
+        // copy minimal info for names and sizes
+        for (const auto &fe : flist) cb->files->push_back({fe.fullPath, fe.storedName, fe.size});
+        cb->total = total;
+        cb->start_time = now_seconds();
+        cb->row = m_row;
+
+        // progress callback (C-style)
+        auto progress_cb = [](zip_t*, double progress, void *ud) {
+            CBData *d = static_cast<CBData*>(ud);
+            if (!d) return;
+            double now = now_seconds();
+            double elapsed = now - d->start_time;
+            uint64_t bytes_done = (uint64_t)(progress * (double)d->total + 0.5);
+
+            // find current file index
+            size_t idx = 0;
+            while (idx < d->cum->size() && (*d->cum)[idx] <= bytes_done) ++idx;
+            uint64_t prev = (idx == 0) ? 0 : (*d->cum)[idx - 1];
+            uint64_t file_done = (bytes_done > prev) ? (bytes_done - prev) : 0;
+            uint64_t file_size = (idx < d->files->size()) ? (*d->files)[idx].size : 1;
+            double filePct = (file_size > 0) ? (100.0 * (double)file_done / (double)file_size) : 100.0;
+            uint64_t remaining = (bytes_done < d->total) ? (d->total - bytes_done) : 0;
+            double rate = (elapsed > 0.0001) ? ((double)bytes_done / elapsed) : 0.0;
+            double eta = (rate > 0.0) ? ((double)remaining / rate) : -1.0;
+            qint64 etaSec = (eta >= 0.0) ? (qint64)(eta + 0.5) : -1;
+
+            // emit signal via Qt (safe across threads)
+            QMetaObject::invokeMethod(d->worker, "emitProgress",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(int, d->row),
+                                      Q_ARG(double, progress * 100.0),
+                                      Q_ARG(int, (int)idx),
+                                      Q_ARG(double, filePct),
+                                      Q_ARG(qint64, etaSec));
+        };
+
+        // register callback
+        if (zip_register_progress_callback_with_state(za, 0.01, progress_cb, [](void *ud){ // free callback
+                CBData *d = static_cast<CBData*>(ud);
+                if (!d) return;
+                delete d->cum;
+                delete d->files;
+                delete d;
+            }, cb) < 0) {
+            // registration failed; free cb and continue without progress
+            delete cb->cum;
+            delete cb->files;
+            delete cb;
+        }
+
+        // close (this performs compression and triggers progress callback)
+        if (zip_close(za) != 0) {
+            qWarning() << "zip_close failed:" << zip_strerror(za);
+            return false;
+        }
+
+        return true;
+    }
+
+public slots:
+    // slot invoked via QMetaObject::invokeMethod from C callback to safely emit Qt signal
+    void emitProgress(int row, double overallPct, int fileIndex, double filePct, qint64 etaSeconds) {
+        Q_UNUSED(row);
+        emit progressUpdated(row, overallPct, fileIndex, filePct, etaSeconds);
+    }
+};
+
+/* ---------------------------
+   MainWindow: UI and wiring
+   --------------------------- */
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        auto *central = new QWidget;
+        auto *vbox = new QVBoxLayout;
+
+        // selectors
+        auto *h1 = new QHBoxLayout;
+        m_inputEdit = new QLabel("<no input>");
+        QPushButton *btnIn = new QPushButton("Select Input");
+        connect(btnIn, &QPushButton::clicked, this, &MainWindow::onSelectInput);
+        h1->addWidget(btnIn);
+        h1->addWidget(m_inputEdit);
+        vbox->addLayout(h1);
+
+        auto *h2 = new QHBoxLayout;
+        m_outEdit = new QLabel("<no output>");
+        QPushButton *btnOut = new QPushButton("Select Output Dir");
+        connect(btnOut, &QPushButton::clicked, this, &MainWindow::onSelectOutput);
+        h2->addWidget(btnOut);
+        h2->addWidget(m_outEdit);
+        vbox->addLayout(h2);
+
+        // table
+        m_table = new QTableView;
+        m_model = new QStandardItemModel(0, 4, this);
+        m_model->setHeaderData(0, Qt::Horizontal, "Name");
+        m_model->setHeaderData(1, Qt::Horizontal, "Size (bytes)");
+        m_model->setHeaderData(2, Qt::Horizontal, "Progress");
+        m_model->setHeaderData(3, Qt::Horizontal, "ETA");
+        m_table->setModel(m_model);
+        m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+        m_table->setItemDelegateForColumn(2, new ProgressDelegate(this));
+        vbox->addWidget(m_table);
+
+        // start button
+        QPushButton *btnStart = new QPushButton("Start");
+        connect(btnStart, &QPushButton::clicked, this, &MainWindow::onStart);
+        vbox->addWidget(btnStart);
+
+        central->setLayout(vbox);
+        setCentralWidget(central);
+        setWindowTitle("Zip Archiver GUI");
+        resize(800, 400);
+    }
+
+private slots:
+    void onSelectInput() {
+        QString path = QFileDialog::getExistingDirectory(this, "Select input directory (or choose parent and use files)");
+        if (!path.isEmpty()) {
+            m_inputPath = path;
+            m_inputEdit->setText(path);
+            populateTableForInput();
+        }
+    }
+    void onSelectOutput() {
+        QString path = QFileDialog::getExistingDirectory(this, "Select output directory");
+        if (!path.isEmpty()) {
+            m_outputDir = path;
+            m_outEdit->setText(path);
+        }
+    }
+
+    void populateTableForInput() {
+        m_model->removeRows(0, m_model->rowCount());
+        if (m_inputPath.isEmpty()) return;
+        struct stat st;
+        if (stat(m_inputPath.toUtf8().constData(), &st) != 0) return;
+        if (S_ISREG(st.st_mode)) {
+            QList<QStandardItem*> row;
+            row << new QStandardItem(QFileInfo(m_inputPath).fileName());
+            row << new QStandardItem(QString::number((qint64)st.st_size));
+            row << new QStandardItem(QString::number(0));
+            row << new QStandardItem(QString("-"));
+            m_model->appendRow(row);
+        } else if (S_ISDIR(st.st_mode)) {
+            DIR *d = opendir(m_inputPath.toUtf8().constData());
+            if (!d) return;
+            struct dirent *ent;
+            while ((ent = readdir(d)) != nullptr) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                QString child = m_inputPath + "/" + QString::fromUtf8(ent->d_name);
+                struct stat st2;
+                if (stat(child.toUtf8().constData(), &st2) != 0) continue;
+                qint64 size = 0;
+                if (S_ISREG(st2.st_mode)) size = (qint64)st2.st_size;
+                else if (S_ISDIR(st2.st_mode)) size = -1; // unknown until scanned
+                QList<QStandardItem*> row;
+                row << new QStandardItem(QString::fromUtf8(ent->d_name));
+                row << new QStandardItem(size >= 0 ? QString::number(size) : QString("-"));
+                row << new QStandardItem(QString::number(0));
+                row << new QStandardItem(QString("-"));
+                m_model->appendRow(row);
+            }
+            closedir(d);
+        }
+    }
+
+    void onStart() {
+        if (m_inputPath.isEmpty() || m_outputDir.isEmpty()) {
+            QMessageBox::warning(this, "Missing paths", "Please select input and output directories.");
+            return;
+        }
+        // For each row, start a worker thread to process that child (or the single file)
+        struct stat st;
+        if (stat(m_inputPath.toUtf8().constData(), &st) != 0) return;
+        if (S_ISREG(st.st_mode)) {
+            // single file: start one worker for row 0
+            ArchiverWorker *w = new ArchiverWorker(m_inputPath, m_outputDir, 0);
+            QThread *t = new QThread;
+            w->moveToThread(t);
+            connect(t, &QThread::started, w, &ArchiverWorker::process);
+            connect(w, &ArchiverWorker::progressUpdated, this, &MainWindow::onProgressUpdated);
+            connect(w, &ArchiverWorker::finished, this, &MainWindow::onFinished);
+            connect(w, &ArchiverWorker::finished, w, &ArchiverWorker::deleteLater);
+            connect(t, &QThread::finished, t, &QThread::deleteLater);
+            connect(w, &ArchiverWorker::finished, t, &QThread::quit);
+            t->start();
+        } else if (S_ISDIR(st.st_mode)) {
+            // spawn one worker per immediate child (rows)
+            int rows = m_model->rowCount();
+            for (int r = 0; r < rows; ++r) {
+                QString name = m_model->item(r,0)->text();
+                QString child = m_inputPath + "/" + name;
+                ArchiverWorker *w = new ArchiverWorker(child, m_outputDir, r);
+                QThread *t = new QThread;
+                w->moveToThread(t);
+                connect(t, &QThread::started, w, &ArchiverWorker::process);
+                connect(w, &ArchiverWorker::progressUpdated, this, &MainWindow::onProgressUpdated);
+                connect(w, &ArchiverWorker::finished, this, &MainWindow::onFinished);
+                connect(w, &ArchiverWorker::finished, w, &ArchiverWorker::deleteLater);
+                connect(t, &QThread::finished, t, &QThread::deleteLater);
+                connect(w, &ArchiverWorker::finished, t, &QThread::quit);
+                t->start();
+            }
+        }
+    }
+
+    void onProgressUpdated(int row, double overallPct, int fileIndex, double filePct, qint64 etaSeconds) {
+        Q_UNUSED(fileIndex);
+        // update model row
+        if (row < 0 || row >= m_model->rowCount()) return;
+        m_model->item(row, 2)->setText(QString::number((int)overallPct));
+        QString etaStr = (etaSeconds < 0) ? QString("-") : QDateTime::fromSecsSinceEpoch(etaSeconds).toUTC().toString("HH:mm:ss");
+        // The above conversion uses epoch; better format manually:
+        if (etaSeconds >= 0) {
+            qint64 s = etaSeconds;
+            int h = (int)(s / 3600);
+            int m = (int)((s % 3600) / 60);
+            int sec = (int)(s % 60);
+            etaStr = QString("%1:%2:%3").arg(h,2,10,QChar('0')).arg(m,2,10,QChar('0')).arg(sec,2,10,QChar('0'));
+        }
+        m_model->item(row, 3)->setText(etaStr);
+    }
+
+    void onFinished(int row, bool ok, const QString &message) {
+        Q_UNUSED(ok);
+        if (row >= 0 && row < m_model->rowCount()) {
+            m_model->item(row, 2)->setText(QString::number(100));
+            m_model->item(row, 3)->setText(QString("done"));
+        }
+        qDebug() << "Finished row" << row << ":" << message;
+    }
+
+private:
+    QLabel *m_inputEdit;
+    QLabel *m_outEdit;
+    QString m_inputPath;
+    QString m_outputDir;
+    QTableView *m_table;
+    QStandardItemModel *m_model;
+};
+
+#include "qzipbak2.moc"
+
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include <QObject>

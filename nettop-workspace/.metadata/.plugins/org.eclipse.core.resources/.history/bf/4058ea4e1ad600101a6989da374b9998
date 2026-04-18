@@ -1,0 +1,785 @@
+// main.cpp
+// Qt5 application: libpcap capture in background thread, socket refresher, GUI table.
+// Single-file example. Compile with -lpcap and Qt5 widgets.
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QTableView>
+#include <QHeaderView>
+#include <QStandardItemModel>
+#include <QTimer>
+#include <QThread>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QDateTime>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QDebug>
+#include <QObject>
+
+#include <pcap.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <net/ethernet.h>
+#include <arpa/inet.h>
+
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <atomic>
+#include <map>
+#include <vector>
+#include <cstring>
+
+// ---------- Configuration ----------
+static const char *DEFAULT_IFACE = "wlan0";
+static const char *DEFAULT_FILTER = "";
+static const int UPDATE_INTERVAL_MS = 1000;
+static const int REFRESHER_INTERVAL_MS = 1000;
+static const int DNS_CACHE_TTL = 60;
+
+// ---------- Helpers ----------
+static QString ipToString(uint32_t ip_net) {
+    struct in_addr a; a.s_addr = ip_net;
+    char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a, buf, sizeof(buf));
+    return QString::fromUtf8(buf);
+}
+
+// ---------- Data structures ----------
+struct ConnKey {
+    QString procName;
+    QString local;   // ip:port
+    QString remote;  // ip:port
+    QString lastRequest;
+    bool operator<(const ConnKey &o) const {
+        if (procName != o.procName) return procName < o.procName;
+        if (local != o.local) return local < o.local;
+        return remote < o.remote;
+    }
+};
+
+struct ConnStats {
+    qint64 bytes_in = 0;
+    qint64 bytes_out = 0;
+    qint64 last_bytes_in = 0;
+    qint64 last_bytes_out = 0;
+    double mb_in = 0.0;
+    double mb_out = 0.0;
+    double kbs_in = 0.0;
+    double kbs_out = 0.0;
+    qint64 last_seen = 0;
+    QString last_request;
+};
+
+// ---------- SocketRefresher: background /proc scanner ----------
+class SocketRefresher : public QThread {
+    Q_OBJECT
+public:
+    SocketRefresher(QObject *parent = nullptr) : QThread(parent), stopFlag(false) {}
+    ~SocketRefresher() { stop(); }
+
+    void stop() {
+        stopFlag.store(true);
+        wait();
+    }
+
+    QString getProcForSocket(const QString &proto, const QString &ip, int port) {
+        QMutexLocker lk(&mapMutex);
+        QString key = proto + "|" + ip + ":" + QString::number(port);
+        return socketToProc.value(key, QString("-"));
+    }
+
+    QMap<QString, QString> snapshot() {
+        QMutexLocker lk(&mapMutex);
+        return socketToProc;
+    }
+
+signals:
+    void refreshed();
+
+protected:
+    void run() override {
+        while (!stopFlag.load()) {
+            buildInodeToPidMap();
+            buildSocketMapFromProcNet();
+            emit refreshed();
+            int slept = 0;
+            while (slept < REFRESHER_INTERVAL_MS && !stopFlag.load()) {
+                msleep(100);
+                slept += 100;
+            }
+        }
+    }
+
+private:
+    std::atomic<bool> stopFlag;
+    QMutex mapMutex;
+    QMap<QString, QString> socketToProc; // key -> procname
+    QMap<QString, QString> inodeToPid;   // inode -> pid
+    QMap<QString, QString> pidToName;    // pid -> comm
+
+    bool readFileLine(const QString &path, QString &out) {
+        FILE *f = fopen(path.toUtf8().constData(), "r");
+        if (!f) return false;
+        char buf[512];
+        if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+        fclose(f);
+        size_t len = strlen(buf);
+        if (len && buf[len-1] == '\n') buf[len-1] = '\0';
+        out = QString::fromUtf8(buf);
+        return true;
+    }
+
+    void buildInodeToPidMap() {
+        inodeToPid.clear();
+        pidToName.clear();
+        DIR *pdir = opendir("/proc");
+        if (!pdir) return;
+        struct dirent *dent;
+        while ((dent = readdir(pdir)) != nullptr) {
+            char *endptr;
+            long pid = strtol(dent->d_name, &endptr, 10);
+            if (*endptr != '\0') continue;
+            QString pidStr = QString::number(pid);
+            QString comm;
+            QString commPath = QString("/proc/%1/comm").arg(pidStr);
+            readFileLine(commPath, comm);
+            if (comm.isEmpty()) comm = QString("-");
+            pidToName[pidStr] = comm;
+
+            QString fdDir = QString("/proc/%1/fd").arg(pidStr);
+            DIR *fdd = opendir(fdDir.toUtf8().constData());
+            if (!fdd) continue;
+            struct dirent *fdent;
+            while ((fdent = readdir(fdd)) != nullptr) {
+                if (strcmp(fdent->d_name, ".")==0 || strcmp(fdent->d_name,"..")==0) continue;
+                QString linkPath = fdDir + "/" + fdent->d_name;
+                char target[PATH_MAX];
+                ssize_t r = readlink(linkPath.toUtf8().constData(), target, sizeof(target)-1);
+                if (r <= 0) continue;
+                target[r] = '\0';
+                const char *prefix = "socket:[";
+                char *p = strstr(target, prefix);
+                if (p) {
+                    p += strlen(prefix);
+                    char *q = strchr(p, ']');
+                    if (q) {
+                        *q = '\0';
+                        QString inode = QString::fromUtf8(p);
+                        inodeToPid[inode] = pidStr;
+                    }
+                }
+            }
+            closedir(fdd);
+        }
+        closedir(pdir);
+    }
+
+    static bool parseProcNetAddr(const QString &hexAddr, QString &ipOut, int &portOut) {
+        QStringList parts = hexAddr.split(':');
+        if (parts.size() != 2) return false;
+        bool ok;
+        quint32 ipHex = parts[0].toUInt(&ok, 16);
+        if (!ok) return false;
+        quint16 port = parts[1].toUShort(&ok, 16);
+        if (!ok) return false;
+        quint32 ipNet = htonl(ipHex);
+        struct in_addr a; a.s_addr = ipNet;
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &a, buf, sizeof(buf));
+        ipOut = QString::fromUtf8(buf);
+        portOut = (int)port;
+        return true;
+    }
+
+    void parseProcNetFile(const char *proto, QMap<QString, QString> &outMap) {
+        QString path = QString("/proc/net/%1").arg(proto);
+        FILE *f = fopen(path.toUtf8().constData(), "r");
+        if (!f) return;
+        char line[2048];
+        if (!fgets(line, sizeof(line), f)) { fclose(f); return; }
+        while (fgets(line, sizeof(line), f)) {
+            char local[128];
+            unsigned long inode = 0;
+            int items = sscanf(line, "%*d: %127s %*s %*s %*s %*s %*s %*s %*s %lu", local, &inode);
+            if (items >= 2) {
+                QString localStr = QString::fromUtf8(local);
+                QString ip; int port;
+                if (!parseProcNetAddr(localStr, ip, port)) continue;
+                QString inodeStr = QString::number(inode);
+                QString pid = inodeToPid.value(inodeStr, QString());
+                QString procname = pid.isEmpty() ? QString("-") : pidToName.value(pid, QString("-"));
+                QString key = QString("%1|%2:%3").arg(proto).arg(ip).arg(port);
+                outMap[key] = procname;
+            }
+        }
+        fclose(f);
+    }
+
+    void buildSocketMapFromProcNet() {
+        QMap<QString, QString> newMap;
+        parseProcNetFile("tcp", newMap);
+        parseProcNetFile("udp", newMap);
+        QMutexLocker lk(&mapMutex);
+        socketToProc.swap(newMap);
+    }
+};
+
+// ---------- PcapWorker: libpcap capture in background ----------
+class PcapWorker : public QObject {
+    Q_OBJECT
+public:
+    PcapWorker(const QString &iface, const QString &filterExpr, SocketRefresher *refresher, QObject *parent = nullptr)
+        : QObject(parent), iface_(iface), filterExpr_(filterExpr), refresher_(refresher), handle_(nullptr) {}
+
+    ~PcapWorker() { stop(); }
+
+public slots:
+    void startCapture() {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        handle_ = pcap_open_live(iface_.toUtf8().constData(), 65535, 1, 1000, errbuf);
+        if (!handle_) {
+            emit error(QString("pcap_open_live failed: %1").arg(errbuf));
+            return;
+        }
+        if (!filterExpr_.isEmpty()) {
+            struct bpf_program fp;
+            if (pcap_compile(handle_, &fp, filterExpr_.toUtf8().constData(), 1, PCAP_NETMASK_UNKNOWN) == -1 ||
+                pcap_setfilter(handle_, &fp) == -1) {
+                emit error(QString("filter error: %1").arg(pcap_geterr(handle_)));
+                pcap_freecode(&fp);
+                pcap_close(handle_);
+                handle_ = nullptr;
+                return;
+            }
+            pcap_freecode(&fp);
+        }
+        // run loop (blocking) in this thread
+        pcap_loop(handle_, -1, &PcapWorker::pcap_cb, reinterpret_cast<u_char*>(this));
+        if (handle_) { pcap_close(handle_); handle_ = nullptr; }
+        emit finished();
+    }
+
+    void stop() {
+        if (handle_) pcap_breakloop(handle_);
+    }
+
+signals:
+    void packetParsed(const ConnKey &key, qint64 bytes_in, qint64 bytes_out, qint64 ts);
+    void error(const QString &msg);
+    void finished();
+
+private:
+    QString iface_;
+    QString filterExpr_;
+    SocketRefresher *refresher_;
+    pcap_t *handle_;
+
+    static void pcap_cb(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+        PcapWorker *self = reinterpret_cast<PcapWorker*>(user);
+        if (!self) return;
+        self->processPacket(h, bytes);
+    }
+
+    static bool is_http_method(const char *s, size_t len) {
+        const char *methods[] = {"GET","POST","PUT","DELETE","HEAD","OPTIONS","PATCH","CONNECT","TRACE"};
+        for (const char *m : methods) {
+            size_t ml = strlen(m);
+            if (len >= ml+1 && memcmp(s, m, ml) == 0 && s[ml] == ' ') return true;
+        }
+        return false;
+    }
+
+    static QString parse_http_request(const u_char *payload, size_t plen) {
+        const char *p = reinterpret_cast<const char*>(payload);
+        const char *hdr_end = strstr(p, "\r\n\r\n");
+        if (!hdr_end) return QString();
+        const char *line_end = (const char*)memchr(p, '\n', hdr_end - p);
+        if (!line_end) return QString();
+        size_t first_len = line_end - p;
+        if (first_len > 0 && p[first_len-1] == '\r') first_len--;
+        if (!is_http_method(p, first_len)) return QString();
+        QString reqline = QString::fromUtf8(p, (int)first_len);
+        // Host header
+        const char *cur = line_end + 1;
+        const char *end = hdr_end;
+        QString host;
+        while (cur < end) {
+            const char *next = (const char*)memchr(cur, '\n', end - cur);
+            if (!next) break;
+            size_t l = next - cur;
+            if (l > 0 && cur[l-1] == '\r') l--;
+            if (l >= 5 && strncasecmp(cur, "Host:", 5) == 0) {
+                const char *val = cur + 5;
+                while (val < next && (*val == ' ' || *val == '\t')) ++val;
+                host = QString::fromUtf8(val, (int)(next - val));
+                break;
+            }
+            cur = next + 1;
+        }
+        if (!host.isEmpty()) reqline += " Host: " + host;
+        return reqline;
+    }
+
+    static QString parse_dns_query(const u_char *payload, size_t plen) {
+        if (plen < 12) return QString();
+        uint16_t qdcount = ntohs(*(uint16_t*)(payload + 4));
+        if (qdcount == 0) return QString();
+        size_t off = 12;
+        QString qname;
+        while (off < plen) {
+            uint8_t len = payload[off++];
+            if (len == 0) break;
+            if (len & 0xC0) { if (off >= plen) break; off++; break; }
+            if (off + len > plen) break;
+            qname += QString::fromUtf8((const char*)(payload + off), len);
+            qname += ".";
+            off += len;
+        }
+        if (!qname.isEmpty() && qname.endsWith(".")) qname.chop(1);
+        return qname;
+    }
+
+    static QString parse_tls_sni(const u_char *payload, size_t plen) {
+        if (plen < 5) return QString();
+        const u_char *p = payload;
+        uint8_t rec_type = p[0];
+        if (rec_type != 22) return QString();
+        uint16_t rec_len = (p[3] << 8) | p[4];
+        if (5 + rec_len > plen) return QString();
+        p += 5;
+        size_t remain = rec_len;
+        if (remain < 4) return QString();
+        uint8_t hs_type = p[0];
+        if (hs_type != 1) return QString();
+        uint32_t hs_len = ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+        if (hs_len + 4 > remain) return QString();
+        p += 4;
+        size_t hs_rem = hs_len;
+        if (hs_rem < 2 + 32 + 1) return QString();
+        p += 2 + 32;
+        hs_rem -= 34;
+        if (hs_rem < 1) return QString();
+        uint8_t sid_len = p[0];
+        p += 1; hs_rem -= 1;
+        if (hs_rem < sid_len) return QString();
+        p += sid_len; hs_rem -= sid_len;
+        if (hs_rem < 2) return QString();
+        uint16_t cs_len = (p[0] << 8) | p[1];
+        p += 2; hs_rem -= 2;
+        if (hs_rem < cs_len) return QString();
+        p += cs_len; hs_rem -= cs_len;
+        if (hs_rem < 1) return QString();
+        uint8_t comp_len = p[0];
+        p += 1; hs_rem -= 1;
+        if (hs_rem < comp_len) return QString();
+        p += comp_len; hs_rem -= comp_len;
+        if (hs_rem < 2) return QString();
+        uint16_t ext_total = (p[0] << 8) | p[1];
+        p += 2; hs_rem -= 2;
+        if (hs_rem < ext_total) return QString();
+        const u_char *ext_end = p + ext_total;
+        while (p + 4 <= ext_end) {
+            uint16_t ext_type = (p[0] << 8) | p[1];
+            uint16_t ext_len = (p[2] << 8) | p[3];
+            p += 4;
+            if (p + ext_len > ext_end) break;
+            if (ext_type == 0x0000) {
+                if (ext_len < 2) break;
+                uint16_t list_len = (p[0] << 8) | p[1];
+                const u_char *q = p + 2;
+                const u_char *qend = p + ext_len;
+                while (q + 3 <= qend) {
+                    uint8_t name_type = q[0];
+                    uint16_t name_len = (q[1] << 8) | q[2];
+                    q += 3;
+                    if (q + name_len > qend) break;
+                    if (name_type == 0) {
+                        return QString::fromUtf8((const char*)q, name_len);
+                    }
+                    q += name_len;
+                }
+                break;
+            }
+            p += ext_len;
+        }
+        return QString();
+    }
+
+    static QString parse_dhcp(const u_char *payload, size_t plen) {
+        if (plen < 240) return QString();
+        const u_char *p = payload;
+        uint32_t xid = ntohl(*(uint32_t*)(p + 4));
+        uint32_t yiaddr = *(uint32_t*)(p + 16);
+        if (!(payload[236] == 0x63 && payload[237] == 0x82 && payload[238] == 0x53 && payload[239] == 0x63)) return QString();
+        const u_char *options = payload + 240;
+        size_t optlen = plen - 240;
+        int msg_type = -1;
+        QString hostname;
+        uint32_t req_ip = 0;
+        size_t off = 0;
+        while (off < optlen) {
+            uint8_t code = options[off++];
+            if (code == 0xff) break;
+            if (code == 0x00) continue;
+            if (off >= optlen) break;
+            uint8_t len = options[off++];
+            if (off + len > optlen) break;
+            if (code == 53 && len == 1) msg_type = options[off];
+            else if (code == 12) hostname = QString::fromUtf8((const char*)(options + off), len);
+            else if (code == 50 && len == 4) memcpy(&req_ip, options + off, 4);
+            off += len;
+        }
+        QString mt;
+        switch (msg_type) {
+            case 1: mt = "DISCOVER"; break;
+            case 2: mt = "OFFER"; break;
+            case 3: mt = "REQUEST"; break;
+            case 5: mt = "ACK"; break;
+            default: mt = QString("TYPE%1").arg(msg_type);
+        }
+        QString yi = yiaddr ? ipToString(yiaddr) : QString("-");
+        QString rip = req_ip ? ipToString(req_ip) : QString("-");
+        return QString("DHCP %1 xid=0x%2 yi=%3 req=%4 host=%5").arg(mt).arg(QString::number(xid,16)).arg(yi).arg(rip).arg(hostname.isEmpty() ? "-" : hostname);
+    }
+
+    void processPacket(const struct pcap_pkthdr *h, const u_char *bytes) {
+        if (!h || !bytes) return;
+        if (h->caplen < sizeof(struct ether_header)) return;
+        const struct ether_header *eth = (const struct ether_header*)bytes;
+        uint16_t eth_type = ntohs(eth->ether_type);
+        if (eth_type != ETHERTYPE_IP) return;
+        size_t ip_off = sizeof(struct ether_header);
+        if (h->caplen < ip_off + sizeof(struct ip)) return;
+        const struct ip *ip = (const struct ip*)(bytes + ip_off);
+        int ihl = ip->ip_hl * 4;
+        if (ihl < 20) return;
+        if (h->caplen < ip_off + ihl) return;
+        uint32_t src_ip = ip->ip_src.s_addr;
+        uint32_t dst_ip = ip->ip_dst.s_addr;
+        qint64 ts = (qint64)h->ts.tv_sec;
+
+        if (ip->ip_p == IPPROTO_TCP) {
+            size_t tcp_off = ip_off + ihl;
+            if (h->caplen < tcp_off + sizeof(struct tcphdr)) return;
+            const struct tcphdr *tcp = (const struct tcphdr*)(bytes + tcp_off);
+            int tcp_hdr_len = tcp->th_off * 4;
+            if (tcp_hdr_len < 20) return;
+            if (h->caplen < tcp_off + tcp_hdr_len) return;
+            size_t payload_off = tcp_off + tcp_hdr_len;
+            size_t payload_len = (h->caplen > payload_off) ? (h->caplen - payload_off) : 0;
+            const u_char *payload = bytes + payload_off;
+            unsigned short sport = ntohs(tcp->th_sport);
+            unsigned short dport = ntohs(tcp->th_dport);
+
+            // determine process via refresher
+            QString proc = QString("-");
+            bool localIsDst = false;
+            if (refresher_) {
+                QString dstIp = ipToString(dst_ip);
+                QString srcIp = ipToString(src_ip);
+                proc = refresher_->getProcForSocket("tcp", dstIp, dport);
+                if (proc == "-" || proc.isEmpty()) {
+                    proc = refresher_->getProcForSocket("tcp", srcIp, sport);
+                    localIsDst = (proc != "-" && !proc.isEmpty());
+                } else {
+                    localIsDst = true;
+                }
+            }
+            if (proc.isEmpty()) proc = "-";
+
+            QString local = localIsDst ? (ipToString(dst_ip) + ":" + QString::number(dport)) : (ipToString(src_ip) + ":" + QString::number(sport));
+            QString remote = localIsDst ? (ipToString(src_ip) + ":" + QString::number(sport)) : (ipToString(dst_ip) + ":" + QString::number(dport));
+            QString lastReq;
+
+            // HTTP
+            if ((dport == 80 || sport == 80) && payload_len > 0 && payload_len < 65536) {
+                if (is_http_method((const char*)payload, payload_len)) {
+                    lastReq = parse_http_request(payload, payload_len);
+                }
+            }
+            // TLS SNI
+            if (lastReq.isEmpty() && (dport == 443 || sport == 443) && payload_len > 0) {
+                QString sni = parse_tls_sni(payload, payload_len);
+                if (!sni.isEmpty()) lastReq = "TLS SNI: " + sni;
+            }
+
+            qint64 bin = localIsDst ? (qint64)payload_len : 0;
+            qint64 bout = localIsDst ? 0 : (qint64)payload_len;
+
+            ConnKey key{proc, local, remote, lastReq};
+            emit packetParsed(key, bin, bout, ts);
+        } else if (ip->ip_p == IPPROTO_UDP) {
+            size_t udp_off = ip_off + ihl;
+            if (h->caplen < udp_off + sizeof(struct udphdr)) return;
+            const struct udphdr *udp = (const struct udphdr*)(bytes + udp_off);
+            size_t payload_off = udp_off + sizeof(struct udphdr);
+            size_t payload_len = (h->caplen > payload_off) ? (h->caplen - payload_off) : 0;
+            const u_char *payload = bytes + payload_off;
+            unsigned short sport = ntohs(udp->uh_sport);
+            unsigned short dport = ntohs(udp->uh_dport);
+
+            QString proc = QString("-");
+            bool localIsDst = false;
+            if (refresher_) {
+                QString dstIp = ipToString(dst_ip);
+                QString srcIp = ipToString(src_ip);
+                proc = refresher_->getProcForSocket("udp", dstIp, dport);
+                if (proc == "-" || proc.isEmpty()) {
+                    proc = refresher_->getProcForSocket("udp", srcIp, sport);
+                    localIsDst = (proc != "-" && !proc.isEmpty());
+                } else {
+                    localIsDst = true;
+                }
+            }
+            if (proc.isEmpty()) proc = "-";
+
+            QString local = localIsDst ? (ipToString(dst_ip) + ":" + QString::number(dport)) : (ipToString(src_ip) + ":" + QString::number(sport));
+            QString remote = localIsDst ? (ipToString(src_ip) + ":" + QString::number(sport)) : (ipToString(dst_ip) + ":" + QString::number(dport));
+            QString lastReq;
+
+            // DNS
+            if (dport == 53 || sport == 53) {
+                QString q = parse_dns_query(payload, payload_len);
+                if (!q.isEmpty()) lastReq = "DNS Q: " + q;
+            }
+            // DHCP
+            if ((dport == 67 || dport == 68 || sport == 67 || sport == 68) && payload_len > 0) {
+                QString dh = parse_dhcp(payload, payload_len);
+                if (!dh.isEmpty()) lastReq = dh;
+            }
+
+            qint64 bin = localIsDst ? (qint64)payload_len : 0;
+            qint64 bout = localIsDst ? 0 : (qint64)payload_len;
+
+            ConnKey key{proc, local, remote, lastReq};
+            emit packetParsed(key, bin, bout, ts);
+        }
+    }
+};
+
+// ---------- MainWindow: GUI ----------
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr)
+        : QMainWindow(parent), refresher_(nullptr), pcapThread_(nullptr), pcapWorker_(nullptr) {
+        setWindowTitle("nettop_qt");
+        resize(1100, 600);
+
+        QWidget *central = new QWidget(this);
+        QVBoxLayout *vbox = new QVBoxLayout(central);
+
+        QHBoxLayout *hbox = new QHBoxLayout();
+        hbox->addWidget(new QLabel("Interface:"));
+        ifaceEdit_ = new QLineEdit(DEFAULT_IFACE);
+        hbox->addWidget(ifaceEdit_);
+        hbox->addWidget(new QLabel("Filter:"));
+        filterEdit_ = new QLineEdit(DEFAULT_FILTER);
+        hbox->addWidget(filterEdit_);
+        startBtn_ = new QPushButton("Start");
+        stopBtn_ = new QPushButton("Stop");
+        stopBtn_->setEnabled(false);
+        hbox->addWidget(startBtn_);
+        hbox->addWidget(stopBtn_);
+        vbox->addLayout(hbox);
+
+        tableView_ = new QTableView(this);
+        model_ = new QStandardItemModel(this);
+        QStringList headers = {"Path/Name", "Local (ip:port)", "Remote (ip:port)", "Last Request", "MB in", "MB out", "KB/s in", "KB/s out", "Last seen"};
+        model_->setHorizontalHeaderLabels(headers);
+        tableView_->setModel(model_);
+        tableView_->setSortingEnabled(true);
+        tableView_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        vbox->addWidget(tableView_);
+
+        setCentralWidget(central);
+
+        uiTimer_ = new QTimer(this);
+        uiTimer_->setInterval(UPDATE_INTERVAL_MS);
+        connect(uiTimer_, &QTimer::timeout, this, &MainWindow::onUiTimer);
+
+        connect(startBtn_, &QPushButton::clicked, this, &MainWindow::onStart);
+        connect(stopBtn_, &QPushButton::clicked, this, &MainWindow::onStop);
+    }
+
+    ~MainWindow() {
+        stopAll();
+    }
+
+public slots:
+    void onStart() {
+        if (pcapWorker_) return;
+
+        // start refresher
+        refresher_ = new SocketRefresher(this);
+        connect(refresher_, &SocketRefresher::refreshed, this, &MainWindow::onRefreshed, Qt::QueuedConnection);
+        refresher_->start();
+
+        // start pcap worker in its own thread
+        QString iface = ifaceEdit_->text().trimmed();
+        if (iface.isEmpty()) iface = DEFAULT_IFACE;
+        QString filter = filterEdit_->text().trimmed();
+
+        pcapThread_ = new QThread(this);
+        pcapWorker_ = new PcapWorker(iface, filter, refresher_, nullptr);
+        pcapWorker_->moveToThread(pcapThread_);
+        connect(pcapThread_, &QThread::started, pcapWorker_, &PcapWorker::startCapture);
+        connect(pcapWorker_, &PcapWorker::packetParsed, this, &MainWindow::onPacketParsed, Qt::QueuedConnection);
+        connect(pcapWorker_, &PcapWorker::error, this, &MainWindow::onWorkerError, Qt::QueuedConnection);
+        connect(pcapWorker_, &PcapWorker::finished, this, &MainWindow::onPcapFinished, Qt::QueuedConnection);
+        pcapThread_->start();
+
+        startBtn_->setEnabled(false);
+        stopBtn_->setEnabled(true);
+        uiTimer_->start();
+    }
+
+    void onStop() {
+        stopAll();
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        uiTimer_->stop();
+    }
+
+    void onWorkerError(const QString &msg) {
+        qWarning() << "pcap worker error:" << msg;
+    }
+
+    void onPcapFinished() {
+        // cleanup worker and thread
+        if (pcapThread_) {
+            pcapThread_->quit();
+            pcapThread_->wait(1000);
+            delete pcapWorker_;
+            pcapWorker_ = nullptr;
+            delete pcapThread_;
+            pcapThread_ = nullptr;
+        }
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        uiTimer_->stop();
+    }
+
+    void onPacketParsed(const ConnKey &key, qint64 bin, qint64 bout, qint64 ts) {
+        QMutexLocker lk(&mapMutex_);
+        ConnStats &s = stats_[key];
+        s.bytes_in += bin;
+        s.bytes_out += bout;
+        s.last_seen = ts;
+        if (!key.lastRequest.isEmpty()) s.last_request = key.lastRequest;
+    }
+
+    void onRefreshed() {
+        // ensure all sockets known by refresher appear in stats_ (with zero bytes)
+        QMap<QString, QString> snap = refresher_->snapshot();
+        QMutexLocker lk(&mapMutex_);
+        for (auto it = snap.constBegin(); it != snap.constEnd(); ++it) {
+            QString key = it.key(); // proto|ip:port
+            QString proc = it.value();
+            QStringList parts = key.split('|');
+            if (parts.size() != 2) continue;
+            QString proto = parts[0];
+            QString local = parts[1];
+            // remote unknown here; set to "-"
+            ConnKey ck{proc, local, QString("-"), QString()};
+            if (!stats_.contains(ck)) {
+                ConnStats s;
+                s.bytes_in = 0;
+                s.bytes_out = 0;
+                s.last_seen = QDateTime::currentSecsSinceEpoch();
+                stats_.insert(ck, s);
+            }
+        }
+    }
+
+    void onUiTimer() {
+        qint64 now = QDateTime::currentSecsSinceEpoch();
+        QMutexLocker lk(&mapMutex_);
+        model_->removeRows(0, model_->rowCount());
+        if (stats_.isEmpty()) {
+            QList<QStandardItem*> items;
+            items << new QStandardItem("[kernel]");
+            items << new QStandardItem("-");
+            items << new QStandardItem("-");
+            items << new QStandardItem("-");
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QDateTime::currentDateTime().toString("HH:mm:ss"));
+            model_->appendRow(items);
+            return;
+        }
+        for (auto it = stats_.begin(); it != stats_.end(); ++it) {
+            const ConnKey &k = it.key();
+            ConnStats &s = it.value();
+            s.mb_in = s.bytes_in / (1024.0 * 1024.0);
+            s.mb_out = s.bytes_out / (1024.0 * 1024.0);
+            qint64 delta_in = s.bytes_in - s.last_bytes_in;
+            qint64 delta_out = s.bytes_out - s.last_bytes_out;
+            s.kbs_in = (delta_in / 1024.0) * (1000.0 / UPDATE_INTERVAL_MS);
+            s.kbs_out = (delta_out / 1024.0) * (1000.0 / UPDATE_INTERVAL_MS);
+            s.last_bytes_in = s.bytes_in;
+            s.last_bytes_out = s.bytes_out;
+
+            QList<QStandardItem*> items;
+            items << new QStandardItem(k.procName.isEmpty() ? "-" : k.procName);
+            items << new QStandardItem(k.local);
+            items << new QStandardItem(k.remote);
+            items << new QStandardItem(s.last_request.isEmpty() ? "-" : s.last_request);
+            items << new QStandardItem(QString::number(s.mb_in, 'f', 3));
+            items << new QStandardItem(QString::number(s.mb_out, 'f', 3));
+            items << new QStandardItem(QString::number(s.kbs_in, 'f', 3));
+            items << new QStandardItem(QString::number(s.kbs_out, 'f', 3));
+            items << new QStandardItem(QDateTime::fromSecsSinceEpoch(s.last_seen).toString("HH:mm:ss"));
+            model_->appendRow(items);
+        }
+    }
+
+private:
+    void stopAll() {
+        if (pcapWorker_) {
+            pcapWorker_->stop();
+            // pcapWorker will emit finished -> onPcapFinished will cleanup
+        }
+        if (refresher_) {
+            refresher_->stop();
+            delete refresher_;
+            refresher_ = nullptr;
+        }
+    }
+
+    QLineEdit *ifaceEdit_;
+    QLineEdit *filterEdit_;
+    QPushButton *startBtn_;
+    QPushButton *stopBtn_;
+    QTableView *tableView_;
+    QStandardItemModel *model_;
+    QTimer *uiTimer_;
+
+    SocketRefresher *refresher_;
+    QThread *pcapThread_;
+    PcapWorker *pcapWorker_;
+
+    QMutex mapMutex_;
+    QMap<ConnKey, ConnStats> stats_;
+};
+
+// ---------- main ----------
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include "main.moc"

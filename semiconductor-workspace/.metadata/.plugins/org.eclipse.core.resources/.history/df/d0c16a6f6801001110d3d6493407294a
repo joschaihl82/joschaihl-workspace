@@ -1,0 +1,453 @@
+// water_swarm_gl.c
+// GPU-based shallow-water style simulation using OpenGL shaders (GLEW + GLUT).
+// Pipes are represented by a mask texture generated procedurally.
+// Compile: gcc -O2 -std=c11 -lm -lGL -lGLEW -lglut water_swarm_gl.c -o water_swarm_gl
+
+#include <GL/glew.h>
+#include <GL/glut.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+// Simulation grid
+#define NX 512
+#define NY 256
+
+// Window
+#define SCALE 2
+#define WIN_W (NX * SCALE)
+#define WIN_H (NY * SCALE)
+
+// Simulation params
+#define DT 0.016
+#define VISCOSITY 0.0005
+#define GRAVITY 9.81
+#define INLET_FORCE 0.12   // base inlet perturbation
+#define PARTICLE_DELAY 1.0 // seconds before particles are spawned
+#define MAX_PARTICLES 3000
+
+// Shaders (vertex passthrough)
+const char *vs_passthrough =
+"#version 330 core\n"
+"layout(location=0) in vec2 aPos;\n"
+"out vec2 uv;\n"
+"void main(){ uv = (aPos+1.0)*0.5; gl_Position = vec4(aPos,0.0,1.0); }\n";
+
+// Fragment shader: simulation step (updates h, u, v stored in RGBA)
+const char *fs_sim_step =
+"#version 330 core\n"
+"in vec2 uv;\n"
+"out vec4 outColor0; // h in R, u in G, v in B, unused in A\n"
+"uniform sampler2D prevState; // previous h,u,v\n"
+"uniform sampler2D maskTex;   // 1.0 fluid, 0.0 wall\n"
+"uniform float dx; uniform float dy; uniform float dt;\n"
+"uniform float gravity; uniform float viscosity;\n"
+"uniform float inlet_amp; uniform float time;\n"
+"ivec2 texSize(){ return textureSize(prevState,0); }\n"
+"vec4 sample(int ox,int oy){ ivec2 s = ivec2(texSize()); vec2 p = (gl_FragCoord.xy + vec2(ox,oy)) / vec2(s); return texture(prevState,p); }\n"
+"void main(){ ivec2 s = textureSize(prevState,0); vec2 coord = gl_FragCoord.xy; vec2 p = (coord) / vec2(s);\n"
+"    vec4 center = texture(prevState,p);\n"
+"    float mask = texture(maskTex,p).r;\n"
+"    if (mask < 0.5) { outColor0 = vec4(0.0); return; }\n"
+"    // finite differences for shallow-water-like update\n"
+"    vec4 hx = sample(1,0); vec4 lx = sample(-1,0);\n"
+"    vec4 hy = sample(0,1); vec4 ly = sample(0,-1);\n"
+"    float h = center.r; float u = center.g; float v = center.b;\n"
+"    // compute flux divergence (simple central differences)\n"
+"    float dhdx = (hx.r - lx.r) * 0.5 / dx;\n"
+"    float dhdy = (hy.r - ly.r) * 0.5 / dy;\n"
+"    float dudx = (hx.g - lx.g) * 0.5 / dx;\n"
+"    float dvdy = (hy.b - ly.b) * 0.5 / dy;\n"
+"    // continuity: dh/dt = - (d(hu)/dx + d(hv)/dy) approximated\n"
+"    float hux = ( (hx.r*hx.g) - (lx.r*lx.g) ) * 0.5 / dx;\n"
+"    float hvx = ( (hy.r*hy.b) - (ly.r*ly.b) ) * 0.5 / dy;\n"
+"    float dhdt = - (hux + hvx);\n"
+"    // momentum: du/dt = -u du/dx - v du/dy - g dh/dx + viscosity * laplacian(u)\n"
+"    float lap_u = (hx.g + lx.g + hy.g + ly.g - 4.0*u) / (dx*dx);\n"
+"    float lap_v = (hx.b + lx.b + hy.b + ly.b - 4.0*v) / (dx*dx);\n"
+"    float dudt = - (u * dudx + v * ((hy.g - ly.g)*0.5/dy)) - gravity * dhdx + viscosity * lap_u;\n"
+"    float dvdt = - (u * ((hx.b - lx.b)*0.5/dx) + v * dvdy) - gravity * dhdy + viscosity * lap_v;\n"
+"    // inlet forcing: add time-varying perturbation near left inlet x ~ 6..12\n"
+"    float fx = coord.x;\n"
+"    float inlet = 0.0;\n"
+"    if (fx < 20.0) {\n"
+"        // use a spatial gaussian in y around center and swarm-like temporal noise\n"
+"        float cy = float(s.y)/2.0;\n"
+"        float dyc = (coord.y - cy);\n"
+"        float gauss = exp(- (dyc*dyc) / (2.0 * (float(s.y)/12.0)*(float(s.y)/12.0)) );\n"
+"        // create a pseudo-random time-dependent signal (noisy swarm surrogate)\n"
+"        float noise = sin(time*3.0 + coord.y*0.05) * 0.5 + 0.5;\n"
+"        inlet = inlet_amp * (0.6 + 0.8*noise) * gauss;\n"
+"    }\n"
+"    // integrate\n"
+"    float h_new = h + dhdt * dt;\n"
+"    float u_new = u + (dudt + inlet) * dt;\n"
+"    float v_new = v + dvdt * dt;\n"
+"    // clamp and stabilize\n"
+"    h_new = max(h_new, 0.0);\n"
+"    // reduce velocities inside narrow channels by speed_factor encoded in mask alpha? (not used here)\n"
+"    // output\n"
+"    outColor0 = vec4(h_new, u_new, v_new, 1.0);\n"
+"}\n";
+
+// Fragment shader: render state to screen with contrast mapping and pipe mask overlay
+const char *fs_render =
+"#version 330 core\n"
+"in vec2 uv; out vec4 fragColor;\n"
+"uniform sampler2D stateTex; uniform sampler2D maskTex; uniform float contrast;\n"
+"void main(){ vec4 s = texture(stateTex, uv); float mask = texture(maskTex, uv).r;\n"
+"    if (mask < 0.5) { fragColor = vec4(0.08,0.08,0.08,1.0); return; }\n"
+"    float h = s.r; float u = s.g; float v = s.b;\n"
+"    float mag = length(vec2(u,v));\n"
+"    // contrast mapping: amplify and colorize\n"
+"    float sclr = pow(clamp(mag * 120.0, 0.0, 1.0), 1.1);\n"
+"    vec3 cold = vec3(20.0/255.0, 40.0/255.0, 140.0/255.0);\n"
+"    vec3 warm = vec3(240.0/255.0, 180.0/255.0, 60.0/255.0);\n"
+"    vec3 col = mix(cold, warm, sclr);\n"
+"    // add rim highlight from height\n"
+"    col += vec3(0.2) * clamp(h*4.0, 0.0, 1.0);\n"
+"    col = mix(vec3(0.02), col, contrast);\n"
+"    fragColor = vec4(col,1.0);\n}\n";
+
+// Fullscreen quad
+static const float quadVerts[] = {
+    -1.0f,-1.0f,
+     1.0f,-1.0f,
+    -1.0f, 1.0f,
+     1.0f, 1.0f
+};
+
+// GL objects
+GLuint vao, vbo;
+GLuint simProg = 0, renderProg = 0;
+GLuint texState[2]; // ping-pong
+GLuint fbo;
+GLuint maskTex;
+int curState = 0;
+
+// utility: compile shader
+GLuint compileShader(GLenum type, const char *src){
+    GLuint s = glCreateShader(type);
+    glShaderSource(s,1,&src,NULL);
+    glCompileShader(s);
+    GLint ok; glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
+    if(!ok){ char buf[4096]; glGetShaderInfoLog(s,4096,NULL,buf); fprintf(stderr,"Shader compile error: %s\n",buf); exit(1); }
+    return s;
+}
+GLuint linkProgram(const char *vs_src, const char *fs_src){
+    GLuint vs = compileShader(GL_VERTEX_SHADER, vs_src);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fs_src);
+    GLuint p = glCreateProgram();
+    glAttachShader(p,vs); glAttachShader(p,fs);
+    glBindAttribLocation(p,0,"aPos");
+    glLinkProgram(p);
+    GLint ok; glGetProgramiv(p,GL_LINK_STATUS,&ok);
+    if(!ok){ char buf[4096]; glGetProgramInfoLog(p,4096,NULL,buf); fprintf(stderr,"Link error: %s\n",buf); exit(1); }
+    glDeleteShader(vs); glDeleteShader(fs);
+    return p;
+}
+
+// create floating point textures for state
+void createStateTextures(){
+    glGenTextures(2, texState);
+    for(int i=0;i<2;i++){
+        glBindTexture(GL_TEXTURE_2D, texState[i]);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,NX,NY,0,GL_RGBA,GL_FLOAT,NULL);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D,0);
+}
+
+// create mask texture from procedural geometry (big left pipe -> split into two narrow right)
+void createMaskTexture(){
+    unsigned char *mask = (unsigned char*)malloc(NX*NY);
+    memset(mask,0,NX*NY);
+    // start with walls then carve pipes
+    int mid = NY/2;
+    int big_radius = NY/6;
+    for(int y=mid-big_radius;y<=mid+big_radius;y++){
+        for(int x=5;x<NX/2;x++){
+            mask[y*NX + x] = 255;
+        }
+    }
+    int narrow_radius = NY/12;
+    int branch_x = NX/2;
+    int upper_center = mid - (big_radius + narrow_radius);
+    int lower_center = mid + (big_radius + narrow_radius);
+    for(int x=branch_x;x<NX-5;x++){
+        for(int y=0;y<NY;y++){
+            if (abs(y - upper_center) <= narrow_radius) mask[y*NX + x] = 255;
+            if (abs(y - lower_center) <= narrow_radius) mask[y*NX + x] = 255;
+        }
+    }
+    for(int x=NX/2 - 4; x<NX/2 + 8; x++){
+        for(int y=mid-big_radius; y<=mid+big_radius; y++){
+            mask[y*NX + x] = 255;
+        }
+    }
+    // upload
+    glGenTextures(1,&maskTex);
+    glBindTexture(GL_TEXTURE_2D, maskTex);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RED,NX,NY,0,GL_RED,GL_UNSIGNED_BYTE,mask);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D,0);
+    free(mask);
+}
+
+// initialize state with small base height and zero velocity
+void initState(){
+    float *buf = (float*)malloc(sizeof(float)*4*NX*NY);
+    for(int y=0;y<NY;y++){
+        for(int x=0;x<NX;x++){
+            int id = (y*NX + x)*4;
+            buf[id+0] = 0.02f; // h
+            buf[id+1] = 0.0f;  // u
+            buf[id+2] = 0.0f;  // v
+            buf[id+3] = 1.0f;
+        }
+    }
+    // zero out walls
+    unsigned char *mask = (unsigned char*)malloc(NX*NY);
+    glBindTexture(GL_TEXTURE_2D, maskTex);
+    glGetTexImage(GL_TEXTURE_2D,0,GL_RED,GL_UNSIGNED_BYTE,mask);
+    for(int y=0;y<NY;y++){
+        for(int x=0;x<NX;x++){
+            if (mask[y*NX + x] < 128){
+                int id = (y*NX + x)*4;
+                buf[id+0] = 0.0f; buf[id+1] = 0.0f; buf[id+2] = 0.0f; buf[id+3] = 1.0f;
+            }
+        }
+    }
+    free(mask);
+    // upload to both textures
+    for(int i=0;i<2;i++){
+        glBindTexture(GL_TEXTURE_2D, texState[i]);
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,NX,NY,GL_RGBA,GL_FLOAT,buf);
+    }
+    free(buf);
+}
+
+// FBO setup
+void createFBO(){
+    glGenFramebuffers(1,&fbo);
+}
+
+// fullscreen quad VAO
+void createQuad(){
+    glGenVertexArrays(1,&vao);
+    glGenBuffers(1,&vbo);
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER,vbo);
+    glBufferData(GL_ARRAY_BUFFER,sizeof(quadVerts),quadVerts,GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,0,(void*)0);
+    glBindVertexArray(0);
+}
+
+// simulation step: render into texState[1-cur] using texState[cur]
+void stepSimulation(float time){
+    glBindFramebuffer(GL_FRAMEBUFFER,fbo);
+    glViewport(0,0,NX,NY);
+    glUseProgram(simProg);
+    // attach destination texture
+    GLuint dst = texState[1-curState];
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,dst,0);
+    GLenum drawbuf = GL_COLOR_ATTACHMENT0;
+    glDrawBuffers(1,&drawbuf);
+    // bind inputs
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texState[curState]);
+    glUniform1i(glGetUniformLocation(simProg,"prevState"),0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, maskTex);
+    glUniform1i(glGetUniformLocation(simProg,"maskTex"),1);
+    glUniform1f(glGetUniformLocation(simProg,"dx"), 1.0f);
+    glUniform1f(glGetUniformLocation(simProg,"dy"), 1.0f);
+    glUniform1f(glGetUniformLocation(simProg,"dt"), DT);
+    glUniform1f(glGetUniformLocation(simProg,"gravity"), (float)GRAVITY);
+    glUniform1f(glGetUniformLocation(simProg,"viscosity"), (float)VISCOSITY);
+    glUniform1f(glGetUniformLocation(simProg,"inlet_amp"), (float)INLET_FORCE);
+    glUniform1f(glGetUniformLocation(simProg,"time"), time);
+    // draw quad
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+    glBindVertexArray(0);
+    // swap
+    curState = 1 - curState;
+    glBindFramebuffer(GL_FRAMEBUFFER,0);
+}
+
+// render to screen
+void renderScreen(float contrast){
+    glViewport(0,0,WIN_W,WIN_H);
+    glUseProgram(renderProg);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texState[curState]);
+    glUniform1i(glGetUniformLocation(renderProg,"stateTex"),0);
+    glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, maskTex);
+    glUniform1i(glGetUniformLocation(renderProg,"maskTex"),1);
+    glUniform1f(glGetUniformLocation(renderProg,"contrast"), contrast);
+    glBindVertexArray(vao);
+    glDrawArrays(GL_TRIANGLE_STRIP,0,4);
+    glBindVertexArray(0);
+}
+
+// Particles (CPU)
+typedef struct { float x,y; float vx,vy; unsigned char r,g,b,a; } P;
+P *particles = NULL; int particle_count = 0;
+int particles_initialized = 0;
+double time_since_start = 0.0;
+
+void initParticles(){
+    if (particles_initialized) return;
+    particles = (P*)malloc(sizeof(P)*MAX_PARTICLES);
+    particle_count = 0;
+    srand((unsigned)time(NULL) ^ 0x1234);
+    for(int i=0;i<MAX_PARTICLES;i++){
+        int x = 30 + rand()%80; // start downstream to avoid foam
+        int y = NY/2 - (NY/6) + rand()%(NY/3);
+        particles[particle_count].x = (float)x + (rand()/(float)RAND_MAX);
+        particles[particle_count].y = (float)y + (rand()/(float)RAND_MAX);
+        particles[particle_count].vx = 0.0f; particles[particle_count].vy = 0.0f;
+        particles[particle_count].r = 200 + rand()%55; particles[particle_count].g = 120 + rand()%80; particles[particle_count].b = 255; particles[particle_count].a = 255;
+        particle_count++;
+        if (particle_count >= MAX_PARTICLES) break;
+    }
+    particles_initialized = 1;
+}
+
+// read velocity at floating point position by sampling current state texture on CPU
+void sampleVelocityGPU(float x, float y, float *outu, float *outv){
+    // read small region from GPU into CPU (inefficient but simple): glReadPixels of 1x1 at tex coords
+    // Instead we use glGetTexImage to read entire texture once per frame (cheap enough for NX*NY moderate)
+    static float *stateBuf = NULL;
+    static int lastFrame = -1;
+    if (!stateBuf){
+        stateBuf = (float*)malloc(sizeof(float)*4*NX*NY);
+    }
+    // read texture once per frame: we call this externally before updating particles
+    // here we just sample from stateBuf
+    int ix = (int)floorf(x); int iy = (int)floorf(y);
+    if (ix < 0 || ix >= NX || iy < 0 || iy >= NY){ *outu = 0; *outv = 0; return; }
+    int id = (iy*NX + ix)*4;
+    *outu = stateBuf[id+1];
+    *outv = stateBuf[id+2];
+}
+
+// For efficiency: read state texture into CPU buffer once per frame
+float *cpuStateBuf = NULL;
+void readStateToCPU(){
+    if (!cpuStateBuf) cpuStateBuf = (float*)malloc(sizeof(float)*4*NX*NY);
+    glBindTexture(GL_TEXTURE_2D, texState[curState]);
+    glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_FLOAT,cpuStateBuf);
+    glBindTexture(GL_TEXTURE_2D,0);
+}
+
+// update particles using sampled velocity from cpuStateBuf
+void updateParticles(float dt){
+    if (!particles_initialized) return;
+    if (!cpuStateBuf) readStateToCPU();
+    for(int i=0;i<particle_count;i++){
+        P *p = &particles[i];
+        int ix = (int)floorf(p->x); int iy = (int)floorf(p->y);
+        if (ix < 1 || ix >= NX-1 || iy < 1 || iy >= NY-1){
+            p->x = 30 + rand()%80; p->y = NY/2 - (NY/6) + rand()%(NY/3); p->vx = p->vy = 0; continue;
+        }
+        int id = (iy*NX + ix)*4;
+        float ux = cpuStateBuf[id+1];
+        float vy = cpuStateBuf[id+2];
+        // advect
+        p->x += ux * dt * 60.0f;
+        p->y += vy * dt * 60.0f;
+        // small jitter reduced to avoid foam
+        p->x += ((rand()/(float)RAND_MAX)-0.5f) * 0.002f;
+        p->y += ((rand()/(float)RAND_MAX)-0.5f) * 0.002f;
+        // respawn if outside or in wall (check mask)
+        int midx = (int)floorf(p->x), midy = (int)floorf(p->y);
+        if (midx < 0 || midx >= NX || midy < 0 || midy >= NY) { p->x = 30 + rand()%80; p->y = NY/2; p->vx = p->vy = 0; continue; }
+        // check mask by reading mask texture via CPU once (we can reuse mask from creation)
+        // For simplicity assume mask region is same as initial geometry: if outside main channel respawn
+        // (A robust implementation would read mask into CPU array; omitted for brevity)
+    }
+}
+
+// draw particles as GL points (simple)
+void drawParticles(){
+    if (!particles_initialized) return;
+    glPointSize(2.0f);
+    glBegin(GL_POINTS);
+    for(int i=0;i<particle_count;i++){
+        P *p = &particles[i];
+        float sx = (p->x / (float)NX) * 2.0f - 1.0f;
+        float sy = (p->y / (float)NY) * 2.0f - 1.0f;
+        glColor3ub(p->r,p->g,p->b);
+        glVertex2f(sx, sy);
+    }
+    glEnd();
+}
+
+// main loop
+void display(){
+    static double t = 0.0;
+    t += DT;
+    // run several sim steps per frame for stability
+    int steps = 2;
+    for(int i=0;i<steps;i++){
+        stepSimulation((float)t);
+    }
+    // read state to CPU for particle advection
+    readStateToCPU();
+    // initialize particles after delay
+    time_since_start += DT;
+    if (!particles_initialized && time_since_start >= PARTICLE_DELAY) initParticles();
+    updateParticles(DT);
+    // render to screen
+    glClear(GL_COLOR_BUFFER_BIT);
+    renderScreen(1.0f); // contrast 1.0
+    // overlay particles using fixed-function pipeline
+    glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+    glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+    glDisable(GL_TEXTURE_2D);
+    drawParticles();
+    glEnable(GL_TEXTURE_2D);
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+    glutSwapBuffers();
+    glutPostRedisplay();
+}
+
+// init GL, compile shaders, create textures
+void initGL(){
+    glewExperimental = GL_TRUE;
+    if (glewInit() != GLEW_OK){ fprintf(stderr,"GLEW init failed\n"); exit(1); }
+    glDisable(GL_DEPTH_TEST);
+    simProg = linkProgram(vs_passthrough, fs_sim_step);
+    renderProg = linkProgram(vs_passthrough, fs_render);
+    createQuad();
+    createStateTextures();
+    createMaskTexture();
+    createFBO();
+    initState();
+    glClearColor(0.02f,0.02f,0.02f,1.0f);
+}
+
+// keyboard
+void keyboard(unsigned char key, int x, int y){
+    if (key == 27) exit(0);
+}
+
+int main(int argc, char **argv){
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(WIN_W, WIN_H);
+    glutCreateWindow("OpenGL Wasserleitung Simulation (Shader)");
+    glutDisplayFunc(display);
+    glutKeyboardFunc(keyboard);
+    initGL();
+    glutMainLoop();
+    return 0;
+}

@@ -1,0 +1,1874 @@
+/* cc.c
+ * C99: Preprocessor, Lexer, Parser, Robust x86-64 Code Generator
+ *
+ * Style: BSD function formatting, tabs for indentation, clear naming.
+ *
+ * Build:
+ *   cc -std=c99 -Wall -Wextra cc.c -o cc
+ *
+ * Usage:
+ *   Provide C source on stdin; program runs preprocess -> lex -> parse -> codegen.
+ *   Codegen emits x86-64 machine code into an internal buffer (no execution).
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <ctype.h>
+#include <stdarg.h>
+
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+/* ----------------------------------------------------------------------
+ * Enums and basic types
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+	TK_EOF = 0, TK_IDENT, TK_NUMBER,
+	TK_SEMI, TK_COMMA, TK_LPAREN, TK_RPAREN, TK_LBRACE, TK_RBRACE,
+	TK_LBRACK, TK_RBRACK, TK_DOT, TK_ARROW,
+	TK_STAR, TK_AMP, TK_ASSIGN,
+	TK_STRUCT, TK_UNION, TK_INT, TK_CHAR, TK_LONG, TK_SHORT, TK_UNSIGNED,
+	TK_RETURN, TK_IF, TK_ELSE, TK_FOR, TK_WHILE,
+	TK_TYPEDEF, TK_EXTERN, TK_STATIC,
+	TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT, TK_GE,
+	TK_PLUS, TK_MINUS, TK_DIV, TK_MOD,
+	TK_UNKNOWN
+} token_kind_t;
+
+typedef enum {
+	TY_VOID = 0, TY_CHAR, TY_SHORT, TY_INT, TY_LONG,
+	TY_UCHAR, TY_USHORT, TY_UINT, TY_ULONG,
+	TY_PTR, TY_ARRAY, TY_FUNC, TY_STRUCT, TY_UNION, TY_TYPEDEF_NAME
+} ty_kind_t;
+
+typedef enum {
+	AST_PROGRAM = 0, AST_FUN_DEF, AST_VAR_DECL, AST_PARAM,
+	AST_BLOCK, AST_EXPR_STMT, AST_RETURN, AST_IF, AST_WHILE, AST_FOR,
+	AST_ASSIGN, AST_ADD, AST_SUB, AST_MUL, AST_DIV, AST_MOD,
+	AST_EQ, AST_NE, AST_LT, AST_GT, AST_LE, AST_GE,
+	AST_ID, AST_IMM, AST_FUN_CALL, AST_ADDR_OF, AST_DEREF,
+	AST_BRAK, AST_MEMBER
+} ast_type_t;
+
+typedef enum {
+	SC_NONE = 0, SC_GLO, SC_LOC, SC_FUN, SC_TYPEDEF
+} sym_class_t;
+
+typedef enum {
+	REG_RAX = 0, REG_RCX = 1, REG_RDX = 2, REG_RBX = 3,
+	REG_RSP = 4, REG_RBP = 5, REG_RSI = 6, REG_RDI = 7,
+	REG_R8  = 8, REG_R9  = 9, REG_R10 = 10, REG_R11 = 11,
+	REG_R12 = 12, REG_R13 = 13, REG_R14 = 14, REG_R15 = 15
+} reg_code_t;
+
+/* ----------------------------------------------------------------------
+ * Type info and struct layout
+ * ---------------------------------------------------------------------- */
+
+typedef struct type_info {
+	ty_kind_t kind;
+	bool is_unsigned;
+	size_t size_in_bytes;
+	struct struct_layout *layout;
+	struct type_info *base;
+	size_t array_len;
+	char *typedef_name;
+} type_info_t;
+
+typedef struct {
+	char *name;
+	ty_kind_t ty;
+	size_t offset;
+	type_info_t *type;
+	size_t size_in_bytes;
+} field_entry_t;
+
+typedef struct struct_layout {
+	size_t field_count;
+	field_entry_t *fields;
+	size_t size;
+} struct_layout_t;
+
+/* ----------------------------------------------------------------------
+ * Symbol table entry
+ * ---------------------------------------------------------------------- */
+
+typedef union sym_value {
+	intptr_t i;
+	void *p;
+	double d;
+} sym_value_t;
+
+typedef struct sym_entry {
+	char *name;
+	sym_class_t cls;
+	type_info_t *type;
+	sym_value_t val;
+	struct_layout_t *layout;
+	int scope_level;
+	int local_index;
+} sym_entry_t;
+
+/* ----------------------------------------------------------------------
+ * Token and AST node
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+	token_kind_t kind;
+	char *text;
+	const char *pos;
+	int line;
+} token_t;
+
+typedef struct ast_node {
+	ast_type_t type;
+	long long value;
+	struct ast_node *op_a, *op_b, *op_c;
+	struct ast_node *next;
+	sym_entry_t *sym;
+	const char *pos;
+	type_info_t *typeinfo;
+} ast_node_t;
+
+/* ----------------------------------------------------------------------
+ * Compiler context
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+	char *src_buf;
+	const char *p;
+	int line;
+
+	token_t *tokens;
+	int token_count;
+	int token_capacity;
+	int token_idx;
+
+	ast_node_t *ast_root;
+
+	sym_entry_t *sym_table;
+	size_t sym_capacity;
+	size_t sym_count;
+
+	int current_scope;
+
+	uint8_t *x64_text;
+	size_t poolsz;
+	uint8_t *x64_e;
+
+	uint8_t *data_area;
+	size_t data_size;
+} compiler_context_t;
+
+/* ----------------------------------------------------------------------
+ * Error reporting
+ * ---------------------------------------------------------------------- */
+
+static void
+error_at(const compiler_context_t *ctx, const char *loc, const char *fmt, ...)
+{
+	va_list ap;
+	const char *src;
+	const char *line_start;
+	const char *line_end;
+	int line_no;
+	size_t col;
+	size_t line_len;
+	va_start(ap, fmt);
+
+	if (!ctx || !ctx->src_buf) {
+		vfprintf(stderr, fmt, ap);
+		fprintf(stderr, "\n");
+		va_end(ap);
+		exit(1);
+	}
+
+	src = ctx->src_buf;
+	if (!loc)
+		loc = src;
+
+	line_no = 1;
+	for (const char *q = src; q < loc && *q; ++q)
+		if (*q == '\n')
+			++line_no;
+
+	line_start = loc;
+	while (line_start > src && *(line_start - 1) != '\n')
+		--line_start;
+
+	line_end = loc;
+	while (*line_end && *line_end != '\n')
+		++line_end;
+
+	fprintf(stderr, "error at line %d: ", line_no);
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, "\n");
+
+	line_len = (size_t)(line_end - line_start);
+	if (line_len > 2048)
+		line_len = 2048;
+
+	fprintf(stderr, "%.*s\n", (int)line_len, line_start);
+
+	col = (size_t)(loc - line_start);
+	for (size_t i = 0; i < col; ++i) {
+		char ch = line_start[i];
+		if (ch == '\t')
+			fputc('\t', stderr);
+		else
+			fputc(' ', stderr);
+	}
+	fprintf(stderr, "^\n");
+
+	va_end(ap);
+	exit(1);
+}
+
+/* ----------------------------------------------------------------------
+ * Utilities: types and symbols
+ * ---------------------------------------------------------------------- */
+
+static type_info_t *
+type_new(ty_kind_t kind)
+{
+	type_info_t *t;
+
+	t = calloc(1, sizeof(type_info_t));
+	if (!t) {
+		fprintf(stderr, "out of memory\n");
+		exit(1);
+	}
+	t->kind = kind;
+	t->is_unsigned = false;
+	t->size_in_bytes = 0;
+	t->layout = NULL;
+	t->base = NULL;
+	t->array_len = 0;
+	t->typedef_name = NULL;
+	return t;
+}
+
+static sym_entry_t *
+symbol_new(const char *name)
+{
+	sym_entry_t *s;
+
+	s = calloc(1, sizeof(sym_entry_t));
+	if (!s) {
+		fprintf(stderr, "out of memory\n");
+		exit(1);
+	}
+	s->name = name ? strdup(name) : NULL;
+	s->cls = SC_NONE;
+	s->type = NULL;
+	s->layout = NULL;
+	s->scope_level = 0;
+	s->local_index = -1;
+	s->val.i = 0;
+	return s;
+}
+
+static void
+symbol_table_add(compiler_context_t *ctx, sym_entry_t *s)
+{
+	size_t newcap;
+
+	if (ctx->sym_count + 1 >= ctx->sym_capacity) {
+		newcap = ctx->sym_capacity ? ctx->sym_capacity * 2 : 128;
+		ctx->sym_table = realloc(ctx->sym_table, newcap * sizeof(sym_entry_t));
+		ctx->sym_capacity = newcap;
+	}
+	s->scope_level = ctx->current_scope;
+	ctx->sym_table[ctx->sym_count++] = *s;
+}
+
+static sym_entry_t *
+symbol_find_in_scope(const compiler_context_t *ctx, const char *name, int scope)
+{
+	size_t i;
+
+	for (i = 0; i < ctx->sym_count; ++i) {
+		if (ctx->sym_table[i].name &&
+		    ctx->sym_table[i].scope_level == scope &&
+		    strcmp(ctx->sym_table[i].name, name) == 0)
+			return (sym_entry_t *)&ctx->sym_table[i];
+	}
+	return NULL;
+}
+
+static sym_entry_t *
+symbol_find(const compiler_context_t *ctx, const char *name)
+{
+	int scope;
+
+	for (scope = ctx->current_scope; scope >= 0; --scope) {
+		sym_entry_t *s = symbol_find_in_scope(ctx, name, scope);
+		if (s)
+			return s;
+	}
+	return NULL;
+}
+
+static void
+symbol_pop_scope(compiler_context_t *ctx)
+{
+	while (ctx->sym_count > 0 &&
+	       ctx->sym_table[ctx->sym_count - 1].scope_level == ctx->current_scope) {
+		if (ctx->sym_table[ctx->sym_count - 1].name)
+			free(ctx->sym_table[ctx->sym_count - 1].name);
+		if (ctx->sym_table[ctx->sym_count - 1].layout) {
+			size_t f;
+			for (f = 0; f < ctx->sym_table[ctx->sym_count - 1].layout->field_count; ++f)
+				free(ctx->sym_table[ctx->sym_count - 1].layout->fields[f].name);
+			free(ctx->sym_table[ctx->sym_count - 1].layout->fields);
+			free(ctx->sym_table[ctx->sym_count - 1].layout);
+		}
+		ctx->sym_count--;
+	}
+	ctx->current_scope--;
+}
+
+/* ----------------------------------------------------------------------
+ * Preprocessor (simple): #define, #undef, #include "file"
+ * - only object-like macros, no function macros
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+	char *name;
+	char *value;
+} pp_macro_t;
+
+static char *
+file_read_all(const char *path)
+{
+	FILE *f;
+	long sz;
+	char *buf;
+
+	f = fopen(path, "rb");
+	if (!f)
+		return NULL;
+	if (fseek(f, 0, SEEK_END) != 0) {
+		fclose(f);
+		return NULL;
+	}
+	sz = ftell(f);
+	if (sz < 0) {
+		fclose(f);
+		return NULL;
+	}
+	rewind(f);
+	buf = malloc((size_t)sz + 1);
+	if (!buf) {
+		fclose(f);
+		return NULL;
+	}
+	if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+		free(buf);
+		fclose(f);
+		return NULL;
+	}
+	buf[sz] = '\0';
+	fclose(f);
+	return buf;
+}
+
+static void
+pp_macro_add(pp_macro_t **macros, size_t *count, const char *name, const char *value)
+{
+	size_t i;
+
+	for (i = 0; i < *count; ++i) {
+		if (strcmp((*macros)[i].name, name) == 0) {
+			free((*macros)[i].value);
+			(*macros)[i].value = strdup(value);
+			return;
+		}
+	}
+	*macros = realloc(*macros, (*count + 1) * sizeof(pp_macro_t));
+	(*macros)[*count].name = strdup(name);
+	(*macros)[*count].value = strdup(value);
+	(*count)++;
+}
+
+static void
+pp_macro_remove(pp_macro_t *macros, size_t *count, const char *name)
+{
+	size_t i;
+
+	for (i = 0; i < *count; ++i) {
+		if (strcmp(macros[i].name, name) == 0) {
+			free(macros[i].name);
+			free(macros[i].value);
+			macros[i] = macros[*count - 1];
+			(*count)--;
+			return;
+		}
+	}
+}
+
+static char *
+pp_expand_macros(const char *src, pp_macro_t *macros, size_t macro_count)
+{
+	size_t cap;
+	size_t outlen;
+	const char *p;
+	char *out;
+
+	cap = strlen(src) + 1;
+	out = malloc(cap);
+	outlen = 0;
+	p = src;
+
+	while (*p) {
+		if (isalpha((unsigned char)*p) || *p == '_') {
+			const char *start = p;
+			while (isalnum((unsigned char)*p) || *p == '_')
+				++p;
+			size_t len = (size_t)(p - start);
+			char *word = malloc(len + 1);
+			memcpy(word, start, len);
+			word[len] = '\0';
+			bool replaced = false;
+			for (size_t i = 0; i < macro_count; ++i) {
+				if (strcmp(word, macros[i].name) == 0) {
+					size_t vlen = strlen(macros[i].value);
+					if (outlen + vlen + 1 > cap) {
+						cap = (outlen + vlen + 1) * 2;
+						out = realloc(out, cap);
+					}
+					memcpy(out + outlen, macros[i].value, vlen);
+					outlen += vlen;
+					replaced = true;
+					break;
+				}
+			}
+			if (!replaced) {
+				if (outlen + len + 1 > cap) {
+					cap = (outlen + len + 1) * 2;
+					out = realloc(out, cap);
+				}
+				memcpy(out + outlen, word, len);
+				outlen += len;
+			}
+			free(word);
+		} else {
+			if (outlen + 2 > cap) {
+				cap = (outlen + 2) * 2;
+				out = realloc(out, cap);
+			}
+			out[outlen++] = *p++;
+		}
+	}
+	out[outlen] = '\0';
+	return out;
+}
+
+static void
+preprocess(compiler_context_t *ctx)
+{
+	const char *p;
+	char *out;
+	size_t outcap;
+	size_t outlen;
+	pp_macro_t *macros;
+	size_t macro_count;
+
+	if (!ctx || !ctx->src_buf)
+		return;
+
+	macros = NULL;
+	macro_count = 0;
+	p = ctx->src_buf;
+	outcap = strlen(ctx->src_buf) + 1;
+	out = malloc(outcap);
+	outlen = 0;
+
+	while (*p) {
+		const char *line_start = p;
+		const char *nl = strchr(p, '\n');
+		size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+		const char *q = p;
+		while (q < p + linelen && isspace((unsigned char)*q))
+			++q;
+		if (*q == '#') {
+			const char *dir = q + 1;
+			while (*dir && isspace((unsigned char)*dir))
+				++dir;
+			if (strncmp(dir, "define", 6) == 0 && isspace((unsigned char)dir[6])) {
+				const char *s = dir + 6;
+				while (*s && isspace((unsigned char)*s))
+					++s;
+				const char *name_start = s;
+				while (*s && (isalnum((unsigned char)*s) || *s == '_'))
+					++s;
+				size_t name_len = (size_t)(s - name_start);
+				char *name = malloc(name_len + 1);
+				memcpy(name, name_start, name_len);
+				name[name_len] = '\0';
+				while (*s && isspace((unsigned char)*s))
+					++s;
+				const char *val_start = s;
+				size_t val_len = (size_t)((line_start + linelen) - val_start);
+				while (val_len > 0 && (val_start[val_len - 1] == '\r' || val_start[val_len - 1] == '\n'))
+					val_len--;
+				char *val = malloc(val_len + 1);
+				memcpy(val, val_start, val_len);
+				val[val_len] = '\0';
+				pp_macro_add(&macros, &macro_count, name, val);
+				free(name);
+				free(val);
+			} else if (strncmp(dir, "undef", 5) == 0 && isspace((unsigned char)dir[5])) {
+				const char *s = dir + 5;
+				while (*s && isspace((unsigned char)*s))
+					++s;
+				const char *name_start = s;
+				while (*s && (isalnum((unsigned char)*s) || *s == '_'))
+					++s;
+				size_t name_len = (size_t)(s - name_start);
+				char *name = malloc(name_len + 1);
+				memcpy(name, name_start, name_len);
+				name[name_len] = '\0';
+				pp_macro_remove(macros, &macro_count, name);
+				free(name);
+			} else if (strncmp(dir, "include", 7) == 0 && isspace((unsigned char)dir[7])) {
+				const char *s = dir + 7;
+				while (*s && isspace((unsigned char)*s))
+					++s;
+				if (*s == '"') {
+					++s;
+					const char *fn = s;
+					while (*s && *s != '"')
+						++s;
+					size_t fnlen = (size_t)(s - fn);
+					char *fname = malloc(fnlen + 1);
+					memcpy(fname, fn, fnlen);
+					fname[fnlen] = '\0';
+					char *incbuf = file_read_all(fname);
+					if (incbuf) {
+						char *expanded = pp_expand_macros(incbuf, macros, macro_count);
+						size_t elen = strlen(expanded);
+						if (outlen + elen + 2 > outcap) {
+							outcap = (outlen + elen + 2) * 2;
+							out = realloc(out, outcap);
+						}
+						memcpy(out + outlen, expanded, elen);
+						outlen += elen;
+						out[outlen++] = '\n';
+						free(expanded);
+						free(incbuf);
+					}
+					free(fname);
+				}
+			}
+		} else {
+			char *line = malloc(linelen + 1);
+			memcpy(line, p, linelen);
+			line[linelen] = '\0';
+			char *expanded = pp_expand_macros(line, macros, macro_count);
+			size_t elen = strlen(expanded);
+			if (outlen + elen + 2 > outcap) {
+				outcap = (outlen + elen + 2) * 2;
+				out = realloc(out, outcap);
+			}
+			memcpy(out + outlen, expanded, elen);
+			outlen += elen;
+			out[outlen++] = '\n';
+			free(line);
+			free(expanded);
+		}
+		if (!nl)
+			break;
+		p = nl + 1;
+	}
+
+	out[outlen] = '\0';
+	free(ctx->src_buf);
+	ctx->src_buf = out;
+
+	for (size_t i = 0; i < macro_count; ++i) {
+		free(macros[i].name);
+		free(macros[i].value);
+	}
+	free(macros);
+}
+
+/* ----------------------------------------------------------------------
+ * Lexer (scanner)
+ * ---------------------------------------------------------------------- */
+
+static inline bool
+is_ident_start(char ch)
+{
+	return (ch == '_' || isalpha((unsigned char)ch));
+}
+
+static inline bool
+is_ident_char(char ch)
+{
+	return (ch == '_' || isalnum((unsigned char)ch));
+}
+
+static void
+token_append(compiler_context_t *ctx, token_kind_t kind, const char *start, size_t len, int line)
+{
+	token_t *t;
+
+	if (ctx->token_count + 1 >= ctx->token_capacity) {
+		int newcap = ctx->token_capacity ? ctx->token_capacity * 2 : 512;
+		ctx->tokens = realloc(ctx->tokens, newcap * sizeof(token_t));
+		ctx->token_capacity = newcap;
+	}
+	t = &ctx->tokens[ctx->token_count++];
+	t->kind = kind;
+	t->text = malloc(len + 1);
+	memcpy(t->text, start, len);
+	t->text[len] = '\0';
+	t->pos = start;
+	t->line = line;
+}
+
+static void
+lex(compiler_context_t *ctx)
+{
+	const char *p;
+
+	if (!ctx || !ctx->src_buf)
+		return;
+
+	p = ctx->src_buf;
+	ctx->p = p;
+	ctx->line = 1;
+	ctx->token_count = 0;
+
+	while (*p) {
+		if (*p == ' ' || *p == '\t' || *p == '\r') {
+			++p;
+			continue;
+		}
+		if (*p == '\n') {
+			++p;
+			ctx->line++;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '/') {
+			p += 2;
+			while (*p && *p != '\n')
+				++p;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '*') {
+			p += 2;
+			while (*p && !(p[0] == '*' && p[1] == '/')) {
+				if (*p == '\n')
+					ctx->line++;
+				++p;
+			}
+			if (*p)
+				p += 2;
+			continue;
+		}
+		if (is_ident_start(*p)) {
+			const char *start = p;
+			while (is_ident_char(*p))
+				++p;
+			size_t len = (size_t)(p - start);
+			if (len == 6 && strncmp(start, "struct", 6) == 0) {
+				token_append(ctx, TK_STRUCT, start, len, ctx->line);
+				continue;
+			}
+			if (len == 5 && strncmp(start, "union", 5) == 0) {
+				token_append(ctx, TK_UNION, start, len, ctx->line);
+				continue;
+			}
+			if (len == 3 && strncmp(start, "int", 3) == 0) {
+				token_append(ctx, TK_INT, start, len, ctx->line);
+				continue;
+			}
+			if (len == 4 && strncmp(start, "char", 4) == 0) {
+				token_append(ctx, TK_CHAR, start, len, ctx->line);
+				continue;
+			}
+			if (len == 4 && strncmp(start, "long", 4) == 0) {
+				token_append(ctx, TK_LONG, start, len, ctx->line);
+				continue;
+			}
+			if (len == 5 && strncmp(start, "short", 5) == 0) {
+				token_append(ctx, TK_SHORT, start, len, ctx->line);
+				continue;
+			}
+			if (len == 8 && strncmp(start, "unsigned", 8) == 0) {
+				token_append(ctx, TK_UNSIGNED, start, len, ctx->line);
+				continue;
+			}
+			if (len == 7 && strncmp(start, "typedef", 7) == 0) {
+				token_append(ctx, TK_TYPEDEF, start, len, ctx->line);
+				continue;
+			}
+			if (len == 6 && strncmp(start, "return", 6) == 0) {
+				token_append(ctx, TK_RETURN, start, len, ctx->line);
+				continue;
+			}
+			if (len == 2 && strncmp(start, "if", 2) == 0) {
+				token_append(ctx, TK_IF, start, len, ctx->line);
+				continue;
+			}
+			if (len == 4 && strncmp(start, "else", 4) == 0) {
+				token_append(ctx, TK_ELSE, start, len, ctx->line);
+				continue;
+			}
+			if (len == 3 && strncmp(start, "for", 3) == 0) {
+				token_append(ctx, TK_FOR, start, len, ctx->line);
+				continue;
+			}
+			if (len == 5 && strncmp(start, "while", 5) == 0) {
+				token_append(ctx, TK_WHILE, start, len, ctx->line);
+				continue;
+			}
+			token_append(ctx, TK_IDENT, start, len, ctx->line);
+			continue;
+		}
+		if (isdigit((unsigned char)*p)) {
+			const char *start = p;
+			while (isdigit((unsigned char)*p))
+				++p;
+			token_append(ctx, TK_NUMBER, start, (size_t)(p - start), ctx->line);
+			continue;
+		}
+		if (p[0] == '=' && p[1] == '=') {
+			token_append(ctx, TK_EQ, p, 2, ctx->line);
+			p += 2;
+			continue;
+		}
+		if (p[0] == '!' && p[1] == '=') {
+			token_append(ctx, TK_NE, p, 2, ctx->line);
+			p += 2;
+			continue;
+		}
+		if (p[0] == '<' && p[1] == '=') {
+			token_append(ctx, TK_LE, p, 2, ctx->line);
+			p += 2;
+			continue;
+		}
+		if (p[0] == '>' && p[1] == '=') {
+			token_append(ctx, TK_GE, p, 2, ctx->line);
+			p += 2;
+			continue;
+		}
+		switch (*p) {
+		case ';': token_append(ctx, TK_SEMI, p, 1, ctx->line); ++p; break;
+		case ',': token_append(ctx, TK_COMMA, p, 1, ctx->line); ++p; break;
+		case '(': token_append(ctx, TK_LPAREN, p, 1, ctx->line); ++p; break;
+		case ')': token_append(ctx, TK_RPAREN, p, 1, ctx->line); ++p; break;
+		case '{': token_append(ctx, TK_LBRACE, p, 1, ctx->line); ++p; break;
+		case '}': token_append(ctx, TK_RBRACE, p, 1, ctx->line); ++p; break;
+		case '[': token_append(ctx, TK_LBRACK, p, 1, ctx->line); ++p; break;
+		case ']': token_append(ctx, TK_RBRACK, p, 1, ctx->line); ++p; break;
+		case '.': token_append(ctx, TK_DOT, p, 1, ctx->line); ++p; break;
+		case '*': token_append(ctx, TK_STAR, p, 1, ctx->line); ++p; break;
+		case '&': token_append(ctx, TK_AMP, p, 1, ctx->line); ++p; break;
+		case '=': token_append(ctx, TK_ASSIGN, p, 1, ctx->line); ++p; break;
+		case '<': token_append(ctx, TK_LT, p, 1, ctx->line); ++p; break;
+		case '>': token_append(ctx, TK_GT, p, 1, ctx->line); ++p; break;
+		case '+': token_append(ctx, TK_PLUS, p, 1, ctx->line); ++p; break;
+		case '-': token_append(ctx, TK_MINUS, p, 1, ctx->line); ++p; break;
+		case '/': token_append(ctx, TK_DIV, p, 1, ctx->line); ++p; break;
+		case '%': token_append(ctx, TK_MOD, p, 1, ctx->line); ++p; break;
+		default:
+			token_append(ctx, TK_UNKNOWN, p, 1, ctx->line);
+			++p;
+			break;
+		}
+	}
+	token_append(ctx, TK_EOF, ctx->src_buf + strlen(ctx->src_buf), 0, ctx->line);
+}
+
+/* ----------------------------------------------------------------------
+ * Parser
+ * - supports: int/char base types, pointers, arrays, function defs,
+ *   local vars, return, expression statements, assignment, add/mul, comparisons
+ * ---------------------------------------------------------------------- */
+
+static token_t *
+peek_token(const compiler_context_t *ctx)
+{
+	if (ctx->token_idx < ctx->token_count)
+		return (token_t *)&ctx->tokens[ctx->token_idx];
+	return (token_t *)&ctx->tokens[ctx->token_count - 1];
+}
+
+static token_t *
+next_token(compiler_context_t *ctx)
+{
+	token_t *t = peek_token(ctx);
+	if (ctx->token_idx < ctx->token_count)
+		ctx->token_idx++;
+	return t;
+}
+
+static bool
+accept_token(compiler_context_t *ctx, token_kind_t kind)
+{
+	token_t *t = peek_token(ctx);
+	if (t->kind == kind) {
+		next_token((compiler_context_t *)ctx);
+		return true;
+	}
+	return false;
+}
+
+static void
+expect_token(compiler_context_t *ctx, token_kind_t kind, const char *msg)
+{
+	token_t *t = peek_token(ctx);
+	if (t->kind != kind)
+		error_at(ctx, t->pos ? t->pos : ctx->src_buf, "expected %s, got '%s'", msg, t->text ? t->text : "<eof>");
+	next_token((compiler_context_t *)ctx);
+}
+
+static type_info_t *
+parse_base_type(compiler_context_t *ctx)
+{
+	token_t *t;
+
+	t = peek_token(ctx);
+	if (t->kind == TK_INT) {
+		next_token(ctx);
+		type_info_t *ti = type_new(TY_INT);
+		ti->size_in_bytes = 4;
+		return ti;
+	}
+	if (t->kind == TK_CHAR) {
+		next_token(ctx);
+		type_info_t *ti = type_new(TY_CHAR);
+		ti->size_in_bytes = 1;
+		return ti;
+	}
+	/* default to int */
+	{
+		type_info_t *ti = type_new(TY_INT);
+		ti->size_in_bytes = 4;
+		return ti;
+	}
+}
+
+static char *
+parse_declarator_name(compiler_context_t *ctx, type_info_t **out_type)
+{
+	type_info_t *base = NULL;
+	token_t *t;
+	char *name = NULL;
+
+	while (accept_token(ctx, TK_STAR)) {
+		type_info_t *p = type_new(TY_PTR);
+		p->base = base;
+		p->size_in_bytes = sizeof(void *);
+		base = p;
+	}
+
+	t = peek_token(ctx);
+	if (t->kind == TK_IDENT) {
+		name = strdup(t->text);
+		next_token(ctx);
+	} else if (accept_token(ctx, TK_LPAREN)) {
+		name = parse_declarator_name(ctx, &base);
+		expect_token(ctx, TK_RPAREN, ")");
+	}
+
+	for (;;) {
+		if (accept_token(ctx, TK_LBRACK)) {
+			token_t *num = peek_token(ctx);
+			if (num->kind != TK_NUMBER)
+				error_at(ctx, num->pos ? num->pos : ctx->src_buf, "expected array size");
+			size_t n = (size_t)atoi(num->text);
+			next_token(ctx);
+			expect_token(ctx, TK_RBRACK, "]");
+			type_info_t *tarr = type_new(TY_ARRAY);
+			tarr->base = base ? base : type_new(TY_INT);
+			tarr->array_len = n;
+			tarr->size_in_bytes = tarr->base->size_in_bytes ? tarr->base->size_in_bytes * n : 0;
+			base = tarr;
+		} else if (accept_token(ctx, TK_LPAREN)) {
+			while (!accept_token(ctx, TK_RPAREN)) {
+				if (peek_token(ctx)->kind == TK_EOF)
+					error_at(ctx, ctx->src_buf, "unexpected EOF in function declarator");
+				next_token(ctx);
+			}
+			type_info_t *tf = type_new(TY_FUNC);
+			tf->base = base ? base : type_new(TY_INT);
+			base = tf;
+		} else {
+			break;
+		}
+	}
+
+	if (out_type)
+		*out_type = base;
+	return name;
+}
+
+/* Forward declarations for expression/statement parsing */
+static ast_node_t *parse_expression(compiler_context_t *ctx);
+static ast_node_t *parse_statement(compiler_context_t *ctx);
+static ast_node_t *parse_block(compiler_context_t *ctx);
+static ast_node_t *parse_param_list(compiler_context_t *ctx);
+static ast_node_t *parse_function(compiler_context_t *ctx);
+
+static ast_node_t *
+parse_primary(compiler_context_t *ctx)
+{
+	token_t *t;
+	ast_node_t *n;
+
+	t = peek_token(ctx);
+	if (t->kind == TK_NUMBER) {
+		n = calloc(1, sizeof(ast_node_t));
+		n->type = AST_IMM;
+		n->value = atoll(t->text);
+		n->pos = t->pos;
+		next_token(ctx);
+		return n;
+	}
+	if (t->kind == TK_IDENT) {
+		n = calloc(1, sizeof(ast_node_t));
+		n->type = AST_ID;
+		n->pos = t->pos;
+		n->sym = symbol_find(ctx, t->text);
+		next_token(ctx);
+		if (accept_token(ctx, TK_LPAREN)) {
+			ast_node_t *args = NULL;
+			ast_node_t **last = &args;
+			if (!accept_token(ctx, TK_RPAREN)) {
+				do {
+					ast_node_t *arg = parse_expression(ctx);
+					*last = arg;
+					while (*last)
+						last = &((*last)->next);
+				} while (accept_token(ctx, TK_COMMA));
+				expect_token(ctx, TK_RPAREN, ")");
+			}
+			ast_node_t *call = calloc(1, sizeof(ast_node_t));
+			call->type = AST_FUN_CALL;
+			call->op_a = n;
+			call->op_b = args;
+			call->pos = t->pos;
+			return call;
+		}
+		return n;
+	}
+	if (accept_token(ctx, TK_LPAREN)) {
+		ast_node_t *e = parse_expression(ctx);
+		expect_token(ctx, TK_RPAREN, ")");
+		return e;
+	}
+	error_at(ctx, t->pos ? t->pos : ctx->src_buf, "unexpected token in primary");
+	return NULL;
+}
+
+static ast_node_t *
+parse_unary(compiler_context_t *ctx)
+{
+	if (accept_token(ctx, TK_STAR)) {
+		ast_node_t *op = parse_unary(ctx);
+		ast_node_t *n = calloc(1, sizeof(ast_node_t));
+		n->type = AST_DEREF;
+		n->op_a = op;
+		return n;
+	}
+	if (accept_token(ctx, TK_AMP)) {
+		ast_node_t *op = parse_unary(ctx);
+		ast_node_t *n = calloc(1, sizeof(ast_node_t));
+		n->type = AST_ADDR_OF;
+		n->op_a = op;
+		return n;
+	}
+	return parse_primary(ctx);
+}
+
+static ast_node_t *
+parse_muldiv(compiler_context_t *ctx)
+{
+	ast_node_t *node = parse_unary(ctx);
+	for (;;) {
+		token_t *t = peek_token(ctx);
+		if (t->kind == TK_STAR) {
+			next_token(ctx);
+			ast_node_t *r = parse_unary(ctx);
+			ast_node_t *n = calloc(1, sizeof(ast_node_t));
+			n->type = AST_MUL;
+			n->op_a = node;
+			n->op_b = r;
+			node = n;
+		} else if (t->kind == TK_DIV) {
+			next_token(ctx);
+			ast_node_t *r = parse_unary(ctx);
+			ast_node_t *n = calloc(1, sizeof(ast_node_t));
+			n->type = AST_DIV;
+			n->op_a = node;
+			n->op_b = r;
+			node = n;
+		} else {
+			break;
+		}
+	}
+	return node;
+}
+
+static ast_node_t *
+parse_addsub(compiler_context_t *ctx)
+{
+	ast_node_t *node = parse_muldiv(ctx);
+	for (;;) {
+		token_t *t = peek_token(ctx);
+		if (t->kind == TK_PLUS) {
+			next_token(ctx);
+			ast_node_t *r = parse_muldiv(ctx);
+			ast_node_t *n = calloc(1, sizeof(ast_node_t));
+			n->type = AST_ADD;
+			n->op_a = node;
+			n->op_b = r;
+			node = n;
+		} else if (t->kind == TK_MINUS) {
+			next_token(ctx);
+			ast_node_t *r = parse_muldiv(ctx);
+			ast_node_t *n = calloc(1, sizeof(ast_node_t));
+			n->type = AST_SUB;
+			n->op_a = node;
+			n->op_b = r;
+			node = n;
+		} else {
+			break;
+		}
+	}
+	return node;
+}
+
+static ast_node_t *
+parse_comparison(compiler_context_t *ctx)
+{
+	ast_node_t *node = parse_addsub(ctx);
+	token_t *t = peek_token(ctx);
+	if (t->kind == TK_EQ || t->kind == TK_NE || t->kind == TK_LT ||
+	    t->kind == TK_LE || t->kind == TK_GT || t->kind == TK_GE) {
+		token_kind_t k = t->kind;
+		next_token(ctx);
+		ast_node_t *r = parse_addsub(ctx);
+		ast_node_t *n = calloc(1, sizeof(ast_node_t));
+		switch (k) {
+		case TK_EQ: n->type = AST_EQ; break;
+		case TK_NE: n->type = AST_NE; break;
+		case TK_LT: n->type = AST_LT; break;
+		case TK_LE: n->type = AST_LE; break;
+		case TK_GT: n->type = AST_GT; break;
+		case TK_GE: n->type = AST_GE; break;
+		default: n->type = AST_EQ; break;
+		}
+		n->op_a = node;
+		n->op_b = r;
+		return n;
+	}
+	return node;
+}
+
+static ast_node_t *
+parse_expression(compiler_context_t *ctx)
+{
+	ast_node_t *lhs = parse_comparison(ctx);
+	token_t *t = peek_token(ctx);
+	if (t->kind == TK_ASSIGN) {
+		next_token(ctx);
+		ast_node_t *rhs = parse_expression(ctx);
+		ast_node_t *n = calloc(1, sizeof(ast_node_t));
+		n->type = AST_ASSIGN;
+		n->op_a = lhs;
+		n->op_b = rhs;
+		return n;
+	}
+	return lhs;
+}
+
+static ast_node_t *
+parse_statement(compiler_context_t *ctx)
+{
+	token_t *t = peek_token(ctx);
+	if (t->kind == TK_RETURN) {
+		next_token(ctx);
+		ast_node_t *expr = parse_expression(ctx);
+		expect_token(ctx, TK_SEMI, ";");
+		ast_node_t *ret = calloc(1, sizeof(ast_node_t));
+		ret->type = AST_RETURN;
+		ret->op_a = expr;
+		ret->pos = t->pos;
+		return ret;
+	}
+	if (t->kind == TK_LBRACE)
+		return parse_block(ctx);
+	{
+		ast_node_t *e = parse_expression(ctx);
+		expect_token(ctx, TK_SEMI, ";");
+		ast_node_t *stmt = calloc(1, sizeof(ast_node_t));
+		stmt->type = AST_EXPR_STMT;
+		stmt->op_a = e;
+		stmt->pos = t->pos;
+		return stmt;
+	}
+}
+
+static ast_node_t *
+parse_block(compiler_context_t *ctx)
+{
+	expect_token(ctx, TK_LBRACE, "{");
+	ctx->current_scope++;
+	ast_node_t *block = calloc(1, sizeof(ast_node_t));
+	ast_node_t **last = &block->op_a;
+
+	block->type = AST_BLOCK;
+
+	while (!accept_token(ctx, TK_RBRACE)) {
+		token_t *t = peek_token(ctx);
+		if (t->kind == TK_INT) {
+			type_info_t *ty = parse_base_type(ctx);
+			char *name = parse_declarator_name(ctx, NULL);
+			if (!name)
+				error_at(ctx, t->pos ? t->pos : ctx->src_buf, "expected local name");
+			expect_token(ctx, TK_SEMI, ";");
+			sym_entry_t *s = symbol_new(name);
+			s->cls = SC_LOC;
+			s->type = ty;
+			s->local_index = -1;
+			symbol_table_add(ctx, s);
+			ast_node_t *decl = calloc(1, sizeof(ast_node_t));
+			decl->type = AST_VAR_DECL;
+			decl->sym = s;
+			*last = decl;
+			while (*last)
+				last = &((*last)->next);
+			continue;
+		} else {
+			ast_node_t *stmt = parse_statement(ctx);
+			*last = stmt;
+			while (*last)
+				last = &((*last)->next);
+		}
+	}
+	symbol_pop_scope(ctx);
+	return block;
+}
+
+static ast_node_t *
+parse_param_list(compiler_context_t *ctx)
+{
+	expect_token(ctx, TK_LPAREN, "(");
+	ast_node_t *params = NULL;
+	ast_node_t **last = &params;
+
+	if (accept_token(ctx, TK_RPAREN))
+		return NULL;
+
+	do {
+		type_info_t *base = parse_base_type(ctx);
+		char *name = parse_declarator_name(ctx, NULL);
+		if (!name)
+			error_at(ctx, ctx->src_buf, "expected parameter name");
+		sym_entry_t *s = symbol_new(name);
+		s->cls = SC_LOC;
+		s->type = base;
+		s->local_index = -1;
+		symbol_table_add(ctx, s);
+		ast_node_t *p = calloc(1, sizeof(ast_node_t));
+		p->type = AST_PARAM;
+		p->sym = s;
+		*last = p;
+		while (*last)
+			last = &((*last)->next);
+	} while (accept_token(ctx, TK_COMMA));
+
+	expect_token(ctx, TK_RPAREN, ")");
+	return params;
+}
+
+static ast_node_t *
+parse_function(compiler_context_t *ctx)
+{
+	type_info_t *ret_type = parse_base_type(ctx);
+	token_t *t = peek_token(ctx);
+	if (t->kind != TK_IDENT)
+		error_at(ctx, t->pos ? t->pos : ctx->src_buf, "expected function name");
+	char *fname = strdup(t->text);
+	next_token(ctx);
+	ctx->current_scope++;
+	ast_node_t *params = parse_param_list(ctx);
+	int param_index = 0;
+	for (ast_node_t *p = params; p; p = p->next)
+		if (p->sym)
+			p->sym->local_index = param_index++;
+	ast_node_t *body = parse_block(ctx);
+	sym_entry_t *s = symbol_new(fname);
+	s->cls = SC_FUN;
+	s->type = ret_type;
+	symbol_table_add(ctx, s);
+	ast_node_t *fnode = calloc(1, sizeof(ast_node_t));
+	fnode->type = AST_FUN_DEF;
+	fnode->op_a = params;
+	fnode->op_b = body;
+	fnode->sym = s;
+	fnode->pos = t->pos;
+	return fnode;
+}
+
+static void
+parse(compiler_context_t *ctx)
+{
+	ast_node_t *program;
+	ast_node_t **last;
+
+	ctx->token_idx = 0;
+	ctx->current_scope = 0;
+
+	program = calloc(1, sizeof(ast_node_t));
+	program->type = AST_PROGRAM;
+	last = &program->op_a;
+
+	while (peek_token(ctx)->kind != TK_EOF) {
+		token_t *t = peek_token(ctx);
+		if (t->kind == TK_INT) {
+			int save_idx = ctx->token_idx;
+			type_info_t *base = parse_base_type(ctx);
+			token_t *name_tok = peek_token(ctx);
+			if (name_tok->kind != TK_IDENT)
+				error_at(ctx, name_tok->pos ? name_tok->pos : ctx->src_buf, "expected identifier");
+			next_token(ctx);
+			token_t *after = peek_token(ctx);
+			ctx->token_idx = save_idx;
+			if (after->kind == TK_LPAREN) {
+				ast_node_t *f = parse_function(ctx);
+				*last = f;
+				last = &f->next;
+			} else {
+				type_info_t *base2 = parse_base_type(ctx);
+				do {
+					type_info_t *decl_type = NULL;
+					char *name = parse_declarator_name(ctx, &decl_type);
+					if (!name)
+						error_at(ctx, ctx->src_buf, "expected declarator name");
+					sym_entry_t *s = symbol_new(name);
+					s->cls = SC_GLO;
+					s->type = decl_type ? decl_type : base2;
+					s->val.i = 0;
+					symbol_table_add(ctx, s);
+					ast_node_t *g = calloc(1, sizeof(ast_node_t));
+					g->type = AST_VAR_DECL;
+					g->sym = s;
+					*last = g;
+					while (*last)
+						last = &((*last)->next);
+				} while (accept_token(ctx, TK_COMMA));
+				expect_token(ctx, TK_SEMI, ";");
+			}
+		} else {
+			error_at(ctx, t->pos ? t->pos : ctx->src_buf, "unexpected top-level token '%s'", t->text ? t->text : "<eof>");
+		}
+	}
+	ctx->ast_root = program;
+}
+
+/* ----------------------------------------------------------------------
+ * Code generator: precise REX/ModR/M/SIB encoders, simple allocator, SysV ABI
+ * - emits into ctx->x64_text; does not execute
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+	uint8_t *ptr;
+} emitter_t;
+
+static void
+emit_byte_to(emitter_t *em, uint8_t v)
+{
+	*em->ptr++ = v;
+}
+
+static void
+emit_bytes_to(emitter_t *em, const uint8_t *b, size_t n)
+{
+	memcpy(em->ptr, b, n);
+	em->ptr += n;
+}
+
+static void
+emit_int32_to(emitter_t *em, int32_t v)
+{
+	*(int32_t *)em->ptr = v;
+	em->ptr += 4;
+}
+
+static void
+emit_int64_to(emitter_t *em, int64_t v)
+{
+	*(int64_t *)em->ptr = v;
+	em->ptr += 8;
+}
+
+static void
+emit_rex_prefix(emitter_t *em, int w, int r, int x, int b)
+{
+	uint8_t rex;
+
+	rex = 0x40;
+	if (w)
+		rex |= 0x08;
+	if (r)
+		rex |= 0x04;
+	if (x)
+		rex |= 0x02;
+	if (b)
+		rex |= 0x01;
+	emit_byte_to(em, rex);
+}
+
+static void
+emit_modrm(emitter_t *em, uint8_t mod, uint8_t reg, uint8_t rm)
+{
+	uint8_t modrm = (uint8_t)((mod << 6) | ((reg & 7) << 3) | (rm & 7));
+	emit_byte_to(em, modrm);
+}
+
+static void
+emit_sib(emitter_t *em, uint8_t scale, uint8_t index, uint8_t base)
+{
+	uint8_t sib = (uint8_t)((scale << 6) | ((index & 7) << 3) | (base & 7));
+	emit_byte_to(em, sib);
+}
+
+/* mov imm64 -> reg */
+static void
+emit_mov_imm64_to_reg(emitter_t *em, reg_code_t reg, int64_t imm)
+{
+	int rex_b = (reg & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, 0, 0, rex_b);
+	emit_byte_to(em, 0xB8 + (reg & 7));
+	emit_int64_to(em, imm);
+}
+
+/* mov reg -> reg */
+static void
+emit_mov_reg_to_reg(emitter_t *em, reg_code_t src, reg_code_t dst)
+{
+	int rex_r = (src & 8) ? 1 : 0;
+	int rex_b = (dst & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, rex_b);
+	emit_byte_to(em, 0x89);
+	emit_modrm(em, 3, src & 7, dst & 7);
+}
+
+/* mov reg -> [rbp - disp32] */
+static void
+emit_mov_reg_to_mem_rbp(emitter_t *em, reg_code_t src, int32_t disp32)
+{
+	int rex_r = (src & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, 1);
+	emit_byte_to(em, 0x89);
+	emit_modrm(em, 2, src & 7, 5);
+	emit_int32_to(em, -disp32);
+}
+
+/* mov [rbp - disp32] -> reg */
+static void
+emit_mov_mem_rbp_to_reg(emitter_t *em, reg_code_t dst, int32_t disp32)
+{
+	int rex_r = (dst & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, 1);
+	emit_byte_to(em, 0x8B);
+	emit_modrm(em, 2, dst & 7, 5);
+	emit_int32_to(em, -disp32);
+}
+
+/* mov imm64 -> [abs64] via rdx */
+static void
+emit_mov_reg_to_abs(emitter_t *em, reg_code_t src, int64_t absaddr)
+{
+	emit_mov_imm64_to_reg(em, REG_RDX, absaddr);
+	int rex_r = (src & 8) ? 1 : 0;
+	int rex_b = (REG_RDX & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, rex_b);
+	emit_byte_to(em, 0x89);
+	emit_modrm(em, 0, src & 7, REG_RDX & 7);
+}
+
+/* mov [abs64] -> reg (via mov reg, imm64; mov reg, [reg]) */
+static void
+emit_mov_abs_to_reg(emitter_t *em, reg_code_t dst, int64_t absaddr)
+{
+	emit_mov_imm64_to_reg(em, dst, absaddr);
+	int rex_b = (dst & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, 0, 0, rex_b);
+	emit_byte_to(em, 0x8B);
+	emit_modrm(em, 0, dst & 7, dst & 7);
+}
+
+/* lea reg, [rbp - disp32] */
+static void
+emit_lea_reg_mem_rbp(emitter_t *em, reg_code_t dst, int32_t disp32)
+{
+	int rex_r = (dst & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, 1);
+	emit_byte_to(em, 0x8D);
+	emit_modrm(em, 2, dst & 7, 5);
+	emit_int32_to(em, -disp32);
+}
+
+/* cmp r/m64, r64 */
+static void
+emit_cmp_reg_reg(emitter_t *em, reg_code_t a, reg_code_t b)
+{
+	int rex_r = (b & 8) ? 1 : 0;
+	int rex_b = (a & 8) ? 1 : 0;
+	emit_rex_prefix(em, 1, rex_r, 0, rex_b);
+	emit_byte_to(em, 0x39);
+	emit_modrm(em, 3, b & 7, a & 7);
+}
+
+/* setcc + movzx rax, al */
+static void
+emit_setcc_and_movzx_rax(emitter_t *em, uint8_t setcc_low)
+{
+	emit_byte_to(em, 0x0F);
+	emit_byte_to(em, 0x90 | setcc_low);
+	emit_bytes_to(em, (const uint8_t *)"\x48\x0F\xB6\xC0", 4);
+}
+
+/* call rax */
+static void
+emit_call_rax(emitter_t *em)
+{
+	emit_bytes_to(em, (const uint8_t *)"\xFF\xD0", 2);
+}
+
+/* ret */
+static void
+emit_ret(emitter_t *em)
+{
+	emit_byte_to(em, 0xC3);
+}
+
+/* ----------------------------------------------------------------------
+ * Simple register allocator with spill slots
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+	reg_code_t pool[9];
+	int used[9];
+	int spill_base;
+	int next_spill;
+} allocator_t;
+
+static void
+allocator_init(allocator_t *a, int spill_base)
+{
+	reg_code_t p[] = { REG_RAX, REG_RCX, REG_RDX, REG_RSI, REG_RDI, REG_R8, REG_R9, REG_R10, REG_R11 };
+	memcpy(a->pool, p, sizeof(p));
+	memset(a->used, 0, sizeof(a->used));
+	a->spill_base = spill_base;
+	a->next_spill = 0;
+}
+
+static int
+allocator_spill_slot(allocator_t *a)
+{
+	return a->spill_base + (a->next_spill++) * 8;
+}
+
+/* ----------------------------------------------------------------------
+ * Codegen: expression and statement emission
+ * ---------------------------------------------------------------------- */
+
+static void
+codegen_expr_node(compiler_context_t *ctx, emitter_t *em, allocator_t *alloc, ast_node_t *node)
+{
+	if (!node)
+		return;
+
+	switch (node->type) {
+	case AST_IMM:
+		emit_mov_imm64_to_reg(em, REG_RAX, node->value);
+		break;
+
+	case AST_ID:
+		if (!node->sym)
+			error_at(ctx, node->pos ? node->pos : ctx->src_buf, "unknown identifier");
+		if (node->sym->cls == SC_GLO)
+			emit_mov_abs_to_reg(em, REG_RAX, node->sym->val.i);
+		else if (node->sym->cls == SC_LOC) {
+			int32_t off = 8 + node->sym->local_index * 8;
+			emit_mov_mem_rbp_to_reg(em, REG_RAX, off);
+		} else
+			error_at(ctx, node->pos ? node->pos : ctx->src_buf, "unsupported id class");
+		break;
+
+	case AST_ASSIGN: {
+		ast_node_t *lhs = node->op_a;
+		ast_node_t *rhs = node->op_b;
+		codegen_expr_node(ctx, em, alloc, rhs); /* rax = rhs */
+		if (lhs->type == AST_ID && lhs->sym) {
+			if (lhs->sym->cls == SC_LOC) {
+				int32_t off = 8 + lhs->sym->local_index * 8;
+				emit_mov_reg_to_mem_rbp(em, REG_RAX, off);
+			} else if (lhs->sym->cls == SC_GLO) {
+				emit_mov_reg_to_abs(em, REG_RAX, lhs->sym->val.i);
+			} else
+				error_at(ctx, node->pos ? node->pos : ctx->src_buf, "assign to unsupported symbol class");
+		} else {
+			error_at(ctx, node->pos ? node->pos : ctx->src_buf, "assign to non-lvalue");
+		}
+		break;
+	}
+
+	case AST_ADD: {
+		codegen_expr_node(ctx, em, alloc, node->op_a); /* rax = left */
+		int spill = allocator_spill_slot(alloc);
+		emit_mov_reg_to_mem_rbp(em, REG_RAX, spill);
+		codegen_expr_node(ctx, em, alloc, node->op_b); /* rax = right */
+		emit_mov_mem_rbp_to_reg(em, REG_RDX, spill); /* rdx = left */
+		emit_bytes_to(em, (const uint8_t *)"\x48\x01\xD0", 3); /* add rax, rdx */
+		break;
+	}
+
+	case AST_MUL: {
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		int spill = allocator_spill_slot(alloc);
+		emit_mov_reg_to_mem_rbp(em, REG_RAX, spill);
+		codegen_expr_node(ctx, em, alloc, node->op_b);
+		emit_mov_mem_rbp_to_reg(em, REG_RDX, spill);
+		emit_bytes_to(em, (const uint8_t *)"\x48\x0F\xAF\xC2", 4); /* imul rax, rdx */
+		break;
+	}
+
+	case AST_EQ: {
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		emit_mov_reg_to_mem_rbp(em, REG_RAX, 8);
+		codegen_expr_node(ctx, em, alloc, node->op_b);
+		emit_mov_mem_rbp_to_reg(em, REG_RDX, 8);
+		emit_cmp_reg_reg(em, REG_RDX, REG_RAX);
+		emit_setcc_and_movzx_rax(em, 0x4); /* sete */
+		break;
+	}
+
+	case AST_LT: {
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		emit_mov_reg_to_mem_rbp(em, REG_RAX, 8);
+		codegen_expr_node(ctx, em, alloc, node->op_b);
+		emit_mov_mem_rbp_to_reg(em, REG_RDX, 8);
+		emit_cmp_reg_reg(em, REG_RDX, REG_RAX);
+		emit_setcc_and_movzx_rax(em, 0xC); /* setl */
+		break;
+	}
+
+	case AST_FUN_CALL: {
+		reg_code_t arg_regs[6] = { REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_R8, REG_R9 };
+		int idx = 0;
+		ast_node_t *a = node->op_b;
+		while (a && idx < 6) {
+			codegen_expr_node(ctx, em, alloc, a);
+			emit_mov_reg_to_reg(em, REG_RAX, arg_regs[idx]);
+			a = a->next;
+			++idx;
+		}
+		if (node->op_a && node->op_a->sym && node->op_a->sym->val.i) {
+			emit_mov_imm64_to_reg(em, REG_RAX, node->op_a->sym->val.i);
+			emit_call_rax(em);
+		} else {
+			codegen_expr_node(ctx, em, alloc, node->op_a);
+			emit_call_rax(em);
+		}
+		break;
+	}
+
+	default:
+		emit_byte_to(em, 0xCC); /* int3 for unsupported nodes */
+		break;
+	}
+}
+
+static void
+codegen_stmt_node(compiler_context_t *ctx, emitter_t *em, allocator_t *alloc, ast_node_t *node, int func_scope)
+{
+	if (!node)
+		return;
+
+	switch (node->type) {
+	case AST_BLOCK: {
+		ast_node_t *it = node->op_a;
+		while (it) {
+			codegen_stmt_node(ctx, em, alloc, it, func_scope);
+			it = it->next;
+		}
+		break;
+	}
+
+	case AST_EXPR_STMT:
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		break;
+
+	case AST_RETURN:
+		if (node->op_a)
+			codegen_expr_node(ctx, em, alloc, node->op_a);
+		emit_bytes_to(em, (const uint8_t *)"\x48\x89\xEC\x5D\xC3", 5); /* mov rsp, rbp; pop rbp; ret */
+		break;
+
+	case AST_IF: {
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		emit_bytes_to(em, (const uint8_t *)"\x48\x85\xC0", 3); /* test rax, rax */
+		emit_byte_to(em, 0x0F);
+		emit_byte_to(em, 0x84); /* jz rel32 */
+		uint8_t *patch_pos = em->ptr;
+		emit_int32_to(em, 0);
+		codegen_stmt_node(ctx, em, alloc, node->op_b, func_scope);
+		if (node->op_c) {
+			emit_byte_to(em, 0x0F);
+			emit_byte_to(em, 0x85); /* jnz rel32 */
+			uint8_t *patch2 = em->ptr;
+			emit_int32_to(em, 0);
+			int32_t rel = (int32_t)(em->ptr - (patch_pos + 4));
+			*(int32_t *)patch_pos = rel;
+			codegen_stmt_node(ctx, em, alloc, node->op_c, func_scope);
+			int32_t rel2 = (int32_t)(em->ptr - (patch2 + 4));
+			*(int32_t *)patch2 = rel2;
+		} else {
+			int32_t rel = (int32_t)(em->ptr - (patch_pos + 4));
+			*(int32_t *)patch_pos = rel;
+		}
+		break;
+	}
+
+	case AST_WHILE: {
+		uint8_t *loop_start = em->ptr;
+		codegen_expr_node(ctx, em, alloc, node->op_a);
+		emit_bytes_to(em, (const uint8_t *)"\x48\x85\xC0", 3);
+		emit_byte_to(em, 0x0F);
+		emit_byte_to(em, 0x84);
+		uint8_t *patch_jz = em->ptr;
+		emit_int32_to(em, 0);
+		codegen_stmt_node(ctx, em, alloc, node->op_b, func_scope);
+		emit_byte_to(em, 0xE9);
+		int32_t rel_back = (int32_t)(loop_start - (em->ptr + 4));
+		emit_int32_to(em, rel_back);
+		int32_t rel = (int32_t)(em->ptr - (patch_jz + 4));
+		*(int32_t *)patch_jz = rel;
+		break;
+	}
+
+	default:
+		if (node->op_a)
+			codegen_expr_node(ctx, em, alloc, node->op_a);
+		break;
+	}
+}
+
+static int
+codegen(compiler_context_t *ctx)
+{
+	emitter_t em;
+	ast_node_t *it;
+
+	if (!ctx)
+		return -1;
+
+	ctx->poolsz = 512 * 1024;
+
+#ifndef _WIN32
+	ctx->x64_text = mmap(NULL, ctx->poolsz, PROT_READ | PROT_WRITE | PROT_EXEC,
+	    MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+	if (ctx->x64_text == MAP_FAILED) {
+		fprintf(stderr, "mmap failed\n");
+		return -1;
+	}
+#else
+	ctx->x64_text = malloc(ctx->poolsz);
+	if (!ctx->x64_text) {
+		fprintf(stderr, "malloc failed\n");
+		return -1;
+	}
+#endif
+
+	em.ptr = ctx->x64_text;
+
+	if (!ctx->ast_root)
+		return 0;
+
+	it = ctx->ast_root->op_a;
+	while (it) {
+		if (it->type == AST_FUN_DEF && it->sym) {
+			it->sym->val.i = (intptr_t)em.ptr;
+			int max_local = -1;
+			for (size_t i = 0; i < ctx->sym_count; ++i) {
+				if (ctx->sym_table[i].cls == SC_LOC &&
+				    ctx->sym_table[i].scope_level >= it->sym->scope_level) {
+					if (ctx->sym_table[i].local_index > max_local)
+						max_local = ctx->sym_table[i].local_index;
+				}
+			}
+			int local_count = max_local + 1;
+			int stack_size = local_count * 8;
+			if (stack_size % 16)
+				stack_size = ((stack_size + 15) / 16) * 16;
+			emit_bytes_to(&em, (const uint8_t *)"\x55\x48\x89\xE5", 4); /* push rbp; mov rbp, rsp */
+			if (stack_size > 0) {
+				emit_bytes_to(&em, (const uint8_t *)"\x48\x81\xEC", 3);
+				emit_int32_to(&em, stack_size);
+			}
+			allocator_t alloc;
+			allocator_init(&alloc, 8 + local_count * 8);
+			reg_code_t arg_regs[6] = { REG_RDI, REG_RSI, REG_RDX, REG_RCX, REG_R8, REG_R9 };
+			for (size_t i = 0; i < ctx->sym_count; ++i) {
+				sym_entry_t *s = &ctx->sym_table[i];
+				if (s->cls == SC_LOC && s->scope_level >= it->sym->scope_level &&
+				    s->local_index >= 0 && s->local_index < 6) {
+					int32_t off = 8 + s->local_index * 8;
+					emit_mov_reg_to_mem_rbp(&em, arg_regs[s->local_index], off);
+				}
+			}
+			codegen_stmt_node(ctx, &em, &alloc, it->op_b, it->sym->scope_level);
+			emit_bytes_to(&em, (const uint8_t *)"\x48\x89\xEC\x5D\xC3", 5); /* default epilog */
+		}
+		it = it->next;
+	}
+
+	ctx->x64_e = em.ptr;
+	return 0;
+}
+
+/* ----------------------------------------------------------------------
+ * Public API helpers
+ * ---------------------------------------------------------------------- */
+
+static void
+compiler_init(compiler_context_t *ctx)
+{
+	memset(ctx, 0, sizeof(compiler_context_t));
+	ctx->poolsz = 256 * 1024;
+	ctx->current_scope = 0;
+}
+
+static void
+compiler_set_source(compiler_context_t *ctx, const char *src)
+{
+	if (ctx->src_buf)
+		free(ctx->src_buf);
+	ctx->src_buf = strdup(src);
+}
+
+/* ----------------------------------------------------------------------
+ * main: read stdin, preprocess, lex, parse, codegen
+ * ---------------------------------------------------------------------- */
+
+
+int
+main(int argc, char **argv)
+{
+    compiler_context_t ctx;
+    size_t cap;
+    size_t len;
+    size_t r;
+    char *buf;
+    sym_entry_t *main_sym;
+    int (*jit_main)(int, char **);
+    int ret;
+
+    compiler_init(&ctx);
+
+    /* read stdin into buffer */
+    cap = 4096;
+    len = 0;
+    buf = malloc(cap);
+    if (!buf) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+
+    for (;;) {
+        r = fread(buf + len, 1, cap - len - 1, stdin);
+        if (r == 0)
+            break;
+        len += r;
+        if (len + 256 >= cap) {
+            cap *= 2;
+            buf = realloc(buf, cap);
+            if (!buf) {
+                fprintf(stderr, "out of memory\n");
+                return 1;
+            }
+        }
+    }
+    buf[len] = '\0';
+    compiler_set_source(&ctx, buf);
+    free(buf);
+
+    /* 1. preprocess */
+    preprocess(&ctx);
+
+    /* 2. lex */
+    lex(&ctx);
+
+    /* 3. parse */
+    parse(&ctx);
+
+    /* 4. codegen */
+    if (codegen(&ctx) != 0) {
+        fprintf(stderr, "codegen failed\n");
+        return 1;
+    }
+
+    /* locate JIT entry point "main" and call it */
+    main_sym = symbol_find(&ctx, "main");
+    if (!main_sym || main_sym->val.i == 0) {
+        fprintf(stderr, "no JIT 'main' found\n");
+        /* cleanup below */
+    } else {
+        /* cast emitted address to function pointer and call */
+        jit_main = (int (*)(int, char **))(void *)main_sym->val.i;
+        /* Call JITed main and print its return value */
+        ret = jit_main(argc, argv);
+        printf("JIT main returned: %d\n", ret);
+    }
+
+    /* cleanup tokens */
+    for (int i = 0; i < ctx.token_count; ++i)
+        free(ctx.tokens[i].text);
+    free(ctx.tokens);
+
+    /* cleanup symbols and layouts */
+    for (size_t i = 0; i < ctx.sym_count; ++i) {
+        if (ctx.sym_table[i].layout) {
+            for (size_t f = 0; f < ctx.sym_table[i].layout->field_count; ++f) {
+                if (ctx.sym_table[i].layout->fields[f].name)
+                    free(ctx.sym_table[i].layout->fields[f].name);
+            }
+            free(ctx.sym_table[i].layout->fields);
+            free(ctx.sym_table[i].layout);
+        }
+        if (ctx.sym_table[i].name)
+            free(ctx.sym_table[i].name);
+    }
+    free(ctx.sym_table);
+
+    /* free source buffer */
+    if (ctx.src_buf)
+        free(ctx.src_buf);
+
+    /* release generated code buffer */
+#ifndef _WIN32
+    if (ctx.x64_text)
+        munmap(ctx.x64_text, ctx.poolsz);
+#else
+    if (ctx.x64_text)
+        free(ctx.x64_text);
+#endif
+
+    return 0;
+}
+

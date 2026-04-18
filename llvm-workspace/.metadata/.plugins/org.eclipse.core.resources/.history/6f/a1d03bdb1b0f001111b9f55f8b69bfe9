@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/wrk/llvm-workspace/unused-optimizer4/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -I/usr/lib/llvm-20/include -O3 -DNDEBUG -std=c++17   -D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS -o CMakeFiles/remove_unused_static_funcs_to_c.dir/unused-optimizer1.cpp.o -c /wrk/llvm-workspace/unused-optimizer4/unused-optimizer1.cpp",
+  "file": "/wrk/llvm-workspace/unused-optimizer4/unused-optimizer1.cpp",
+  "output": "CMakeFiles/remove_unused_static_funcs_to_c.dir/unused-optimizer1.cpp.o"
+}
+]

@@ -1,0 +1,6 @@
+/wrk/kernel-workspace/exectrace1/CMakeFiles/kbuild.dir
+/wrk/kernel-workspace/exectrace1/CMakeFiles/kclean.dir
+/wrk/kernel-workspace/exectrace1/CMakeFiles/kinstall.dir
+/wrk/kernel-workspace/exectrace1/CMakeFiles/show.dir
+/wrk/kernel-workspace/exectrace1/CMakeFiles/edit_cache.dir
+/wrk/kernel-workspace/exectrace1/CMakeFiles/rebuild_cache.dir

@@ -1,0 +1,881 @@
+// wt_crawler.cpp
+// Single-file Wt application that provides a UI for the crawler + integrated search.
+// Combines a lightweight crawler (based on provided crawler code), SQLite storage (with FTS5),
+// and a Wt UI with Dashboard, Frontier, Detail and Search screens.
+//
+// Build (example):
+// g++ wt_crawler.cpp -o wt_crawler -std=c++17 `pkg-config --cflags --libs wt` -lcurl -lsqlite3 -lxml2 -lcrypto -pthread
+//
+// Run:
+// ./wt_crawler --docroot . --http-address 0.0.0.0 --http-port 8080
+//
+// Notes:
+// - This is an amalgamated single-file example intended as a working skeleton.
+// - It implements core DB schema, a background worker loop, simple fetch+parse, and Wt UI + REST resources.
+// - For production use, harden error handling, sanitize inputs, and respect robots.txt / legal constraints.
+
+#include <Wt/WApplication.h>
+#include <Wt/WContainerWidget.h>
+#include <Wt/WPushButton.h>
+#include <Wt/WLineEdit.h>
+#include <Wt/WText.h>
+#include <Wt/WServer.h>
+#include <Wt/WResource.h>
+#include <Wt/WAnchor.h>
+#include <Wt/WTable.h>
+#include <Wt/WStackedWidget.h>
+#include <Wt/WDataTable.h>
+#include <Wt/WDialog.h>
+#include <Wt/WTextArea.h>
+#include <Wt/WProgressBar.h>
+#include <Wt/WCheckBox.h>
+#include <Wt/WComboBox.h>
+#include <Wt/WBootstrapTheme.h>
+#include <Wt/WBreak.h>
+#include <Wt/Json/Object.h>
+#include <Wt/Json/Array.h>
+#include <Wt/Json/Serializer.h>
+#include <Wt/Http/Request.h>
+#include <Wt/Http/Response.h>
+#include <Wt/Utils.h>
+
+#include <curl/curl.h>
+#include <sqlite3.h>
+#include <openssl/sha.h>
+#include <libxml/HTMLparser.h>
+#include <libxml/xpath.h>
+
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <ctime>
+#include <algorithm>
+#include <cctype>
+#include <regex>
+#include <queue>
+#include <map>
+
+using namespace Wt;
+using namespace std::chrono_literals;
+
+// ----------------------------- Configuration -----------------------------
+static const char* DB_FILENAME = "crawler_wt.db";
+static const char* USER_AGENT = "WtAddressCrawler/1.0";
+static const int DEFAULT_WORKERS = 4;
+static const int POLITE_DELAY_MS = 150;
+
+// ----------------------------- Globals -----------------------------
+static sqlite3* g_db = nullptr;
+static std::mutex g_db_mutex;
+
+struct FrontierItem {
+    std::string url;
+    std::string normalized;
+    int depth;
+    double score;
+    std::time_t queued_at;
+};
+
+static std::mutex g_frontier_mutex;
+static std::condition_variable g_frontier_cv;
+static std::deque<FrontierItem> g_frontier;
+static std::atomic<bool> g_crawl_running(false);
+static std::atomic<int> g_workers_count(DEFAULT_WORKERS);
+static std::vector<std::thread> g_worker_threads;
+static std::atomic<int> g_crawled_count(0);
+static std::atomic<int> g_email_count(0);
+static std::atomic<int> g_phone_count(0);
+
+// ----------------------------- Utilities -----------------------------
+static std::string now_iso() {
+    auto t = std::time(nullptr);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return std::string(buf);
+}
+
+static std::string sha256_hex(const unsigned char* data, size_t len) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    SHA256_Update(&ctx, data, len);
+    SHA256_Final(hash, &ctx);
+    std::ostringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) ss << std::setw(2) << (int)hash[i];
+    return ss.str();
+}
+
+static size_t curl_write_cb(void* ptr, size_t size, size_t nmemb, void* userdata) {
+    std::string* s = (std::string*)userdata;
+    size_t add = size * nmemb;
+    s->append((char*)ptr, add);
+    return add;
+}
+
+// ----------------------------- DB: schema and helpers -----------------------------
+static void db_exec(const char* sql) {
+    char* err = nullptr;
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    if (sqlite3_exec(g_db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "DB error: " << (err ? err : "(unknown)") << "\n";
+        if (err) sqlite3_free(err);
+    }
+}
+
+static void db_init() {
+    if (sqlite3_open(DB_FILENAME, &g_db) != SQLITE_OK) {
+        std::cerr << "Cannot open DB: " << sqlite3_errmsg(g_db) << "\n";
+        exit(1);
+    }
+    // Enable WAL for concurrency
+    db_exec("PRAGMA journal_mode=WAL;");
+    // Core tables
+    db_exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS urls (
+            id INTEGER PRIMARY KEY,
+            url TEXT UNIQUE,
+            normalized TEXT UNIQUE,
+            depth INTEGER,
+            score REAL,
+            inbound INTEGER DEFAULT 0,
+            crawled INTEGER DEFAULT 0,
+            content_hash TEXT,
+            crawled_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS emails (id INTEGER PRIMARY KEY, email TEXT UNIQUE, source_url TEXT, discovered_at TEXT);
+        CREATE TABLE IF NOT EXISTS phones (id INTEGER PRIMARY KEY, phone TEXT UNIQUE, source_url TEXT, discovered_at TEXT);
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(url, title, body, content='');
+    )SQL");
+}
+
+static bool db_insert_url_if_new(const std::string& url, const std::string& norm, int depth, double score) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT OR IGNORE INTO urls (url, normalized, depth, score) VALUES (?, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, norm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, depth);
+    sqlite3_bind_double(stmt, 4, score);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE && sqlite3_changes(g_db) > 0);
+}
+
+static void db_mark_crawled(const std::string& norm, const std::string& hash_hex) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "UPDATE urls SET crawled = 1, content_hash = ?, crawled_at = ? WHERE normalized = ?;";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
+    sqlite3_bind_text(stmt, 1, hash_hex.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, now_iso().c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, norm.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static bool db_has_normalized(const std::string& norm) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "SELECT 1 FROM urls WHERE normalized = ? LIMIT 1;";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, norm.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    bool found = (rc == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static bool db_insert_email(const std::string& email, const std::string& source) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT OR IGNORE INTO emails (email, source_url, discovered_at) VALUES (?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, email.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, now_iso().c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE && sqlite3_changes(g_db) > 0);
+}
+
+static bool db_insert_phone(const std::string& phone, const std::string& source) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT OR IGNORE INTO phones (phone, source_url, discovered_at) VALUES (?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return false;
+    sqlite3_bind_text(stmt, 1, phone.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, source.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, now_iso().c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return (rc == SQLITE_DONE && sqlite3_changes(g_db) > 0);
+}
+
+static void db_index_doc(const std::string& url, const std::string& title, const std::string& body) {
+    std::lock_guard<std::mutex> lk(g_db_mutex);
+    sqlite3_stmt* stmt = nullptr;
+    const char* sql = "INSERT INTO docs_fts (rowid, url, title, body) VALUES (NULL, ?, ?, ?);";
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) != SQLITE_OK) return;
+    sqlite3_bind_text(stmt, 1, url.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, title.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, body.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+// ----------------------------- Simple normalization/resolution -----------------------------
+static std::string normalize_url(const std::string& url) {
+    // Very small normalization: strip fragment and trailing slash
+    std::string s = url;
+    auto pos = s.find('#');
+    if (pos != std::string::npos) s.erase(pos);
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
+// ----------------------------- Extraction helpers -----------------------------
+static void extract_emails_and_phones(const std::string& text, const std::string& source) {
+    static const std::regex email_re(R"(([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})))", std::regex::icase);
+    static const std::regex phone_re(R"((\+?[0-9][0-9\-\.\s\(\)]{6,}[0-9]))", std::regex::icase);
+
+    std::smatch m;
+    std::string s = text;
+    auto it = s.cbegin();
+    while (std::regex_search(it, s.cend(), m, email_re)) {
+        std::string email = m[1].str();
+        std::transform(email.begin(), email.end(), email.begin(), ::tolower);
+        if (db_insert_email(email, source)) {
+            g_email_count++;
+            std::cerr << "[NEW EMAIL] " << email << " (source: " << source << ")\n";
+        }
+        it = m.suffix().first;
+    }
+    it = s.cbegin();
+    while (std::regex_search(it, s.cend(), m, phone_re)) {
+        std::string phone = m[1].str();
+        // normalize phone: keep digits and leading +
+        std::string norm;
+        for (char c : phone) if (std::isdigit((unsigned char)c) || (c == '+' && norm.empty())) norm.push_back(c);
+        if (!norm.empty()) {
+            if (db_insert_phone(norm, source)) {
+                g_phone_count++;
+                std::cerr << "[NEW PHONE] " << norm << " (source: " << source << ")\n";
+            }
+        }
+        it = m.suffix().first;
+    }
+}
+
+// ----------------------------- Fetch + parse -----------------------------
+static bool fetch_url(CURL* curl, const std::string& url, std::string& out_body, std::string& out_content_type, long& out_code) {
+    out_body.clear();
+    out_content_type.clear();
+    out_code = 0;
+    curl_easy_reset(curl);
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, USER_AGENT);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out_body);
+    struct curl_slist* headers = nullptr;
+    // header callback to capture content-type
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, +[](char* buffer, size_t size, size_t nitems, void* userdata)->size_t {
+        size_t len = size * nitems;
+        std::string hdr(buffer, len);
+        std::string* ct = (std::string*)userdata;
+        std::string key = "Content-Type:";
+        if (hdr.size() >= key.size() && strncasecmp(hdr.c_str(), key.c_str(), key.size()) == 0) {
+            // extract value
+            auto p = hdr.c_str() + key.size();
+            while (*p && isspace((unsigned char)*p)) ++p;
+            std::string v(p, hdr.cend());
+            // trim
+            while (!v.empty() && (v.back() == '\r' || v.back() == '\n')) v.pop_back();
+            *ct = v;
+        }
+        return len;
+    });
+    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &out_content_type);
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        return false;
+    }
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out_code);
+    // only accept HTML
+    if (!out_content_type.empty() && out_content_type.find("text/html") == std::string::npos) {
+        return false;
+    }
+    return true;
+}
+
+static void parse_html_and_index(const std::string& html, const std::string& base_url) {
+    if (html.empty()) return;
+    htmlDocPtr doc = htmlReadMemory(html.c_str(), (int)html.size(), base_url.c_str(), NULL, HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING | HTML_PARSE_RECOVER);
+    if (!doc) return;
+    xmlXPathContextPtr xpathCtx = xmlXPathNewContext(doc);
+    if (!xpathCtx) { xmlFreeDoc(doc); return; }
+
+    // Extract title
+    std::string title;
+    xmlXPathObjectPtr titleObj = xmlXPathEvalExpression((xmlChar*)"//title/text()", xpathCtx);
+    if (titleObj && titleObj->nodesetval && titleObj->nodesetval->nodeNr > 0) {
+        xmlNodePtr n = titleObj->nodesetval->nodeTab[0];
+        if (n && n->content) title = (const char*)n->content;
+    }
+    if (titleObj) xmlXPathFreeObject(titleObj);
+
+    // Extract text nodes into body
+    xmlXPathObjectPtr textObj = xmlXPathEvalExpression((xmlChar*)"//text()", xpathCtx);
+    std::string body;
+    if (textObj && textObj->nodesetval) {
+        xmlNodeSetPtr nodes = textObj->nodesetval;
+        for (int i = 0; i < nodes->nodeNr; ++i) {
+            xmlNodePtr node = nodes->nodeTab[i];
+            if (node && node->content) {
+                body.append((const char*)node->content);
+                body.push_back(' ');
+            }
+        }
+    }
+    if (textObj) xmlXPathFreeObject(textObj);
+
+    // Index into FTS and extract entities
+    db_index_doc(base_url, title, body);
+    extract_emails_and_phones(body, base_url);
+
+    // Extract hrefs and enqueue (simple)
+    xmlXPathObjectPtr hrefObj = xmlXPathEvalExpression((xmlChar*)"//@href", xpathCtx);
+    if (hrefObj && hrefObj->nodesetval) {
+        xmlNodeSetPtr nodes = hrefObj->nodesetval;
+        for (int i = 0; i < nodes->nodeNr; ++i) {
+            xmlAttrPtr attr = (xmlAttrPtr)nodes->nodeTab[i];
+            if (attr && attr->children && attr->children->content) {
+                const char* href = (const char*)attr->children->content;
+                std::string hrefs(href);
+                // skip mailto/tel
+                if (hrefs.rfind("mailto:", 0) == 0) continue;
+                if (hrefs.rfind("tel:", 0) == 0) continue;
+                // resolve relative: very naive
+                std::string resolved = hrefs;
+                if (hrefs.rfind("http://", 0) != 0 && hrefs.rfind("https://", 0) != 0) {
+                    // join base_url up to last '/'
+                    auto pos = base_url.find_last_of('/');
+                    if (pos != std::string::npos) {
+                        resolved = base_url.substr(0, pos) + "/" + hrefs;
+                    } else {
+                        resolved = base_url + "/" + hrefs;
+                    }
+                }
+                std::string norm = normalize_url(resolved);
+                if (!db_has_normalized(norm)) {
+                    FrontierItem it;
+                    it.url = resolved;
+                    it.normalized = norm;
+                    it.depth = 0;
+                    it.score = 1.0;
+                    it.queued_at = std::time(nullptr);
+                    {
+                        std::lock_guard<std::mutex> lk(g_frontier_mutex);
+                        g_frontier.push_back(it);
+                        g_frontier_cv.notify_one();
+                    }
+                    db_insert_url_if_new(resolved, norm, it.depth, it.score);
+                }
+            }
+        }
+    }
+    if (hrefObj) xmlXPathFreeObject(hrefObj);
+
+    xmlXPathFreeContext(xpathCtx);
+    xmlFreeDoc(doc);
+}
+
+// ----------------------------- Worker loop -----------------------------
+static void worker_loop(int id) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+    while (g_crawl_running.load()) {
+        FrontierItem item;
+        {
+            std::unique_lock<std::mutex> lk(g_frontier_mutex);
+            g_frontier_cv.wait_for(lk, 500ms, []{ return !g_frontier.empty() || !g_crawl_running.load(); });
+            if (!g_crawl_running.load() && g_frontier.empty()) break;
+            if (g_frontier.empty()) continue;
+            item = g_frontier.front();
+            g_frontier.pop_front();
+        }
+        // polite delay
+        std::this_thread::sleep_for(std::chrono::milliseconds(POLITE_DELAY_MS));
+        std::string body, ctype;
+        long code = 0;
+        bool ok = fetch_url(curl, item.url, body, ctype, code);
+        if (!ok) {
+            std::cerr << "[worker " << id << "] fetch failed: " << item.url << "\n";
+            continue;
+        }
+        // compute hash
+        std::string hash = sha256_hex((const unsigned char*)body.data(), body.size());
+        db_mark_crawled(item.normalized, hash);
+        parse_html_and_index(body, item.url);
+        g_crawled_count++;
+        std::cerr << "[" << now_iso() << "] [worker " << id << "] crawled: " << item.url << " code=" << code << "\n";
+    }
+    curl_easy_cleanup(curl);
+}
+
+// ----------------------------- API Resources -----------------------------
+class ApiResource : public WResource {
+public:
+    ApiResource() { suggestFileName("api"); }
+    ~ApiResource() override { beingDeleted(); }
+
+    // POST /api/crawl/control  { action: start|stop, seed: url, workers: n }
+    // POST /api/frontier add {url}
+    // POST /api/search { q, page, per_page }
+    void handleRequest(const Http::Request& request, Http::Response& response) override {
+        response.setMimeType("application/json");
+        try {
+            if (request.method() == "POST") {
+                std::string path = request.pathInfo(); // e.g., "/crawl/control" or "/frontier" or "/search"
+                std::string body;
+                std::istream& in = request.in();
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                body = ss.str();
+
+                // Very small JSON parsing using Wt::Json (expects valid JSON)
+                Wt::Json::Object obj;
+                try {
+                    Wt::Json::parse(body, obj);
+                } catch (...) {
+                    // fallback: parse form parameters
+                }
+
+                if (path == "/crawl/control") {
+                    std::string action;
+                    if (obj.contains("action")) action = obj.get("action").toString();
+                    else if (request.getParameter("action")) action = request.getParameter("action");
+                    if (action == "start") {
+                        std::string seed;
+                        if (obj.contains("seed")) seed = obj.get("seed").toString();
+                        else if (request.getParameter("seed")) seed = request.getParameter("seed");
+                        int workers = DEFAULT_WORKERS;
+                        if (obj.contains("workers")) workers = (int)obj.get("workers").toNumber();
+                        else if (request.getParameter("workers")) workers = std::stoi(request.getParameter("workers"));
+                        start_crawl(seed, workers);
+                        Wt::Json::Object out;
+                        out["status"] = "started";
+                        out["workers"] = workers;
+                        response.out() << Wt::Json::serialize(out);
+                        return;
+                    } else if (action == "stop") {
+                        stop_crawl();
+                        Wt::Json::Object out;
+                        out["status"] = "stopped";
+                        response.out() << Wt::Json::serialize(out);
+                        return;
+                    }
+                } else if (path == "/frontier") {
+                    // add seed
+                    std::string url;
+                    if (obj.contains("url")) url = obj.get("url").toString();
+                    else if (request.getParameter("url")) url = request.getParameter("url");
+                    if (!url.empty()) {
+                        FrontierItem it;
+                        it.url = url;
+                        it.normalized = normalize_url(url);
+                        it.depth = 0;
+                        it.score = 10.0;
+                        it.queued_at = std::time(nullptr);
+                        {
+                            std::lock_guard<std::mutex> lk(g_frontier_mutex);
+                            g_frontier.push_back(it);
+                            g_frontier_cv.notify_one();
+                        }
+                        db_insert_url_if_new(url, it.normalized, it.depth, it.score);
+                        Wt::Json::Object out;
+                        out["status"] = "enqueued";
+                        out["url"] = url;
+                        response.out() << Wt::Json::serialize(out);
+                        return;
+                    }
+                } else if (path == "/search") {
+                    std::string q;
+                    int page = 0, per_page = 20;
+                    if (obj.contains("q")) q = obj.get("q").toString();
+                    if (obj.contains("page")) page = (int)obj.get("page").toNumber();
+                    if (obj.contains("per_page")) per_page = (int)obj.get("per_page").toNumber();
+
+                    // Simple FTS5 query
+                    std::lock_guard<std::mutex> lk(g_db_mutex);
+                    sqlite3_stmt* stmt = nullptr;
+                    std::string sql = "SELECT url, title, snippet(docs_fts, 2, '<b>', '</b>', '...', 10) as snippet FROM docs_fts WHERE docs_fts MATCH ? LIMIT ? OFFSET ?;";
+                    if (sqlite3_prepare_v2(g_db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+                        std::string qparam = q.empty() ? "*" : q;
+                        sqlite3_bind_text(stmt, 1, qparam.c_str(), -1, SQLITE_TRANSIENT);
+                        sqlite3_bind_int(stmt, 2, per_page);
+                        sqlite3_bind_int(stmt, 3, page * per_page);
+                        Wt::Json::Array results;
+                        while (sqlite3_step(stmt) == SQLITE_ROW) {
+                            const unsigned char* url = sqlite3_column_text(stmt, 0);
+                            const unsigned char* title = sqlite3_column_text(stmt, 1);
+                            const unsigned char* snippet = sqlite3_column_text(stmt, 2);
+                            Wt::Json::Object r;
+                            r["url"] = url ? (const char*)url : "";
+                            r["title"] = title ? (const char*)title : "";
+                            r["snippet"] = snippet ? (const char*)snippet : "";
+                            results.push_back(r);
+                        }
+                        sqlite3_finalize(stmt);
+                        Wt::Json::Object out;
+                        out["results"] = results;
+                        response.out() << Wt::Json::serialize(out);
+                        return;
+                    } else {
+                        Wt::Json::Object out;
+                        out["error"] = "search not available";
+                        response.out() << Wt::Json::serialize(out);
+                        return;
+                    }
+                }
+            }
+            // default
+            Wt::Json::Object out;
+            out["error"] = "invalid request";
+            response.out() << Wt::Json::serialize(out);
+        } catch (const std::exception& ex) {
+            response.setStatus(500);
+            Wt::Json::Object out;
+            out["error"] = std::string("server error: ") + ex.what();
+            response.out() << Wt::Json::serialize(out);
+        }
+    }
+
+private:
+    void start_crawl(const std::string& seed, int workers) {
+        if (g_crawl_running.load()) return;
+        if (!seed.empty()) {
+            FrontierItem it;
+            it.url = seed;
+            it.normalized = normalize_url(seed);
+            it.depth = 0;
+            it.score = 10.0;
+            it.queued_at = std::time(nullptr);
+            {
+                std::lock_guard<std::mutex> lk(g_frontier_mutex);
+                g_frontier.push_back(it);
+                g_frontier_cv.notify_one();
+            }
+            db_insert_url_if_new(seed, it.normalized, it.depth, it.score);
+        }
+        g_workers_count.store(workers);
+        g_crawl_running.store(true);
+        // spawn workers
+        for (int i = 0; i < workers; ++i) {
+            g_worker_threads.emplace_back([i](){ worker_loop(i+1); });
+        }
+    }
+
+    void stop_crawl() {
+        if (!g_crawl_running.load()) return;
+        g_crawl_running.store(false);
+        g_frontier_cv.notify_all();
+        for (auto& t : g_worker_threads) if (t.joinable()) t.join();
+        g_worker_threads.clear();
+    }
+};
+
+// ----------------------------- Wt Application -----------------------------
+class CrawlerApp : public WApplication {
+public:
+    CrawlerApp(const WEnvironment& env, ApiResource* api)
+        : WApplication(env), api_(api)
+    {
+        setTitle("Wt Crawler & Search");
+        // theme
+        auto theme = std::make_shared<WBootstrapTheme>();
+        theme->setVersion(WBootstrapTheme::Version::v4);
+        setTheme(theme);
+
+        root()->addWidget(std::make_unique<WText>("<h2>Address Crawler — Dashboard</h2>"));
+
+        // Top controls
+        auto controls = root()->addWidget(std::make_unique<WContainerWidget>());
+        startBtn_ = controls->addWidget(std::make_unique<WPushButton>("Start Crawl"));
+        stopBtn_  = controls->addWidget(std::make_unique<WPushButton>("Stop Crawl"));
+        seedInput_ = controls->addWidget(std::make_unique<WLineEdit>());
+        seedInput_->setPlaceholderText("Seed URL (optional)");
+        enqueueBtn_ = controls->addWidget(std::make_unique<WPushButton>("Enqueue Seed"));
+        controls->addWidget(std::make_unique<WBreak>());
+
+        // Metrics
+        metrics_ = root()->addWidget(std::make_unique<WContainerWidget>());
+        crawledText_ = metrics_->addWidget(std::make_unique<WText>("Crawled: 0"));
+        queuedText_  = metrics_->addWidget(std::make_unique<WText>(" | Queued: 0"));
+        emailsText_  = metrics_->addWidget(std::make_unique<WText>(" | Emails: 0"));
+        phonesText_  = metrics_->addWidget(std::make_unique<WText>(" | Phones: 0"));
+        metrics_->addWidget(std::make_unique<WBreak>());
+
+        // Progress
+        progress_ = root()->addWidget(std::make_unique<WProgressBar>());
+        progress_->setRange(0, 100);
+        progress_->setValue(0);
+
+        // Search box
+        auto searchRow = root()->addWidget(std::make_unique<WContainerWidget>());
+        searchBox_ = searchRow->addWidget(std::make_unique<WLineEdit>());
+        searchBox_->setPlaceholderText("Search crawled content");
+        searchBtn_ = searchRow->addWidget(std::make_unique<WPushButton>("Search"));
+        searchResults_ = root()->addWidget(std::make_unique<WDataTable>());
+
+        // Frontier table
+        root()->addWidget(std::make_unique<WText>("<h3>Frontier</h3>"));
+        frontierTable_ = root()->addWidget(std::make_unique<WDataTable>());
+        frontierTable_->setMargin(10, Side::Top);
+        frontierTable_->setHeaderCount(1);
+        frontierTable_->addColumn("url", "URL");
+        frontierTable_->addColumn("queued_at", "Queued At");
+
+        // Recent crawled
+        root()->addWidget(std::make_unique<WText>("<h3>Recent Crawled</h3>"));
+        recentTable_ = root()->addWidget(std::make_unique<WDataTable>());
+        recentTable_->addColumn("url", "URL");
+        recentTable_->addColumn("crawled_at", "Crawled At");
+
+        // Wire events
+        startBtn_->clicked().connect([=](){
+            // call API to start
+            Wt::Json::Object req;
+            req["action"] = "start";
+            req["seed"] = seedInput_->text().toUTF8();
+            req["workers"] = (int)g_workers_count.load();
+            doApiPost("/api/crawl/control", req);
+        });
+        stopBtn_->clicked().connect([=](){
+            Wt::Json::Object req;
+            req["action"] = "stop";
+            doApiPost("/api/crawl/control", req);
+        });
+        enqueueBtn_->clicked().connect([=](){
+            Wt::Json::Object req;
+            req["url"] = seedInput_->text().toUTF8();
+            doApiPost("/api/frontier", req);
+            seedInput_->setText("");
+            refreshFrontier();
+        });
+        searchBtn_->clicked().connect([=](){
+            doSearch(searchBox_->text().toUTF8());
+        });
+
+        // periodic UI refresh
+        timer_ = addChild(std::make_unique<WContainerWidget>()); // dummy holder
+        refreshTimerThread_ = std::thread([this](){
+            while (true) {
+                std::this_thread::sleep_for(1s);
+                // schedule UI update on main thread
+                this->doJavaScript("/* tick */");
+                WApplication::instance()->post([this](){ refreshMetrics(); refreshFrontier(); refreshRecent(); });
+                if (!WApplication::instance()) break;
+            }
+        });
+        // initial refresh
+        refreshMetrics();
+        refreshFrontier();
+        refreshRecent();
+    }
+
+    ~CrawlerApp() {
+        // stop background timer thread
+        if (refreshTimerThread_.joinable()) {
+            refreshTimerThread_.detach();
+        }
+    }
+
+private:
+    ApiResource* api_;
+    WPushButton* startBtn_ = nullptr;
+    WPushButton* stopBtn_ = nullptr;
+    WLineEdit* seedInput_ = nullptr;
+    WPushButton* enqueueBtn_ = nullptr;
+    WContainerWidget* metrics_ = nullptr;
+    WText* crawledText_ = nullptr;
+    WText* queuedText_ = nullptr;
+    WText* emailsText_ = nullptr;
+    WText* phonesText_ = nullptr;
+    WProgressBar* progress_ = nullptr;
+    WLineEdit* searchBox_ = nullptr;
+    WPushButton* searchBtn_ = nullptr;
+    WDataTable* searchResults_ = nullptr;
+    WDataTable* frontierTable_ = nullptr;
+    WDataTable* recentTable_ = nullptr;
+    WContainerWidget* timer_ = nullptr;
+    std::thread refreshTimerThread_;
+
+    void doApiPost(const std::string& path, const Wt::Json::Object& obj) {
+        // simple HTTP POST using libcurl to localhost (assumes same server)
+        std::string url = std::string("http://127.0.0.1:8080") + path;
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
+        std::string payload = Wt::Json::serialize(obj);
+        std::string resp;
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payload.size());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        curl_easy_perform(curl);
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(curl);
+        // ignore response for now
+    }
+
+    void doSearch(const std::string& q) {
+        // call /api/search
+        std::string url = "http://127.0.0.1:8080/api/search";
+        CURL* curl = curl_easy_init();
+        if (!curl) return;
+        Wt::Json::Object req;
+        req["q"] = q;
+        std::string payload = Wt::Json::serialize(req);
+        std::string resp;
+        struct curl_slist* hdrs = nullptr;
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)payload.size());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        curl_easy_perform(curl);
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(curl);
+
+        // parse JSON response
+        try {
+            Wt::Json::Value v = Wt::Json::parse(resp);
+            if (v.type() == Wt::Json::ObjectType) {
+                Wt::Json::Object o = v;
+                if (o.contains("results")) {
+                    Wt::Json::Array arr = o.get("results");
+                    searchResults_->clear();
+                    searchResults_->addColumn("url", "URL");
+                    searchResults_->addColumn("title", "Title");
+                    searchResults_->addColumn("snippet", "Snippet");
+                    for (size_t i = 0; i < arr.size(); ++i) {
+                        Wt::Json::Object r = arr.get(i);
+                        std::string url = r.get("url").toString();
+                        std::string title = r.get("title").toString();
+                        std::string snippet = r.get("snippet").toString();
+                        int row = searchResults_->rowCount();
+                        searchResults_->insertRow(row);
+                        searchResults_->setText(row, 0, url);
+                        searchResults_->setText(row, 1, title);
+                        searchResults_->setText(row, 2, snippet);
+                    }
+                }
+            }
+        } catch (...) {
+            // ignore
+        }
+    }
+
+    void refreshMetrics() {
+        crawledText_->setText("Crawled: " + std::to_string(g_crawled_count.load()));
+        emailsText_->setText(" | Emails: " + std::to_string(g_email_count.load()));
+        phonesText_->setText(" | Phones: " + std::to_string(g_phone_count.load()));
+        std::lock_guard<std::mutex> lk(g_frontier_mutex);
+        queuedText_->setText(" | Queued: " + std::to_string((int)g_frontier.size()));
+        // progress: naive
+        int pct = std::min(100, (int)g_crawled_count.load());
+        progress_->setValue(pct);
+    }
+
+    void refreshFrontier() {
+        std::lock_guard<std::mutex> lk(g_frontier_mutex);
+        frontierTable_->clear();
+        frontierTable_->addColumn("url", "URL");
+        frontierTable_->addColumn("queued_at", "Queued At");
+        int r = 0;
+        for (auto it = g_frontier.begin(); it != g_frontier.end(); ++it) {
+            frontierTable_->insertRow(r);
+            frontierTable_->setText(r, 0, it->url);
+            frontierTable_->setText(r, 1, std::to_string((long)it->queued_at));
+            ++r;
+        }
+    }
+
+    void refreshRecent() {
+        // query DB for recent crawled
+        std::lock_guard<std::mutex> lk(g_db_mutex);
+        sqlite3_stmt* stmt = nullptr;
+        const char* sql = "SELECT url, crawled_at FROM urls WHERE crawled = 1 ORDER BY crawled_at DESC LIMIT 20;";
+        if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            recentTable_->clear();
+            recentTable_->addColumn("url", "URL");
+            recentTable_->addColumn("crawled_at", "Crawled At");
+            int r = 0;
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                const unsigned char* url = sqlite3_column_text(stmt, 0);
+                const unsigned char* crawled_at = sqlite3_column_text(stmt, 1);
+                recentTable_->insertRow(r);
+                recentTable_->setText(r, 0, url ? (const char*)url : "");
+                recentTable_->setText(r, 1, crawled_at ? (const char*)crawled_at : "");
+                ++r;
+            }
+            sqlite3_finalize(stmt);
+        }
+    }
+};
+
+// ----------------------------- main -----------------------------
+int main(int argc, char** argv) {
+    try {
+        // init DB
+        db_init();
+
+        // init curl global
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+
+        // create API resource
+        auto api = std::make_shared<ApiResource>();
+
+        WServer server(argc, argv, WTHTTP_CONFIGURATION);
+
+        server.addResource(api.get(), "/api");
+        // Note: ApiResource expects pathInfo to be "/crawl/control" or "/frontier" or "/search"
+        // so we mount it at /api and use pathInfo accordingly.
+
+        server.addEntryPoint(Wt::EntryPointType::Application,
+            [api](const WEnvironment& env) {
+                return std::make_unique<CrawlerApp>(env, api.get());
+            });
+
+        if (server.start()) {
+            int sig = WServer::waitForShutdown();
+            std::cerr << "Shutdown (signal = " << sig << ")\n";
+            server.stop();
+        }
+
+        // cleanup
+        curl_global_cleanup();
+        if (g_db) sqlite3_close(g_db);
+    } catch (const std::exception& ex) {
+        std::cerr << "Fatal: " << ex.what() << "\n";
+        return 1;
+    }
+    return 0;
+}

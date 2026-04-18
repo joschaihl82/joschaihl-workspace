@@ -1,0 +1,323 @@
+/*
+ * Minimaler Flusssimulator mit Partikel-Schwarm, GLUT + GLEW + GLSL
+ *
+ * Build-Beispiel (Linux):
+ *   gcc river_pso.c -lGL -lGLEW -lglut -lm -o river_pso
+ */
+
+#include <GL/glew.h>
+#include <GL/glut.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+#define NUM_PARTICLES 20000
+
+typedef struct {
+    float x, y;
+    float vx, vy;
+} Particle;
+
+static Particle particles[NUM_PARTICLES];
+static GLuint particleVBO = 0;
+static GLuint shaderProgram = 0;
+static int windowWidth = 1280;
+static int windowHeight = 720;
+static float timeStep = 0.016f; // ~60 FPS
+static float globalTime = 0.0f;
+
+// ---------------- GLSL Shader (sehr einfach) ----------------
+
+static const char *vertexShaderSrc =
+"#version 120\n"
+"attribute vec2 aPos;\n"
+"void main() {\n"
+"    gl_PointSize = 2.0;\n"
+"    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+"}\n";
+
+static const char *fragmentShaderSrc =
+"#version 120\n"
+"void main() {\n"
+"    // leicht variierende Blautöne\n"
+"    float r = 0.0;\n"
+"    float g = 0.3 + 0.2 * (gl_FragCoord.y / 720.0);\n"
+"    float b = 0.7 + 0.3 * (gl_FragCoord.x / 1280.0);\n"
+"    gl_FragColor = vec4(r, g, b, 1.0);\n"
+"}\n";
+
+// ---------------- Hilfsfunktionen ----------------
+
+static void checkCompile(GLuint obj, GLenum type) {
+    GLint status = 0;
+    if (type == GL_VERTEX_SHADER || type == GL_FRAGMENT_SHADER) {
+        glGetShaderiv(obj, GL_COMPILE_STATUS, &status);
+        if (!status) {
+            char log[1024];
+            glGetShaderInfoLog(obj, sizeof(log), NULL, log);
+            fprintf(stderr, "Shader compile error:\n%s\n", log);
+            exit(EXIT_FAILURE);
+        }
+    } else if (type == GL_PROGRAM) {
+        glGetProgramiv(obj, GL_LINK_STATUS, &status);
+        if (!status) {
+            char log[1024];
+            glGetProgramInfoLog(obj, sizeof(log), NULL, log);
+            fprintf(stderr, "Program link error:\n%s\n", log);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+static GLuint createShaderProgram(void) {
+    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+
+    glShaderSource(vs, 1, &vertexShaderSrc, NULL);
+    glShaderSource(fs, 1, &fragmentShaderSrc, NULL);
+
+    glCompileShader(vs);
+    checkCompile(vs, GL_VERTEX_SHADER);
+    glCompileShader(fs);
+    checkCompile(fs, GL_FRAGMENT_SHADER);
+
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glBindAttribLocation(prog, 0, "aPos");
+    glLinkProgram(prog);
+    checkCompile(prog, GL_PROGRAM);
+
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+
+    return prog;
+}
+
+// ---------------- Fluss-Geometrie & Feld ----------------
+
+/*
+ * Normalisierte Koordinaten:
+ *   x, y in [-1, 1]
+ *
+ * Idee:
+ *   - Links: sehr breiter Hauptfluss (dicke vertikale Zone).
+ *   - Nach rechts: mehrere dünnere Seitenarme, die sich verzweigen.
+ */
+
+static int inRiverMask(float x, float y) {
+    // Hauptfluss: breite vertikale Zone links
+    float mainCenterX = -0.8f;
+    float mainHalfWidth = 0.25f; // sehr dick
+    if (fabsf(x - mainCenterX) < mainHalfWidth) {
+        return 1;
+    }
+
+    // Seitenarme: je weiter rechts, desto dünner
+    // Wir definieren ein paar "Kanäle", die sich leicht schlängeln.
+    // Beispiel: 3 Arme, deren Breite mit x abnimmt.
+    float armCentersY[3] = { -0.4f, 0.0f, 0.4f };
+    for (int i = 0; i < 3; ++i) {
+        float baseY = armCentersY[i];
+        // leichte Sinuskrümmung abhängig von x
+        float centerY = baseY + 0.2f * sinf(3.0f * x + i);
+        // Breite nimmt mit x ab: bei x=-0.5 noch relativ breit, bei x=1 sehr dünn
+        float t = (x + 0.5f) / 1.5f; // grobe Normierung
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) t = 1.0f;
+        float halfWidth = 0.18f * (1.0f - t) + 0.03f * t; // von ~0.18 auf ~0.03
+
+        if (x > -0.5f && fabsf(y - centerY) < halfWidth) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Fluss-Vektorfeld:
+ *   - Hauptfluss: von links nach rechts, leicht nach unten.
+ *   - Seitenarme: mehr Variation, leichte Krümmung.
+ */
+static void riverField(float x, float y, float *fx, float *fy) {
+    // Grundrichtung: nach rechts
+    float vx = 1.0f;
+    float vy = 0.0f;
+
+    // Wenn im Hauptflussbereich: leichte Neigung nach unten
+    float mainCenterX = -0.8f;
+    float mainHalfWidth = 0.25f;
+    if (fabsf(x - mainCenterX) < mainHalfWidth) {
+        vx = 1.0f;
+        vy = -0.2f;
+    }
+
+    // Seitenarme: etwas mehr Struktur
+    if (x > -0.5f) {
+        // leichte Wirbel/Meander
+        vx = 1.0f + 0.3f * sinf(5.0f * y + 2.0f * x);
+        vy = 0.3f * cosf(4.0f * x + 3.0f * y);
+    }
+
+    // Normalisieren
+    float len = sqrtf(vx * vx + vy * vy);
+    if (len < 1e-5f) len = 1e-5f;
+    *fx = vx / len;
+    *fy = vy / len;
+}
+
+// ---------------- Partikel-Schwarm (PSO-artig) ----------------
+
+static void respawnParticle(int i) {
+    // Starte links im Hauptfluss, zufällige y-Position innerhalb der Flussmaske
+    float x = -1.1f + 0.05f * ((float)rand() / RAND_MAX); // etwas links außerhalb
+    float y = -1.0f + 2.0f * ((float)rand() / RAND_MAX);
+
+    // Stelle sicher, dass wir in der Flussmaske landen (oder nahe dran)
+    int tries = 0;
+    while (!inRiverMask(x, y) && tries < 20) {
+        y = -1.0f + 2.0f * ((float)rand() / RAND_MAX);
+        tries++;
+    }
+
+    particles[i].x = x;
+    particles[i].y = y;
+
+    float fx, fy;
+    riverField(x, y, &fx, &fy);
+    particles[i].vx = fx * (0.3f + 0.4f * ((float)rand() / RAND_MAX));
+    particles[i].vy = fy * (0.3f + 0.4f * ((float)rand() / RAND_MAX));
+}
+
+static void initParticles(void) {
+    for (int i = 0; i < NUM_PARTICLES; ++i) {
+        respawnParticle(i);
+    }
+}
+
+/*
+ * PSO-artiges Update:
+ *   - Partikel folgen dem Flussfeld (riverField).
+ *   - Velocity wird an das Feld angepasst (Attraction).
+ *   - Kleine Zufallsstörung für "Wellen".
+ */
+static void updateParticles(float dt) {
+    const float attraction = 2.0f;   // wie stark zum Flussvektor gezogen
+    const float damping    = 0.2f;   // Reibung
+    const float noiseAmp   = 0.3f;   // Wellen/Zufall
+
+    for (int i = 0; i < NUM_PARTICLES; ++i) {
+        float x = particles[i].x;
+        float y = particles[i].y;
+
+        // Wenn Partikel außerhalb des relevanten Bereichs oder nicht im Fluss: respawn
+        if (x > 1.2f || x < -1.2f || y < -1.2f || y > 1.2f || !inRiverMask(x, y)) {
+            respawnParticle(i);
+            continue;
+        }
+
+        float fx, fy;
+        riverField(x, y, &fx, &fy);
+
+        // PSO-artig: Velocity Richtung Flussvektor
+        particles[i].vx += attraction * fx * dt;
+        particles[i].vy += attraction * fy * dt;
+
+        // Dämpfung
+        particles[i].vx *= (1.0f - damping * dt);
+        particles[i].vy *= (1.0f - damping * dt);
+
+        // Rauschen (Wellen)
+        float nx = ((float)rand() / RAND_MAX - 0.5f) * noiseAmp;
+        float ny = ((float)rand() / RAND_MAX - 0.5f) * noiseAmp;
+        particles[i].vx += nx * dt;
+        particles[i].vy += ny * dt;
+
+        // Positionsupdate
+        particles[i].x += particles[i].vx * dt;
+        particles[i].y += particles[i].vy * dt;
+    }
+}
+
+// ---------------- OpenGL / GLUT ----------------
+
+static void initGL(void) {
+    glewInit();
+    glClearColor(0.02f, 0.02f, 0.05f, 1.0f);
+    glDisable(GL_DEPTH_TEST);
+
+    shaderProgram = createShaderProgram();
+
+    glGenBuffers(1, &particleVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    glBufferData(GL_ARRAY_BUFFER, NUM_PARTICLES * 2 * sizeof(float), NULL, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+static void uploadParticles(void) {
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    float *data = (float *)glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY);
+    if (data) {
+        for (int i = 0; i < NUM_PARTICLES; ++i) {
+            data[2 * i + 0] = particles[i].x;
+            data[2 * i + 1] = particles[i].y;
+        }
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+static void display(void) {
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(shaderProgram);
+
+    glBindBuffer(GL_ARRAY_BUFFER, particleVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void*)0);
+
+    glDrawArrays(GL_POINTS, 0, NUM_PARTICLES);
+
+    glDisableVertexAttribArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glUseProgram(0);
+
+    glutSwapBuffers();
+}
+
+static void idle(void) {
+    globalTime += timeStep;
+    updateParticles(timeStep);
+    uploadParticles();
+    glutPostRedisplay();
+}
+
+static void reshape(int w, int h) {
+    windowWidth = w;
+    windowHeight = h;
+    glViewport(0, 0, w, h);
+}
+
+// ---------------- main ----------------
+
+int main(int argc, char **argv) {
+    srand((unsigned int)time(NULL));
+
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(windowWidth, windowHeight);
+    glutCreateWindow("Flusssimulator mit Partikel-Schwarm");
+
+    initGL();
+    initParticles();
+    uploadParticles();
+
+    glutDisplayFunc(display);
+    glutIdleFunc(idle);
+    glutReshapeFunc(reshape);
+
+    glutMainLoop();
+    return 0;
+}

@@ -1,0 +1,1548 @@
+/*
+ * nanoc.c
+ *
+ * Teaching C compiler front-end and x86-64 code generator that emits
+ * AT&T-syntax assembly. This file is an extended, self-contained single-file
+ * compiler front-end (lexer, parser, semantic analysis) and a code generator
+ * that prints AT&T-style x86-64 assembly (GAS / clang/ gcc compatible).
+ *
+ * notes:
+ * - at&t syntax differences applied: registers prefixed with '%', immediates with '$',
+ * memory operands like -8(%rbp), instruction operand order is src, dest.
+ * - push/pop use pushq/popq with register operands (e.g., pushq %rax).
+ * - movq $imm, %rax for immediates; leaq -8(%rbp), %rax for addresses.
+ *
+ * this is educational code and not production-grade.
+ */
+
+#define _gnu_source
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <assert.h>
+
+/* ----------------------------------------------------------------------
+ * configuration
+ * ---------------------------------------------------------------------- */
+
+#define temp_token_buffer_size 1024 // local buffer for string/char literal parsing
+#define align_to(n, a) (((n) + ((a)-1)) & ~((a)-1))
+
+/* ----------------------------------------------------------------------
+ * error handling
+ * ---------------------------------------------------------------------- */
+
+static char *current_input = null;
+
+void error_at(char *loc, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	int pos = (int) (loc - current_input);
+	fprintf(stderr, "\n--- compile error ---\n");
+	fprintf(stderr, "%s\n", current_input);
+	fprintf(stderr, "%*s^ ", pos, "");
+	vfprintf(stderr, fmt, ap);
+	fprintf(stderr, "\n---------------------\n");
+	va_end(ap);
+	exit(1);
+}
+
+/* ----------------------------------------------------------------------
+ * tiny preprocessor (inline includes only, with /usr/include fallback)
+ * ---------------------------------------------------------------------- */
+
+/* read entire file into a newly allocated buffer (caller must free) */
+static char* read_file(const char *path) {
+    file *fp = fopen(path, "rb");
+    if (!fp) {
+        return null;
+    }
+    if (fseek(fp, 0, seek_end) != 0) {
+        fclose(fp);
+        return null;
+    }
+    long size = ftell(fp);
+    if (size < 0) size = 0;
+    rewind(fp);
+    char *buf = calloc((size_t)size + 1, 1);
+    if (!buf) {
+        fclose(fp);
+        return null;
+    }
+    size_t n = fread(buf, 1, (size_t)size, fp);
+    buf[n] = '\0';
+    fclose(fp);
+    return buf;
+}
+
+/* helper: append string to dynamic buffer */
+static void append_to_buf(char **outp, size_t *outcap, size_t *outlen, const char *s, size_t slen) {
+    if (*outlen + slen + 1 > *outcap) {
+        size_t newcap = (*outcap == 0) ? (slen + 1024) : (*outcap * 2 + slen);
+        *outp = realloc(*outp, newcap);
+        *outcap = newcap;
+    }
+    memcpy(*outp + *outlen, s, slen);
+    *outlen += slen;
+    (*outp)[*outlen] = '\0';
+}
+
+/* very small preprocess: inline includes only. no macro support. */
+static char* preprocess(const char *input) {
+    const char *p = input;
+    char *out = null;
+    size_t outcap = 0;
+    size_t outlen = 0;
+
+    while (*p) {
+        /* detect line start and optional leading whitespace */
+        const char *scan = p;
+        while (*scan && *scan != '\n' && isspace((unsigned char)*scan)) scan++;
+        if (*scan == '#') {
+            const char *hash = scan;
+            const char *q = hash + 1;
+            while (isspace((unsigned char)*q)) q++;
+            if (!strncmp(q, "include", 7) && isspace((unsigned char)q[7])) {
+                q += 7;
+                while (isspace((unsigned char)*q)) q++;
+                char fname[1024] = {0};
+                int fi = 0;
+                char delim = 0;
+                if (*q == '"' || *q == '<') {
+                    delim = *q++;
+                    while (*q && *q != (delim == '<' ? '>' : '"') && fi < (int)sizeof(fname)-1) {
+                        fname[fi++] = *q++;
+                    }
+                    fname[fi] = '\0';
+                    if (*q) q++; /* skip closing quote or > */
+                } else {
+                    /* malformed include: copy the line as-is and continue */
+                    const char *ln = hash;
+                    while (*ln && *ln != '\n') ln++;
+                    append_to_buf(&out, &outcap, &outlen, hash, (size_t)(ln - hash));
+                    if (*ln == '\n') {
+                        append_to_buf(&out, &outcap, &outlen, "\n", 1);
+                        p = ln + 1;
+                    } else {
+                        p = ln;
+                    }
+                    continue;
+                }
+
+                /* read included file and inline it. */
+                char *inc = null;
+
+                /* try to open the file as given first */
+                {
+                    file *fp = fopen(fname, "rb");
+                    if (fp) {
+                        fclose(fp);
+                        inc = read_file(fname);
+                    }
+                }
+
+                /* if not found, try /usr/include/<fname> as a fallback */
+                if (!inc) {
+                    char sys_path[2048];
+                    snprintf(sys_path, sizeof(sys_path), "/usr/include/%s", fname);
+                    file *fp2 = fopen(sys_path, "rb");
+                    if (fp2) {
+                        fclose(fp2);
+                        inc = read_file(sys_path);
+                    }
+                }
+
+                if (!inc) {
+                    fprintf(stderr, "error: cannot open include file '%s' or '/usr/include/%s'\n", fname, fname);
+                    exit(1);
+                }
+
+                /* recursively preprocess included content to allow nested includes */
+                char *inc_pp = preprocess(inc);
+                append_to_buf(&out, &outcap, &outlen, inc_pp, strlen(inc_pp));
+                free(inc_pp);
+                free(inc);
+
+                /* skip to end of current line in original input */
+                const char *ln = q;
+                while (*ln && *ln != '\n') ln++;
+                if (*ln == '\n') {
+                    append_to_buf(&out, &outcap, &outlen, "\n", 1);
+                    p = ln + 1;
+                } else {
+                    p = ln;
+                }
+                continue;
+            }
+            /* not an include: fallthrough to copy the line */
+        }
+
+        /* copy one character */
+        append_to_buf(&out, &outcap, &outlen, p, 1);
+        p++;
+    }
+
+    if (!out) {
+        out = calloc(1, 1);
+    }
+    return out;
+}
+
+/* ----------------------------------------------------------------------
+ * lexer
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+	tok_eof = 0,
+	// keywords
+	tok_int,
+	tok_char,
+	tok_long,
+	tok_unsigned,
+	tok_return,
+	tok_if,
+	tok_else,
+	tok_while,
+	tok_for,
+	tok_struct,
+	tok_void,
+	tok_break,
+	tok_continue,
+	// literals and identifiers
+	tok_ident,
+	tok_number,
+	tok_char_literal,
+	tok_string_literal,
+	// operators and punctuation
+	tok_semi,
+	tok_comma,
+	tok_lparen,
+	tok_rparen,
+	tok_lbrace,
+	tok_rbrace,
+	tok_lbracket,
+	tok_rbracket,
+	tok_plus,
+	tok_minus,
+	tok_star,
+	tok_slash,
+	tok_eq,
+	tok_neq,
+	tok_assign,
+	tok_lt,
+	tok_le,
+	tok_gt,
+	tok_ge,
+	tok_amp,
+	tok_and,
+	tok_or,
+	tok_not,
+	tok_arrow, // ->
+	tok_unknown
+} tokentype;
+
+typedef struct token token;
+struct token {
+	tokentype type;
+	char *str;      // for identifiers and string literals
+	long val;       // for numeric and char literals / string literal id
+	char *loc;      // pointer into original input (for error reporting)
+	token *next;    // used during initial lexing
+};
+
+static token *tokens = null; // token array pointer
+static int token_idx = 0;    // index into tokens array
+
+// string literal table (dynamic array)
+typedef struct {
+	int id;
+	char *s;
+} stringlit;
+static stringlit *string_table = null;
+static int string_table_count = 0;
+static int string_table_capacity = 0;
+
+static token* tokenize(const char *p_in) {
+	// build linked list of tokens first
+	current_input = (char*) p_in;
+	token head = { 0 };
+	token *cur = &head;
+	const char *p = p_in;
+
+	// reset string table for a fresh run
+	string_table_count = 0;
+	// free and reset capacity if tokenize is called multiple times
+	if (string_table) free(string_table);
+	string_table = null;
+	string_table_capacity = 0;
+
+	while (*p) {
+		// skip whitespace
+		if (isspace((unsigned char )*p)) {
+			p++;
+			continue;
+		}
+
+		// comments
+		if (p[0] == '/' && p[1] == '/') {
+			p += 2;
+			while (*p && *p != '\n')
+				p++;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '*') {
+			p += 2;
+			while (*p && !(p[0] == '*' && p[1] == '/'))
+				p++;
+			if (*p)
+				p += 2;
+			continue;
+		}
+
+		// numbers (decimal only for now)
+		if (isdigit((unsigned char )*p)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_number;
+			cur->loc = (char*) p;
+			char *end;
+			cur->val = strtol(p, &end, 10);
+			p = end;
+			continue;
+		}
+
+		// identifiers and keywords
+		if (isalpha((unsigned char)*p) || *p == '_') {
+			const char *start = p;
+			int len = 0;
+			while (isalnum((unsigned char)p[len]) || p[len] == '_')
+				len++;
+			char *s = strndup(start, len);
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->loc = (char*) start;
+			cur->str = s;
+			// check keywords
+			if (!strcmp(s, "int"))
+				cur->type = tok_int;
+			else if (!strcmp(s, "char"))
+				cur->type = tok_char;
+			else if (!strcmp(s, "long"))
+				cur->type = tok_long;
+			else if (!strcmp(s, "unsigned"))
+				cur->type = tok_unsigned;
+			else if (!strcmp(s, "return"))
+				cur->type = tok_return;
+			else if (!strcmp(s, "if"))
+				cur->type = tok_if;
+			else if (!strcmp(s, "else"))
+				cur->type = tok_else;
+			else if (!strcmp(s, "while"))
+				cur->type = tok_while;
+			else if (!strcmp(s, "for"))
+				cur->type = tok_for;
+			else if (!strcmp(s, "struct"))
+				cur->type = tok_struct;
+			else if (!strcmp(s, "void"))
+				cur->type = tok_void;
+			else if (!strcmp(s, "break"))
+				cur->type = tok_break;
+			else if (!strcmp(s, "continue"))
+				cur->type = tok_continue;
+			else
+				cur->type = tok_ident;
+			p += len;
+			continue;
+		}
+
+		// character literal
+		if (*p == '\'') {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->loc = (char*) p;
+			p++;
+			int c = 0;
+			if (*p == '\\') {
+				p++;
+				if (*p == 'n')
+					c = '\n';
+				else if (*p == 't')
+					c = '\t';
+				else if (*p == '\\')
+					c = '\\';
+				else
+					c = *p;
+				p++;
+			} else {
+				c = *p++;
+			}
+			if (*p != '\'')
+				error_at((char*) p, "unterminated character literal");
+			p++;
+			cur->type = tok_char_literal;
+			cur->val = c;
+			continue;
+		}
+
+		// string literal
+		if (*p == '"') {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->loc = (char*) p;
+			p++;
+			char buf[temp_token_buffer_size];
+			int i = 0;
+			while (*p && *p != '"') {
+				if (*p == '\\') {
+					p++;
+					if (*p == 'n')
+						buf[i++] = '\n';
+					else if (*p == 't')
+						buf[i++] = '\t';
+					else if (*p == '\\')
+						buf[i++] = '\\';
+					else
+						buf[i++] = *p;
+					p++;
+				} else {
+					buf[i++] = *p++;
+				}
+				if (i >= temp_token_buffer_size - 1)
+					error_at((char*) p, "string literal too long");
+			}
+			if (*p != '"')
+				error_at((char*) p, "unterminated string literal");
+			buf[i] = '\0';
+			p++;
+			cur->type = tok_string_literal;
+			cur->str = strndup(buf, i);
+
+			// register string literal in dynamic table
+			if (string_table_count >= string_table_capacity) {
+				int new_cap = string_table_capacity == 0 ? 16 : string_table_capacity * 2;
+				string_table = realloc(string_table, new_cap * sizeof(stringlit));
+				string_table_capacity = new_cap;
+			}
+			// copy string literal to global table
+			string_table[string_table_count].id = string_table_count;
+			string_table[string_table_count].s = strdup(cur->str);
+			// store the id in the token's value field
+			cur->val = string_table_count;
+			string_table_count++;
+
+			continue;
+		}
+
+		// multi-char operators
+		if (!strncmp(p, "==", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_eq;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, "!=", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_neq;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, "<=", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_le;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, ">=", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_ge;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, "&&", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_and;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, "||", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_or;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+		if (!strncmp(p, "->", 2)) {
+			cur = cur->next = calloc(1, sizeof(token));
+			cur->type = tok_arrow;
+			cur->loc = (char*) p;
+			p += 2;
+			continue;
+		}
+
+		// single-char tokens
+		cur = cur->next = calloc(1, sizeof(token));
+		cur->loc = (char*) p;
+		switch (*p++) {
+		case '+':
+			cur->type = tok_plus;
+			break;
+		case '-':
+			cur->type = tok_minus;
+			break;
+		case '*':
+			cur->type = tok_star;
+			break;
+		case '/':
+			cur->type = tok_slash;
+			break;
+		case '(':
+			cur->type = tok_lparen;
+			break;
+		case ')':
+			cur->type = tok_rparen;
+			break;
+		case '{':
+			cur->type = tok_lbrace;
+			break;
+		case '}':
+			cur->type = tok_rbrace;
+			break;
+		case '[':
+			cur->type = tok_lbracket;
+			break;
+		case ']':
+			cur->type = tok_rbracket;
+			break;
+		case ';':
+			cur->type = tok_semi;
+			break;
+		case ',':
+			cur->type = tok_comma;
+			break;
+		case '=':
+			cur->type = tok_assign;
+			break;
+		case '<':
+			cur->type = tok_lt;
+			break;
+		case '>':
+			cur->type = tok_gt;
+			break;
+		case '&':
+			cur->type = tok_amp;
+			break;
+		case '!':
+			cur->type = tok_not;
+			break;
+		default:
+			cur->type = tok_unknown;
+			error_at((char*) p - 1, "unexpected character '%c'", *(p - 1));
+		}
+	}
+
+	cur = cur->next = calloc(1, sizeof(token));
+	cur->type = tok_eof;
+	cur->loc = (char*) p;
+
+	// convert linked list to array for random access
+	int count = 0;
+	for (token *t = head.next; t; t = t->next)
+		count++;
+	token *arr = calloc(count, sizeof(token));
+	token *t = head.next;
+	for (int i = 0; i < count; i++) {
+		arr[i] = *t;
+		// keep pointers to strings; do not free t->str here
+		t = t->next;
+	}
+	return arr;
+}
+
+/* token helpers */
+static token* cur_token(void) {
+	return &tokens[token_idx];
+}
+static token* peek_token(int offset) {
+	return &tokens[token_idx + offset];
+}
+static int at_eof(void) {
+	return cur_token()->type == tok_eof;
+}
+
+static token* consume_token(tokentype ty) {
+	if (cur_token()->type != ty) {
+		error_at(cur_token()->loc, "expected token %d but got %d", ty,
+				cur_token()->type);
+	}
+	return &tokens[token_idx++];
+}
+
+static int consume_if(tokentype ty) {
+	if (cur_token()->type == ty) {
+		token_idx++;
+		return 1;
+	}
+	return 0;
+}
+
+static token* consume_ident(void) {
+	if (cur_token()->type != tok_ident)
+		error_at(cur_token()->loc, "expected identifier");
+	return &tokens[token_idx++];
+}
+
+/* ----------------------------------------------------------------------
+ * types
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+	typek_int,
+	typek_char,
+	typek_long,
+	typek_void,
+	typek_array,
+	typek_ptr,
+	typek_struct
+} basetypekind;
+
+typedef struct type {
+	basetypekind kind;
+	int is_unsigned;
+	int pointer_level;
+	int array_size;      // for arrays
+	struct type *base;   // base type for pointers/arrays
+} type;
+
+static type* type_int(void) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_int;
+	return t;
+}
+static type* type_char(void) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_char;
+	return t;
+}
+static type* type_long(void) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_long;
+	return t;
+}
+static type* type_void(void) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_void;
+	return t;
+}
+static type* type_ptr(type *base) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_ptr;
+	t->pointer_level = base ? base->pointer_level + 1 : 1;
+	t->base = base;
+	return t;
+}
+static type* type_array(type *base, int size) {
+	type *t = calloc(1, sizeof(type));
+	t->kind = typek_array;
+	t->array_size = size;
+	t->base = base;
+	return t;
+}
+
+/* compute size of type in bytes (simplified) */
+int get_type_size(type *t) {
+	if (!t)
+		return 8;
+	if (t->pointer_level > 0 || t->kind == typek_ptr)
+		return 8;
+	switch (t->kind) {
+	case typek_long:
+		return 8;
+	case typek_int:
+		return 4;
+	case typek_char:
+		return 1;
+	case typek_array:
+		if (!t->base) return 8;
+		return t->array_size * get_type_size(t->base);
+	default:
+		return 8;
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * ast
+ * ---------------------------------------------------------------------- */
+
+typedef enum {
+	ast_program,
+	ast_func,
+	ast_param,
+	ast_compound,
+	ast_return,
+	ast_if,
+	ast_while,
+	ast_for,
+	ast_break,
+	ast_continue,
+	ast_var_decl,
+	ast_expr_stmt,
+	ast_assign,
+	ast_binop,
+	ast_unop,
+	ast_call,
+	ast_num,
+	ast_char,
+	ast_string,
+	ast_ident,
+	ast_addr,
+	ast_deref,
+	ast_cast
+} astkind;
+
+typedef struct var {
+	char *name;
+	type *type;
+	int offset;         // offset from rbp (positive number)
+	struct var *next;
+} var;
+
+typedef struct function {
+	char *name;
+	type *ret_type;
+	var **params;       // dynamic array of var*
+	int num_params;
+	int param_capacity; // new member for dynamic array
+	var *locals;        // linked list
+	int stack_size;
+	struct astnode *body;
+	int label_break;
+	int label_continue;
+} function;
+
+typedef struct astnode {
+	astkind kind;
+	token *tok;                 // token associated (for error reporting)
+	type *dtype;                // computed type
+	struct astnode **children;  // dynamic array of astnode*
+	int child_count;
+	int child_capacity;         // new member for dynamic array
+	// for specific node kinds:
+	long num_val;               // for ast_num, ast_char, and ast_string id
+	char *str_val;              // for ast_string and ast_ident
+	char op;                    // for simple binop/unop representation
+	function *func_def;         // for ast_func
+	var *var_def;               // for ast_var_decl or ast_ident resolution
+} astnode;
+
+static astnode* new_node(astkind k, token *tok) {
+	astnode *n = calloc(1, sizeof(astnode));
+	n->kind = k;
+	n->tok = tok;
+	n->children = null;
+	n->child_capacity = 0;
+	return n;
+}
+
+static void ast_add_child(astnode *parent, astnode *child) {
+	if (!parent || !child)
+		return;
+	if (parent->child_count >= parent->child_capacity) {
+		// grow array
+		int new_cap = parent->child_capacity == 0 ? 4 : parent->child_capacity * 2;
+		parent->children = realloc(parent->children, new_cap * sizeof(astnode*));
+		parent->child_capacity = new_cap;
+	}
+	parent->children[parent->child_count++] = child;
+}
+
+/* ----------------------------------------------------------------------
+ * symbol table helpers
+ * ---------------------------------------------------------------------- */
+
+static var* add_local(function *f, char *name, type *type) {
+	var *v = calloc(1, sizeof(var));
+	v->name = name;
+	v->type = type;
+	int size = get_type_size(type);
+	if (size <= 0)
+		size = 8;
+	// allocate on stack: increase stack_size and set offset
+	f->stack_size = align_to(f->stack_size + size, 8);
+	v->offset = f->stack_size;
+	v->next = f->locals;
+	f->locals = v;
+	return v;
+}
+
+static var* find_var_in_function(function *f, const char *name) {
+	for (var *v = f->locals; v; v = v->next) {
+		if (!strcmp(v->name, name))
+			return v;
+	}
+	return null;
+}
+
+/* ----------------------------------------------------------------------
+ * parser
+ * ---------------------------------------------------------------------- */
+
+static type* parse_type_specifier(void);
+static astnode* parse_expression(void);
+static astnode* parse_statement(void);
+static astnode* parse_compound(void);
+static astnode* parse_function(void);
+
+static int is_type_keyword(token *t) {
+	if (!t)
+		return 0;
+	return t->type == tok_int || t->type == tok_char || t->type == tok_long
+			|| t->type == tok_void || t->type == tok_unsigned;
+}
+
+static type* parse_type_specifier(void) {
+	// basic types
+	int is_unsigned = 0;
+	if (consume_if(tok_unsigned))
+		is_unsigned = 1;
+
+	type *base = null;
+	if (consume_if(tok_int))
+		base = type_int();
+	else if (consume_if(tok_char))
+		base = type_char();
+	else if (consume_if(tok_long))
+		base = type_long();
+	else if (consume_if(tok_void))
+		base = type_void();
+	else if (consume_if(tok_struct)) {
+		// struct tag is here for declarations like `struct node *p;`
+		consume_ident(); // struct name
+		base = type_int(); // placeholder type
+	}
+	else
+		error_at(cur_token()->loc, "expected type specifier");
+
+	base->is_unsigned = is_unsigned;
+
+	// pointer levels
+	while (consume_if(tok_star)) {
+		type *p = type_ptr(base);
+		p->base = base;
+		base = p;
+	}
+
+	// array (only in declarations, not in general type expressions)
+	if (consume_if(tok_lbracket)) {
+		// allow empty brackets for pointers (e.g. char s[])
+		if (cur_token()->type != tok_number) {
+			consume_token(tok_rbracket);
+			type *ptr = type_ptr(base);
+			return ptr;
+		}
+
+		token *size_tok = consume_token(tok_number);
+		consume_token(tok_rbracket);
+		type *arr = type_array(base, (int) size_tok->val);
+		return arr;
+	}
+
+	return base;
+}
+
+/* primary expressions */
+static astnode* parse_primary(void) {
+	token *t = cur_token();
+	if (consume_if(tok_lparen)) {
+		astnode *n = parse_expression();
+		consume_token(tok_rparen);
+		return n;
+	}
+	if (t->type == tok_number) {
+		astnode *n = new_node(ast_num, consume_token(tok_number));
+		n->num_val = t->val;
+		n->dtype = type_int();
+		return n;
+	}
+	if (t->type == tok_char_literal) {
+		astnode *n = new_node(ast_char, consume_token(tok_char_literal));
+		n->num_val = t->val;
+		n->dtype = type_char();
+		return n;
+	}
+	if (t->type == tok_string_literal) {
+		astnode *n = new_node(ast_string, consume_token(tok_string_literal));
+		n->str_val = strdup(t->str);
+		n->num_val = t->val;
+		type *pt = type_ptr(type_char());
+		n->dtype = pt;
+		return n;
+	}
+	if (t->type == tok_ident) {
+		// could be a function call or identifier
+		token *idtok = consume_ident();
+		if (consume_if(tok_lparen)) {
+			// function call
+			astnode *call = new_node(ast_call, idtok);
+			// parse args
+			if (!consume_if(tok_rparen)) {
+				astnode *arg = parse_expression();
+				ast_add_child(call, arg);
+				while (consume_if(tok_comma)) {
+					astnode *a = parse_expression();
+					ast_add_child(call, a);
+				}
+				consume_token(tok_rparen);
+			}
+			call->dtype = type_int(); // assume int return for now
+			return call;
+		} else {
+			astnode *n = new_node(ast_ident, idtok);
+			n->str_val = strdup(idtok->str);
+			return n;
+		}
+	}
+
+	error_at(t->loc, "expected primary expression");
+	return null;
+}
+
+/* unary */
+static astnode* parse_unary(void) {
+	token *t = cur_token();
+	if (consume_if(tok_plus))
+		return parse_unary();
+	if (consume_if(tok_minus)) {
+		astnode *n = new_node(ast_unop, t);
+		n->op = '-';
+		ast_add_child(n, parse_unary());
+		return n;
+	}
+	if (consume_if(tok_not)) {
+		astnode *n = new_node(ast_unop, t);
+		n->op = '!';
+		ast_add_child(n, parse_unary());
+		return n;
+	}
+	if (consume_if(tok_star)) {
+		astnode *n = new_node(ast_deref, t);
+		ast_add_child(n, parse_unary());
+		return n;
+	}
+	if (consume_if(tok_amp)) {
+		astnode *n = new_node(ast_addr, t);
+		ast_add_child(n, parse_unary());
+		return n;
+	}
+	return parse_primary();
+}
+
+/* multiplicative */
+static astnode* parse_mul(void) {
+	astnode *node = parse_unary();
+	while (cur_token()->type == tok_star || cur_token()->type == tok_slash) {
+		token *op = &tokens[token_idx++];
+		astnode *n = new_node(ast_binop, op);
+		n->op = (op->type == tok_star) ? '*' : '/';
+		ast_add_child(n, node);
+		ast_add_child(n, parse_unary());
+		node = n;
+	}
+	return node;
+}
+
+/* additive */
+static astnode* parse_add(void) {
+	astnode *node = parse_mul();
+	while (cur_token()->type == tok_plus || cur_token()->type == tok_minus) {
+		token *op = &tokens[token_idx++];
+		astnode *n = new_node(ast_binop, op);
+		n->op = (op->type == tok_plus) ? '+' : '-';
+		ast_add_child(n, node);
+		ast_add_child(n, parse_mul());
+		node = n;
+	}
+	return node;
+}
+
+/* relational */
+static astnode* parse_relational(void) {
+	astnode *node = parse_add();
+	while (cur_token()->type == tok_lt || cur_token()->type == tok_gt
+			|| cur_token()->type == tok_le || cur_token()->type == tok_ge) {
+		token *op = &tokens[token_idx++];
+		astnode *n = new_node(ast_binop, op);
+		if (op->type == tok_lt)
+			n->op = '<';
+		else if (op->type == tok_gt)
+			n->op = '>';
+		else if (op->type == tok_le)
+			n->op = 'l'; // 'l' for <=
+		else
+			n->op = 'g'; // 'g' for >=
+		ast_add_child(n, node);
+		ast_add_child(n, parse_add());
+		node = n;
+	}
+	return node;
+}
+
+/* equality */
+static astnode* parse_equality(void) {
+	astnode *node = parse_relational();
+	while (cur_token()->type == tok_eq || cur_token()->type == tok_neq) {
+		token *op = &tokens[token_idx++];
+		astnode *n = new_node(ast_binop, op);
+		n->op = (op->type == tok_eq) ? '=' : '!';
+		ast_add_child(n, node);
+		ast_add_child(n, parse_relational());
+		node = n;
+	}
+	return node;
+}
+
+/* logical and */
+static astnode* parse_logical_and(void) {
+	astnode *node = parse_equality();
+	while (consume_if(tok_and)) {
+		token *op = &tokens[token_idx - 1];
+		astnode *n = new_node(ast_binop, op);
+		n->op = '&';
+		ast_add_child(n, node);
+		ast_add_child(n, parse_equality());
+		node = n;
+	}
+	return node;
+}
+
+/* logical or */
+static astnode* parse_logical_or(void) {
+	astnode *node = parse_logical_and();
+	while (consume_if(tok_or)) {
+		token *op = &tokens[token_idx - 1];
+		astnode *n = new_node(ast_binop, op);
+		n->op = '|';
+		ast_add_child(n, node);
+		ast_add_child(n, parse_logical_and());
+		node = n;
+	}
+	return node;
+}
+
+/* assignment */
+static astnode* parse_assignment(void) {
+	astnode *node = parse_logical_or();
+	if (consume_if(tok_assign)) {
+		token *op = &tokens[token_idx - 1];
+		astnode *n = new_node(ast_assign, op);
+		ast_add_child(n, node);
+		ast_add_child(n, parse_assignment());
+		return n;
+	}
+	return node;
+}
+
+static astnode* parse_expression(void) {
+	return parse_assignment();
+}
+
+/* statement parsing */
+
+static astnode* parse_compound(void) {
+	consume_token(tok_lbrace);
+	astnode *blk = new_node(ast_compound, cur_token());
+	while (!consume_if(tok_rbrace)) {
+		astnode *s = parse_statement();
+		ast_add_child(blk, s);
+	}
+	return blk;
+}
+
+static astnode* parse_statement(void) {
+	token *t = cur_token();
+
+	if (consume_if(tok_lbrace)) {
+		// roll back one token because parse_compound expects '{' consumed
+		token_idx--;
+		return parse_compound();
+	}
+
+	if (consume_if(tok_if)) {
+		astnode *n = new_node(ast_if, cur_token() - 1);
+		consume_token(tok_lparen);
+		ast_add_child(n, parse_expression());
+		consume_token(tok_rparen);
+		ast_add_child(n, parse_statement());
+		if (consume_if(tok_else)) {
+			ast_add_child(n, parse_statement());
+		}
+		return n;
+	}
+
+	if (consume_if(tok_while)) {
+		astnode *n = new_node(ast_while, cur_token() - 1);
+		consume_token(tok_lparen);
+		ast_add_child(n, parse_expression());
+		consume_token(tok_rparen);
+		ast_add_child(n, parse_statement());
+		return n;
+	}
+
+	if (consume_if(tok_for)) {
+		astnode *n = new_node(ast_for, cur_token() - 1);
+		consume_token(tok_lparen);
+		// init
+		if (!consume_if(tok_semi)) {
+			if (is_type_keyword(cur_token())) {
+				// declaration in for-init
+				type *t = parse_type_specifier();
+				token *id = consume_ident();
+				astnode *decl = new_node(ast_var_decl, id);
+				decl->dtype = t;
+				if (consume_if(tok_assign)) {
+					ast_add_child(decl, parse_expression());
+				}
+				consume_token(tok_semi);
+				ast_add_child(n, decl);
+			} else {
+				ast_add_child(n, parse_expression());
+				consume_token(tok_semi);
+			}
+		} else {
+			ast_add_child(n, null);
+		}
+		// cond
+		if (!consume_if(tok_semi)) {
+			ast_add_child(n, parse_expression());
+			consume_token(tok_semi);
+		} else {
+			ast_add_child(n, null);
+		}
+		// incr
+		if (!consume_if(tok_rparen)) {
+			ast_add_child(n, parse_expression());
+			consume_token(tok_rparen);
+		} else {
+			ast_add_child(n, null);
+		}
+		ast_add_child(n, parse_statement());
+		return n;
+	}
+
+	if (consume_if(tok_break)) {
+		astnode *n = new_node(ast_break, cur_token() - 1);
+		consume_token(tok_semi);
+		return n;
+	}
+
+	if (consume_if(tok_continue)) {
+		astnode *n = new_node(ast_continue, cur_token() - 1);
+		consume_token(tok_semi);
+		return n;
+	}
+
+	if (consume_if(tok_return)) {
+		astnode *n = new_node(ast_return, cur_token() - 1);
+		if (!consume_if(tok_semi)) {
+			ast_add_child(n, parse_expression());
+			consume_token(tok_semi);
+		}
+		return n;
+	}
+
+	// declaration or struct definition
+	if (is_type_keyword(cur_token()) || cur_token()->type == tok_struct) {
+		token *type_tok = cur_token();
+		type *t = parse_type_specifier();
+
+		// handle struct definition: struct name { members... };
+		if (type_tok->type == tok_struct && cur_token()->type == tok_lbrace) {
+			// struct definition: struct name { ... } ;
+			// this block only consumes the tokens and returns a dummy decl node.
+			consume_token(tok_lbrace);
+			while (!consume_if(tok_rbrace)) {
+				// parse members: type + ident + semi
+				parse_type_specifier();
+				consume_ident();
+				consume_token(tok_semi);
+			}
+			consume_token(tok_semi);
+
+			// return dummy node
+			astnode *dummy_struct = new_node(ast_var_decl, type_tok);
+			dummy_struct->dtype = type_void();
+			return dummy_struct;
+		}
+
+		// normal declaration: type id [= init] ;
+		token *id = consume_ident();
+		astnode *decl = new_node(ast_var_decl, id);
+		decl->dtype = t;
+		if (consume_if(tok_assign)) {
+			ast_add_child(decl, parse_expression());
+		}
+		consume_token(tok_semi);
+		return decl;
+	}
+
+	// expression statement
+	astnode *expr = parse_expression();
+	consume_token(tok_semi);
+	astnode *stmt = new_node(ast_expr_stmt, expr->tok);
+	ast_add_child(stmt, expr);
+	return stmt;
+}
+
+/* function parsing */
+static astnode* parse_function(void) {
+	type *ret = parse_type_specifier();
+	token *name_tok = consume_ident();
+	astnode *fn = new_node(ast_func, name_tok);
+	function *f = calloc(1, sizeof(function));
+	f->name = strdup(name_tok->str);
+	f->ret_type = ret;
+	fn->func_def = f;
+
+	// initialize dynamic parameter array
+	f->params = null;
+	f->num_params = 0;
+	f->param_capacity = 0;
+
+	consume_token(tok_lparen);
+	if (!consume_if(tok_rparen)) {
+		while (1) {
+			type *pt = parse_type_specifier();
+			token *pname = consume_ident();
+			var *pv = calloc(1, sizeof(var));
+			pv->name = strdup(pname->str);
+			pv->type = pt;
+
+			// dynamic array resize for parameters
+			if (f->num_params >= f->param_capacity) {
+				int new_cap = f->param_capacity == 0 ? 4 : f->param_capacity * 2;
+				f->params = realloc(f->params, new_cap * sizeof(var*));
+				f->param_capacity = new_cap;
+			}
+
+			f->params[f->num_params++] = pv;
+
+			if (consume_if(tok_comma))
+				continue;
+			consume_token(tok_rparen);
+			break;
+		}
+	}
+
+	astnode *body = parse_compound();
+	ast_add_child(fn, body);
+	f->body = body;
+	return fn;
+}
+
+/* program */
+static astnode* parse_program(void) {
+	astnode *prog = new_node(ast_program, null);
+	while (!at_eof()) {
+        token *t = cur_token();
+
+        // handle top-level struct definition/declaration
+        if (t->type == tok_struct) {
+            astnode *decl = parse_statement();
+            ast_add_child(prog, decl);
+            continue;
+        }
+
+        // otherwise, assume it's a function definition/declaration
+		astnode *fn = parse_function();
+		ast_add_child(prog, fn);
+	}
+	return prog;
+}
+
+/* ----------------------------------------------------------------------
+ * semantic analysis
+ * ---------------------------------------------------------------------- */
+
+static function **global_functions = null; // dynamic array
+static int global_function_count = 0;
+static int global_function_capacity = 0;
+
+static void register_function(function *f) {
+	if (global_function_count >= global_function_capacity) {
+		int new_cap = global_function_capacity == 0 ? 16 : global_function_capacity * 2;
+		global_functions = realloc(global_functions, new_cap * sizeof(function*));
+		global_function_capacity = new_cap;
+	}
+	global_functions[global_function_count++] = f;
+}
+
+static function* find_function(const char *name) {
+	for (int i = 0; i < global_function_count; i++) {
+		if (!strcmp(global_functions[i]->name, name))
+			return global_functions[i];
+	}
+	return null;
+}
+
+static void semantic_resolve(astnode *node, function *curf);
+
+static void semantic_program(astnode *prog) {
+	// register functions
+	for (int i = 0; i < prog->child_count; i++) {
+		astnode *fnnode = prog->children[i];
+		if (fnnode->kind == ast_func) {
+            function *f = fnnode->func_def;
+            register_function(f);
+        } else if (fnnode->kind == ast_var_decl && fnnode->tok->type == tok_struct) {
+            // ignore dummy struct nodes
+            continue;
+        } else {
+            error_at(fnnode->tok ? fnnode->tok->loc : current_input,
+					"top-level node is not a function or struct definition");
+        }
+	}
+
+	// now process each function
+	for (int i = 0; i < prog->child_count; i++) {
+		astnode *fnnode = prog->children[i];
+        if (fnnode->kind != ast_func) continue;
+
+		function *f = fnnode->func_def;
+
+		f->stack_size = 0;
+		f->locals = null;
+
+		// correctly calculate parameter offsets and link into locals (reverse order for stack)
+		for (int j = f->num_params - 1; j >= 0; j--) {
+			var *p = f->params[j];
+			int size = get_type_size(p->type);
+			if (size <= 0) size = 8;
+			f->stack_size = align_to(f->stack_size + size, 8);
+			p->offset = f->stack_size;
+			// link parameter directly into locals list
+			p->next = f->locals;
+			f->locals = p;
+		}
+
+		// walk body
+		semantic_resolve(fnnode->children[0], f);
+		// finalize stack size alignment to 16 bytes for abi
+		f->stack_size = align_to(f->stack_size, 16);
+	}
+}
+
+static void semantic_resolve(astnode *node, function *curf) {
+	if (!node)
+		return;
+	switch (node->kind) {
+	case ast_compound:
+		for (int i = 0; i < node->child_count; i++)
+			semantic_resolve(node->children[i], curf);
+		break;
+	case ast_var_decl: {
+		// ignore the dummy struct declaration node
+		if (node->dtype && node->dtype->kind == typek_void && node->tok && node->tok->type == tok_struct)
+			break;
+
+		// add to locals
+		token *id = node->tok;
+		if (!id || id->type != tok_ident)
+			error_at(node->tok ? node->tok->loc : current_input,
+					"invalid variable declaration");
+		var *v = add_local(curf, strdup(id->str), node->dtype);
+		node->var_def = v;
+		if (node->child_count > 0 && node->children[0]) {
+			semantic_resolve(node->children[0], curf);
+		}
+		break;
+	}
+	case ast_ident: {
+		// resolve variable
+		var *v = find_var_in_function(curf, node->str_val);
+		if (!v) {
+			// check if it's a known function (e.g. for implicit function declarations)
+			if (find_function(node->str_val)) {
+				// handled by ast_call later if used correctly
+				node->dtype = type_int(); // default function return type
+				break;
+			}
+			error_at(node->tok->loc, "unknown identifier: %s", node->str_val);
+		}
+		node->var_def = v;
+		node->dtype = v->type;
+		break;
+	}
+	case ast_num:
+	case ast_char:
+	case ast_string:
+		// types already set during parsing
+		break;
+	case ast_call:
+		// resolve function call (only checks args for now)
+		for (int i = 0; i < node->child_count; i++)
+			semantic_resolve(node->children[i], curf);
+		// try to resolve function name if known, otherwise assume int return
+		if (find_function(node->tok->str)) {
+			// for simplicity, we don't resolve ret_type here, keep int
+		}
+		node->dtype = type_int();
+		break;
+	case ast_unop:
+	case ast_deref:
+	case ast_addr:
+		semantic_resolve(node->children[0], curf);
+		if (node->kind == ast_deref) {
+			if (!node->children[0]->dtype
+					|| (node->children[0]->dtype->pointer_level == 0 && node->children[0]->dtype->kind != typek_ptr)) {
+				error_at(node->tok->loc, "dereferencing non-pointer");
+			}
+			node->dtype =
+					node->children[0]->dtype->base ?
+							node->children[0]->dtype->base : type_int();
+		} else if (node->kind == ast_addr) {
+			node->dtype = type_ptr(node->children[0]->dtype);
+		} else {
+			node->dtype = type_int();
+		}
+		break;
+	case ast_binop:
+	case ast_assign:
+		for (int i = 0; i < node->child_count; i++)
+			semantic_resolve(node->children[i], curf);
+		if (node->kind == ast_assign) {
+			node->dtype = node->children[0]->dtype;
+		} else {
+			node->dtype = type_int();
+		}
+		break;
+	case ast_expr_stmt:
+		semantic_resolve(node->children[0], curf);
+		break;
+	case ast_if:
+	case ast_while:
+	case ast_for:
+		for (int i = 0; i < node->child_count; i++)
+			semantic_resolve(node->children[i], curf);
+		break;
+	case ast_return:
+		if (node->child_count > 0 && node->children[0])
+			semantic_resolve(node->children[0], curf);
+		break;
+	case ast_break:
+	case ast_continue:
+		break;
+	default:
+		for (int i = 0; i < node->child_count; i++)
+			semantic_resolve(node->children[i], curf);
+		break;
+	}
+}
+
+/* ----------------------------------------------------------------------
+ * code generation (placeholder)
+ * ---------------------------------------------------------------------- */
+
+void generate_code(astnode *prog) {
+	(void)prog;
+    printf(".text\n");
+	printf("### code generation placeholder ###\n");
+    for (int i = 0; i < string_table_count; i++) {
+        printf(".lc_str_%d:\n", string_table[i].id);
+        printf("  .string \"%s\"\n", string_table[i].s);
+    }
+    printf("###################################\n");
+}
+
+
+/* ----------------------------------------------------------------------
+ * internal test suite
+ * ---------------------------------------------------------------------- */
+
+static void run_internal_tests(void) {
+	const char *test_code =
+"// linked list definition\n"
+"struct node {\n"
+"    int val;\n"
+"    struct node *next;\n"
+"};\n"
+"void func_a(int a, char b) { \n"
+"    unsigned long c = a; c = c + b; \n"
+"    if (a > 0) { if (b == 'c') { c = 10; } else { c = 20; } } \n"
+"    while (c < 30) { \n"
+"        for (int i = 0; i < 5; i++) { \n"
+"            if (i == 2) { continue; } \n"
+"            if (i == 4) { break; } \n"
+"            c = c + 1; \n"
+"        } \n"
+"    } \n"
+"    struct test_s { int x; char *p; }; \n"
+"    struct node *ptr1 = 0;\n"
+"    // int list_val = ptr1->val; // uncomment once -> operator is implemented\n"
+"    return; \n"
+"} \n"
+"int main() { \n"
+"    func_a(1, 'x'); \n"
+"    char *s = \"string test\\n\"; \n"
+"    return 0; \n"
+"}";
+
+    fprintf(stderr, "\n--- running internal tests ---\n");
+
+    // re-run the compiler components using the internal test code.
+    current_input = (char*) test_code;
+    tokens = tokenize(test_code);
+    token_idx = 0;
+
+    astnode *prog = parse_program();
+    semantic_program(prog);
+    generate_code(prog);
+
+    fprintf(stderr, "internal test code compiled successfully.\n");
+}
+
+
+/* ----------------------------------------------------------------------
+ * main
+ * ---------------------------------------------------------------------- */
+
+int main(int argc, char **argv) {
+
+    if (argc < 2) {
+        // run internal tests if no file is provided
+        run_internal_tests();
+        return 0;
+    }
+
+    /* read original source */
+    char *src = read_file(argv[1]);
+    if (!src) {
+        fprintf(stderr, "error: cannot open source file '%s'\n", argv[1]);
+        return 1;
+    }
+
+    /* preprocess (inline includes, with /usr/include fallback) */
+    char *pp_src = preprocess(src);
+    free(src);
+
+    /* tokenize preprocessed source */
+    current_input = pp_src;
+    tokens = tokenize(pp_src);
+    token_idx = 0;
+
+    /* parse program */
+    astnode *prog = parse_program();
+
+    /* semantic analysis */
+    semantic_program(prog);
+
+    /* continue with code generation as before */
+    generate_code(prog);
+
+    /* cleanup (not exhaustive, only freeing the main source buffer) */
+    free(pp_src);
+
+    return 0;
+}

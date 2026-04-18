@@ -1,0 +1,2 @@
+#define google-drive_VERSION_MAJOR @google-drive_VERSION_MAJOR@
+#define google-drive_VERSION_MINOR @google-drive_VERSION_MINOR@

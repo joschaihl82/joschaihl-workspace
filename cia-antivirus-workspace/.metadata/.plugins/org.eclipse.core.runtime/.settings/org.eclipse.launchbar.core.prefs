@@ -1,0 +1,9 @@
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.cdt.debug.core.coreBuildDescriptorType\:cia-antivirus5,org.eclipse.launchbar.core.descriptorType.default\:cia-antivirus5 Configuration
+eclipse.preferences.version=1
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:cia-antivirus4/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:cia-antivirus4/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:cia-antivirus5/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:cia-antivirus5/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

@@ -1,0 +1,60 @@
+cmake_minimum_required(VERSION 3.16)
+
+# Projekt
+project(MiniNotepad LANGUAGES C)
+
+# --- Hinweis / Kontrolle des Generators ---
+# CMake kann den Generator nicht aus CMakeLists.txt erzwingen.
+# Diese Datei prüft jedoch, ob der verwendete Generator "Unix Makefiles" ist
+# und bricht mit einer klaren Fehlermeldung ab, falls nicht.
+if(NOT CMAKE_GENERATOR STREQUAL "Unix Makefiles")
+    message(FATAL_ERROR "Dieser Build erwartet den Generator \"Unix Makefiles\". Bitte neu aufrufen z.B.:\n  cmake -S . -B build -G \"Unix Makefiles\"\noder benutze das mitgelieferte Wrapper-Skript, falls vorhanden.")
+endif()
+
+# --- Standardwerte (nur setzen, wenn nicht bereits vom Aufrufer angegeben) ---
+# Setze MinGW-w64 GCC als Default-Compiler, falls nicht gesetzt.
+if(NOT DEFINED CMAKE_C_COMPILER)
+    set(CMAKE_C_COMPILER "x86_64-w64-mingw32-gcc" CACHE STRING "Default C compiler" FORCE)
+endif()
+
+# Setze Pfad zu make (GNU Make) als Default, falls nicht gesetzt.
+if(NOT DEFINED CMAKE_MAKE_PROGRAM)
+    # Passe diesen Pfad an deine Umgebung an falls nötig (z.B. C:/msys64/usr/bin/make.exe)
+    set(CMAKE_MAKE_PROGRAM "/usr/bin/make" CACHE FILEPATH "Path to make program" FORCE)
+endif()
+
+# Erzwinge Unicode-Defines
+add_compile_definitions(UNICODE _UNICODE)
+# C-Standard
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Quellen
+set(SOURCES
+    notepad1.c
+)
+
+# Erstelle Windows-GUI Executable (WIN32 verhindert Konsolenfenster)
+add_executable(${PROJECT_NAME} WIN32 ${SOURCES})
+
+# Linke benötigte Windows-Bibliotheken
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    comctl32
+    user32
+    gdi32
+    kernel32
+    advapi32
+)
+
+# Ziel-spezifische Defines
+target_compile_definitions(${PROJECT_NAME} PRIVATE _WIN32_WINNT=0x0601)
+
+# Warnungen aktivieren
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+elseif(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W4 /permissive-)
+endif()
+
+# Install-Regel (optional)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)

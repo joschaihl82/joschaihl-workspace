@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Copy Project &apos;jocrawler&apos;" description="Copy Project &apos;jocrawler&apos;" destination="/wrk/crawler-workspace" element="/jocrawler" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="jocrawler2" stamp="1771769621987"/>
+</session>

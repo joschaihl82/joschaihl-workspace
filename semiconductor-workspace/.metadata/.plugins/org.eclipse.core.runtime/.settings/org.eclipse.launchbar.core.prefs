@@ -1,0 +1,17 @@
+LaunchTargetManager/configs/transistor4\ Debug=org.eclipse.launchbar.core.launchTargetType.local\:Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine2 Debug,org.eclipse.launchbar.core.descriptorType.default\:QtPaintClone,org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine1,org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann2 Debug,org.eclipse.launchbar.core.descriptorType.default\:hydroca Debug,org.eclipse.launchbar.core.descriptorType.default\:particleswarm Debug,org.eclipse.launchbar.core.descriptorType.default\:particleswarm2 Debug,org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann Debug,org.eclipse.launchbar.core.descriptorType.default\:particleswarm3 Debug,org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann3 Debug,org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann4 Debug,org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine5,org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine5 Debug,org.eclipse.launchbar.core.descriptorType.default\:paint Debug,org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine4 Debug,org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine1 (1),org.eclipse.launchbar.core.descriptorType.default\:transistor,org.eclipse.launchbar.core.descriptorType.default\:transistor (1),org.eclipse.launchbar.core.descriptorType.default\:transistor3 Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor5 Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor4 Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor6 Debug,org.eclipse.launchbar.core.descriptorType.default\:icons Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor7 Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor8 Debug,org.eclipse.launchbar.core.descriptorType.default\:transistor9 Debug
+eclipse.preferences.version=1
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:winpaint/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:winpaint/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:winpaint3/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:winpaint3/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann3\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:laticeboltzmann3\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine1/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:semiconductormachine1/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:transistor3\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:transistor4\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:transistor4\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

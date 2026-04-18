@@ -1,0 +1,135 @@
+cmake_minimum_required(VERSION 3.13)
+project(remove_unused_static_funcs_to_c LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Allow user to pass -DLLVM_DIR=/path/to/llvm/cmake
+if(NOT DEFINED LLVM_DIR)
+  message(STATUS "LLVM_DIR not set; you can pass -DLLVM_DIR=/path/to/llvm/cmake")
+endif()
+
+# Option to force debug flags from the command line
+# Default: ENABLE_DEBUG is ON
+# Usage: cmake -S . -B build -DENABLE_DEBUG=OFF  (to disable)
+option(ENABLE_DEBUG "Force debug compile flags (-g3 -O0 -ggdb3 etc.)" ON)
+
+# Default build type if not specified
+if(NOT CMAKE_BUILD_TYPE AND NOT ENABLE_DEBUG)
+  set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+# If ENABLE_DEBUG is requested (default ON), set build type to Debug
+if(ENABLE_DEBUG)
+  message(STATUS "ENABLE_DEBUG=ON -> forcing Debug build type and debug flags")
+  set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Choose the type of build." FORCE)
+endif()
+
+message(STATUS "CMake build type: ${CMAKE_BUILD_TYPE}")
+
+# Set conservative debug flags as a list (each flag is a separate item)
+# -g3: maximum debug info
+# -O0: disable optimizations for easier debugging
+# -ggdb3: GDB-friendly debug info
+# -fno-omit-frame-pointer: keep frame pointers for backtraces
+# -DDEBUG: define DEBUG macro
+set(DEBUG_C_FLAGS -g3 -O0 -ggdb3 -fno-omit-frame-pointer -DDEBUG)
+set(DEBUG_CXX_FLAGS -g3 -O0 -ggdb3 -fno-omit-frame-pointer -DDEBUG)
+
+# Set conservative release flags if not already set
+if(NOT CMAKE_C_FLAGS_RELEASE)
+  set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+endif()
+if(NOT CMAKE_CXX_FLAGS_RELEASE)
+  set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+endif()
+
+# Apply debug flags to the C and CXX flags variables used by CMake
+# Join list into string for the CMAKE_*_FLAGS_DEBUG variables
+string(REPLACE ";" " " DEBUG_C_FLAGS_STR "${DEBUG_C_FLAGS}")
+string(REPLACE ";" " " DEBUG_CXX_FLAGS_STR "${DEBUG_CXX_FLAGS}")
+set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} ${DEBUG_C_FLAGS_STR}" CACHE STRING "Flags used by the C compiler during debug builds" FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${DEBUG_CXX_FLAGS_STR}" CACHE STRING "Flags used by the C++ compiler during debug builds" FORCE)
+
+# Find LLVM (headers/definitions)
+find_package(LLVM REQUIRED CONFIG)
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "LLVM include dirs: ${LLVM_INCLUDE_DIRS}")
+
+# Try to find Clang package; fall back to libclang-cpp if needed
+set(USE_LIBCLANG_CPP OFF)
+find_package(Clang QUIET CONFIG)
+
+if(Clang_FOUND)
+  message(STATUS "Found Clang package")
+  if(TARGET clangBasic)
+    message(STATUS "Clang imported targets available")
+    set(CLANG_LINK_TARGETS clangTooling clangBasic clangAST clangFrontend clangLex clangRewrite)
+  else()
+    message(WARNING "Clang package found but clangBasic target is missing; falling back to libclang-cpp")
+    set(USE_LIBCLANG_CPP ON)
+  endif()
+else()
+  message(WARNING "Clang package not found via CMake; falling back to libclang-cpp")
+  set(USE_LIBCLANG_CPP ON)
+endif()
+
+# If fallback is required, locate libclang-cpp
+if(USE_LIBCLANG_CPP)
+  find_library(LIBCLANG_CPP NAMES clang-cpp libclang-cpp
+               PATHS /usr/lib /usr/lib64 /usr/lib/llvm-20/lib /usr/local/lib
+               NO_DEFAULT_PATH)
+  if(LIBCLANG_CPP)
+    message(STATUS "Found libclang-cpp: ${LIBCLANG_CPP}")
+  else()
+    message(FATAL_ERROR "libclang-cpp not found. Install libclang-cpp-dev (or libclang-dev) or provide a working Clang CMake package. You can also set LLVM_DIR to your LLVM installation's cmake directory.")
+  endif()
+endif()
+
+# Include LLVM headers and definitions
+include_directories(${LLVM_INCLUDE_DIRS})
+add_definitions(${LLVM_DEFINITIONS})
+
+# Source file (adjust name if your source file differs)
+set(SRC unused-optimizer1.cpp)
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${SRC}")
+  file(GLOB CPP_GLOB RELATIVE ${CMAKE_SOURCE_DIR} "${CMAKE_SOURCE_DIR}/*.cpp")
+  if(CPP_GLOB)
+    list(SORT CPP_GLOB)
+    list(GET CPP_GLOB 0 FIRST_CPP)
+    message(WARNING "Default source ${SRC} not found. Using first .cpp file: ${FIRST_CPP}")
+    set(SRC ${FIRST_CPP})
+  else()
+    message(FATAL_ERROR "No .cpp source file found. Place your source (e.g., ${SRC}) in the project root or pass -DSRC_FILES=\"file.cpp\"")
+  endif()
+endif()
+
+add_executable(${PROJECT_NAME} ${SRC})
+
+# If Debug build, add target-specific compile options too (modern CMake)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  # Pass each flag separately so the compiler receives them as distinct arguments
+  target_compile_options(${PROJECT_NAME} PRIVATE ${DEBUG_CXX_FLAGS})
+  target_compile_options(${PROJECT_NAME} PRIVATE ${DEBUG_C_FLAGS})
+endif()
+
+# Link appropriately depending on availability
+if(Clang_FOUND AND NOT USE_LIBCLANG_CPP)
+  if(DEFINED CLANG_INCLUDE_DIRS)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${CLANG_INCLUDE_DIRS})
+  endif()
+  # Link only the Clang component targets (do not require LLVM::LLVM)
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${CLANG_LINK_TARGETS})
+else()
+  target_include_directories(${PROJECT_NAME} PRIVATE ${LLVM_INCLUDE_DIRS})
+  target_link_libraries(${PROJECT_NAME} PRIVATE ${LIBCLANG_CPP})
+endif()
+
+# Make sure debug symbols are preserved in installed artifacts (optional)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+message(STATUS "To configure: cmake -DLLVM_DIR=/path/to/llvm/cmake -S . -B build")
+message(STATUS "Then: cmake --build build -- -j")
+message(STATUS "ENABLE_DEBUG is ON by default; to disable: cmake -S . -B build -DENABLE_DEBUG=OFF")
+message(STATUS "Or set build type explicitly: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release")

@@ -1,0 +1,375 @@
+// kernel/kernel.c
+#include <stdint.h>
+#include <stddef.h>
+#include <stdarg.h>
+
+/* --- 1. Constants & Macros --- */
+#define PAGE_PRESENT (1ULL << 0)
+#define PAGE_RW      (1ULL << 1)
+#define PAGE_PWT     (1ULL << 3) // Write-Through caching
+#define PAGE_PS      (1ULL << 7) // 2MiB Page
+
+/* Use native 8x8 font (no stretching) and no margins */
+#define CHAR_WIDTH   8
+#define CHAR_HEIGHT  8
+#define MARGIN_X     0
+#define MARGIN_Y     0
+
+/* Background color for the whole screen (blue).
+   Use 0x0000FF for pure blue in 0xRRGGBB format. */
+#define BG_COLOR 0x0000FF
+#define FG_COLOR 0x00FFFFFF
+
+// Increased heap size to 16MB to hold a full 1080p/4k backbuffer
+#define HEAP_SIZE   0x1000000UL
+
+typedef struct {
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t PixelsPerScanLine;
+    uint64_t FrameBufferBase;
+} KernelGOPInfo;
+
+/* --- 2. GDT & TSS Structures --- */
+struct GDTEntry {
+    uint16_t limit_low, base_low;
+    uint8_t  base_mid, access, gran, base_high;
+} __attribute__((packed));
+
+struct GDTSystemDescriptor {
+    struct GDTEntry low;
+    uint32_t base_upper32, reserved;
+} __attribute__((packed));
+
+struct GDTPtr { uint16_t limit; uint64_t base; } __attribute__((packed));
+
+struct TSS {
+    uint32_t res0; uint64_t rsp0, rsp1, rsp2, res1, ist[7], res2;
+    uint16_t res3, iopb_offset;
+} __attribute__((packed));
+
+/* --- 3. Global State --- */
+uint64_t pml4[512] __attribute__((aligned(4096)));
+// Expanded Heap for Backbuffer storage
+uint8_t page_heap[HEAP_SIZE] __attribute__((aligned(4096)));
+static size_t page_ptr = 0;
+
+static struct {
+    struct GDTEntry null, code, data;
+    struct GDTSystemDescriptor tss;
+} __attribute__((packed, aligned(8))) gdt_table;
+
+static struct GDTPtr gdt_ptr;
+static struct TSS kernel_tss;
+static uint8_t tss_stack[4096];
+
+uint32_t pps, screen_width, screen_height;
+size_t buffer_size_bytes;
+
+// fbb will point to backbuffer (RAM) for drawing operations
+volatile uint32_t *fbb;
+// frontbuffer points to actual VRAM
+volatile uint32_t *frontbuffer;
+// backbuffer points to allocated RAM
+uint32_t *backbuffer;
+
+static uint32_t cursor_x = MARGIN_X, cursor_y = MARGIN_Y;
+
+/* --- 4. Font 8x8 Basic (Full Array) --- */
+static const uint8_t font8x8_basic[95][8] = {
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},{0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00},{0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00},{0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00},
+    {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00},{0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00},{0x1C,0x36,0x1C,0x3B,0x6E,0x66,0x3B,0x00},{0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00},
+    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00},{0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00},{0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00},{0x00,0x18,0x18,0x7E,0x18,0x18,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x0C},{0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00},{0x00,0x40,0x30,0x18,0x0C,0x06,0x02,0x00},
+    {0x3E,0x63,0x67,0x6B,0x73,0x63,0x3E,0x00},{0x0C,0x1C,0x0C,0x0C,0x0C,0x0C,0x3F,0x00},{0x3E,0x63,0x03,0x1E,0x30,0x60,0x7F,0x00},{0x3E,0x63,0x03,0x1E,0x03,0x63,0x3E,0x00},
+    {0x06,0x0E,0x16,0x26,0x7F,0x06,0x06,0x00},{0x7F,0x60,0x7E,0x03,0x03,0x63,0x3E,0x00},{0x1C,0x30,0x60,0x7E,0x63,0x63,0x3E,0x00},{0x7F,0x63,0x03,0x06,0x0C,0x18,0x18,0x00},
+    {0x3E,0x63,0x63,0x3E,0x63,0x63,0x3E,0x00},{0x3E,0x63,0x63,0x3F,0x03,0x06,0x3C,0x00},{0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x00},{0x00,0x18,0x18,0x00,0x18,0x18,0x0C,0x00},
+    {0x00,0x06,0x0C,0x18,0x30,0x18,0x0C,0x06},{0x00,0x00,0x7E,0x00,0x7E,0x00,0x00,0x00},{0x00,0x60,0x30,0x18,0x0C,0x18,0x30,0x60},{0x3E,0x63,0x03,0x06,0x0C,0x00,0x0C,0x00},
+    {0x3E,0x63,0x63,0x6F,0x6B,0x6E,0x30,0x00},{0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00},{0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00},{0x3E,0x63,0x60,0x60,0x60,0x63,0x3E,0x00},
+    {0x3E,0x66,0x66,0x66,0x66,0x66,0x3E,0x00},{0x7F,0x60,0x60,0x7E,0x60,0x60,0x7F,0x00},{0x7F,0x60,0x60,0x7E,0x60,0x60,0x60,0x00},{0x3E,0x63,0x60,0x6E,0x63,0x63,0x3E,0x00},
+    {0x66,0x66,0x66,0x7F,0x66,0x66,0x66,0x00},{0x3C,0x18,0x18,0x18,0x18,0x18,0x3C,0x00},{0x1E,0x0C,0x0C,0x0C,0x0C,0x6C,0x38,0x00},{0x66,0x6C,0x78,0x70,0x78,0x6C,0x66,0x00},
+    {0x60,0x60,0x60,0x60,0x60,0x60,0x7F,0x00},{0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0x00},{0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00},{0x3E,0x63,0x63,0x63,0x63,0x63,0x3E,0x00},
+    {0x3F,0x66,0x66,0x3E,0x60,0x60,0x60,0x00},{0x3E,0x63,0x63,0x63,0x6B,0x67,0x3E,0x02},{0x3F,0x66,0x66,0x3E,0x6C,0x66,0x63,0x00},{0x3E,0x63,0x60,0x3E,0x03,0x63,0x3E,0x00},
+    {0x7F,0x18,0x18,0x18,0x18,0x18,0x18,0x00},{0x66,0x66,0x66,0x66,0x66,0x66,0x3E,0x00},{0x66,0x66,0x66,0x66,0x66,0x3C,0x18,0x00},{0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00},
+    {0x63,0x63,0x36,0x1C,0x36,0x63,0x63,0x00},{0x66,0x66,0x66,0x3C,0x18,0x18,0x18,0x00},{0x7F,0x06,0x0C,0x18,0x30,0x60,0x7F,0x00},{0x3C,0x30,0x30,0x30,0x30,0x30,0x3C,0x00},
+    {0x00,0x02,0x06,0x0C,0x18,0x30,0x40,0x00},{0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00},{0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00},{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF},
+    {0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x3E,0x03,0x3F,0x63,0x3E,0x00},{0x60,0x60,0x7E,0x63,0x63,0x63,0x7E,0x00},{0x00,0x00,0x3E,0x63,0x60,0x63,0x3E,0x00},
+    {0x03,0x03,0x3F,0x63,0x63,0x63,0x3F,0x00},{0x00,0x00,0x3E,0x63,0x7F,0x60,0x3E,0x00},{0x1C,0x36,0x30,0x78,0x30,0x30,0x30,0x00},{0x00,0x00,0x3F,0x63,0x63,0x3F,0x03,0x3E},
+    {0x60,0x60,0x7E,0x63,0x63,0x63,0x63,0x00},{0x18,0x00,0x38,0x18,0x18,0x18,0x3C,0x00},{0x06,0x00,0x06,0x06,0x06,0x66,0x3C,0x00},{0x60,0x60,0x66,0x6C,0x78,0x6C,0x66,0x00},
+    {0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00},{0x00,0x00,0x66,0x7F,0x6B,0x6B,0x63,0x00},{0x00,0x00,0x7E,0x63,0x63,0x63,0x63,0x00},{0x00,0x00,0x3E,0x63,0x63,0x63,0x3E,0x00},
+    {0x00,0x00,0x7E,0x63,0x63,0x7E,0x60,0x60},{0x00,0x00,0x3F,0x63,0x63,0x3F,0x03,0x03},{0x00,0x00,0x7E,0x63,0x60,0x60,0x60,0x00},{0x00,0x00,0x3E,0x60,0x3E,0x03,0x3E,0x00},
+    {0x30,0x30,0x7E,0x30,0x30,0x30,0x1C,0x00},{0x00,0x00,0x63,0x63,0x63,0x63,0x3E,0x00},{0x00,0x00,0x63,0x63,0x63,0x36,0x1C,0x00},{0x00,0x00,0x63,0x6B,0x6B,0x7F,0x36,0x00},
+    {0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00},{0x00,0x00,0x63,0x63,0x63,0x3F,0x03,0x3E},{0x00,0x00,0x7F,0x0C,0x18,0x30,0x7F,0x00},{0x0C,0x18,0x18,0x30,0x18,0x18,0x0C,0x00},
+    {0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00},{0x30,0x18,0x18,0x0C,0x18,0x18,0x30,0x00},{0x00,0x00,0x3B,0x6E,0x00,0x00,0x00,0x00}
+};
+
+/* --- 5. Utilities & Scrolling --- */
+void* memset(void* dest, int ch, size_t count) {
+    uint8_t* p = (uint8_t*)dest;
+    while (count--) *p++ = (uint8_t)ch;
+    return dest;
+}
+
+/* memcpy64: optimized copy using 64-bit words, handles remainder bytes */
+void memcpy64(void* dest, const void* src, size_t count) {
+    uint8_t* d8 = (uint8_t*)dest;
+    const uint8_t* s8 = (const uint8_t*)src;
+    size_t n64 = count / 8;
+    uint64_t* d64 = (uint64_t*)d8;
+    const uint64_t* s64 = (const uint64_t*)s8;
+    while (n64--) *d64++ = *s64++;
+    size_t rem = count % 8;
+    d8 = (uint8_t*)d64;
+    s8 = (const uint8_t*)s64;
+    while (rem--) *d8++ = *s8++;
+}
+
+/* kernel_alloc_page: allocate a zeroed 4KiB page from page_heap */
+void* kernel_alloc_page() {
+    if (page_ptr + 4096 > HEAP_SIZE) return NULL; // Safety check
+    void* ptr = &page_heap[page_ptr];
+    page_ptr += 4096;
+    memset(ptr, 0, 4096);
+    return ptr;
+}
+
+/* Blit the Backbuffer to the Frontbuffer (VRAM) */
+void swap_buffers() {
+    if (!frontbuffer || !backbuffer) return;
+    memcpy64((void*)frontbuffer, (const void*)backbuffer, buffer_size_bytes);
+}
+
+/* Scroll: use full screen height (no margins) and CHAR_HEIGHT rows */
+void scroll() {
+    uint32_t top = MARGIN_Y;               // 0 by default
+    uint32_t bottom = screen_height;       // full screen
+
+    if (screen_height < CHAR_HEIGHT) {
+        // Nothing to do
+        return;
+    }
+
+    // Move every scanline up by CHAR_HEIGHT inside the full screen
+    for (uint32_t y = top; y + CHAR_HEIGHT < bottom; y++) {
+        uint32_t dst = y * pps;
+        uint32_t src = (y + CHAR_HEIGHT) * pps;
+        memcpy64((void*)&fbb[dst], (const void*)&fbb[src], (size_t)pps * 4);
+    }
+
+    // Clear the bottom CHAR_HEIGHT rows to BG_COLOR
+    for (uint32_t y = bottom - CHAR_HEIGHT; y < bottom; y++) {
+        uint32_t base = y * pps;
+        for (uint32_t x = 0; x < pps; x++) {
+            fbb[base + x] = BG_COLOR;
+        }
+    }
+
+    // Adjust cursor
+    if (cursor_y >= (uint32_t)CHAR_HEIGHT) cursor_y -= CHAR_HEIGHT;
+    else cursor_y = top;
+
+    // Push the updated backbuffer to VRAM
+    swap_buffers();
+}
+
+/* draw_char: render 8x8 font at native size (no stretching), full-screen aware */
+void draw_char(char c) {
+    if (c == '\n') {
+        cursor_x = MARGIN_X;
+        cursor_y += CHAR_HEIGHT;
+        if (cursor_y + CHAR_HEIGHT > screen_height) scroll();
+        return;
+    }
+
+    if (c == '\r') {
+        cursor_x = MARGIN_X;
+        return;
+    }
+
+    if (cursor_x + CHAR_WIDTH > screen_width) {
+        cursor_x = MARGIN_X;
+        cursor_y += CHAR_HEIGHT;
+        if (cursor_y + CHAR_HEIGHT > screen_height) scroll();
+    }
+
+    if ((unsigned char)c < 32 || (unsigned char)c > 126) return;
+    const uint8_t* g = font8x8_basic[(unsigned char)c - 32];
+
+    for (int r = 0; r < 8; r++) {
+        uint32_t y = cursor_y + r;
+        if (y >= screen_height) continue;
+        uint32_t base = y * pps + cursor_x;
+        for (int col = 0; col < 8; col++) {
+            if ((g[r] >> (7 - col)) & 1) {
+                uint32_t x = cursor_x + col;
+                if (x >= screen_width) continue;
+                fbb[base + col] = FG_COLOR; // white pixel for glyph
+            } else {
+                // Keep background as BG_COLOR (ensures full-screen background)
+                uint32_t x = cursor_x + col;
+                if (x >= screen_width) continue;
+                fbb[base + col] = BG_COLOR;
+            }
+        }
+    }
+    cursor_x += CHAR_WIDTH;
+}
+
+/* Minimal printf supporting %d %x %s and literal characters.
+   Uses safe va_arg types matching the expected call sites. */
+void printf(const char* fmt, ...) {
+    va_list args; va_start(args, fmt);
+    while (*fmt) {
+        if (*fmt == '%' && *(fmt + 1)) {
+            fmt++;
+            if (*fmt == 'd') {
+                int n = va_arg(args, int);
+                if (n == 0) { draw_char('0'); }
+                else {
+                    char buf[32]; int i = 0; int neg = 0;
+                    long long v = n;
+                    if (v < 0) { neg = 1; v = -v; }
+                    while (v > 0) { buf[i++] = '0' + (v % 10); v /= 10; }
+                    if (neg) buf[i++] = '-';
+                    while (i > 0) draw_char(buf[--i]);
+                }
+            } else if (*fmt == 'x') {
+                unsigned int n = va_arg(args, unsigned int);
+                if (n == 0) { draw_char('0'); }
+                else {
+                    char buf[32]; int i = 0;
+                    unsigned int v = n;
+                    while (v > 0) {
+                        unsigned int m = v & 0xF;
+                        buf[i++] = (m < 10) ? ('0' + m) : ('A' + (m - 10));
+                        v >>= 4;
+                    }
+                    while (i > 0) draw_char(buf[--i]);
+                }
+            } else if (*fmt == 's') {
+                const char* s = va_arg(args, const char*);
+                if (!s) s = "(null)";
+                while (*s) draw_char(*s++);
+            } else if (*fmt == '%') {
+                draw_char('%');
+            } else {
+                // Unknown specifier: print it literally
+                draw_char('%'); draw_char(*fmt);
+            }
+        } else {
+            draw_char(*fmt);
+        }
+        fmt++;
+    }
+    va_end(args);
+    // Trigger swap at end of print to make text visible
+    swap_buffers();
+}
+
+/* --- 6. Paging, GDT & TSS Init --- */
+void init_paging(KernelGOPInfo *kgi) {
+    const uint64_t flags = PAGE_PRESENT | PAGE_RW;
+    const uint64_t fb_flags = PAGE_PRESENT | PAGE_RW | PAGE_PWT;
+    uint64_t *pdpt = (uint64_t*)kernel_alloc_page();
+    if (!pdpt) return;
+    pml4[0] = (uint64_t)pdpt | flags;
+    for (int i = 0; i < 4; i++) {
+        uint64_t *pd = (uint64_t*)kernel_alloc_page();
+        if (!pd) return;
+        pdpt[i] = (uint64_t)pd | flags;
+        for (int j = 0; j < 512; j++) {
+            uint64_t addr = (uint64_t)(i * 512 + j) * 0x200000ULL;
+            uint64_t f = (addr >= kgi->FrameBufferBase && addr < kgi->FrameBufferBase + 0x2000000ULL) ? fb_flags : flags;
+            pd[j] = addr | f | PAGE_PS;
+        }
+    }
+    __asm__ volatile ("mov %0, %%cr3" :: "r"(pml4) : "memory");
+}
+
+void init_gdt_tss() {
+    // Zero the GDT table to be safe
+    memset(&gdt_table, 0, sizeof(gdt_table));
+
+    gdt_table.code.access = 0x9A; gdt_table.code.gran = 0x20;
+    gdt_table.data.access = 0x92;
+    uint64_t tss_base = (uint64_t)&kernel_tss;
+    memset(&kernel_tss, 0, sizeof(kernel_tss));
+    kernel_tss.rsp0 = kernel_tss.ist[0] = (uint64_t)tss_stack + sizeof(tss_stack);
+    kernel_tss.iopb_offset = sizeof(kernel_tss);
+    gdt_table.tss.low.limit_low = sizeof(kernel_tss) - 1;
+    gdt_table.tss.low.base_low = (uint16_t)tss_base;
+    gdt_table.tss.low.base_mid = (uint8_t)(tss_base >> 16);
+    gdt_table.tss.low.access = 0x89;
+    gdt_table.tss.low.base_high = (uint8_t)(tss_base >> 24);
+    gdt_table.tss.base_upper32 = (uint32_t)(tss_base >> 32);
+    gdt_ptr.limit = sizeof(gdt_table) - 1;
+    gdt_ptr.base = (uint64_t)&gdt_table;
+    __asm__ volatile ("lgdt %0\n\tmov $0x18, %%ax\n\tltr %%ax" :: "m"(gdt_ptr) : "rax", "memory");
+}
+
+/* --- 7. Main --- */
+void kmain(KernelGOPInfo *kgi) {
+    // 1. Setup VRAM pointer and screen metrics
+    frontbuffer = (volatile uint32_t*)(uintptr_t)kgi->FrameBufferBase;
+    pps = kgi->PixelsPerScanLine;
+    screen_width = kgi->Width;
+    screen_height = kgi->Height;
+    buffer_size_bytes = (size_t)screen_height * (size_t)pps * 4UL;
+
+    // 2. Initialize Paging and GDT
+    init_paging(kgi);
+    init_gdt_tss();
+
+    // 3. Allocate Backbuffer in RAM (continuous pages)
+    int pages_needed = (int)((buffer_size_bytes + 4095) / 4096);
+    void* bb_start = kernel_alloc_page();
+    if (!bb_start) {
+        // allocation failed; hang
+        while (1) { __asm__("hlt"); }
+    }
+    for (int i = 1; i < pages_needed; i++) {
+        if (!kernel_alloc_page()) {
+            // allocation failed; hang
+            while (1) { __asm__("hlt"); }
+        }
+    }
+    backbuffer = (uint32_t*)bb_start;
+
+    // 4. Point drawing operations (fbb) to the RAM Backbuffer
+    fbb = (volatile uint32_t*)backbuffer;
+
+    // Clear Backbuffer to BG_COLOR (blue background) across the whole screen
+    for (uint32_t y = 0; y < screen_height; y++) {
+        uint32_t base = y * pps;
+        for (uint32_t x = 0; x < pps; x++) {
+            fbb[base + x] = BG_COLOR;
+        }
+    }
+
+    // Initial Swap (to clear actual screen)
+    swap_buffers();
+
+    // Reset cursor to top-left (no margins)
+    cursor_x = MARGIN_X;
+    cursor_y = MARGIN_Y;
+
+    printf("Kernel: GDT/TSS and Paging Loaded.\n");
+    printf("Video: Double Buffered (RAM -> VRAM), full-screen, no margins, blue background.\n");
+
+    for (int i = 0; i < 1000; i++) {
+        printf("Loop %d\n", i);
+    }
+
+    while (1) { __asm__("hlt"); }
+}
+
+__attribute__((naked)) void _start(void) {
+    __asm__ volatile (
+        "cli\n\t"
+        "mov %rcx, %rdi\n\t"
+        "sub $8, %rsp\n\t"
+        "call kmain\n\t"
+        "hlt"
+    );
+}
+

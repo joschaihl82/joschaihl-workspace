@@ -1,0 +1,530 @@
+<!doctype html>
+
+<html>
+
+<head>
+    <meta charset="utf-8">
+    
+    <style>
+    #app {
+        position: fixed;
+        top: 25%; left: 15%;
+    }
+    
+    #col {
+        padding-right: 30px;
+    }
+    
+    #table {
+        border-collapse: collapse;
+    }
+    
+    #glyph {
+        width: 330px;
+        height: 328px;
+    }
+    
+    .pixel {
+        border: 1px solid #000;
+        cursor: pointer;
+        padding: 10px;
+    }
+    
+    .buttons {
+        padding: 10px;
+        text-align: center;
+    }
+    
+    body {
+        font-family: verdana;
+    }
+    </style>
+    
+    <script src="jquery.min.js"></script>
+</head>
+
+<body>
+    <form autocomplete="off">
+    
+    <table cellpadding="0" cellspacing="0" id="app">
+    <tr>
+        <td align="center" id="col">
+            <textarea id="glyph"></textarea>
+            
+            <div class="buttons">
+                <input type="button" id="saveGlyph" value="Save">
+                <input type="button" id="loadGlyph" value="Load">
+            </div>
+        </td>
+        
+        <td align="center" id="col">
+            <table cellpadding="0" cellspacing="0" id="table">
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+                
+                <tr>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                    <td data-value="255" class="pixel"></td>
+                </tr>
+            </table>
+            
+            <div class="buttons">
+                <select>
+                    <option value="a">Glyph A</option>
+                </select>
+                
+                <input type="button" id="loadFromFont" value="Load">
+            </div>
+        </td>
+        
+        <td align="center">
+            <table cellpadding="5" cellspacing="0">
+                <tr>
+                    <td align="center"><strong>Shade</strong></td>
+                    <td align="center"><strong>Size</strong></td>
+                    <td align="center"><strong>Subpixel</strong></td>
+                    <td align="center"><strong>Grid</strong></td>
+                </tr>
+                <tr>
+                    <td valign="top">
+                        <input type="radio" name="shade" value="1.00" checked>&nbsp;100%<br>
+                        <input type="radio" name="shade" value="0.95">&nbsp;95%<br>
+                        <input type="radio" name="shade" value="0.90">&nbsp;90%<br>
+                        <input type="radio" name="shade" value="0.85">&nbsp;85%<br>
+                        <input type="radio" name="shade" value="0.80">&nbsp;80%<br>
+                        <input type="radio" name="shade" value="0.75">&nbsp;75%<br>
+                        <input type="radio" name="shade" value="0.70">&nbsp;70%<br>
+                        <input type="radio" name="shade" value="0.65">&nbsp;65%<br>
+                        <input type="radio" name="shade" value="0.60">&nbsp;60%<br>
+                        <input type="radio" name="shade" value="0.55">&nbsp;55%<br>
+                        <input type="radio" name="shade" value="0.50">&nbsp;50%<br>
+                        <input type="radio" name="shade" value="0.45">&nbsp;45%<br>
+                        <input type="radio" name="shade" value="0.40">&nbsp;40%<br>
+                        <input type="radio" name="shade" value="0.35">&nbsp;35%<br>
+                        <input type="radio" name="shade" value="0.30">&nbsp;30%<br>
+                        <input type="radio" name="shade" value="0.25">&nbsp;25%<br>
+                        <input type="radio" name="shade" value="0.20">&nbsp;20%<br>
+                        <input type="radio" name="shade" value="0.15">&nbsp;15%<br>
+                        <input type="radio" name="shade" value="0.10">&nbsp;10%
+                    </td>
+                    
+                    <td valign="top">
+                        <input type="radio" name="size" class="size" value="1" checked>&nbsp;Original<br>
+                        <input type="radio" name="size" class="size" value="100">&nbsp;16px<br>
+                    </td>
+                    
+                    <td valign="top">
+                        <input type="radio" name="sp" class="sp" value="1">&nbsp;On<br>
+                        <input type="radio" name="sp" class="sp" value="0" checked>&nbsp;Off<br>
+                        
+                        <br>
+                        
+                        <input type="radio" name="spOrder" class="spOrder" value="r" checked>&nbsp;RGB<br>
+                        <input type="radio" name="spOrder" class="spOrder" value="b">&nbsp;BGR<br>
+                    </td>
+                    
+                    <td valign="top">
+                        <input type="radio" name="grid" class="grid" value="1" checked>&nbsp;On<br>
+                        <input type="radio" name="grid" class="grid" value="0">&nbsp;Off<br>
+                    </td>
+                </tr>
+            </table>
+        </td>
+    </tr>
+    </table>
+    
+    </form>
+    
+    <script>
+        $('.pixel').on('click', function() {
+            var shade = parseFloat($('input[name=shade]:checked').val())
+            
+            if ($(this).attr('data-value') == 255) {
+                var color = float2color(shade)
+                $(this).attr('data-value', color)
+            } else {
+                $(this).attr('data-value', 255)
+            }
+            
+            saveValue()
+            drawGlyph()
+        })
+        
+        $('.size').on('click', function() {
+            var size = parseFloat($('input[name=size]:checked').val())
+            
+            $('.pixel').css('padding', 10 / size)
+            
+            if (size != 1) {
+                $('input[name=grid]').filter('[value=0]').prop('checked', true).click()
+            }
+        })
+        
+        $('.grid').on('click', function() {
+            var grid = parseFloat($('input[name=grid]:checked').val())
+            
+            if (grid == 1) {
+                $('.pixel').css('border', '1px solid #000')
+            } else {
+                $('.pixel').css('border', 'none')
+            }
+        })
+        
+        $('#loadGlyph, .sp, .spOrder').on('click', function() {
+            drawGlyph()
+        })
+        
+        function color2hex(color, colorType) {
+            var colorHex = Number(parseInt(color, 10)).toString(16)
+            colorHex = ('00' + colorHex).substring(colorHex.length)
+            
+            var colorLgt = Number(parseInt(color / 2, 10)).toString(16)
+            colorLgt = ('00' + colorLgt).substring(colorLgt.length)
+            
+            switch(colorType) {
+                case 'r' :
+                    return '#' + colorHex + colorLgt + '00'
+                case 'b' :
+                    return '#' + '00' + colorLgt + colorHex
+                 default :
+                    return '#' + colorHex + colorHex + colorHex
+            }
+        }
+        
+        function float2color(percentage) {
+            return 255 - parseInt(255 * percentage)
+        }
+        
+        function saveValue() {
+            $('#glyph').val('')
+            
+            $('.pixel').each(function() {
+                var color = $(this).attr('data-value')
+                var colorPadded = ('000' + color).substring(color.length)
+                
+                $('#glyph').val($('#glyph').val() + colorPadded)
+            })
+        }
+        
+        function drawGlyph() {
+            var sp = parseFloat($('input[name=sp]:checked').val())
+            var spOrder = $('input[name=spOrder]:checked').val()
+            var black = false
+            var count = 1
+            
+            $('#glyph').val().match(/.{3}/g).forEach((color, gIndex) => {
+                $('.pixel').each(function(pIndex) {
+                    if (gIndex == pIndex) { 
+                        $(this).attr('data-value', color)
+                        
+                        colorType = ''
+                        
+                        if (sp == 1) {
+                            if (color > 0 && color < 255) {
+                                if (black == false) {
+                                    if (spOrder == 'r') {
+                                        colorType = 'r'
+                                    } else {
+                                        colorType = 'b'
+                                    }
+                                } else {
+                                    if (spOrder == 'r') {
+                                        colorType = 'b'
+                                    } else {
+                                        colorType = 'r'
+                                    }
+                                }
+                            } else if (color == 255) {
+                                black = false
+                            } else if (color == 0) {
+                                black = true
+                            }
+                        }
+                        
+                        var hex = color2hex(color, colorType)
+                        $(this).css('background-color', hex)
+                        
+                        if (count == 14) {
+                            black = false
+                            count = 0
+                        }
+                        
+                        count++
+                    }
+                })
+            })
+            
+            
+        }
+    </script>
+</body>
+
+<!-- letter glyphs
+
+h = 255255153000000077230255255255255255255255255255153000000077230255255255255255255255255255153000000077230255255255255255255255255255153000000077230255255255255255255255255255153000000077230255255255255255255255255255153000000077204128026000000128230255255255153000000026026000000000000000128230255255153000000026204230230128000000000179255255153000000077230255255179000000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153255255153000000077230255255204026000000153
+ -->
+</html>

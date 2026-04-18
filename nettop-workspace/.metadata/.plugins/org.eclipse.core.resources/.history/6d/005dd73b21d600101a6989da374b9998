@@ -1,0 +1,57 @@
+cmake_minimum_required(VERSION 3.10)
+project(nettop LANGUAGES CXX)
+
+# Use C++17
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Prefer Release by default
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# Find Qt5 components
+find_package(Qt5 COMPONENTS Widgets Network Concurrent OpenGL REQUIRED)
+
+# Source
+set(SRC
+  nettop.cpp
+)
+
+# Create executable
+add_executable(nettop ${SRC})
+
+# Include directories (Qt will provide include paths automatically)
+# Link libraries: Qt modules and libpcap
+target_link_libraries(nettop
+  PRIVATE
+    Qt5::Widgets
+    Qt5::Network
+    Qt5::Concurrent
+    Qt5::OpenGL
+    pcap
+)
+
+# Compiler warnings and definitions
+if(MSVC)
+  target_compile_options(nettop PRIVATE /W4 /permissive-)
+else()
+  target_compile_options(nettop PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+  # Enable position independent code on some platforms if desired
+  set_target_properties(nettop PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# Install rule (optional)
+install(TARGETS nettop RUNTIME DESTINATION bin)
+
+# Helpful messages
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "Qt5 found: Widgets Network Concurrent OpenGL")
+message(STATUS "Linking with libpcap (pcap)")
+
+# If libpcap is not found by the linker, you can also try to locate it explicitly:
+# find_library(PCAP_LIB pcap)
+# if(PCAP_LIB)
+#   target_link_libraries(nettop PRIVATE ${PCAP_LIB})
+# endif()

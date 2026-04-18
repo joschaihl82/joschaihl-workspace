@@ -1,0 +1,9 @@
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:ovalface4 Debug,org.eclipse.launchbar.core.descriptorType.default\:ovalfillface Debug,org.eclipse.launchbar.core.descriptorType.default\:face4 Debug,org.eclipse.launchbar.core.descriptorType.default\:face1 (1),org.eclipse.launchbar.core.descriptorType.default\:tracker1 Debug,org.eclipse.launchbar.core.descriptorType.default\:tracker4 Debug,org.eclipse.launchbar.core.descriptorType.default\:ovalface Debug,org.eclipse.launchbar.core.descriptorType.default\:face1 (2),org.eclipse.launchbar.core.descriptorType.default\:pupil Debug,org.eclipse.launchbar.core.descriptorType.default\:ovalface2 Debug,org.eclipse.launchbar.core.descriptorType.default\:tracker3 Debug,org.eclipse.launchbar.core.descriptorType.default\:camshift Debug,org.eclipse.launchbar.core.descriptorType.default\:face1,org.eclipse.launchbar.core.descriptorType.default\:tracker2 Debug,org.eclipse.launchbar.core.descriptorType.default\:randpupiltree Debug
+eclipse.preferences.version=1
+org.eclipse.launchbar.core.descriptorType.default\:face1/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:face1/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.launchbar.core.descriptorType.default\:ovalface4\ Debug/activeLaunchMode=run
+org.eclipse.launchbar.core.descriptorType.default\:ovalface4\ Debug/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

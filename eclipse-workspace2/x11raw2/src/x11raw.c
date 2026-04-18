@@ -1,0 +1,444 @@
+// Build with:
+// gcc rawx11.c -o rawx11 -g -Wall
+// Tested on xubuntu 20.
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/select.h>
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <time.h>
+
+#define FATAL_ERROR(msg, ...) do { fprintf(stderr, "Fatal: " msg "\n", ##__VA_ARGS__); exit(EXIT_FAILURE); } while (0)
+
+//
+// X11 protocol definitions
+//
+enum {
+    X11_OPCODE_CREATE_WINDOW = 1,
+    X11_OPCODE_MAP_WINDOW    = 8,
+    X11_OPCODE_CREATE_GC     = 55,
+    X11_OPCODE_PUT_IMAGE     = 72,
+    X11_OPCODE_GET_INPUT_FOCUS = 43,
+
+    X11_CW_EVENT_MASK            = 1 << 11,
+    X11_EVENT_MASK_KEY_PRESS     = 1 << 0,
+    X11_EVENT_MASK_BUTTON_PRESS  = 1 << 2,
+    X11_EVENT_MASK_POINTER_MOTION= 1 << 6,
+};
+
+typedef struct __attribute__((packed)) {
+    uint8_t  order;
+    uint8_t  pad1;
+    uint16_t major_version, minor_version;
+    uint16_t auth_proto_name_len;
+    uint16_t auth_proto_data_len;
+    uint16_t pad2;
+} connection_request_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t root_id;
+    uint32_t colormap;
+    uint32_t white, black;
+    uint32_t input_mask;
+    uint16_t width, height;
+    uint16_t width_mm, height_mm;
+    uint16_t maps_min, maps_max;
+    uint32_t root_visual_id;
+    uint8_t  backing_store;
+    uint8_t  save_unders;
+    uint8_t  depth;
+    uint8_t  allowed_depths_len;
+} screen_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t depth;
+    uint8_t bpp;
+    uint8_t scanline_pad;
+    uint8_t pad[5];
+} pixmap_format_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t release;
+    uint32_t id_base, id_mask;
+    uint32_t motion_buffer_size;
+    uint16_t vendor_len;
+    uint16_t request_max;
+    uint8_t  num_screens;
+    uint8_t  num_pixmap_formats;
+    uint8_t  image_byte_order;
+    uint8_t  bitmap_bit_order;
+    uint8_t  scanline_unit, scanline_pad;
+    uint8_t  keycode_min, keycode_max;
+    uint32_t pad;
+    char     vendor_string[1];
+} connection_reply_success_body_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  success;
+    uint8_t  pad;
+    uint16_t major_version, minor_version;
+    uint16_t len; // length in 4-byte units following this header
+} connection_reply_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t  group;
+    uint8_t  bits;
+    uint16_t colormap_entries;
+    uint32_t mask_red, mask_green, mask_blue;
+    uint32_t pad;
+} visual_t;
+
+typedef struct {
+    int socket_fd;
+
+    connection_reply_header_t        connection_reply_header;
+    connection_reply_success_body_t *connection_reply_success_body;
+
+    pixmap_format_t *pixmap_formats; // Points into connection_reply_success_body.
+    screen_t        *screens;        // Points into connection_reply_success_body.
+
+    uint32_t next_resource_id;
+    uint32_t graphics_context_id;
+    uint32_t window_id;
+} state_t;
+
+static void fatal_write(int fd, const void *buf, size_t count) {
+    ssize_t n = write(fd, buf, count);
+    if (n < 0) FATAL_ERROR("write failed: %s", strerror(errno));
+    if ((size_t)n != count) FATAL_ERROR("short write: %zd/%zu", n, count);
+}
+
+static void fatal_read(int fd, void *buf, size_t count) {
+    ssize_t n = read(fd, buf, count);
+    if (n < 0) FATAL_ERROR("read failed: %s", strerror(errno));
+    if ((size_t)n != count) FATAL_ERROR("short read: %zd/%zu", n, count);
+}
+
+// Simple helper to get the MIT-MAGIC-COOKIE-1 16-byte value from ~/.Xauthority
+static int read_xauth_cookie(uint8_t out[16]) {
+    char path[1024];
+    const char *home = getenv("HOME");
+    if (!home) home = "";
+    snprintf(path, sizeof(path), "%s/.Xauthority", home);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    uint8_t buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+    if (n < 16) return -1;
+
+    memcpy(out, buf + (n - 16), 16);
+    return 0;
+}
+
+void x11_init(state_t *state) {
+    // Open socket and connect.
+    state->socket_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (state->socket_fd < 0) {
+        FATAL_ERROR("Create socket failed: %s", strerror(errno));
+    }
+
+    struct sockaddr_un serv_addr;
+    memset(&serv_addr, 0, sizeof(serv_addr));
+    serv_addr.sun_family = AF_UNIX;
+    const char *xpath = "/tmp/.X11-unix/X0";
+    size_t xpath_len = strlen(xpath);
+    if (xpath_len >= sizeof(serv_addr.sun_path)) {
+        FATAL_ERROR("X socket path too long");
+    }
+    memcpy(serv_addr.sun_path, xpath, xpath_len + 1);
+
+    if (connect(state->socket_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+        FATAL_ERROR("Couldn't connect: %s", strerror(errno));
+    }
+
+    // Read Xauthority cookie.
+    uint8_t xauth_cookie[16];
+    if (read_xauth_cookie(xauth_cookie) != 0) {
+        FATAL_ERROR("Couldn't read MIT-MAGIC-COOKIE-1 from .Xauthority");
+    }
+
+    // Send connection request.
+    connection_request_t request = {0};
+    request.order = 'l';  // Little endian.
+    request.major_version = 11;
+    request.minor_version = 0;
+    request.auth_proto_name_len = 18; // "MIT-MAGIC-COOKIE-1"
+    request.auth_proto_data_len = 16;
+
+    fatal_write(state->socket_fd, &request, sizeof(connection_request_t));
+
+    // Auth name with 4-byte padding (18 -> 20)
+    const char auth_name_padded[20] = "MIT-MAGIC-COOKIE-1\0\0";
+    fatal_write(state->socket_fd, auth_name_padded, sizeof(auth_name_padded));
+
+    // Auth data: 16 bytes
+    fatal_write(state->socket_fd, xauth_cookie, sizeof(xauth_cookie));
+
+    // Read connection reply header.
+    fatal_read(state->socket_fd, &state->connection_reply_header, sizeof(connection_reply_header_t));
+    if (state->connection_reply_header.success == 0) {
+        FATAL_ERROR("Connection reply indicated failure.");
+    }
+
+    // Read rest of connection reply.
+    uint16_t body_len_units = state->connection_reply_header.len;
+    if (body_len_units == 0) {
+        FATAL_ERROR("Connection reply body length is zero.");
+    }
+    size_t body_bytes = (size_t)body_len_units * 4;
+    state->connection_reply_success_body = (connection_reply_success_body_t *)malloc(body_bytes);
+    if (!state->connection_reply_success_body) {
+        FATAL_ERROR("malloc failed for connection reply body");
+    }
+    fatal_read(state->socket_fd, state->connection_reply_success_body, body_bytes);
+
+    // Set some pointers into the connection reply because they'll be convenient later.
+    int vendor_len_plus_padding = (state->connection_reply_success_body->vendor_len + 3) & ~3;
+
+    // Bounds guard before pointer math
+    uint8_t *base = (uint8_t *)state->connection_reply_success_body;
+    if ((size_t)vendor_len_plus_padding + sizeof(*state->pixmap_formats) > body_bytes) {
+        FATAL_ERROR("Reply body too small for vendor string/pixmap formats");
+    }
+
+    state->pixmap_formats = (pixmap_format_t *)(state->connection_reply_success_body->vendor_string + vendor_len_plus_padding);
+
+    // Check pixmap formats block fits
+    size_t pf_count = state->connection_reply_success_body->num_pixmap_formats;
+    size_t pf_bytes = pf_count * sizeof(pixmap_format_t);
+    uint8_t *pf_end = (uint8_t *)state->pixmap_formats + pf_bytes;
+    if ((size_t)(pf_end - base) > body_bytes) {
+        FATAL_ERROR("Reply body too small for pixmap formats");
+    }
+
+    state->screens = (screen_t *)pf_end;
+
+    // Ensure at least one screen fits
+    if ((size_t)((uint8_t *)&state->screens[0] + sizeof(screen_t) - base) > body_bytes) {
+        FATAL_ERROR("Reply body too small for screens");
+    }
+
+    state->next_resource_id = state->connection_reply_success_body->id_base;
+}
+
+static uint32_t generate_id(state_t *state) {
+    return state->next_resource_id++;
+}
+
+void create_gc(state_t *state) {
+    state->graphics_context_id = generate_id(state);
+    const int len = 4; // words, including header
+    uint32_t packet[len];
+    packet[0] = X11_OPCODE_CREATE_GC | ((uint32_t)len << 16);
+    packet[1] = state->graphics_context_id;
+    packet[2] = state->screens[0].root_id; // drawable
+    packet[3] = 0; // Value mask.
+    fatal_write(state->socket_fd, packet, len * 4);
+}
+
+void create_window(state_t *state, uint16_t w, uint16_t h, uint32_t window_parent) {
+    state->window_id = generate_id(state);
+
+    // We include one value (event mask) so header length increases by 1 word.
+    const int len = 9; // words, including header (was 8)
+    uint32_t packet[len];
+    packet[0] = X11_OPCODE_CREATE_WINDOW | ((uint32_t)len << 16);
+    packet[1] = state->window_id;
+    packet[2] = window_parent;  // parent drawable
+    packet[3] = 0;              // x,y pos. System will position window.
+    packet[4] = ((uint32_t)w) | ((uint32_t)h << 16);
+    packet[5] = 0;              // border_width and class (default)
+    packet[6] = 0;              // Visual: Copy from parent.
+    packet[7] = X11_CW_EVENT_MASK; // value_mask: we provide event mask
+    // The single value we provide: event mask bits
+    packet[8] = X11_EVENT_MASK_KEY_PRESS | X11_EVENT_MASK_BUTTON_PRESS | X11_EVENT_MASK_POINTER_MOTION;
+    fatal_write(state->socket_fd, packet, len * 4);
+}
+
+void map_window(state_t *state) {
+    const int len = 2; // words, including header
+    uint32_t packet[len];
+    packet[0] = X11_OPCODE_MAP_WINDOW | ((uint32_t)len << 16);
+    packet[1] = state->window_id;
+    fatal_write(state->socket_fd, packet, len * 4);
+}
+
+void put_image(state_t *state) {
+    enum { W = 100, H = 100 };
+    enum { BYTES_PER_PIXEL = 4 };
+    enum { DATA_WORDS = W * H }; // number of 32-bit pixels
+    enum { HEADER_WORDS_AFTER_WORD0 = 5 }; // words 1..5
+    // total words = 1 (word0) + HEADER_WORDS_AFTER_WORD0 + DATA_WORDS = 6 + DATA_WORDS
+    size_t total_words = 6 + DATA_WORDS;
+    size_t total_bytes = total_words * 4;
+
+    static uint32_t *packet = NULL;
+    static size_t allocated = 0;
+    if (!packet || allocated < total_bytes) {
+        free(packet);
+        packet = (uint32_t *)malloc(total_bytes);
+        if (!packet) FATAL_ERROR("malloc failed for PutImage packet");
+        allocated = total_bytes;
+    }
+
+    uint32_t *bmp = packet + 6; // bitmap data starts after 6 words (word indices 0..5)
+    for (int y = 0; y < H; y++) {
+        uint32_t *row = bmp + y * W;
+        for (int x = 0; x < W; x++) {
+            // Generate white-noise pixel: 24-bit RGB (0x00RRGGBB)
+            uint32_t rgb = (uint32_t)(rand() & 0x00FFFFFF);
+            row[x] = rgb;
+        }
+    }
+
+    // format=2 (ZPixmap) in byte 1
+    uint32_t bmp_format = (uint32_t)(2 << 8);
+    // Length is in 4-byte units following the first word:
+    // header words after word0 = 5 (words 1..5) + data words = W*H
+    uint32_t req_len_units = (uint32_t)(HEADER_WORDS_AFTER_WORD0 + DATA_WORDS);
+    uint32_t request_len = (req_len_units << 16);
+
+    packet[0] = X11_OPCODE_PUT_IMAGE | bmp_format | request_len;
+    packet[1] = state->window_id;            // drawable
+    packet[2] = state->graphics_context_id;  // GC
+    packet[3] = ((uint32_t)W) | ((uint32_t)H << 16); // width & height
+    packet[4] = 0; // dst x & y
+    // byte 0: left_pad (0), byte 1: depth (24), bytes 2-3: unused/pad
+    packet[5] = (uint32_t)(24 << 8);
+
+    fatal_write(state->socket_fd, packet, total_bytes);
+}
+
+// Forward declaration for event handler used by flush
+static void handle_event_and_maybe_redraw(state_t *state, uint8_t *evbuf, size_t evlen);
+
+// x11_flush: send GetInputFocus and wait for its reply.
+// While waiting, read incoming 32-byte messages and dispatch events.
+// Returns when a reply (response_type == 1) is received.
+void x11_flush(state_t *state) {
+    // Build GetInputFocus request: opcode 43, length = 1 word (header only)
+    uint32_t req = X11_OPCODE_GET_INPUT_FOCUS | (1u << 16);
+    fatal_write(state->socket_fd, &req, 4);
+
+    // Now read messages until we get a reply (response_type == 1).
+    // Each X message (reply or event or error) is 32 bytes for replies/events.
+    uint8_t msg[32];
+    while (1) {
+        // Read exactly 32 bytes
+        fatal_read(state->socket_fd, msg, sizeof(msg));
+
+        uint8_t response_type = msg[0];
+        if (response_type == 1) {
+            // Normal reply: flush complete
+            return;
+        } else if (response_type == 0) {
+            // Error packet: log and continue (or handle as needed)
+            fprintf(stderr, "x11_flush: received X error packet (opcode=%u)\n", msg[1]);
+            // continue reading until reply arrives
+        } else {
+            // It's an event (response_type is event type)
+            handle_event_and_maybe_redraw(state, msg, sizeof(msg));
+            // continue waiting for the reply
+        }
+    }
+}
+
+static void handle_event_and_maybe_redraw(state_t *state, uint8_t *evbuf, size_t evlen) {
+    if (evlen < 1) return;
+    uint8_t type = evbuf[0];
+    switch (type) {
+        case 2: { // KeyPress
+            uint8_t keycode = evbuf[1];
+            fprintf(stderr, "KeyPress: keycode=%u\n", keycode);
+            // Example: exit on keycode 9 (Escape on many setups) - optional
+            if (keycode == 9) {
+                fprintf(stderr, "Escape pressed, exiting.\n");
+                exit(0);
+            }
+            break;
+        }
+        case 4: { // ButtonPress
+            uint8_t button = evbuf[1];
+            // x,y are 16-bit at offsets 8 and 10 in many event formats
+            uint16_t x = *(uint16_t *)(evbuf + 8);
+            uint16_t y = *(uint16_t *)(evbuf + 10);
+            fprintf(stderr, "ButtonPress: button=%u at (%u,%u)\n", button, x, y);
+            break;
+        }
+        case 6: { // MotionNotify
+            uint16_t x = *(uint16_t *)(evbuf + 8);
+            uint16_t y = *(uint16_t *)(evbuf + 10);
+            fprintf(stderr, "MotionNotify: at (%u,%u)\n", x, y);
+            break;
+        }
+        case 12: { // Expose
+            // On Expose, redraw the window
+            fprintf(stderr, "Expose event: refreshing image\n");
+            put_image(state);
+            break;
+        }
+        default:
+            // Other events can be logged if desired
+            // fprintf(stderr, "Event type %u\n", type);
+            break;
+    }
+}
+
+int main() {
+    state_t state = {0};
+    srand((unsigned)time(NULL)); // seed RNG for white noise
+    x11_init(&state);
+    create_gc(&state);
+    create_window(&state, 320, 240, state.screens[0].root_id);
+    map_window(&state);
+
+    // Event loop: wait for events from X server and also periodically refresh
+    const int EVENT_SIZE = 32; // X11 events/replies are 32 bytes
+    uint8_t evbuf[EVENT_SIZE];
+
+    // We'll call x11_flush() after each periodic put_image to ensure the server processed it.
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(state.socket_fd, &rfds);
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 10000; // 10 ms timeout -> periodic refresh
+
+        int r = select(state.socket_fd + 1, &rfds, NULL, NULL, &tv);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            FATAL_ERROR("select failed: %s", strerror(errno));
+        } else if (r == 0) {
+            // timeout: periodic refresh
+            put_image(&state);
+            // Ensure server processed the PutImage and any prior requests.
+            // This will block until the GetInputFocus reply arrives, but will dispatch
+            // any events received while waiting.
+            x11_flush(&state);
+            continue;
+        } else {
+            if (FD_ISSET(state.socket_fd, &rfds)) {
+                // Read one message (32 bytes)
+                ssize_t n = read(state.socket_fd, evbuf, EVENT_SIZE);
+                if (n <= 0) {
+                    FATAL_ERROR("read event failed or connection closed: %s", strerror(errno));
+                }
+                // If server sends more than 32 bytes at once, we only handle the first 32 here.
+                handle_event_and_maybe_redraw(&state, evbuf, (size_t)n);
+                // continue loop to handle more events or timeouts
+            }
+        }
+    }
+    return 0;
+}

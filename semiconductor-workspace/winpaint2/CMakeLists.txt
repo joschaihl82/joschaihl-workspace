@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.16)
+
+# Cross-Compiler fest einbrennen
+set(CMAKE_SYSTEM_NAME Windows)
+set(TOOLCHAIN_PATH "/usr/bin")
+set(TOOLCHAIN_PREFIX "i686-w64-mingw32")
+
+set(CMAKE_C_COMPILER "${TOOLCHAIN_PATH}/${TOOLCHAIN_PREFIX}-gcc")
+set(CMAKE_CXX_COMPILER "${TOOLCHAIN_PATH}/${TOOLCHAIN_PREFIX}-g++")
+set(CMAKE_RC_COMPILER "${TOOLCHAIN_PATH}/${TOOLCHAIN_PREFIX}-windres")
+
+project(WinPaint C)
+
+# Pfade zu den Windows-Headern explizit hinzufügen
+# Falls dein Pfad abweicht (z.B. /usr/local/...), hier anpassen:
+include_directories("/usr/${TOOLCHAIN_PREFIX}/include")
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static-libgcc -static -O2")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--subsystem,windows -static")
+
+add_compile_definitions(UNICODE _UNICODE)
+
+add_executable(winpaint WIN32 paint.c)
+
+target_link_libraries(winpaint PRIVATE
+    comctl32
+    gdi32
+    user32
+    kernel32
+    comdlg32
+    msimg32
+)

@@ -1,0 +1,7 @@
+/dat/semiconductor-workspace/winpaint/CMakeFiles/winpaint.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/edit_cache.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/rebuild_cache.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/list_install_components.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/install.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/install/local.dir
+/dat/semiconductor-workspace/winpaint/CMakeFiles/install/strip.dir

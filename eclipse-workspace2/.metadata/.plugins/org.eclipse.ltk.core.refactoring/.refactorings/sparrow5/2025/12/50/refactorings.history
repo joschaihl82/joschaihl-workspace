@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;sparrow5/sparrow.c&apos; to &apos;sparrow.c.txt&apos;" description="Rename resource &apos;sparrow.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="sparrow.c" name="sparrow.c.txt" stamp="1765719834248" updateReferences="true"/>
+</session>

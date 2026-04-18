@@ -1,0 +1,491 @@
+// File: semiconductor_line_tool.c
+// Compile: gcc -o semiconductor_line_tool semiconductor_line_tool.c `sdl2-config --cflags --libs` -lSDL2_ttf -lm
+//
+// Verhalten:
+// 1) Erster Linksklick im Gitter setzt den Startpunkt der Linie.
+// 2) Solange die Maustaste gehalten wird, wird eine Vorschau der Linie angezeigt.
+//    Beim Loslassen wird die Linie mit Bresenham in das Bitmap gezeichnet.
+// 3) Jeder weitere Linksklick im Gitter setzt das Ende der Linie absolut neu
+//    (die Linie wird neu gezeichnet und bleibt so bestehen).
+//
+// Hintergrund ist standardmäßig Isolator (BT_I).
+// Links neben der Toolbox gibt es weiterhin Tools (Isolator, Halbleiter, Leiter, Plus, Minus).
+// Taste 'c' setzt das Bitmap zurück.
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <stdint.h>
+#include <math.h>
+
+#define GRID_W 160
+#define GRID_H 120
+
+#define CELL_MIN 2
+#define CELL_MAX 20
+#define CELL_DEFAULT 5
+
+#define TOOLBOX_W 160
+
+enum {
+    BT_I = 0, // Isolator
+    BT_S = 1, // Halbleiter
+    BT_C = 2, // Leiter
+    BT_P = 3, // Pluspol
+    BT_M = 4  // Minuspol
+};
+
+static SDL_Color COLORS[] = {
+    {80, 80, 80, 255},    // I Grau
+    {0, 180, 0, 255},     // S Grün
+    {255, 255, 0, 255},   // C Gelb
+    {255, 0, 0, 255},     // P Rot
+    {0, 0, 255, 255}      // M Blau
+};
+
+const char* TOOL_LABELS[] = {
+    "Isolator",
+    "Halbleiter",
+    "Leiter",
+    "Pluspol",
+    "Minuspol"
+};
+
+typedef struct {
+    int cell_size;
+    int window_w;
+    int window_h;
+    SDL_Window* win;
+    SDL_Renderer* ren;
+    TTF_Font* font;
+    uint8_t bitmap[GRID_W * GRID_H]; // 1D 8-bit per cell
+    int current_tool;
+    bool running;
+} AppState;
+
+static inline int idx(int x, int y) { return y * GRID_W + x; }
+
+// Initialisiere Bitmap: Standardhintergrund = Isolator (BT_I)
+static void init_bitmap(AppState* app) {
+    for (int i = 0; i < GRID_W * GRID_H; ++i) app->bitmap[i] = BT_I;
+    // Polstreifen (wie vorher)
+    for (int y = 0; y < GRID_H; ++y) {
+        app->bitmap[idx(5, y)] = BT_P;
+        app->bitmap[idx(GRID_W - 6, y)] = BT_M;
+    }
+    // ein paar zufällige Halbleiter zur Optik
+    srand((unsigned)time(NULL));
+    for (int i = 0; i < 800; ++i) {
+        int x = rand() % GRID_W;
+        int y = rand() % GRID_H;
+        app->bitmap[idx(x, y)] = (rand() % 4 == 0) ? BT_S : BT_I;
+    }
+}
+
+static void update_window_size(AppState* app) {
+    app->window_w = GRID_W * app->cell_size + TOOLBOX_W;
+    app->window_h = GRID_H * app->cell_size;
+    SDL_SetWindowSize(app->win, app->window_w, app->window_h);
+}
+
+static void draw_text(AppState* app, const char* text, int x, int y, SDL_Color color) {
+    if (!app->font) return;
+    SDL_Surface* surf = TTF_RenderUTF8_Blended(app->font, text, color);
+    if (!surf) return;
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(app->ren, surf);
+    SDL_Rect dst = { x, y, surf->w, surf->h };
+    SDL_FreeSurface(surf);
+    if (tex) {
+        SDL_RenderCopy(app->ren, tex, NULL, &dst);
+        SDL_DestroyTexture(tex);
+    }
+}
+
+// Bresenham auf Gitterzellen (integers)
+static void bresenham_draw(AppState* app, int x0, int y0, int x1, int y1, uint8_t value) {
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (1) {
+        if (x0 >= 0 && x0 < GRID_W && y0 >= 0 && y0 < GRID_H) {
+            app->bitmap[idx(x0, y0)] = value;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// Mappe Fenster-Koordinaten auf logische Pixel und Gitterzellen (integers)
+static void window_to_logical_and_grid(AppState* app, int mx, int my, int *logical_x, int *logical_y, int *gx, int *gy) {
+    int logical_w = GRID_W * app->cell_size + TOOLBOX_W;
+    int logical_h = GRID_H * app->cell_size;
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(app->win, &win_w, &win_h);
+    if (win_w <= 0) win_w = 1;
+    if (win_h <= 0) win_h = 1;
+    float sx = (float)logical_w / (float)win_w;
+    float sy = (float)logical_h / (float)win_h;
+    float lx = mx * sx;
+    float ly = my * sy;
+    if (logical_x) *logical_x = (int)lx;
+    if (logical_y) *logical_y = (int)ly;
+    if (gx) *gx = (int)(lx) / app->cell_size;
+    if (gy) *gy = (int)(ly) / app->cell_size;
+}
+
+// Render: zeichnet Bitmap und Toolbox; falls preview_active true, zeichnet Vorschau-Linie
+static void render(AppState* app, bool preview_active, int px0, int py0, int px1, int py1) {
+    SDL_SetRenderDrawColor(app->ren, 20, 20, 20, 255);
+    SDL_RenderClear(app->ren);
+
+    // Bitmap zeichnen
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            uint8_t v = app->bitmap[idx(x, y)];
+            SDL_Color col = COLORS[v];
+            SDL_SetRenderDrawColor(app->ren, col.r, col.g, col.b, 255);
+            SDL_Rect r = { x * app->cell_size, y * app->cell_size, app->cell_size, app->cell_size };
+            SDL_RenderFillRect(app->ren, &r);
+        }
+    }
+
+    // Toolbox Hintergrund
+    SDL_SetRenderDrawColor(app->ren, 40, 40, 40, 255);
+    SDL_Rect toolbox = { GRID_W * app->cell_size, 0, TOOLBOX_W, app->window_h };
+    SDL_RenderFillRect(app->ren, &toolbox);
+
+    // Tools
+    for (int i = 0; i < 5; ++i) {
+        SDL_Color c = COLORS[i];
+        SDL_SetRenderDrawColor(app->ren, c.r, c.g, c.b, 255);
+        SDL_Rect r = { GRID_W * app->cell_size + 16, 16 + i * 56, 40, 40 };
+        SDL_RenderFillRect(app->ren, &r);
+        if (i == app->current_tool) {
+            SDL_SetRenderDrawColor(app->ren, 255, 255, 255, 255);
+            SDL_Rect br = { r.x - 2, r.y - 2, r.w + 4, r.h + 4 };
+            SDL_RenderDrawRect(app->ren, &br);
+        }
+        SDL_Color white = { 230, 230, 230, 255 };
+        draw_text(app, TOOL_LABELS[i], GRID_W * app->cell_size + 64, 24 + i * 56, white);
+    }
+
+    // Buttons
+    SDL_Rect btn_start = { GRID_W * app->cell_size + 16, app->window_h - 160, 120, 36 };
+    SDL_Rect btn_step  = { GRID_W * app->cell_size + 16, app->window_h - 116, 120, 36 };
+    SDL_Rect btn_zoom_in  = { GRID_W * app->cell_size + 16, app->window_h - 72, 56, 36 };
+    SDL_Rect btn_zoom_out = { GRID_W * app->cell_size + 80, app->window_h - 72, 56, 36 };
+    SDL_Rect btn_clear = { GRID_W * app->cell_size + 16, app->window_h - 32, 120, 24 };
+
+    SDL_SetRenderDrawColor(app->ren, 70, 70, 70, 255);
+    SDL_RenderFillRect(app->ren, &btn_start);
+    SDL_RenderFillRect(app->ren, &btn_step);
+    SDL_RenderFillRect(app->ren, &btn_zoom_in);
+    SDL_RenderFillRect(app->ren, &btn_zoom_out);
+    SDL_RenderFillRect(app->ren, &btn_clear);
+
+    SDL_Color white = { 230, 230, 230, 255 };
+    draw_text(app, app->running ? "Pause" : "Start", btn_start.x + 18, btn_start.y + 8, white);
+    draw_text(app, "Step", btn_step.x + 40, btn_step.y + 8, white);
+    draw_text(app, "Zoom+", btn_zoom_in.x + 6, btn_zoom_in.y + 8, white);
+    draw_text(app, "Zoom-", btn_zoom_out.x + 6, btn_zoom_out.y + 8, white);
+    draw_text(app, "Clear", btn_clear.x + 36, btn_clear.y + 2, white);
+
+    // Preview-Linie (wenn aktiv): zeichne mit weißem Rahmen über den Zellen
+    if (preview_active) {
+        SDL_SetRenderDrawColor(app->ren, 255, 255, 255, 200);
+        // Bresenham auf Preview: zeichne nur Rahmen (nicht in Bitmap schreiben)
+        int x0 = px0, y0 = py0, x1 = px1, y1 = py1;
+        int dx = abs(x1 - x0);
+        int sx = x0 < x1 ? 1 : -1;
+        int dy = -abs(y1 - y0);
+        int sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        while (1) {
+            if (x0 >= 0 && x0 < GRID_W && y0 >= 0 && y0 < GRID_H) {
+                SDL_Rect r = { x0 * app->cell_size, y0 * app->cell_size, app->cell_size, app->cell_size };
+                // leichter Rahmen: draw rect
+                SDL_RenderDrawRect(app->ren, &r);
+            }
+            if (x0 == x1 && y0 == y1) break;
+            int e2 = 2 * err;
+            if (e2 >= dy) { err += dy; x0 += sx; }
+            if (e2 <= dx) { err += dx; y0 += sy; }
+        }
+    }
+
+    SDL_RenderPresent(app->ren);
+}
+
+static bool point_in_rect(int px, int py, SDL_Rect* r) {
+    return (px >= r->x && px < r->x + r->w && py >= r->y && py < r->y + r->h);
+}
+
+// simplified simulation step on 1D bitmap
+static void step_simulation(AppState* app) {
+    uint8_t copy[GRID_W * GRID_H];
+    memcpy(copy, app->bitmap, sizeof(copy));
+
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            uint8_t orig = copy[idx(x, y)];
+            if (orig == BT_I || orig == BT_P || orig == BT_M) continue;
+            int cntP, cntM, cntC;
+            count_neighbors_bitmap(app, x, y, &cntP, &cntM, &cntC);
+
+            if (orig == BT_S) {
+                if ((cntP + cntM) >= 4 || cntC >= 3) {
+                    app->bitmap[idx(x, y)] = BT_C;
+                } else if (cntC >= 2 && (rand() % 100) < 30) {
+                    app->bitmap[idx(x, y)] = BT_C;
+                } else {
+                    app->bitmap[idx(x, y)] = BT_S;
+                }
+            } else if (orig == BT_C) {
+                if (cntP == 0 && cntM == 0 && cntC == 0) {
+                    if ((rand() % 100) < 5) app->bitmap[idx(x, y)] = BT_S;
+                    else app->bitmap[idx(x, y)] = BT_C;
+                } else {
+                    app->bitmap[idx(x, y)] = BT_C;
+                }
+            }
+        }
+    }
+}
+
+
+int main(int argc, char* argv[]) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (TTF_Init() != 0) {
+        fprintf(stderr, "TTF_Init error: %s\n", TTF_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    AppState app;
+    app.cell_size = CELL_DEFAULT;
+    app.current_tool = BT_C; // Standardwerkzeug: Leiter (kann geändert werden)
+    app.running = false;
+    app.font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14);
+    if (!app.font) app.font = NULL;
+
+    app.window_w = GRID_W * app.cell_size + TOOLBOX_W;
+    app.window_h = GRID_H * app.cell_size;
+
+    app.win = SDL_CreateWindow("Linienwerkzeug (Bresenham) - 1D Bitmap",
+                               SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               app.window_w, app.window_h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    if (!app.win) {
+        fprintf(stderr, "SDL_CreateWindow error: %s\n", SDL_GetError());
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
+    }
+    app.ren = SDL_CreateRenderer(app.win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!app.ren) {
+        fprintf(stderr, "SDL_CreateRenderer error: %s\n", SDL_GetError());
+        SDL_DestroyWindow(app.win);
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
+    }
+
+    init_bitmap(&app);
+
+    bool quit = false;
+    bool dragging = false;       // true während Maustaste gedrückt nach Start gesetzt
+    bool has_start = false;      // true wenn Startpunkt gesetzt
+    int start_x = -1, start_y = -1;
+    bool has_line = false;       // true wenn bereits eine Linie gezeichnet wurde (Endpunkt gesetzt)
+    int end_x = -1, end_y = -1;
+    int preview_x = -1, preview_y = -1; // aktuelle Maus-Zelle für Vorschau
+
+    Uint32 last_step = SDL_GetTicks();
+    const Uint32 step_interval = 100; // ms pro Simulationsschritt
+
+    while (!quit) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                quit = true;
+            } else if (e.type == SDL_WINDOWEVENT) {
+                if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    int w = e.window.data1;
+                    int h = e.window.data2;
+                    app.window_w = w;
+                    app.window_h = h;
+                }
+            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                // Linksklick: wenn im Gitter und noch kein Start gesetzt -> setze Start
+                // Wenn bereits eine Linie existiert, weiterer Klick setzt Endpunkt absolut neu
+                int mx = e.button.x;
+                int my = e.button.y;
+                int logical_x = 0, logical_y = 0, gx = -1, gy = -1;
+                window_to_logical_and_grid(&app, mx, my, &logical_x, &logical_y, &gx, &gy);
+
+                if (logical_x >= 0 && logical_x < GRID_W * app.cell_size &&
+                    logical_y >= 0 && logical_y < GRID_H * app.cell_size) {
+                    // Klick im Gitter
+                    if (!has_start) {
+                        // erster Klick: Startpunkt setzen und in Drag-Modus wechseln
+                        has_start = true;
+                        start_x = gx;
+                        start_y = gy;
+                        dragging = true;
+                        preview_x = gx;
+                        preview_y = gy;
+                        // keine Linie wird sofort gezeichnet; Vorschau erscheint beim Ziehen
+                    } else if (has_start && !dragging && has_line) {
+                        // weitere Klicks: setze Endpunkt absolut neu und zeichne Linie
+                        end_x = gx;
+                        end_y = gy;
+                        bresenham_draw(&app, start_x, start_y, end_x, end_y, (uint8_t)app.current_tool);
+                        has_line = true;
+                        // nach dem Setzen bleibt start erhalten, dragging bleibt false
+                    } else if (has_start && !has_line) {
+                        // Falls Start gesetzt, aber keine Linie (z.B. Start gesetzt earlier and mouse released),
+                        // ein Klick startet erneut Drag zum Setzen eines neuen Endes.
+                        dragging = true;
+                        preview_x = gx;
+                        preview_y = gy;
+                    } else {
+                        // sonst: starte Drag
+                        dragging = true;
+                        preview_x = gx;
+                        preview_y = gy;
+                    }
+                } else {
+                    // Klick in Toolbox/Buttons
+                    // Map logical coords for toolbox hit tests
+                    int lx = logical_x;
+                    int ly = logical_y;
+                    for (int i = 0; i < 5; ++i) {
+                        SDL_Rect r = { GRID_W * app.cell_size + 16, 16 + i * 56, 40, 40 };
+                        if (point_in_rect(lx, ly, &r)) {
+                            app.current_tool = i;
+                        }
+                    }
+                    SDL_Rect btn_start = { GRID_W * app.cell_size + 16, app.window_h - 160, 120, 36 };
+                    SDL_Rect btn_step  = { GRID_W * app.cell_size + 16, app.window_h - 116, 120, 36 };
+                    SDL_Rect btn_zoom_in  = { GRID_W * app.cell_size + 16, app.window_h - 72, 56, 36 };
+                    SDL_Rect btn_zoom_out = { GRID_W * app.cell_size + 80, app.window_h - 72, 56, 36 };
+                    SDL_Rect btn_clear = { GRID_W * app.cell_size + 16, app.window_h - 32, 120, 24 };
+
+                    if (point_in_rect(lx, ly, &btn_start)) {
+                        app.running = !app.running;
+                    } else if (point_in_rect(lx, ly, &btn_step)) {
+                        step_simulation(&app);
+                    } else if (point_in_rect(lx, ly, &btn_zoom_in)) {
+                        if (app.cell_size < CELL_MAX) { app.cell_size++; update_window_size(&app); }
+                    } else if (point_in_rect(lx, ly, &btn_zoom_out)) {
+                        if (app.cell_size > CELL_MIN) { app.cell_size--; update_window_size(&app); }
+                    } else if (point_in_rect(lx, ly, &btn_clear)) {
+                        init_bitmap(&app);
+                        // reset line state
+                        has_start = false;
+                        dragging = false;
+                        has_line = false;
+                        start_x = start_y = end_x = end_y = -1;
+                        preview_x = preview_y = -1;
+                    }
+                }
+            } else if (e.type == SDL_MOUSEBUTTONUP) {
+                // Beim Loslassen: wenn wir gerade draggen und Start gesetzt -> zeichne Linie bis Release-Punkt
+                int mx = e.button.x;
+                int my = e.button.y;
+                int logical_x = 0, logical_y = 0, gx = -1, gy = -1;
+                window_to_logical_and_grid(&app, mx, my, &logical_x, &logical_y, &gx, &gy);
+
+                // robust: prüfe ob wir im Gitter sind; falls nicht, ignorieren
+                if (dragging && has_start &&
+                    logical_x >= 0 && logical_x < GRID_W * app.cell_size &&
+                    logical_y >= 0 && logical_y < GRID_H * app.cell_size) {
+                    // Zeichne Linie von Start zu Release-Punkt
+                    end_x = gx;
+                    end_y = gy;
+                    bresenham_draw(&app, start_x, start_y, end_x, end_y, (uint8_t)app.current_tool);
+                    has_line = true;
+                }
+                // Dragging beenden
+                dragging = false;
+                preview_x = preview_y = -1;
+            } else if (e.type == SDL_MOUSEMOTION) {
+                // Vorschau aktualisieren, falls dragging aktiv
+                int mx = e.motion.x;
+                int my = e.motion.y;
+                Uint32 mouse_state = SDL_GetMouseState(NULL, NULL);
+                bool left_pressed = (mouse_state & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+                int logical_x = 0, logical_y = 0, gx = -1, gy = -1;
+                window_to_logical_and_grid(&app, mx, my, &logical_x, &logical_y, &gx, &gy);
+
+                if (dragging && left_pressed &&
+                    logical_x >= 0 && logical_x < GRID_W * app.cell_size &&
+                    logical_y >= 0 && logical_y < GRID_H * app.cell_size) {
+                    preview_x = gx;
+                    preview_y = gy;
+                } else {
+                    // falls Maus außerhalb oder Taste losgelassen, Preview deaktivieren
+                    if (!left_pressed) {
+                        preview_x = preview_y = -1;
+                        dragging = false;
+                    }
+                }
+            } else if (e.type == SDL_KEYDOWN) {
+                if (e.key.keysym.sym == SDLK_SPACE) {
+                    app.running = !app.running;
+                } else if (e.key.keysym.sym == SDLK_c) {
+                    init_bitmap(&app);
+                    has_start = false;
+                    dragging = false;
+                    has_line = false;
+                    start_x = start_y = end_x = end_y = -1;
+                    preview_x = preview_y = -1;
+                } else if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS) {
+                    if (app.cell_size < CELL_MAX) { app.cell_size++; update_window_size(&app); }
+                } else if (e.key.keysym.sym == SDLK_MINUS) {
+                    if (app.cell_size > CELL_MIN) { app.cell_size--; update_window_size(&app); }
+                } else if (e.key.keysym.sym == SDLK_1) {
+                    app.current_tool = BT_I;
+                } else if (e.key.keysym.sym == SDLK_2) {
+                    app.current_tool = BT_S;
+                } else if (e.key.keysym.sym == SDLK_3) {
+                    app.current_tool = BT_C;
+                } else if (e.key.keysym.sym == SDLK_4) {
+                    app.current_tool = BT_P;
+                } else if (e.key.keysym.sym == SDLK_5) {
+                    app.current_tool = BT_M;
+                }
+            }
+        }
+
+        Uint32 now = SDL_GetTicks();
+        if (app.running && now - last_step >= step_interval) {
+            step_simulation(&app);
+            last_step = now;
+        }
+
+        // Render mit Preview wenn dragging aktiv und Start gesetzt
+        bool preview_active = (dragging && has_start && preview_x >= 0 && preview_y >= 0);
+        int px0 = start_x, py0 = start_y, px1 = preview_x, py1 = preview_y;
+        render(&app, preview_active, px0, py0, px1, py1);
+
+        SDL_Delay(8);
+    }
+
+    if (app.font) TTF_CloseFont(app.font);
+    TTF_Quit();
+    SDL_DestroyRenderer(app.ren);
+    SDL_DestroyWindow(app.win);
+    SDL_Quit();
+    return 0;
+}

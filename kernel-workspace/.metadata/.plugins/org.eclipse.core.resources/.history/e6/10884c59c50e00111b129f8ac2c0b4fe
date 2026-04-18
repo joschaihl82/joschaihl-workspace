@@ -1,0 +1,134 @@
+// exectrace1.c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Josh + Copilot");
+MODULE_DESCRIPTION("Trace executed binaries and print resolved full path using sched_process_exec tracepoint");
+MODULE_VERSION("0.6");
+
+/*
+ * This module attaches a probe to the sched_process_exec tracepoint and logs
+ * the resolved executable path (when available) or the bprm->filename fallback.
+ *
+ * Implementation notes:
+ * - Some kernels export helper register_trace_sched_process_exec/unregister_trace_*
+ *   while others expose the tracepoint symbol __tracepoint_sched_process_exec.
+ * - To be portable, this file uses the tracepoint pointer symbol
+ *   __tracepoint_sched_process_exec (declared extern). On kernels that define
+ *   that symbol the module will register via tracepoint_probe_register.
+ *
+ * If your kernel does not expose the __tracepoint_sched_process_exec symbol,
+ * you'll need to either:
+ *  - build against kernel headers that export register_trace_sched_process_exec,
+ *  - or adapt this code to use the kernel's available tracepoint registration API.
+ */
+
+/* Use our own ratelimit state to be portable across kernel versions */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+/* Tracepoint probe callback */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+    char *buf = NULL;
+    char *path = NULL;
+
+    if (!p || !bprm)
+        return;
+
+    /* Rate-limit logging to avoid flooding the kernel log */
+    if (!__ratelimit(&exectrace_rl))
+        return;
+
+    /* If the kernel has opened the file for the new executable, try to resolve its full path */
+    if (bprm->file) {
+        struct path fpath;
+
+        /* copy the path structure to avoid races and take a reference */
+        fpath = bprm->file->f_path;
+        path_get(&fpath);
+
+        buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+        if (!buf) {
+            path_put(&fpath);
+            pr_info("exectrace: pid=%d comm=%s filename=%s (no mem for path)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+            return;
+        }
+
+        path = d_path(&fpath, buf, PATH_MAX);
+        if (IS_ERR(path)) {
+            pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+                p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+        } else {
+            pr_info("exectrace: pid=%d comm=%s path=%s\n",
+                p->pid, p->comm, path);
+        }
+
+        kfree(buf);
+        path_put(&fpath);
+    } else {
+        /* Fall back to bprm->filename when file pointer is not available */
+        pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+            p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+    }
+}
+
+/*
+ * Try to use the tracepoint symbol exported by the kernel:
+ *   extern struct tracepoint __tracepoint_sched_process_exec;
+ *
+ * Many kernels define that symbol; if your kernel does, the module will
+ * register the probe via tracepoint_probe_register(&__tracepoint_sched_process_exec, ...).
+ *
+ * If your kernel does not export that symbol, you'll need to adapt the
+ * registration method to whatever the kernel provides (e.g., register_trace_* helpers).
+ */
+extern struct tracepoint __tracepoint_sched_process_exec;
+static struct tracepoint *tp_sched = &__tracepoint_sched_process_exec;
+
+static int tp_registered;
+
+/* Module init/exit */
+static int __init exectrace_init(void)
+{
+    int ret;
+
+    /* Register probe using the tracepoint pointer */
+    ret = tracepoint_probe_register(tp_sched,
+                                    (void *)probe_sched_process_exec,
+                                    NULL);
+    if (ret) {
+        pr_err("exectrace: tracepoint_probe_register failed (ret=%d)\n", ret);
+        return ret;
+    }
+
+    tp_registered = 1;
+    pr_info("exectrace: module loaded, tracing exec paths\n");
+    return 0;
+}
+
+static void __exit exectrace_exit(void)
+{
+    if (tp_registered)
+        tracepoint_probe_unregister(tp_sched,
+                                    (void *)probe_sched_process_exec,
+                                    NULL);
+    pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);

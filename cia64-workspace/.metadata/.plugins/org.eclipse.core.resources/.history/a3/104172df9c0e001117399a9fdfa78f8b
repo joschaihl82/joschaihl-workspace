@@ -1,0 +1,864 @@
+/*
+  genhdr_plus.c
+  Enhanced prototype extractor for C source files.
+
+  Build:
+    gcc -std=c11 -O2 -o genhdr_plus genhdr_plus.c
+
+  Notes:
+    - This is a heuristic tool; for perfect results use a real C parser (libclang).
+    - The code focuses on robustness for common real-world C code.
+*/
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* ----------------------------- Configuration ----------------------------- */
+
+#define READ_STEP 65536
+#define MAX_TOKEN 1024
+#define MAX_SIG 65536
+
+/* ----------------------------- Utilities -------------------------------- */
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) { fprintf(stderr, "Out of memory\n"); exit(2); }
+    return p;
+}
+
+static void *xrealloc(void *p, size_t n) {
+    p = realloc(p, n);
+    if (!p) { fprintf(stderr, "Out of memory\n"); exit(2); }
+    return p;
+}
+
+static void die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    exit(1);
+}
+
+static void verbose_printf(int verbose, const char *fmt, ...) {
+    if (!verbose) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+/* ----------------------------- File IO ---------------------------------- */
+
+static char *read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    size_t cap = READ_STEP;
+    char *buf = xmalloc(cap + 1);
+    size_t len = 0;
+    while (1) {
+        size_t r = fread(buf + len, 1, READ_STEP, f);
+        len += r;
+        if (r < READ_STEP) break;
+        cap += READ_STEP;
+        buf = xrealloc(buf, cap + 1);
+    }
+    buf[len] = '\0';
+    fclose(f);
+    if (out_len) *out_len = len;
+    return buf;
+}
+
+/* ----------------------------- Lexer ------------------------------------ */
+
+/* Token types */
+typedef enum {
+    T_EOF = 0,
+    T_IDENT,
+    T_NUMBER,
+    T_STRING,
+    T_CHAR,
+    T_PUNCT,    /* single punctuation like ; , ( ) { } * & = */
+    T_PREPROC,  /* preprocessor line */
+    T_OTHER
+} tok_t;
+
+typedef struct {
+    tok_t type;
+    char *text; /* nul-terminated */
+    size_t pos; /* offset in original buffer */
+} token;
+
+typedef struct {
+    const char *buf;
+    size_t len;
+    size_t i;
+    int line;
+} lexer;
+
+/* Create lexer */
+static void lex_init(lexer *L, const char *buf) {
+    L->buf = buf;
+    L->len = strlen(buf);
+    L->i = 0;
+    L->line = 1;
+}
+
+/* Helpers */
+static int is_ident_start(char c) {
+    return (c == '_' || isalpha((unsigned char)c));
+}
+static int is_ident_char(char c) {
+    return (c == '_' || isalnum((unsigned char)c));
+}
+
+/* Read next token; caller must free token.text */
+static token lex_next(lexer *L) {
+    token tk = {T_EOF, NULL, L->i};
+    const char *s = L->buf;
+    size_t n = L->len;
+    size_t i = L->i;
+
+    /* Skip whitespace but count lines */
+    while (i < n && isspace((unsigned char)s[i])) {
+        if (s[i] == '\n') L->line++;
+        i++;
+    }
+    if (i >= n) { L->i = i; tk.type = T_EOF; tk.text = strdup(""); return tk; }
+
+    tk.pos = i;
+
+    /* Preprocessor line */
+    if (s[i] == '#') {
+        size_t j = i;
+        while (j < n && s[j] != '\n') j++;
+        size_t len = j - i;
+        tk.type = T_PREPROC;
+        tk.text = xmalloc(len + 1);
+        memcpy(tk.text, s + i, len);
+        tk.text[len] = '\0';
+        L->i = j;
+        return tk;
+    }
+
+    /* Comments and strings handled by skipping here to simplify tokens */
+    if (s[i] == '/' && i + 1 < n && s[i+1] == '*') {
+        /* block comment */
+        size_t j = i + 2;
+        while (j + 1 < n && !(s[j] == '*' && s[j+1] == '/')) {
+            if (s[j] == '\n') L->line++;
+            j++;
+        }
+        if (j + 1 < n) j += 2;
+        L->i = j;
+        return lex_next(L);
+    }
+    if (s[i] == '/' && i + 1 < n && s[i+1] == '/') {
+        /* line comment */
+        size_t j = i + 2;
+        while (j < n && s[j] != '\n') j++;
+        L->i = j;
+        return lex_next(L);
+    }
+
+    /* Strings */
+    if (s[i] == '"') {
+        size_t j = i + 1;
+        while (j < n) {
+            if (s[j] == '\\' && j + 1 < n) { j += 2; continue; }
+            if (s[j] == '"') { j++; break; }
+            if (s[j] == '\n') L->line++;
+            j++;
+        }
+        size_t len = j - i;
+        tk.type = T_STRING;
+        tk.text = xmalloc(len + 1);
+        memcpy(tk.text, s + i, len);
+        tk.text[len] = '\0';
+        L->i = j;
+        return tk;
+    }
+
+    /* Char literal */
+    if (s[i] == '\'') {
+        size_t j = i + 1;
+        while (j < n) {
+            if (s[j] == '\\' && j + 1 < n) { j += 2; continue; }
+            if (s[j] == '\'') { j++; break; }
+            if (s[j] == '\n') L->line++;
+            j++;
+        }
+        size_t len = j - i;
+        tk.type = T_CHAR;
+        tk.text = xmalloc(len + 1);
+        memcpy(tk.text, s + i, len);
+        tk.text[len] = '\0';
+        L->i = j;
+        return tk;
+    }
+
+    /* Identifiers */
+    if (is_ident_start(s[i])) {
+        size_t j = i + 1;
+        while (j < n && is_ident_char(s[j])) j++;
+        size_t len = j - i;
+        tk.type = T_IDENT;
+        tk.text = xmalloc(len + 1);
+        memcpy(tk.text, s + i, len);
+        tk.text[len] = '\0';
+        L->i = j;
+        return tk;
+    }
+
+    /* Numbers */
+    if (isdigit((unsigned char)s[i])) {
+        size_t j = i + 1;
+        while (j < n && (isdigit((unsigned char)s[j]) || s[j]=='.' || s[j]=='x' || s[j]=='X' || s[j]=='u' || s[j]=='U' || s[j]=='l' || s[j]=='L' || s[j]=='e' || s[j]=='E' || s[j]=='+' || s[j]=='-')) j++;
+        size_t len = j - i;
+        tk.type = T_NUMBER;
+        tk.text = xmalloc(len + 1);
+        memcpy(tk.text, s + i, len);
+        tk.text[len] = '\0';
+        L->i = j;
+        return tk;
+    }
+
+    /* Punctuation */
+    {
+        char c = s[i];
+        /* treat two-char punctuators like '->' '::' '==' '!=' '<=' '>=' '<<' '>>' '&&' '||' as single tokens */
+        if (i + 1 < n) {
+            char d = s[i+1];
+            if ((c == '-' && d == '>') || (c == ':' && d == ':') || (c == '=' && d == '=') ||
+                (c == '!' && d == '=') || (c == '<' && d == '=') || (c == '>' && d == '=') ||
+                (c == '<' && d == '<') || (c == '>' && d == '>') || (c == '&' && d == '&') ||
+                (c == '|' && d == '|')) {
+                tk.type = T_PUNCT;
+                tk.text = xmalloc(3);
+                tk.text[0] = c; tk.text[1] = d; tk.text[2] = '\0';
+                L->i = i + 2;
+                return tk;
+            }
+        }
+        /* single char punct */
+        tk.type = T_PUNCT;
+        tk.text = xmalloc(2);
+        tk.text[0] = c; tk.text[1] = '\0';
+        L->i = i + 1;
+        return tk;
+    }
+}
+
+/* Free token */
+static void tok_free(token *t) {
+    if (t->text) free(t->text);
+    t->text = NULL;
+}
+
+/* ----------------------------- Helpers ---------------------------------- */
+
+/* Check if token text equals string */
+static int tok_eq(const token *t, const char *s) {
+    if (!t || !t->text) return 0;
+    return strcmp(t->text, s) == 0;
+}
+
+/* Check if token is a control keyword that should not be treated as function */
+static int is_control_keyword_tok(const token *t) {
+    if (t->type != T_IDENT) return 0;
+    const char *kw[] = {"if","for","while","switch","return","sizeof","else","case","do","goto"};
+    for (size_t i = 0; i < sizeof(kw)/sizeof(kw[0]); ++i)
+        if (strcmp(t->text, kw[i]) == 0) return 1;
+    return 0;
+}
+
+/* Remove leading and trailing whitespace from a string in-place */
+static void trim_inplace(char *s) {
+    char *a = s;
+    while (*a && isspace((unsigned char)*a)) a++;
+    if (a != s) memmove(s, a, strlen(a) + 1);
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len-1])) s[--len] = '\0';
+}
+
+/* Remove parameter names from a parameter list string.
+   Input: "(int a, const char *b, void)"
+   Output: "(int, const char *, void)"
+   This is a heuristic: it tries to remove trailing identifiers in each parameter.
+*/
+static char *strip_param_names(const char *params) {
+    if (!params) return NULL;
+    size_t n = strlen(params);
+    char *out = xmalloc(n + 1);
+    size_t oi = 0;
+    size_t i = 0;
+    /* copy '(' */
+    if (params[i] == '(') out[oi++] = params[i++];
+    int depth = 0;
+    while (i < n) {
+        /* stop at closing ')' at top level */
+        if (params[i] == ')' && depth == 0) {
+            out[oi++] = ')';
+            i++;
+            break;
+        }
+        /* handle nested parentheses (function pointers) */
+        if (params[i] == '(') {
+            depth++;
+            out[oi++] = '(';
+            i++;
+            continue;
+        }
+        if (params[i] == ')') {
+            depth--;
+            out[oi++] = ')';
+            i++;
+            continue;
+        }
+        /* copy until comma or top-level ')' */
+        /* For each parameter, we attempt to remove the last identifier token */
+        /* Find the end of this parameter */
+        size_t start = i;
+        size_t j = i;
+        int local_depth = depth;
+        while (j < n) {
+            if (params[j] == '(') local_depth++;
+            else if (params[j] == ')') {
+                if (local_depth == 0) break;
+                local_depth--;
+            } else if (params[j] == ',' && local_depth == depth) break;
+            j++;
+        }
+        /* substring params[start..j-1] is one parameter */
+        size_t plen = j - start;
+        char *part = xmalloc(plen + 1);
+        memcpy(part, params + start, plen);
+        part[plen] = '\0';
+        trim_inplace(part);
+        /* Now remove trailing identifier from part if present */
+        /* Walk backwards skipping spaces, pointer stars, and qualifiers */
+        size_t k = strlen(part);
+        if (k > 0) {
+            /* remove trailing attributes like __attribute__((...)) or __declspec(...) */
+            /* naive: remove occurrences of __attribute__ or __declspec at end */
+            while (k > 0 && isspace((unsigned char)part[k-1])) part[--k] = '\0';
+            /* detect trailing identifier: scan backwards until a char that cannot be part of identifier */
+            size_t endid = k;
+            while (endid > 0 && (isalnum((unsigned char)part[endid-1]) || part[endid-1]=='_' )) endid--;
+            /* if there is a space before endid, and endid < k, we assume it's a name */
+            int removed = 0;
+            if (endid < k) {
+                size_t p = endid;
+                while (p > 0 && isspace((unsigned char)part[p-1])) p--;
+                /* ensure there's at least one non-space before the name (a type) */
+                if (p > 0) {
+                    /* remove the name */
+                    part[endid] = '\0';
+                    trim_inplace(part);
+                    removed = 1;
+                }
+            }
+            /* If removal didn't happen, keep as-is */
+        }
+        /* Append cleaned part to out */
+        size_t plen2 = strlen(part);
+        if (plen2 > 0) {
+            memcpy(out + oi, part, plen2);
+            oi += plen2;
+        }
+        free(part);
+        /* append comma if needed */
+        if (j < n && params[j] == ',') {
+            out[oi++] = ',';
+            out[oi++] = ' ';
+            j++; /* skip comma */
+        }
+        i = j;
+    }
+    out[oi] = '\0';
+    return out;
+}
+
+/* Remove common trailing attributes after a signature, e.g. __attribute__((...)) or __declspec(...) */
+static void strip_trailing_attributes(char *s) {
+    /* naive approach: remove occurrences of __attribute__ or __declspec and following parentheses */
+    char *p;
+    while ((p = strstr(s, "__attribute__")) != NULL) {
+        char *q = strchr(p, '(');
+        if (!q) break;
+        /* find matching parentheses */
+        int depth = 0;
+        char *r = q;
+        while (*r) {
+            if (*r == '(') depth++;
+            else if (*r == ')') {
+                depth--;
+                if (depth == 0) { r++; break; }
+            }
+            r++;
+        }
+        if (*r == '\0') break;
+        memmove(p, r, strlen(r) + 1);
+    }
+    while ((p = strstr(s, "__declspec")) != NULL) {
+        char *q = strchr(p, '(');
+        if (!q) break;
+        int depth = 0;
+        char *r = q;
+        while (*r) {
+            if (*r == '(') depth++;
+            else if (*r == ')') {
+                depth--;
+                if (depth == 0) { r++; break; }
+            }
+            r++;
+        }
+        if (*r == '\0') break;
+        memmove(p, r, strlen(r) + 1);
+    }
+    /* also remove GCC style attribute ((...)) after signature */
+    /* remove trailing tokens like __attribute__((...)) or __attribute__ ((...)) */
+}
+
+/* Generate include guard from filename */
+static void make_guard(const char *outname, char *guard, size_t gcap) {
+    /* Use uppercase, non-alnum -> underscore, ensure ends with _H */
+    size_t j = 0;
+    for (size_t i = 0; outname[i] && j + 2 < gcap; ++i) {
+        unsigned char c = (unsigned char)outname[i];
+        if (isalnum(c)) guard[j++] = toupper(c);
+        else guard[j++] = '_';
+    }
+    if (j + 3 < gcap) {
+        guard[j++] = '_';
+        guard[j++] = 'H';
+        guard[j] = '\0';
+    } else guard[j-1] = '\0';
+}
+
+/* ----------------------------- Prototype extraction --------------------- */
+
+/* Heuristic: given a buffer, scan for patterns that look like function definitions:
+   <return-type> <name>(<params>) [attributes] { ... }
+
+   We use the lexer to find an identifier followed by '(' and then a matching ')' and then a '{'
+   with only whitespace/comments/attributes between ')' and '{'.
+*/
+typedef struct {
+    int include_static;
+    int verbose;
+    FILE *out;
+    int dry_run;
+} extractor_opts;
+
+static int is_type_token(const token *t) {
+    if (!t) return 0;
+    if (t->type == T_IDENT) {
+        /* common type keywords */
+        const char *types[] = {"void","char","short","int","long","float","double","signed","unsigned","const","volatile","struct","union","enum","size_t","ssize_t","ptrdiff_t","int8_t","int16_t","int32_t","int64_t","uint8_t","uint16_t","uint32_t","uint64_t","bool","_Bool"};
+        for (size_t i = 0; i < sizeof(types)/sizeof(types[0]); ++i)
+            if (strcmp(t->text, types[i]) == 0) return 1;
+        /* user-defined types also appear as identifiers; we can't reliably detect them */
+        return 1;
+    }
+    if (t->type == T_PUNCT && (strcmp(t->text, "*") == 0 || strcmp(t->text, "&") == 0)) return 1;
+    return 0;
+}
+
+/* Attempt to extract prototypes from buffer and write to out */
+static void extract_from_buffer(const char *buf, const char *srcname, extractor_opts *opts) {
+    lexer L;
+    lex_init(&L, buf);
+    token prev = {T_EOF, NULL, 0};
+    token cur = lex_next(&L);
+    token next = lex_next(&L);
+
+    while (cur.type != T_EOF) {
+        /* Look for identifier followed by '(' */
+        if (cur.type == T_IDENT && next.type == T_PUNCT && strcmp(next.text, "(") == 0) {
+            /* Avoid control keywords */
+            if (is_control_keyword_tok(&cur)) {
+                /* skip */
+            } else {
+                /* Save position and attempt to find matching ')' */
+                size_t start_pos = cur.pos;
+                /* Backtrack a bit to include return type tokens before cur */
+                /* We'll collect tokens from some tokens before cur to the closing ')' */
+                /* Save tokens in a small dynamic array */
+                token *saved = NULL;
+                size_t sc = 0, sc_cap = 0;
+                /* backtrack: we want up to 6 tokens before cur to capture return type */
+                /* For simplicity, re-lex from beginning up to start_pos and collect tokens */
+                lexer L2;
+                lex_init(&L2, buf);
+                token t;
+                while ((t = lex_next(&L2)).type != T_EOF && t.pos < start_pos) {
+                    if (sc + 1 >= sc_cap) {
+                        sc_cap = sc_cap ? sc_cap * 2 : 32;
+                        saved = xrealloc(saved, sc_cap * sizeof(token));
+                    }
+                    saved[sc++] = t; /* shallow copy; t.text is malloc'd */
+                }
+                /* include cur token */
+                if (sc + 1 >= sc_cap) {
+                    sc_cap = sc_cap ? sc_cap * 2 : 32;
+                    saved = xrealloc(saved, sc_cap * sizeof(token));
+                }
+                saved[sc++] = cur;
+                /* now include tokens until matching ')' */
+                int depth = 0;
+                token t2 = next;
+                if (sc + 1 >= sc_cap) {
+                    sc_cap = sc_cap ? sc_cap * 2 : 32;
+                    saved = xrealloc(saved, sc_cap * sizeof(token));
+                }
+                saved[sc++] = t2;
+                while (t2.type != T_EOF) {
+                    token t3 = lex_next(&L);
+                    t2 = t3;
+                    if (sc + 1 >= sc_cap) {
+                        sc_cap = sc_cap ? sc_cap * 2 : 32;
+                        saved = xrealloc(saved, sc_cap * sizeof(token));
+                    }
+                    saved[sc++] = t2;
+                    if (t2.type == T_PUNCT) {
+                        if (strcmp(t2.text, "(") == 0) depth++;
+                        else if (strcmp(t2.text, ")") == 0) {
+                            if (depth == 0) break;
+                            depth--;
+                        }
+                    }
+                }
+                /* After we found ')', peek ahead for attributes and '{' */
+                /* Save tokens until we hit '{' or ';' or '=' or T_PREPROC or T_EOF */
+                token look;
+                size_t look_saved = 0;
+                token *lookbuf = NULL;
+                while ((look = lex_next(&L)).type != T_EOF) {
+                    if (look_saved + 1 >= sc_cap) {
+                        sc_cap = sc_cap ? sc_cap * 2 : 32;
+                        saved = xrealloc(saved, sc_cap * sizeof(token));
+                    }
+                    saved[sc++] = look;
+                    lookbuf = saved; /* reuse */
+                    if (look.type == T_PUNCT) {
+                        if (strcmp(look.text, "{") == 0) {
+                            /* candidate function definition */
+                            /* Build signature string from saved tokens up to ')' and optional attributes */
+                            /* Find index of the ')' token in saved */
+                            ssize_t idx_rparen = -1;
+                            for (ssize_t k = sc - 1; k >= 0; --k) {
+                                if (saved[k].type == T_PUNCT && strcmp(saved[k].text, ")") == 0) { idx_rparen = k; break; }
+                            }
+                            if (idx_rparen < 0) break;
+                            /* Build signature text from tokens starting at some earlier token */
+                            /* Find a reasonable start: go back until previous ';' or '}' or start */
+                            ssize_t start_idx = idx_rparen;
+                            for (ssize_t k = idx_rparen - 1; k >= 0; --k) {
+                                if (saved[k].type == T_PUNCT && (strcmp(saved[k].text, ";") == 0 || strcmp(saved[k].text, "}") == 0)) {
+                                    start_idx = k + 1;
+                                    break;
+                                }
+                                start_idx = k;
+                            }
+                            /* Compose signature string */
+                            char sig[MAX_SIG];
+                            size_t si = 0;
+                            for (ssize_t k = start_idx; k <= idx_rparen; ++k) {
+                                if (saved[k].type == T_PREPROC) continue;
+                                if (saved[k].type == T_STRING || saved[k].type == T_CHAR) continue;
+                                /* add space between identifiers/punct as needed */
+                                if (si > 0 && !isspace((unsigned char)sig[si-1])) {
+                                    /* if previous char is alnum and current token starts with alnum, add space */
+                                    if ((saved[k].text[0] == '_' || isalnum((unsigned char)saved[k].text[0])) &&
+                                        (isalnum((unsigned char)sig[si-1]) || sig[si-1] == '_')) {
+                                        sig[si++] = ' ';
+                                    }
+                                }
+                                size_t tlen = strlen(saved[k].text);
+                                if (si + tlen + 2 >= sizeof(sig)) break;
+                                memcpy(sig + si, saved[k].text, tlen);
+                                si += tlen;
+                                sig[si] = '\0';
+                            }
+                            sig[si] = '\0';
+                            trim_inplace(sig);
+                            /* strip trailing attributes */
+                            strip_trailing_attributes(sig);
+                            /* Now separate name and params: find first '(' from the right that matches the rparen */
+                            char *rparen = strrchr(sig, ')');
+                            char *lparen = NULL;
+                            if (rparen) {
+                                /* find matching '(' */
+                                int d = 0;
+                                for (char *p = rparen; p >= sig; --p) {
+                                    if (*p == ')') d++;
+                                    else if (*p == '(') {
+                                        d--;
+                                        if (d == 0) { lparen = p; break; }
+                                    }
+                                }
+                            }
+                            if (!lparen) {
+                                /* not a function */
+                            } else {
+                                /* Extract name token before '(' */
+                                char namebuf[256] = {0};
+                                char *p = lparen - 1;
+                                while (p >= sig && isspace((unsigned char)*p)) p--;
+                                char *end = p;
+                                while (p >= sig && (isalnum((unsigned char)*p) || *p == '_' || *p == '*')) p--;
+                                p++;
+                                size_t nlen = end - p + 1;
+                                if (nlen >= sizeof(namebuf)) nlen = sizeof(namebuf)-1;
+                                memcpy(namebuf, p, nlen);
+                                namebuf[nlen] = '\0';
+                                trim_inplace(namebuf);
+                                /* skip if name is control keyword */
+                                if (namebuf[0] && !is_control_keyword_tok(&(token){T_IDENT, namebuf, 0})) {
+                                    /* skip static if requested */
+                                    if (!opts->include_static) {
+                                        /* check if 'static' appears before name in sig */
+                                        if (strstr(sig, "static") != NULL) {
+                                            /* ensure 'static' is a separate token */
+                                            /* naive check: if "static" substring exists, skip */
+                                            /* more precise check could be implemented */
+                                            verbose_printf(opts->verbose, "Skipping static function: %s\n", namebuf);
+                                            /* free saved tokens */
+                                            for (size_t kk = 0; kk < sc; ++kk) tok_free(&saved[kk]);
+                                            free(saved);
+                                            break;
+                                        }
+                                    }
+                                    /* Extract parameter substring */
+                                    size_t lidx = lparen - sig;
+                                    size_t ridx = rparen - sig;
+                                    size_t plen = ridx - lidx + 1;
+                                    char *params = xmalloc(plen + 1);
+                                    memcpy(params, sig + lidx, plen);
+                                    params[plen] = '\0';
+                                    /* strip parameter names */
+                                    char *clean_params = strip_param_names(params);
+                                    /* Build prototype: everything before '(' trimmed + clean_params + ';' */
+                                    char proto[MAX_SIG];
+                                    size_t prelen = lidx;
+                                    if (prelen >= sizeof(proto)-1) prelen = sizeof(proto)-2;
+                                    memcpy(proto, sig, prelen);
+                                    proto[prelen] = '\0';
+                                    trim_inplace(proto);
+                                    /* remove any trailing '{' or other junk */
+                                    /* append cleaned params */
+                                    size_t curp = strlen(proto);
+                                    if (curp + strlen(clean_params) + 4 >= sizeof(proto)) {
+                                        /* too long, skip */
+                                    } else {
+                                        strcat(proto, clean_params);
+                                        strcat(proto, ";");
+                                        /* Write prototype */
+                                        if (opts->dry_run) {
+                                            printf("%s\n\n", proto);
+                                        } else {
+                                            fprintf(opts->out, "%s\n\n", proto);
+                                        }
+                                        verbose_printf(opts->verbose, "Extracted prototype from %s: %s\n", srcname, proto);
+                                    }
+                                    free(params);
+                                    free(clean_params);
+                                }
+                            }
+                            /* free saved tokens */
+                            for (size_t kk = 0; kk < sc; ++kk) tok_free(&saved[kk]);
+                            free(saved);
+                            break; /* continue scanning outer loop */
+                        } else if (strcmp(look.text, ";") == 0 || strcmp(look.text, "=") == 0) {
+                            /* not a definition, probably a declaration or function pointer */
+                            for (size_t kk = 0; kk < sc; ++kk) tok_free(&saved[kk]);
+                            free(saved);
+                            break;
+                        }
+                    } else if (look.type == T_EOF) {
+                        for (size_t kk = 0; kk < sc; ++kk) tok_free(&saved[kk]);
+                        free(saved);
+                        break;
+                    }
+                } /* end lookahead */
+            }
+        }
+        /* advance tokens */
+        tok_free(&prev);
+        prev = cur;
+        cur = next;
+        next = lex_next(&L);
+    }
+
+    tok_free(&prev);
+    tok_free(&cur);
+    tok_free(&next);
+}
+
+/* ----------------------------- Directory walk --------------------------- */
+
+static int has_suffix(const char *s, const char *suf) {
+    size_t n = strlen(s), m = strlen(suf);
+    if (n < m) return 0;
+    return strcmp(s + n - m, suf) == 0;
+}
+
+static void collect_c_files(const char *path, char ***out_files, size_t *out_count, int recurse, int verbose) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        verbose_printf(verbose, "stat failed for %s: %s\n", path, strerror(errno));
+        return;
+    }
+    if (S_ISREG(st.st_mode)) {
+        if (has_suffix(path, ".c")) {
+            *out_files = xrealloc(*out_files, (*out_count + 1) * sizeof(char *));
+            (*out_files)[*out_count] = strdup(path);
+            (*out_count)++;
+        }
+        return;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        DIR *d = opendir(path);
+        if (!d) { verbose_printf(verbose, "opendir failed for %s: %s\n", path, strerror(errno)); return; }
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char child[PATH_MAX];
+            snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+            struct stat st2;
+            if (stat(child, &st2) != 0) continue;
+            if (S_ISDIR(st2.st_mode) && recurse) {
+                collect_c_files(child, out_files, out_count, recurse, verbose);
+            } else if (S_ISREG(st2.st_mode) && has_suffix(child, ".c")) {
+                *out_files = xrealloc(*out_files, (*out_count + 1) * sizeof(char *));
+                (*out_files)[*out_count] = strdup(child);
+                (*out_count)++;
+            }
+        }
+        closedir(d);
+    }
+}
+
+/* ----------------------------- Self-test -------------------------------- */
+
+static void run_selftest(void) {
+    puts("Running self-tests...");
+    const char *sample =
+        "/* sample */\n"
+        "int add(int a, int b) {\n"
+        "  return a + b;\n"
+        "}\n"
+        "static void helper(const char *s) { }\n"
+        "void *alloc(size_t n) __attribute__((malloc));\n"
+        "int (*fp)(int,int) = NULL;\n"
+        "int k_and_r(a, b) int a; int b; { return a+b; }\n";
+    extractor_opts opts = { .include_static = 1, .verbose = 1, .out = stdout, .dry_run = 1 };
+    extract_from_buffer(sample, "<selftest>", &opts);
+    puts("Self-tests done.");
+}
+
+/* ----------------------------- Main ------------------------------------- */
+
+int main(int argc, char **argv) {
+    const char *outname = "prototypes.h";
+    int include_static = 0;
+    int recurse = 0;
+    int verbose = 0;
+    int dry_run = 0;
+    int argi = 1;
+
+    if (argc == 1) {
+        fprintf(stderr, "Usage: %s [-o out.h] [-a] [-R] [-v] [-n] file1.c [file2.c ...]\n", argv[0]);
+        return 1;
+    }
+
+    while (argi < argc && argv[argi][0] == '-') {
+        if (strcmp(argv[argi], "-o") == 0) {
+            if (argi + 1 >= argc) die("Missing argument for -o\n");
+            outname = argv[++argi];
+        } else if (strcmp(argv[argi], "-a") == 0) {
+            include_static = 1;
+        } else if (strcmp(argv[argi], "-R") == 0) {
+            recurse = 1;
+        } else if (strcmp(argv[argi], "-v") == 0) {
+            verbose = 1;
+        } else if (strcmp(argv[argi], "-n") == 0) {
+            dry_run = 1;
+        } else if (strcmp(argv[argi], "--selftest") == 0) {
+            run_selftest();
+            return 0;
+        } else {
+            break;
+        }
+        argi++;
+    }
+
+    if (argi >= argc) {
+        fprintf(stderr, "No input files specified\n");
+        return 1;
+    }
+
+    /* Collect files */
+    char **files = NULL;
+    size_t file_count = 0;
+    for (int i = argi; i < argc; ++i) {
+        collect_c_files(argv[i], &files, &file_count, recurse, verbose);
+    }
+    if (file_count == 0) die("No .c files found\n");
+
+    /* Open output */
+    FILE *out = stdout;
+    if (!dry_run) {
+        out = fopen(outname, "w");
+        if (!out) die("Cannot open output file %s: %s\n", outname, strerror(errno));
+    }
+
+    /* Write header preamble */
+    char guard[256];
+    make_guard(outname, guard, sizeof(guard));
+    if (!dry_run) {
+        fprintf(out, "#ifndef %s\n#define %s\n\n", guard, guard);
+        fprintf(out, "/* Prototypes extracted by genhdr_plus */\n\n#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n");
+    } else {
+        printf("/* Dry run: prototypes that would be written to %s */\n\n", outname);
+    }
+
+    extractor_opts opts = { .include_static = include_static, .verbose = verbose, .out = out, .dry_run = dry_run };
+
+    for (size_t i = 0; i < file_count; ++i) {
+        size_t len;
+        char *buf = read_file(files[i], &len);
+        if (!buf) {
+            verbose_printf(verbose, "Warning: cannot read %s\n", files[i]);
+            continue;
+        }
+        verbose_printf(verbose, "Processing %s (%zu bytes)\n", files[i], len);
+        extract_from_buffer(buf, files[i], &opts);
+        free(buf);
+    }
+
+    if (!dry_run) {
+        fprintf(out, "#ifdef __cplusplus\n}\n#endif\n\n#endif /* %s */\n", guard);
+        fclose(out);
+    } else {
+        printf("\n/* End of dry run */\n");
+    }
+
+    for (size_t i = 0; i < file_count; ++i) free(files[i]);
+    free(files);
+
+    return 0;
+}

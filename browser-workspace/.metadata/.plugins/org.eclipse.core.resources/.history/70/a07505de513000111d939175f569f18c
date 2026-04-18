@@ -1,0 +1,86 @@
+// file: browser.c
+#include <gtk/gtk.h>
+#include <webkit2/webkit2.h>
+
+typedef struct {
+  GtkWidget *window;
+  GtkWidget *notebook;
+} App;
+
+static WebKitWebView* create_webview(App *app, const char *uri) {
+  WebKitWebView *wv = WEBKIT_WEB_VIEW(webkit_web_view_new());
+  gtk_widget_set_hexpand(GTK_WIDGET(wv), TRUE);
+  gtk_widget_set_vexpand(GTK_WIDGET(wv), TRUE);
+  if (uri) webkit_web_view_load_uri(wv, uri);
+  return wv;
+}
+
+static void on_go(GtkEntry *entry, gpointer user_data) {
+  GtkWidget *nb = GTK_WIDGET(user_data);
+  int page = gtk_notebook_get_current_page(GTK_NOTEBOOK(nb));
+  GtkWidget *sc = gtk_notebook_get_nth_page(GTK_NOTEBOOK(nb), page);
+  WebKitWebView *wv = WEBKIT_WEB_VIEW(g_object_get_data(G_OBJECT(sc), "webview"));
+  const char *text = gtk_entry_get_text(entry);
+  if (!g_str_has_prefix(text, "http://") && !g_str_has_prefix(text, "https://")) {
+    char *u = g_strdup_printf("https://%s", text);
+    webkit_web_view_load_uri(wv, u);
+    g_free(u);
+  } else webkit_web_view_load_uri(wv, text);
+}
+
+static GtkWidget* make_tab(App *app, const char *uri) {
+  GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+  WebKitWebView *wv = create_webview(app, uri);
+  g_object_set_data(G_OBJECT(box), "webview", wv);
+  gtk_box_append(GTK_BOX(box), GTK_WIDGET(wv));
+  return box;
+}
+
+static void add_tab_cb(GtkButton *b, gpointer user_data) {
+  App *app = user_data;
+  GtkWidget *tab = make_tab(app, "https://www.example.org");
+  gtk_notebook_append_page(GTK_NOTEBOOK(app->notebook), tab, NULL);
+  gtk_widget_show(tab);
+  int p = gtk_notebook_get_n_pages(GTK_NOTEBOOK(app->notebook)) - 1;
+  gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), p);
+}
+
+int main(int argc, char **argv) {
+  gtk_init();
+  App app;
+  app.window = gtk_window_new();
+  gtk_window_set_default_size(GTK_WINDOW(app.window), 1200, 800);
+  g_signal_connect(app.window, "close-request", G_CALLBACK(gtk_window_destroy), NULL);
+
+  GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+  GtkWidget *header = gtk_header_bar_new();
+  gtk_header_bar_set_title(GTK_HEADER_BAR(header), "MiniGTK4Browser");
+  gtk_box_append(GTK_BOX(vbox), header);
+
+  GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+  GtkWidget *back = gtk_button_new_from_icon_name("go-previous-symbolic");
+  GtkWidget *forward = gtk_button_new_from_icon_name("go-next-symbolic");
+  GtkWidget *reload = gtk_button_new_from_icon_name("view-refresh-symbolic");
+  GtkWidget *addtab = gtk_button_new_from_icon_name("tab-new-symbolic");
+  GtkWidget *entry = gtk_entry_new();
+  gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "URL or search");
+  gtk_box_append(GTK_BOX(toolbar), back);
+  gtk_box_append(GTK_BOX(toolbar), forward);
+  gtk_box_append(GTK_BOX(toolbar), reload);
+  gtk_box_append(GTK_BOX(toolbar), entry);
+  gtk_box_append(GTK_BOX(toolbar), addtab);
+  gtk_header_bar_set_custom_title(GTK_HEADER_BAR(header), toolbar);
+
+  app.notebook = gtk_notebook_new();
+  GtkWidget *first = make_tab(&app, "https://www.example.org");
+  gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), first, NULL);
+  gtk_box_append(GTK_BOX(vbox), app.notebook);
+
+  g_signal_connect(addtab, "clicked", G_CALLBACK(add_tab_cb), &app);
+  g_signal_connect(entry, "activate", G_CALLBACK(on_go), app.notebook);
+
+  gtk_window_set_child(GTK_WINDOW(app.window), vbox);
+  gtk_widget_show(app.window);
+  gtk_main();
+  return 0;
+}

@@ -1,0 +1,449 @@
+// rf_eye_detector.c
+// Plain C Random-Forest eye detector using V4L2 and SDL2
+// Compile: gcc -O3 -std=c11 rf_eye_detector.c -o rf_eye_detector -lSDL2
+
+#define _POSIX_C_SOURCE 200809L
+#define _DEFAULT_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
+#include <SDL2/SDL.h>
+
+#define PATCH_W 24
+#define PATCH_H 24
+#define PATCH_SZ (PATCH_W*PATCH_H)
+#define MAX_DETECTIONS 1024
+
+// --- Simple forest structures ---
+typedef struct {
+    uint16_t a, b; // pixel indices in flattened patch
+} Pair;
+
+typedef struct {
+    int32_t feature; // -1 => leaf
+    int32_t left;
+    int32_t right;
+    int32_t value; // leaf value 0/1
+} Node;
+
+typedef struct {
+    uint32_t K;
+    uint32_t W, H;
+    uint32_t num_trees;
+    Pair *pairs; // K entries
+    Node **trees; // array of pointers to node arrays
+    uint32_t *tree_node_counts;
+} Forest;
+
+// --- V4L2 capture helpers (single buffer mmap) ---
+struct buffer {
+    void *start;
+    size_t length;
+};
+
+static int xioctl(int fd, int request, void *arg) {
+    int r;
+    do r = ioctl(fd, request, arg);
+    while (r == -1 && errno == EINTR);
+    return r;
+}
+
+int open_camera(const char *dev, int *fd_out, int *width, int *height) {
+    int fd = open(dev, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) {
+        perror("open camera");
+        return -1;
+    }
+    struct v4l2_capability cap;
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        perror("VIDIOC_QUERYCAP");
+        close(fd);
+        return -1;
+    }
+    struct v4l2_format fmt;
+    memset(&fmt,0,sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = 640;
+    fmt.fmt.pix.height = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_INTERLACED;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("VIDIOC_S_FMT");
+        close(fd);
+        return -1;
+    }
+    *width = fmt.fmt.pix.width;
+    *height = fmt.fmt.pix.height;
+    // request buffers
+    struct v4l2_requestbuffers req;
+    memset(&req,0,sizeof(req));
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        perror("VIDIOC_REQBUFS");
+        close(fd);
+        return -1;
+    }
+    struct buffer *buffers = calloc(req.count, sizeof(*buffers));
+    for (unsigned int i=0;i<req.count;i++) {
+        struct v4l2_buffer buf;
+        memset(&buf,0,sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            perror("VIDIOC_QUERYBUF");
+            free(buffers);
+            close(fd);
+            return -1;
+        }
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) {
+            perror("mmap");
+            free(buffers);
+            close(fd);
+            return -1;
+        }
+    }
+    // queue buffers
+    for (unsigned int i=0;i<req.count;i++) {
+        struct v4l2_buffer buf;
+        memset(&buf,0,sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("VIDIOC_QBUF");
+            // continue
+        }
+    }
+    // start
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("VIDIOC_STREAMON");
+        // continue
+    }
+    *fd_out = fd;
+    // store buffers pointer in fd via malloc? For simplicity, we will re-query buffers on each read.
+    // But we need buffers pointer later; instead, store globally via static pointer.
+    // To keep code simple, we will re-query buffer on dequeue and use mmaped pointers from earlier.
+    // Save buffers in static global:
+    static struct buffer *g_buffers = NULL;
+    static unsigned int g_buf_count = 0;
+    if (g_buffers) free(g_buffers);
+    g_buffers = buffers;
+    g_buf_count = req.count;
+    // store via environment? We'll use helper functions that reference g_buffers via extern-like static functions below.
+    // For simplicity, we keep them static in this function's scope by using static variables above and helper functions below will access them.
+    return 0;
+}
+
+// To access the static buffers created above, we declare accessor functions:
+static struct buffer *get_buffers_ptr(unsigned int *count) {
+    extern struct buffer *__g_v4l2_buffers;
+    // hack: we can't access the static inside open_camera from here; instead, re-implement open_camera to set global.
+    return NULL;
+}
+
+// To avoid complexity with static scoping, rework: implement a minimal capture loop that re-implements buffer setup and uses local variables in main.
+// For clarity and reliability, we'll implement capture setup in main below.
+
+
+// --- Forest loader ---
+Forest *forest_load(const char *path) {
+    FILE *f = fopen(path,"rb");
+    if (!f) { perror("open forest"); return NULL; }
+    Forest *F = calloc(1,sizeof(Forest));
+    if (fread(&F->K, sizeof(uint32_t), 1, f) != 1) { fclose(f); free(F); return NULL; }
+    if (fread(&F->W, sizeof(uint32_t), 1, f) != 1) { fclose(f); free(F); return NULL; }
+    if (fread(&F->H, sizeof(uint32_t), 1, f) != 1) { fclose(f); free(F); return NULL; }
+    if (fread(&F->num_trees, sizeof(uint32_t), 1, f) != 1) { fclose(f); free(F); return NULL; }
+    if (F->W != PATCH_W || F->H != PATCH_H) {
+        fprintf(stderr,"Warning: forest patch size %ux%u differs from runtime %ux%u\n", F->W, F->H, PATCH_W, PATCH_H);
+    }
+    F->pairs = malloc(sizeof(Pair) * F->K);
+    if (fread(F->pairs, sizeof(Pair), F->K, f) != F->K) { perror("read pairs"); fclose(f); free(F); return NULL; }
+    F->trees = calloc(F->num_trees, sizeof(Node*));
+    F->tree_node_counts = calloc(F->num_trees, sizeof(uint32_t));
+    for (uint32_t t=0;t<F->num_trees;t++) {
+        uint32_t n;
+        if (fread(&n, sizeof(uint32_t), 1, f) != 1) { perror("read node count"); fclose(f); return NULL; }
+        F->tree_node_counts[t] = n;
+        Node *nodes = malloc(sizeof(Node) * n);
+        if (fread(nodes, sizeof(Node), n, f) != n) { perror("read nodes"); fclose(f); return NULL; }
+        F->trees[t] = nodes;
+    }
+    fclose(f);
+    return F;
+}
+
+void forest_free(Forest *F) {
+    if (!F) return;
+    if (F->pairs) free(F->pairs);
+    if (F->trees) {
+        for (uint32_t t=0;t<F->num_trees;t++) if (F->trees[t]) free(F->trees[t]);
+        free(F->trees);
+    }
+    if (F->tree_node_counts) free(F->tree_node_counts);
+    free(F);
+}
+
+// Evaluate one tree: iterative
+static inline int eval_tree(const Node *nodes, uint32_t node_count, const uint8_t *features) {
+    int idx = 0;
+    while (1) {
+        const Node *n = &nodes[idx];
+        if (n->feature == -1) return n->value;
+        int f = n->feature;
+        if (f < 0) return 0;
+        if (features[f]) idx = n->right;
+        else idx = n->left;
+        if (idx < 0 || (uint32_t)idx >= node_count) return 0;
+    }
+}
+
+// Evaluate forest on features (binary vector length K)
+int forest_predict(const Forest *F, const uint8_t *features) {
+    int votes = 0;
+    for (uint32_t t=0;t<F->num_trees;t++) {
+        int v = eval_tree(F->trees[t], F->tree_node_counts[t], features);
+        votes += v;
+    }
+    // majority
+    return (votes * 2 >= (int)F->num_trees) ? 1 : 0;
+}
+
+// --- Utility: convert YUYV to RGB888 and grayscale ---
+static inline void yuyv_to_gray(const uint8_t *yuyv, uint8_t *gray, int w, int h) {
+    // YUYV: Y0 U0 Y1 V0 ...
+    int idx = 0;
+    for (int i=0;i<w*h*2;i+=4) {
+        uint8_t y0 = yuyv[i+0];
+        uint8_t u  = yuyv[i+1];
+        uint8_t y1 = yuyv[i+2];
+        uint8_t v  = yuyv[i+3];
+        gray[idx++] = y0;
+        gray[idx++] = y1;
+    }
+}
+
+// --- Sliding window detector ---
+typedef struct { int x,y,w,h; } Rect;
+typedef struct { Rect r; float score; } Det;
+
+int detect_windows(const Forest *F, const uint8_t *gray, int imgw, int imgh, Det *dets, int maxdets) {
+    int detc = 0;
+    // Precompute pair offsets relative to patch top-left
+    int K = F->K;
+    int offsets_a[K];
+    int offsets_b[K];
+    for (uint32_t i=0;i<F->K;i++) {
+        offsets_a[i] = F->pairs[i].a;
+        offsets_b[i] = F->pairs[i].b;
+    }
+    // For each window position (stride 4 for speed)
+    int stride = 4;
+    for (int y=0; y + PATCH_H <= imgh; y += stride) {
+        for (int x=0; x + PATCH_W <= imgw; x += stride) {
+            // Build flattened patch pointer base
+            // Instead of copying patch, we index into gray using (row*imgw + col)
+            // Build features
+            uint8_t features[K];
+            for (int i=0;i<K;i++) {
+                int ai = offsets_a[i];
+                int bi = offsets_b[i];
+                int ay = ai / PATCH_W;
+                int ax = ai % PATCH_W;
+                int by = bi / PATCH_W;
+                int bx = bi % PATCH_W;
+                uint8_t va = gray[(y+ay)*imgw + (x+ax)];
+                uint8_t vb = gray[(y+by)*imgw + (x+bx)];
+                features[i] = (va < vb) ? 1 : 0;
+            }
+            int pred = forest_predict(F, features);
+            if (pred) {
+                if (detc < maxdets) {
+                    dets[detc].r.x = x;
+                    dets[detc].r.y = y;
+                    dets[detc].r.w = PATCH_W;
+                    dets[detc].r.h = PATCH_H;
+                    dets[detc].score = 1.0f;
+                    detc++;
+                }
+            }
+        }
+    }
+    return detc;
+}
+
+// Simple non-max suppression: remove overlapping boxes (center distance)
+int nms(Det *in, int n, Det *out, int maxout) {
+    int used[n];
+    memset(used,0,sizeof(used));
+    int outc = 0;
+    for (int i=0;i<n;i++) {
+        if (used[i]) continue;
+        Det cur = in[i];
+        for (int j=i+1;j<n;j++) {
+            if (used[j]) continue;
+            int cx1 = cur.r.x + cur.r.w/2;
+            int cy1 = cur.r.y + cur.r.h/2;
+            int cx2 = in[j].r.x + in[j].r.w/2;
+            int cy2 = in[j].r.y + in[j].r.h/2;
+            int dx = cx1 - cx2;
+            int dy = cy1 - cy2;
+            if (dx*dx + dy*dy < (PATCH_W/2)*(PATCH_W/2)) {
+                used[j] = 1;
+            }
+        }
+        if (outc < maxout) out[outc++] = cur;
+    }
+    return outc;
+}
+
+// --- Main: capture, detect, display ---
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr,"Usage: %s /dev/video0 forest24.dat\n", argv[0]);
+        return 1;
+    }
+    const char *dev = argv[1];
+    const char *forest_path = argv[2];
+
+    Forest *F = forest_load(forest_path);
+    if (!F) { fprintf(stderr,"Failed to load forest\n"); return 1; }
+
+    // Open camera and set format, buffers (inline, simpler than earlier attempt)
+    int fd = open(dev, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) { perror("open"); return 1; }
+    struct v4l2_capability cap;
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { perror("VIDIOC_QUERYCAP"); close(fd); return 1; }
+    struct v4l2_format fmt;
+    memset(&fmt,0,sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = 640;
+    fmt.fmt.pix.height = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) { perror("VIDIOC_S_FMT"); close(fd); return 1; }
+    int width = fmt.fmt.pix.width;
+    int height = fmt.fmt.pix.height;
+
+    struct v4l2_requestbuffers req;
+    memset(&req,0,sizeof(req));
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) { perror("VIDIOC_REQBUFS"); close(fd); return 1; }
+    struct buffer *buffers = calloc(req.count, sizeof(*buffers));
+    for (unsigned int i=0;i<req.count;i++) {
+        struct v4l2_buffer buf;
+        memset(&buf,0,sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) { perror("VIDIOC_QUERYBUF"); close(fd); return 1; }
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) { perror("mmap"); close(fd); return 1; }
+    }
+    for (unsigned int i=0;i<req.count;i++) {
+        struct v4l2_buffer buf;
+        memset(&buf,0,sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); }
+    }
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) { perror("VIDIOC_STREAMON"); close(fd); return 1; }
+
+    // SDL init
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr,"SDL_Init: %s\n", SDL_GetError()); return 1; }
+    SDL_Window *win = SDL_CreateWindow("RF Eye Detector", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, 0);
+    if (!win) { fprintf(stderr,"SDL_CreateWindow: %s\n", SDL_GetError()); return 1; }
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, width, height);
+
+    uint8_t *gray = malloc(width * height);
+    uint8_t *rgb = malloc(width * height * 3);
+
+    Det raw_dets[MAX_DETECTIONS];
+    Det final_dets[MAX_DETECTIONS];
+
+    int running = 1;
+    while (running) {
+        // dequeue
+        struct v4l2_buffer buf;
+        memset(&buf,0,sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+            if (errno == EAGAIN) { usleep(1000); continue; }
+            perror("VIDIOC_DQBUF");
+            break;
+        }
+        // convert to gray
+        yuyv_to_gray((uint8_t*)buffers[buf.index].start, gray, width, height);
+        // detect
+        int nd = detect_windows(F, gray, width, height, raw_dets, MAX_DETECTIONS);
+        int nf = nms(raw_dets, nd, final_dets, MAX_DETECTIONS);
+
+        // convert gray -> RGB for display
+        for (int i=0;i<width*height;i++) {
+            uint8_t v = gray[i];
+            rgb[3*i+0] = v;
+            rgb[3*i+1] = v;
+            rgb[3*i+2] = v;
+        }
+        // update texture
+        SDL_UpdateTexture(tex, NULL, rgb, width*3);
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+        // draw detections
+        SDL_SetRenderDrawColor(ren, 255, 0, 0, 255);
+        for (int i=0;i<nf;i++) {
+            SDL_Rect r = { final_dets[i].r.x, final_dets[i].r.y, final_dets[i].r.w, final_dets[i].r.h };
+            SDL_RenderDrawRect(ren, &r);
+        }
+        SDL_RenderPresent(ren);
+
+        // requeue buffer
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); break; }
+
+        // SDL events
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_q) running = 0;
+            }
+        }
+    }
+
+    // cleanup
+    enum v4l2_buf_type t2 = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    xioctl(fd, VIDIOC_STREAMOFF, &t2);
+    for (unsigned int i=0;i<req.count;i++) munmap(buffers[i].start, buffers[i].length);
+    free(buffers);
+    close(fd);
+
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+
+    free(gray);
+    free(rgb);
+    forest_free(F);
+    return 0;
+}

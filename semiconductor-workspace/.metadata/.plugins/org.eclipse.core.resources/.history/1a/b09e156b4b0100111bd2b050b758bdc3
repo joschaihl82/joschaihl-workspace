@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.16)
+
+# Diese Variablen MÜSSEN vor project() stehen für Cross-Compiling
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
+set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
+set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+
+project(WinPaint C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Statisches Linken (verhindert 'Missing DLL' Fehler in Wine/Windows)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static-libgcc -static")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static")
+
+add_compile_definitions(UNICODE _UNICODE)
+
+# Win32 GUI Executable (verhindert das Konsolenfenster im Hintergrund)
+add_executable(winpaint WIN32 paint.c)
+
+# Alle notwendigen Win32 Bibliotheken
+target_link_libraries(winpaint PRIVATE
+    comctl32
+    gdi32
+    user32
+    kernel32
+    comdlg32
+    uxtheme
+    msimg32
+)

@@ -1,0 +1,11 @@
+config/pc-dialer/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/pc-dialer/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/pc-dialer/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/pc-dialer/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/pc-dialer/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/pc-dialer2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/pc-dialer2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/pc-dialer2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/pc-dialer2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/pc-dialer2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+eclipse.preferences.version=1

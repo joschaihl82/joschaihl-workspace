@@ -1,0 +1,75 @@
+xghost.c: In function ‘hsv_to_rgb’:
+xghost.c:93:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+   93 |         if (vi < 0) vi = 0; if (vi > 255) vi = 255;
+      |         ^~
+xghost.c:93:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+   93 |         if (vi < 0) vi = 0; if (vi > 255) vi = 255;
+      |                             ^~
+xghost.c:117:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  117 |     if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |     ^~
+xghost.c:117:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  117 |     if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |                         ^~
+xghost.c:118:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  118 |     if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |     ^~
+xghost.c:118:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  118 |     if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |                         ^~
+xghost.c:119:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  119 |     if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |     ^~
+xghost.c:119:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  119 |     if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |                         ^~
+xghost.c: In function ‘apply_hsva_ghost_sepia’:
+xghost.c:144:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  144 |         if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f;
+      |         ^~
+xghost.c:144:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  144 |         if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f;
+      |                                 ^~
+xghost.c:145:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  145 |         if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+      |         ^~
+xghost.c:145:33: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  145 |         if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+      |                                 ^~
+xghost.c:159:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  159 |             if (orr < 0) orr = 0; if (orr > 255) orr = 255;
+      |             ^~
+xghost.c:159:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  159 |             if (orr < 0) orr = 0; if (orr > 255) orr = 255;
+      |                                   ^~
+xghost.c:160:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  160 |             if (org < 0) org = 0; if (org > 255) org = 255;
+      |             ^~
+xghost.c:160:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  160 |             if (org < 0) org = 0; if (org > 255) org = 255;
+      |                                   ^~
+xghost.c:161:13: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  161 |             if (orb < 0) orb = 0; if (orb > 255) orb = 255;
+      |             ^~
+xghost.c:161:35: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  161 |             if (orb < 0) orb = 0; if (orb > 255) orb = 255;
+      |                                   ^~
+xghost.c: In function ‘mjpeg_to_rgb24’:
+xghost.c:201:97: warning: unused parameter ‘expected_w’ [-Wunused-parameter]
+  201 | static int mjpeg_to_rgb24(const unsigned char *mjpeg, size_t mjpeg_len, unsigned char *rgb, int expected_w, int expected_h)
+      |                                                                                             ~~~~^~~~~~~~~~
+xghost.c:201:113: warning: unused parameter ‘expected_h’ [-Wunused-parameter]
+  201 | static int mjpeg_to_rgb24(const unsigned char *mjpeg, size_t mjpeg_len, unsigned char *rgb, int expected_w, int expected_h)
+      |                                                                                                             ~~~~^~~~~~~~~~
+xghost.c: In function ‘main’:
+xghost.c:364:68: error: ‘struct v4l2_fract’ has no member named ‘den’
+  364 |             unsigned int den = streamparm.parm.capture.timeperframe.den;
+      |                                                                    ^
+xghost.c:365:68: error: ‘struct v4l2_fract’ has no member named ‘num’
+  365 |             unsigned int num = streamparm.parm.capture.timeperframe.num;
+      |                                                                    ^
+xghost.c:581:39: error: ‘ghost_alpha’ undeclared (first use in this function)
+  581 |             his[0] = (unsigned char)((ghost_alpha * (float)his[0] + (1.0f - ghost_alpha) * (float)cur[0]) + 0.5f);
+      |                                       ^~~~~~~~~~~
+xghost.c:581:39: note: each undeclared identifier is reported only once for each function it appears in
+make: *** [Makefile:23: ghost_filter] Error 1

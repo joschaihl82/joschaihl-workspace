@@ -1,0 +1,442 @@
+// jemu.c
+// JIT emulator: threaded execution + real-time rendering with FPS title.
+// No mutexes; simple best-effort refresh. Resolution: 1024x768 ARGB8888.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <pthread.h>
+
+#ifdef __INTELLISENSE__
+#define SDL_INIT_VIDEO 0
+#define SDL_WINDOWPOS_CENTERED 0
+typedef struct SDL_Window SDL_Window;
+typedef struct SDL_Renderer SDL_Renderer;
+typedef struct SDL_Texture SDL_Texture;
+typedef union SDL_Event SDL_Event;
+#else
+#include <SDL2/SDL.h>
+#endif
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+
+#define FB_WIDTH   1024
+#define FB_HEIGHT  768
+#define RAM_SIZE   8192 // small stack/data RAM
+
+typedef struct {
+    // 16 general-purpose 64-bit registers (rA..rP)
+    uint64_t rA,rB,rC,rD,rE,rF,rG,rH,rI,rJ,rK,rL,rM,rN,rO,rP;
+
+    // System registers
+    uint64_t rSP;      // stack pointer (byte offset into ram[])
+    uint64_t rFlags;   // flags (low byte used: bit0 = ZF)
+    uint64_t rTimer;   // timer
+
+    // Framebuffer (ARGB8888)
+    uint32_t framebuffer[FB_WIDTH * FB_HEIGHT];
+
+    // Emulated RAM / stack
+    uint8_t ram[RAM_SIZE];
+
+    int pc;
+} CPUState;
+
+// Offsets
+#define RA_OFF       0x00
+#define RB_OFF       0x08
+#define RC_OFF       0x10
+#define RD_OFF       0x18
+#define RE_OFF       0x20
+#define RF_OFF       0x28
+#define RG_OFF       0x30
+#define RH_OFF       0x38
+#define RI_OFF       0x40
+#define RJ_OFF       0x48
+#define RK_OFF       0x50
+#define RL_OFF       0x58
+#define RM_OFF       0x60
+#define RN_OFF       0x68
+#define RO_OFF       0x70
+#define RP_OFF       0x78
+#define RSP_OFF      0x80
+#define RFLAGS_OFF   0x88
+#define RTIMER_OFF   0x90
+#define FB_OFF       0x98
+#define RAM_OFF      (FB_OFF + (FB_WIDTH * FB_HEIGHT * sizeof(uint32_t)))
+
+// ISA opcodes (3-byte format)
+#define OP_HALT        0x00
+#define OP_MOV_IMM     0x01
+#define OP_MOV_REG     0x02
+#define OP_ADD_REG     0x03
+#define OP_SUB_REG     0x04
+#define OP_AND_REG     0x10
+#define OP_OR_REG      0x11
+#define OP_XOR_REG     0x12
+#define OP_NOT_REG     0x13
+#define OP_SHL_REG     0x14
+#define OP_SHR_REG     0x15
+#define OP_INC_REG     0x16
+#define OP_DEC_REG     0x17
+#define OP_CMP_REG     0x20
+#define OP_JMP_REL     0x21
+#define OP_JNE_REL     0x22
+#define OP_JE_REL      0x23
+#define OP_PUSH_REG    0x30
+#define OP_POP_REG     0x31
+#define OP_GET_TIMER   0x40
+#define OP_WRITE_FB_A  0x07 // framebuffer[reg[B] (low 32)] = reg[A] (low 32)
+
+typedef void (*JIT_Func)(CPUState* state);
+
+// -----------------------------------------------------------------------------
+// JIT helpers
+// -----------------------------------------------------------------------------
+
+static uint64_t get_reg_offset(int idx) {
+    switch (idx) {
+        case 0: return RA_OFF; case 1: return RB_OFF; case 2: return RC_OFF; case 3: return RD_OFF;
+        case 4: return RE_OFF; case 5: return RF_OFF; case 6: return RG_OFF; case 7: return RH_OFF;
+        case 8: return RI_OFF; case 9: return RJ_OFF; case 10: return RK_OFF; case 11: return RL_OFF;
+        case 12: return RM_OFF; case 13: return RN_OFF; case 14: return RO_OFF; case 15: return RP_OFF;
+        case 16: return RSP_OFF; default: return UINT64_MAX;
+    }
+}
+
+static uint8_t* allocate_executable_memory(size_t size) {
+    long ps = sysconf(_SC_PAGE_SIZE); if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps; size = (size + page - 1) & ~(page - 1);
+    uint8_t* buf = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) { perror("mmap exec memory"); return NULL; }
+    printf("[jit] allocated %zu bytes at %p\n", size, (void*)buf);
+    return buf;
+}
+static void release_executable_memory(void* p, size_t size) {
+    long ps = sysconf(_SC_PAGE_SIZE); if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps; size = (size + page - 1) & ~(page - 1);
+    if (p && p != MAP_FAILED) munmap(p, size);
+}
+
+static void emit_modrm_disp32_rdi(uint8_t** p, uint8_t reg) { **p = (uint8_t)(0x80 | ((reg & 7) << 3) | 0x07); (*p)++; }
+static void emit_disp32(uint8_t** p, uint32_t d32) { *((uint32_t*)(*p)) = d32; (*p) += 4; }
+static void emit_load_reg64_rax(uint8_t** p, int reg_idx){ uint64_t off=get_reg_offset(reg_idx); *(*p)++=0x48; *(*p)++=0x8B; emit_modrm_disp32_rdi(p,0); emit_disp32(p,(uint32_t)off);}
+static void emit_load_reg64_rcx(uint8_t** p, int reg_idx){ uint64_t off=get_reg_offset(reg_idx); *(*p)++=0x48; *(*p)++=0x8B; emit_modrm_disp32_rdi(p,1); emit_disp32(p,(uint32_t)off);}
+static void emit_store_reg64_from_rax(uint8_t** p,int reg_idx){ uint64_t off=get_reg_offset(reg_idx); *(*p)++=0x48; *(*p)++=0x89; emit_modrm_disp32_rdi(p,0); emit_disp32(p,(uint32_t)off);}
+static void emit_store_reg64_from_rcx(uint8_t** p,int reg_idx){ uint64_t off=get_reg_offset(reg_idx); *(*p)++=0x48; *(*p)++=0x89; emit_modrm_disp32_rdi(p,1); emit_disp32(p,(uint32_t)off);}
+
+// -----------------------------------------------------------------------------
+// JIT compiler
+// -----------------------------------------------------------------------------
+
+static JIT_Func jit_compile(const uint8_t* rom, size_t rom_size) {
+    const size_t MAX_CODE = 65536;
+    uint8_t* code = allocate_executable_memory(MAX_CODE);
+    if (!code) return NULL;
+    uint8_t* cp = code;
+
+    const int MAX_INS = 8192;
+    size_t pc_to_native[MAX_INS];
+    typedef struct { int target_rom_pc; uint8_t* disp_ptr; } Fix;
+    Fix fixups[MAX_INS]; int fixup_count = 0;
+
+    int pc = 0;
+    while (pc < (int)rom_size) {
+        int idx = pc / 3;
+        if (idx >= MAX_INS) { fprintf(stderr, "[jit] ROM too large\n"); release_executable_memory(code, MAX_CODE); return NULL; }
+        pc_to_native[idx] = (size_t)(cp - code);
+
+        uint8_t op = rom[pc];
+        uint8_t arg_lo = (pc + 1 < (int)rom_size) ? rom[pc + 1] : 0;
+        uint8_t arg_hi = (pc + 2 < (int)rom_size) ? rom[pc + 2] : 0;
+        uint16_t arg = (uint16_t)(arg_lo | (arg_hi << 8));
+
+        int reg_a = arg & 0x0F;
+        int reg_b = (arg >> 4) & 0x0F;
+        int16_t simm16 = (int16_t)arg;
+
+        switch (op) {
+            case OP_HALT: { *cp++ = 0xC3; pc += 3; goto finalize; }
+
+            case OP_MOV_IMM: {
+                uint64_t off = get_reg_offset(reg_a);
+                *cp++ = 0xC7; *cp++ = 0x87; emit_disp32(&cp, (uint32_t)off);        *((uint32_t*)cp) = (uint32_t)arg; cp += 4;
+                *cp++ = 0xC7; *cp++ = 0x87; emit_disp32(&cp, (uint32_t)(off + 4)); *((uint32_t*)cp) = 0; cp += 4;
+                pc += 3; break;
+            }
+
+            case OP_MOV_REG: { emit_load_reg64_rax(&cp, reg_b); emit_store_reg64_from_rax(&cp, reg_a); pc += 3; break; }
+            case OP_ADD_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0x01;*cp++=0xC8; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_SUB_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0x29;*cp++=0xC8; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_AND_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0x21;*cp++=0xC8; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_OR_REG:  { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0x09;*cp++=0xC8; emit_store_reg64_from_rax(&cp,reg_a);  pc+=3; break; }
+            case OP_XOR_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0x31;*cp++=0xC8; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_NOT_REG: { emit_load_reg64_rax(&cp, reg_a); *cp++=0x48;*cp++=0xF7;*cp++=0xD0; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_SHL_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0xD3;*cp++=0xE0; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_SHR_REG: { emit_load_reg64_rax(&cp, reg_a); emit_load_reg64_rcx(&cp, reg_b); *cp++=0x48;*cp++=0xD3;*cp++=0xE8; emit_store_reg64_from_rax(&cp,reg_a); pc+=3; break; }
+            case OP_INC_REG: { uint64_t off=get_reg_offset(reg_a); *cp++=0x48;*cp++=0xFF;*cp++=0x87; emit_disp32(&cp,(uint32_t)off); pc+=3; break; }
+            case OP_DEC_REG: { uint64_t off=get_reg_offset(reg_a); *cp++=0x48;*cp++=0xFF;*cp++=0x8F; emit_disp32(&cp,(uint32_t)off); pc+=3; break; }
+
+            case OP_CMP_REG: {
+                emit_load_reg64_rax(&cp, reg_a);
+                uint64_t offb = get_reg_offset(reg_b);
+                *cp++=0x48;*cp++=0x3B; emit_modrm_disp32_rdi(&cp,0); emit_disp32(&cp,(uint32_t)offb);
+                *cp++=0x0F;*cp++=0x94;*cp++=0xC0; // setz al
+                *cp++=0x88;*cp++=0x87; emit_disp32(&cp,(uint32_t)RFLAGS_OFF);
+                pc+=3; break;
+            }
+
+            case OP_JMP_REL: {
+                *cp++=0xE9; uint8_t* disp=cp; cp+=4;
+                fixups[fixup_count].target_rom_pc = pc + 3 + simm16;
+                fixups[fixup_count].disp_ptr = disp; fixup_count++; pc+=3; break;
+            }
+
+            case OP_JNE_REL:
+            case OP_JE_REL: {
+                *cp++=0x0F;*cp++=0xB6;*cp++=0x87; emit_disp32(&cp,(uint32_t)RFLAGS_OFF); // movzx eax, byte [rdi+RFLAGS_OFF]
+                *cp++=0x85;*cp++=0xC0; // test eax, eax
+                *cp++=0x0F;*cp++=(op==OP_JNE_REL)?0x85:0x84;
+                uint8_t* disp=cp; cp+=4;
+                fixups[fixup_count].target_rom_pc = pc + 3 + simm16;
+                fixups[fixup_count].disp_ptr = disp; fixup_count++; pc+=3; break;
+            }
+
+            case OP_PUSH_REG: {
+                emit_load_reg64_rcx(&cp,16); *cp++=0x48;*cp++=0x83;*cp++=0xE9;*cp++=0x08;
+                emit_store_reg64_from_rcx(&cp,16);
+                emit_load_reg64_rax(&cp,reg_a);
+                *cp++=0x48;*cp++=0x89;*cp++=0x84;*cp++=0x0F; emit_disp32(&cp,(uint32_t)RAM_OFF);
+                pc+=3; break;
+            }
+
+            case OP_POP_REG: {
+                emit_load_reg64_rcx(&cp,16);
+                *cp++=0x48;*cp++=0x8B;*cp++=0x84;*cp++=0x0F; emit_disp32(&cp,(uint32_t)RAM_OFF);
+                *cp++=0x48;*cp++=0x83;*cp++=0xC1;*cp++=0x08;
+                emit_store_reg64_from_rcx(&cp,16);
+                emit_store_reg64_from_rax(&cp,reg_a);
+                pc+=3; break;
+            }
+
+            case OP_GET_TIMER: {
+                *cp++=0x48;*cp++=0x8B;*cp++=0x87; emit_disp32(&cp,(uint32_t)RTIMER_OFF);
+                emit_store_reg64_from_rax(&cp,reg_a);
+                *cp++=0x48;*cp++=0xFF; emit_modrm_disp32_rdi(&cp,0); emit_disp32(&cp,(uint32_t)RTIMER_OFF);
+                pc+=3; break;
+            }
+
+            case OP_WRITE_FB_A: {
+                *cp++=0x8B;*cp++=0x8F; emit_disp32(&cp,(uint32_t)RB_OFF); // ECX=index
+                *cp++=0x8B;*cp++=0x87; emit_disp32(&cp,(uint32_t)RA_OFF); // EAX=color
+                *cp++=0x89;*cp++=0x84;*cp++=0x8F; emit_disp32(&cp,(uint32_t)FB_OFF);
+                pc+=3; break;
+            }
+
+            default: { fprintf(stderr,"[jit] unknown opcode 0x%02X at pc 0x%X\n",op,pc); release_executable_memory(code,MAX_CODE); return NULL; }
+        }
+        if ((size_t)(cp - code) > MAX_CODE - 64) { fprintf(stderr,"[jit] code buffer overflow\n"); release_executable_memory(code,MAX_CODE); return NULL; }
+    }
+
+finalize:
+    for (int i=0;i<fixup_count;i++){
+        int tgt_pc = fixups[i].target_rom_pc;
+        if (tgt_pc < 0 || (tgt_pc/3) >= MAX_INS) { fprintf(stderr,"[jit] jump target out of range: pc=%d\n",tgt_pc); release_executable_memory(code,MAX_CODE); return NULL; }
+        size_t tgt_native = pc_to_native[tgt_pc/3];
+        uint8_t* disp = fixups[i].disp_ptr;
+        size_t next_ip = (size_t)(disp - code) + 4;
+        int32_t rel32 = (int32_t)((int64_t)tgt_native - (int64_t)next_ip);
+        *((int32_t*)disp) = rel32;
+    }
+
+    printf("[jit] compiled %zu bytes\n", (size_t)(cp - code));
+    return (JIT_Func)code;
+}
+
+// -----------------------------------------------------------------------------
+// Demo ROM: full-screen blink every run
+// -----------------------------------------------------------------------------
+
+static const uint8_t* create_rom(size_t* out_size) {
+    const uint32_t LIMIT = (uint32_t)(FB_WIDTH * FB_HEIGHT); // 786432 < 65535, so imm16 won't hold; we iterate per frame by chunks.
+    // For simplicity, we fill the entire buffer each run using rB as index 0..(WIDTH*HEIGHT-1).
+    // We'll use a smaller chunk per run for high FPS: fill 4096 pixels per invocation, wrap around.
+
+    const uint16_t CHUNK = 4096;
+    const uint16_t BLINK_MASK = 0x0020;
+    const int16_t loop_start_pc = 12;
+    const int16_t end_pc = 27;
+    const int16_t back_offset = (int16_t)(loop_start_pc - (end_pc + 3)); // 12 - 30 = -18
+
+    uint8_t rom[] = {
+        // Init: if rB >= LIMIT, wrap to 0 (we won't encode LIMIT due to imm16 constraints; wrap in host between frames)
+        OP_MOV_IMM, 0x20, (uint8_t)(BLINK_MASK & 0xFF), // rD = mask
+
+        // pc 6: loop start
+        OP_GET_TIMER, 0x40, 0x00,                    // rE = timer++
+        OP_AND_REG,   0x42, 0x00,                    // rE &= rD
+        OP_CMP_REG,   0x42, 0x00,                    // cmp rE, rD
+        OP_JNE_REL,   0x06, 0x00,                    // if not equal -> jump to zero-write block
+
+        // color write block
+        OP_WRITE_FB_A,0x01, 0x00,                    // fb[rB] = rA
+        OP_JMP_REL,   0x06, 0x00,                    // skip zero-write block
+
+        // zero-write block
+        OP_MOV_IMM,   0x00, 0x00,                    // rA = 0
+        OP_WRITE_FB_A,0x01, 0x00,                    // fb[rB] = 0
+        OP_MOV_IMM,   0x00, 0xFF,                    // rA = 0x00FF (restore low16 color)
+
+        // advance index (chunked)
+        OP_INC_REG,   0x10, 0x00,                    // rB++
+        OP_HALT,      0x00, 0x00
+    };
+
+    size_t sz = sizeof(rom);
+    uint8_t* copy = (uint8_t*)malloc(sz);
+    if (!copy) return NULL;
+    memcpy(copy, rom, sz);
+    *out_size = sz;
+    return copy;
+}
+
+// -----------------------------------------------------------------------------
+// Thread worker: run JIT repeatedly without locks
+// -----------------------------------------------------------------------------
+
+typedef struct {
+    CPUState* state;
+    JIT_Func fn;
+    volatile int running;
+} Shared;
+
+static void* worker_thread(void* arg) {
+    Shared* s = (Shared*)arg;
+    const uint32_t total = FB_WIDTH * FB_HEIGHT;
+    const uint32_t chunk = 4096; // per run
+    while (s->running) {
+        // Run JIT chunk: increments rB by 1 per HALT; run it chunk times
+        for (uint32_t i = 0; i < chunk && s->running; i++) {
+            if (s->state->rB >= total) s->state->rB = 0;
+            s->fn(s->state);
+        }
+        // No sleep, no locks
+    }
+    return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// Main: render loop with FPS in window title
+// -----------------------------------------------------------------------------
+
+int main(void) {
+    size_t rom_size = 0;
+    const uint8_t* rom = create_rom(&rom_size);
+    if (!rom) { fprintf(stderr, "failed to create ROM\n"); return 1; }
+
+    CPUState state;
+    memset(&state, 0, sizeof(state));
+    state.rSP = RAM_SIZE;
+    state.rA  = 0xFF0000FFu; // ARGB blue
+    state.rTimer = 0;
+    state.rB = 0;
+
+    JIT_Func fn = jit_compile(rom, rom_size);
+    if (!fn) { free((void*)rom); return 1; }
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        release_executable_memory((void*)fn, 65536);
+        free((void*)rom);
+        return 1;
+    }
+
+    const int WIN_W = FB_WIDTH;
+    const int WIN_H = FB_HEIGHT;
+
+    SDL_Window* win = SDL_CreateWindow(
+        "JIT x64 emulator (threaded, no locks)",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WIN_W, WIN_H,
+        SDL_WINDOW_SHOWN
+    );
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit(); release_executable_memory((void*)fn, 65536); free((void*)rom); return 1;
+    }
+
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!ren) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win); SDL_Quit();
+        release_executable_memory((void*)fn, 65536); free((void*)rom); return 1;
+    }
+
+    SDL_RenderSetLogicalSize(ren, FB_WIDTH, FB_HEIGHT);
+
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, FB_WIDTH, FB_HEIGHT);
+    if (!tex) {
+        fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+        SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        release_executable_memory((void*)fn, 65536); free((void*)rom); return 1;
+    }
+
+    Shared shared = { .state = &state, .fn = fn, .running = 1 };
+
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, worker_thread, &shared) != 0) {
+        perror("pthread_create");
+        shared.running = 0;
+        SDL_DestroyTexture(tex); SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        release_executable_memory((void*)fn, 65536); free((void*)rom);
+        return 1;
+    }
+
+    uint64_t frames = 0;
+    uint32_t last = SDL_GetTicks();
+
+    int running = 1;
+    SDL_Event ev;
+    while (running) {
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+        }
+
+        SDL_UpdateTexture(tex, NULL, state.framebuffer, FB_WIDTH * sizeof(uint32_t));
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+        SDL_RenderPresent(ren);
+
+        frames++;
+        uint32_t now = SDL_GetTicks();
+        if (now - last >= 1000) {
+            char title[128];
+            snprintf(title, sizeof(title), "JIT x64 emulator (threaded, no locks) - %llu FPS",
+                     (unsigned long long)frames);
+            SDL_SetWindowTitle(win, title);
+            frames = 0;
+            last = now;
+        }
+        // No delay
+    }
+
+    shared.running = 0;
+    pthread_join(worker, NULL);
+
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+
+    release_executable_memory((void*)fn, 65536);
+    free((void*)rom);
+    printf("[emu] shutdown.\n");
+    return 0;
+}

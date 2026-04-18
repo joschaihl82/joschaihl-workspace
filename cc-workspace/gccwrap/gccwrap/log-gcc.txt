@@ -1,0 +1,1 @@
+buildme.sh: 15: gccwrap: not found

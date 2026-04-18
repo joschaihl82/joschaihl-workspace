@@ -1,0 +1,129 @@
+```c
+// exectrace1.c
+// Minimal, portable sched_process_exec probe that avoids referencing
+// non-exported kernel symbols (e.g., task_numa_group_id, kallsyms_lookup_name).
+//
+// Build with: obj-m := exectrace1.o
+// Then: make -C /lib/modules/$(uname -r)/build M=$PWD modules V=1
+
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/sched.h>
+#include <linux/binfmts.h>
+#include <linux/tracepoint.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/limits.h>
+#include <linux/ratelimit.h>
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("josh");
+MODULE_DESCRIPTION("Trace exec paths and print resolved full path using sched_process_exec tracepoint");
+MODULE_VERSION("1.2");
+
+/* Rate-limit state (portable macro) */
+DEFINE_RATELIMIT_STATE(exectrace_rl, 5 * HZ, 10);
+
+/*
+ * Probe callback matching sched_process_exec tracepoint:
+ * void probe(void *data, struct task_struct *p, pid_t old_pid, struct linux_binprm *bprm)
+ */
+static void probe_sched_process_exec(void *data,
+                                     struct task_struct *p,
+                                     pid_t old_pid,
+                                     struct linux_binprm *bprm)
+{
+	char *buf = NULL;
+	char *path = NULL;
+
+	if (!p || !bprm)
+		return;
+
+	/* Rate-limit logging */
+	if (!__ratelimit(&exectrace_rl))
+		return;
+
+	/* Prefer the opened file's path when available */
+	if (bprm->file) {
+		struct path fpath;
+
+		/* copy the path and take a reference to avoid races */
+		fpath = bprm->file->f_path;
+		path_get(&fpath);
+
+		buf = kmalloc(PATH_MAX, GFP_ATOMIC);
+		if (!buf) {
+			path_put(&fpath);
+			pr_info("exectrace: pid=%d comm=%s filename=%s (no mem)\n",
+				p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+			return;
+		}
+
+		path = d_path(&fpath, buf, PATH_MAX);
+		if (IS_ERR(path)) {
+			pr_info("exectrace: pid=%d comm=%s filename=%s (d_path failed)\n",
+				p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+		} else {
+			pr_info("exectrace: pid=%d comm=%s path=%s\n",
+				p->pid, p->comm, path);
+		}
+
+		kfree(buf);
+		path_put(&fpath);
+	} else {
+		/* Fallback to the filename string provided by binfmt */
+		pr_info("exectrace: pid=%d comm=%s filename=%s\n",
+			p->pid, p->comm, bprm->filename ? bprm->filename : "<null>");
+	}
+}
+
+/*
+ * Use the kernel-exported tracepoint symbol if available.
+ * Declaring this extern will require the symbol at link time (modpost),
+ * so only do this when your kernel exports __tracepoint_sched_process_exec.
+ *
+ * This file intentionally avoids:
+ *  - CREATE_TRACE_POINTS / including trace/events/sched.h
+ *  - kallsyms_lookup_name or other runtime symbol lookups
+ *  - any references to internal symbols such as task_numa_group_id
+ */
+extern struct tracepoint __tracepoint_sched_process_exec;
+static struct tracepoint *tp_sched = &__tracepoint_sched_process_exec;
+static bool tp_registered;
+
+/* Module init: register probe with the tracepoint pointer */
+static int __init exectrace_init(void)
+{
+	int ret;
+
+	if (!tp_sched) {
+		pr_err("exectrace: __tracepoint_sched_process_exec not available\n");
+		return -ENODEV;
+	}
+
+	ret = tracepoint_probe_register(tp_sched, (void *)probe_sched_process_exec, NULL);
+	if (ret) {
+		pr_err("exectrace: tracepoint_probe_register failed (ret=%d)\n", ret);
+		return ret;
+	}
+
+	tp_registered = true;
+	pr_info("exectrace: module loaded, tracing exec paths\n");
+	return 0;
+}
+
+/* Module exit: unregister probe */
+static void __exit exectrace_exit(void)
+{
+	if (tp_registered && tp_sched)
+		tracepoint_probe_unregister(tp_sched, (void *)probe_sched_process_exec, NULL);
+
+	pr_info("exectrace: module unloaded\n");
+}
+
+module_init(exectrace_init);
+module_exit(exectrace_exit);
+```

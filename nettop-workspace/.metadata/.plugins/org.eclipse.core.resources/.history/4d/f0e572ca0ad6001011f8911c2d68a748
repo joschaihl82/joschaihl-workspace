@@ -1,0 +1,174 @@
+// nettop_qt.cpp  - Qt5 nettop with 10ms UI refresh (single-file example)
+#include <QApplication>
+#include <QTableView>
+#include <QAbstractTableModel>
+#include <QTimer>
+#include <QThread>
+#include <QMutex>
+#include <QMap>
+#include <QStringList>
+#include <pcap.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+struct ProcStat {
+    pid_t pid;
+    QString cmd;
+    uint64_t inBytes=0, outBytes=0;
+    uint64_t inPrev=0, outPrev=0;
+};
+
+class NetModel : public QAbstractTableModel {
+    Q_OBJECT
+public:
+    explicit NetModel(QObject *parent=nullptr) : QAbstractTableModel(parent) {}
+    QList<ProcStat> rows;
+
+    int rowCount(const QModelIndex&) const override { return rows.size(); }
+    int columnCount(const QModelIndex&) const override { return 5; }
+
+    QVariant headerData(int c, Qt::Orientation, int) const override {
+        QStringList h = {"Path/Name","Input MB","Output MB","Input KB/s","Output KB/s"};
+        return h.value(c);
+    }
+
+    QVariant data(const QModelIndex &idx, int role) const override {
+        if(role!=Qt::DisplayRole) return {};
+        const ProcStat &p = rows.at(idx.row());
+        switch(idx.column()){
+            case 0: return p.cmd;
+            case 1: return QString::number(p.inBytes/1024.0/1024.0,'f',2);
+            case 2: return QString::number(p.outBytes/1024.0/1024.0,'f',2);
+            case 3: return QString::number((p.inBytes - p.inPrev)/1024.0,'f',2);
+            case 4: return QString::number((p.outBytes - p.outPrev)/1024.0,'f',2);
+        }
+        return {};
+    }
+
+    // Efficient in-place update: apply snapshot and emit dataChanged for the whole table
+    void applySnapshot(const QMap<pid_t, ProcStat> &snapshot) {
+        // Build a map from pid->index for quick lookup
+        QHash<pid_t,int> idxMap;
+        for(int i=0;i<rows.size();++i) idxMap.insert(rows[i].pid, i);
+
+        // Update existing rows and mark new ones
+        QList<int> changedRows;
+        QList<ProcStat> newRows;
+        for(auto it = snapshot.constBegin(); it != snapshot.constEnd(); ++it){
+            pid_t pid = it.key();
+            const ProcStat &ps = it.value();
+            if(idxMap.contains(pid)){
+                int i = idxMap.value(pid);
+                // update prev counters before replacing
+                rows[i].inPrev = rows[i].inBytes;
+                rows[i].outPrev = rows[i].outBytes;
+                rows[i].inBytes = ps.inBytes;
+                rows[i].outBytes = ps.outBytes;
+                rows[i].cmd = ps.cmd;
+                changedRows.append(i);
+            } else {
+                ProcStat nr = ps;
+                nr.inPrev = ps.inBytes;
+                nr.outPrev = ps.outBytes;
+                newRows.append(nr);
+            }
+        }
+
+        // Append new rows (if any)
+        if(!newRows.isEmpty()){
+            beginInsertRows(QModelIndex(), rows.size(), rows.size() + newRows.size() - 1);
+            for(const ProcStat &r : newRows) rows.append(r);
+            endInsertRows();
+            // mark appended rows as changed
+            for(int i = rows.size() - newRows.size(); i < rows.size(); ++i) changedRows.append(i);
+        }
+
+        // Optionally prune rows not present in snapshot (not done here to avoid flicker)
+        if(!rows.isEmpty() && !changedRows.isEmpty()){
+            int minRow = *std::min_element(changedRows.begin(), changedRows.end());
+            int maxRow = *std::max_element(changedRows.begin(), changedRows.end());
+            QModelIndex topLeft = index(minRow, 0);
+            QModelIndex bottomRight = index(maxRow, columnCount()-1);
+            emit dataChanged(topLeft, bottomRight);
+        }
+    }
+};
+
+class CaptureThread : public QThread {
+    Q_OBJECT
+public:
+    QMutex mutex;
+    QMap<pid_t, ProcStat> stats;
+
+    void run() override {
+        char err[PCAP_ERRBUF_SIZE];
+        pcap_t *p = pcap_open_live("any", 65536, 1, 500, err);
+        if(!p) return;
+        while(!isInterruptionRequested()){
+            pcap_dispatch(p, 100, [](u_char *user, const struct pcap_pkthdr *h, const u_char *bytes){
+                CaptureThread *self = (CaptureThread*)user;
+                if(h->caplen < 14+20) return;
+                const u_char *ip = bytes+14;
+                if((ip[0]>>4)!=4) return;
+                uint8_t proto = ip[9];
+                int ihl = (ip[0]&0x0F)*4;
+                const u_char *l4 = ip+ihl;
+                if(h->caplen < 14 + ihl) return;
+                uint16_t sport=0,dport=0;
+                if(proto==6 && h->caplen >= 14+ihl+20){ sport = ntohs(*(uint16_t*)(l4)); dport = ntohs(*(uint16_t*)(l4+2)); }
+                else if(proto==17 && h->caplen >= 14+ihl+8){ sport = ntohs(*(uint16_t*)(l4)); dport = ntohs(*(uint16_t*)(l4+2)); }
+                else return;
+
+                // Simplified attribution: attribute to pid 0 (kernel) unless mapping implemented.
+                pid_t pid = 0;
+
+                self->mutex.lock();
+                ProcStat &ps = self->stats[pid];
+                ps.pid = pid;
+                if(ps.cmd.isEmpty()) ps.cmd = (pid==0?QString("[kernel]"):QString("pid%1").arg(pid));
+                ps.inBytes += h->len; // for demo we treat all as input
+                self->mutex.unlock();
+            }, (u_char*)this);
+            msleep(50);
+        }
+        pcap_close(p);
+    }
+signals:
+    void updated();
+};
+
+int main(int argc, char **argv){
+    QApplication a(argc,argv);
+    NetModel model;
+    QTableView tv; tv.setModel(&model);
+    tv.setWindowTitle("---- nettop ----");
+    tv.resize(800,600);
+    tv.show();
+
+    CaptureThread cap;
+    cap.start();
+
+    // UI timer: 10 ms refresh
+    QTimer uiTimer;
+    uiTimer.setInterval(10); // 10 ms
+    QObject::connect(&uiTimer, &QTimer::timeout, [&](){
+        // Copy snapshot under lock quickly
+        cap.mutex.lock();
+        QMap<pid_t, ProcStat> snapshot = cap.stats;
+        cap.mutex.unlock();
+
+        // Apply snapshot to model (efficient in-place update)
+        model.applySnapshot(snapshot);
+    });
+    uiTimer.start();
+
+    int ret = a.exec();
+    cap.requestInterruption();
+    cap.wait();
+    return ret;
+}
+
+#include "nettop_qt.moc"

@@ -1,0 +1,32 @@
+#ifndef APP_H
+#define APP_H
+
+
+#define TOOLBAR_HEIGHT 48
+#define STATUS_HEIGHT 24
+
+/* Public API zwischen Modulen */
+
+/* Initialisierung / Shutdown */
+int render_init(int win_w, int win_h);
+void render_shutdown(void);
+
+/* Resize / Draw */
+void render_resize(int w, int h);
+void render_draw(void);
+
+/* Zoom / Pan (zentriert) */
+void render_zoom_to_centered(double new_zoom, int animate);
+void render_zoom_in_centered(void);
+void render_zoom_out_centered(void);
+
+/* UI entrypoints (main registriert GLUT callbacks that call these) */
+void ui_init(void);
+void ui_on_display(void);
+void ui_on_reshape(int w, int h);
+void ui_on_mouse(int button, int state, int x, int y);
+void ui_on_motion(int x, int y);
+void ui_on_passive_motion(int x, int y);
+void ui_on_keyboard(unsigned char key, int x, int y);
+
+#endif /* APP_H */

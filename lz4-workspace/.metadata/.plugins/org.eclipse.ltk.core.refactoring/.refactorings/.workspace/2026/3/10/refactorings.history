@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Copy Project &apos;lz4packer1&apos;" description="Copy Project &apos;lz4packer1&apos;" destination="/wrk/lz4-workspace" element="/lz4packer1" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="lz4packer2" stamp="1772879933095"/>&#x0A;<refactoring comment="Delete resource &apos;lz4packer2/build&apos;" deleteContents="false" description="Delete resource &apos;lz4packer2/build&apos;" element1="/lz4packer2/build" flags="7" id="org.eclipse.ltk.core.refactoring.delete.resources" resources="1" stamp="1772880188565"/>
+</session>

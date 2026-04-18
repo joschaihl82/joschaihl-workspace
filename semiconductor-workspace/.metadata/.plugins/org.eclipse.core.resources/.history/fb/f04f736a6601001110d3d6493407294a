@@ -1,0 +1,333 @@
+// hydro_ca_sdl2.c
+// Kompiliere mit: gcc -O2 -o hydro hydro_ca_sdl2.c `sdl2-config --cflags --libs` -lm
+
+#include <SDL2/SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+#define W 200
+#define H 120
+#define CELL_SIZE 6
+
+// pipe mask bits
+#define P_N 1
+#define P_E 2
+#define P_S 4
+#define P_W 8
+
+// Simulation parameters (anpassbar)
+const double C = 0.25;           // Flusskoeffizient (Leitfähigkeit)
+const double dt = 0.5;           // Zeitschritt
+const double damping = 0.999;    // leichte Dämpfung
+const double wave_threshold = 0.02; // Schwelle für dunkle Wellenkante
+const double max_h_display = 1.0; // max Höhe für Farbskalierung
+
+// Grid
+static uint8_t pipe_mask[H][W];
+static double h[H][W];
+static double h_next[H][W];
+
+// Hilfsfunktionen
+static inline int in_bounds(int y, int x) { return x>=0 && x<W && y>=0 && y<H; }
+
+void clear_grid() {
+    memset(pipe_mask, 0, sizeof(pipe_mask));
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) { h[y][x]=0.0; h_next[y][x]=0.0; }
+}
+
+// Erzeuge ein Beispielnetz: eine Hauptleitung, die sich aufspaltet und wieder zusammenführt
+void build_example_network() {
+    clear_grid();
+    int mid = H/2;
+    // Hauptleitung horizontal
+    for (int x=10; x<W-10; x++) {
+        pipe_mask[mid][x] |= P_E | P_W;
+        if (x>10) pipe_mask[mid][x-1] |= P_E;
+        if (x<W-11) pipe_mask[mid][x+1] |= P_W;
+    }
+    // Links: Split in drei Äste (oben, mitte, unten)
+    int split_x = 40;
+    pipe_mask[mid][split_x] |= P_N | P_S;
+    // obere Verzweigung
+    for (int y=mid-1; y>mid-18; y--) {
+        pipe_mask[y][split_x] |= P_S | P_N;
+        pipe_mask[y+1][split_x] |= P_N;
+    }
+    // obere Bogen nach rechts
+    int bx = split_x;
+    int by = mid-18;
+    for (int x=bx; x<bx+30; x++) {
+        pipe_mask[by][x] |= P_W | P_E;
+        if (x>bx) pipe_mask[by][x-1] |= P_E;
+    }
+    // mittlere Abzweigung (kurzer)
+    for (int x=split_x; x<split_x+18; x++) {
+        pipe_mask[mid-6][x] |= P_W | P_E;
+        if (x>split_x) pipe_mask[mid-6][x-1] |= P_E;
+    }
+    // untere Abzweigung
+    for (int y=mid+1; y<mid+18; y++) {
+        pipe_mask[y][split_x] |= P_N | P_S;
+        pipe_mask[y-1][split_x] |= P_S;
+    }
+    by = mid+18;
+    for (int x=bx; x<bx+30; x++) {
+        pipe_mask[by][x] |= P_W | P_E;
+        if (x>bx) pipe_mask[by][x-1] |= P_E;
+    }
+    // Rechts: wieder zusammenführen
+    int join_x = W-50;
+    // connect top branch down to main
+    for (int x=bx+30; x<=join_x; x++) {
+        pipe_mask[mid-18][x] |= P_W | P_E;
+        if (x>bx+30) pipe_mask[mid-18][x-1] |= P_E;
+    }
+    for (int x=bx+30; x<=join_x; x++) {
+        pipe_mask[mid+18][x] |= P_W | P_E;
+        if (x>bx+30) pipe_mask[mid+18][x-1] |= P_E;
+    }
+    // vertical connectors to main near join_x
+    for (int y=mid-18; y<mid; y++) {
+        pipe_mask[y][join_x] |= P_N | P_S;
+        pipe_mask[y+1][join_x] |= P_N;
+    }
+    for (int y=mid+18; y>mid; y--) {
+        pipe_mask[y][join_x+6] |= P_N | P_S;
+        pipe_mask[y-1][join_x+6] |= P_S;
+    }
+    // connect to main horizontal
+    for (int x=join_x; x< W-10; x++) {
+        pipe_mask[mid][x] |= P_W | P_E;
+        if (x>join_x) pipe_mask[mid][x-1] |= P_E;
+    }
+
+    // Initiale Wasserverteilung: etwas Wasser in der linken Hälfte der Hauptleitung
+    for (int x=12; x<split_x; x++) {
+        h[mid][x] = 0.6 * (1.0 - 0.5 * ((double)(x-12)/(split_x-12)));
+    }
+    // kleine Störung in einem Ast, um Wellen zu erzeugen
+    h[mid-6][split_x+4] += 0.4;
+    h[mid-18][bx+6] += 0.3;
+}
+
+// Simulation: ein Zeitschritt
+void step_simulation() {
+    // Nullsetzen
+    for (int y=0;y<H;y++) for (int x=0;x<W;x++) h_next[y][x] = h[y][x];
+
+    // Wir berechnen Flüsse paarweise, um Konservierung zu gewährleisten.
+    // Für jede Zelle, für jeden Nachbarn (N,E,S,W) mit Rohrverbindung:
+    for (int y=0;y<H;y++) {
+        for (int x=0;x<W;x++) {
+            if (!pipe_mask[y][x]) continue;
+            double hi = h[y][x];
+            // N
+            if (pipe_mask[y][x] & P_N) {
+                int ny=y-1, nx=x;
+                if (in_bounds(ny,nx) && (pipe_mask[ny][nx] & P_S)) {
+                    double hj = h[ny][nx];
+                    double diff = hi - hj;
+                    if (diff > 0) {
+                        double F = C * diff * dt;
+                        // begrenzen, damit nicht mehr Wasser als vorhanden verschoben wird
+                        double maxmove = hi;
+                        if (F > maxmove) F = maxmove;
+                        h_next[y][x] -= F;
+                        h_next[ny][nx] += F;
+                    }
+                }
+            }
+            // E
+            if (pipe_mask[y][x] & P_E) {
+                int ny=y, nx=x+1;
+                if (in_bounds(ny,nx) && (pipe_mask[ny][nx] & P_W)) {
+                    double hj = h[ny][nx];
+                    double diff = hi - hj;
+                    if (diff > 0) {
+                        double F = C * diff * dt;
+                        double maxmove = hi;
+                        if (F > maxmove) F = maxmove;
+                        h_next[y][x] -= F;
+                        h_next[ny][nx] += F;
+                    }
+                }
+            }
+            // S
+            if (pipe_mask[y][x] & P_S) {
+                int ny=y+1, nx=x;
+                if (in_bounds(ny,nx) && (pipe_mask[ny][nx] & P_N)) {
+                    double hj = h[ny][nx];
+                    double diff = hi - hj;
+                    if (diff > 0) {
+                        double F = C * diff * dt;
+                        double maxmove = hi;
+                        if (F > maxmove) F = maxmove;
+                        h_next[y][x] -= F;
+                        h_next[ny][nx] += F;
+                    }
+                }
+            }
+            // W
+            if (pipe_mask[y][x] & P_W) {
+                int ny=y, nx=x-1;
+                if (in_bounds(ny,nx) && (pipe_mask[ny][nx] & P_E)) {
+                    double hj = h[ny][nx];
+                    double diff = hi - hj;
+                    if (diff > 0) {
+                        double F = C * diff * dt;
+                        double maxmove = hi;
+                        if (F > maxmove) F = maxmove;
+                        h_next[y][x] -= F;
+                        h_next[ny][nx] += F;
+                    }
+                }
+            }
+        }
+    }
+
+    // Dämpfung und Kopieren zurück
+    for (int y=0;y<H;y++) {
+        for (int x=0;x<W;x++) {
+            if (!pipe_mask[y][x]) { h[y][x]=0.0; continue; }
+            // Verhindere negative Höhen durch numerische Fehler
+            if (h_next[y][x] < 0.0) h_next[y][x] = 0.0;
+            // Dämpfung
+            h[y][x] = h_next[y][x] * damping;
+            // Begrenze maximale Höhe (nur für Stabilität)
+            if (h[y][x] > 5.0) h[y][x] = 5.0;
+        }
+    }
+}
+
+// Zeichnen
+void render(SDL_Renderer *ren) {
+    // Hintergrund schwarz
+    SDL_SetRenderDrawColor(ren, 0,0,0,255);
+    SDL_RenderClear(ren);
+
+    // Zellen zeichnen
+    for (int y=0;y<H;y++) {
+        for (int x=0;x<W;x++) {
+            int sx = x * CELL_SIZE;
+            int sy = y * CELL_SIZE;
+            SDL_Rect cell = { sx, sy, CELL_SIZE, CELL_SIZE };
+
+            if (pipe_mask[y][x]) {
+                // Rohrgrundfarbe: weiß
+                SDL_SetRenderDrawColor(ren, 255,255,255,255);
+                SDL_RenderFillRect(ren, &cell);
+
+                // Wasser: blau, Höhe skaliert
+                double hh = h[y][x];
+                double frac = hh / max_h_display;
+                if (frac > 1.0) frac = 1.0;
+                if (frac > 0.0001) {
+                    int water_h_px = (int)round(frac * CELL_SIZE);
+                    SDL_Rect water_rect = { sx, sy + (CELL_SIZE - water_h_px), CELL_SIZE, water_h_px };
+                    // Farbskala: hellblau -> tiefblau
+                    int r = (int)(30 + (1.0-frac)*40);   // 30..70
+                    int g = (int)(120 + (1.0-frac)*60);  // 120..180
+                    int b = (int)(200 + frac*55);        // 200..255
+                    SDL_SetRenderDrawColor(ren, r,g,b,255);
+                    SDL_RenderFillRect(ren, &water_rect);
+
+                    // Wellenkante: wenn starker Gradient zu einem Nachbarn
+                    double max_grad = 0.0;
+                    // check neighbors
+                    const int dy[4] = {-1,0,1,0};
+                    const int dx[4] = {0,1,0,-1};
+                    for (int k=0;k<4;k++) {
+                        int ny=y+dy[k], nx=x+dx[k];
+                        if (!in_bounds(ny,nx)) continue;
+                        if (!(pipe_mask[ny][nx])) continue;
+                        double grad = fabs(h[y][x] - h[ny][nx]);
+                        if (grad > max_grad) max_grad = grad;
+                    }
+                    if (max_grad > wave_threshold) {
+                        // zeichne dunkle Kante oben der Wasserfläche
+                        SDL_SetRenderDrawColor(ren, 0,0,120,255); // dunkelblau
+                        SDL_Rect edge = { sx, sy + (CELL_SIZE - water_h_px), CELL_SIZE, 1 };
+                        SDL_RenderFillRect(ren, &edge);
+                    }
+                }
+            } else {
+                // Leerzelle: Hintergrund (schwarz) -> nichts zu tun
+            }
+        }
+    }
+
+    SDL_RenderPresent(ren);
+}
+
+int main(int argc, char **argv) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init Fehler: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    int win_w = W * CELL_SIZE;
+    int win_h = H * CELL_SIZE;
+    SDL_Window *win = SDL_CreateWindow("Hydrodynamischer Zellularautomat - Rohre",
+                                       SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                       win_w, win_h, SDL_WINDOW_SHOWN);
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow Fehler: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!ren) {
+        fprintf(stderr, "SDL_CreateRenderer Fehler: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        SDL_Quit();
+        return 1;
+    }
+
+    build_example_network();
+
+    int running = 1;
+    Uint32 last = SDL_GetTicks();
+    double accumulator = 0.0;
+    const double sim_step_ms = 16.0; // ~60 Hz visual
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+                if (ev.key.keysym.sym == SDLK_r) build_example_network(); // reset
+            }
+            if (ev.type == SDL_MOUSEBUTTONDOWN) {
+                int mx = ev.button.x / CELL_SIZE;
+                int my = ev.button.y / CELL_SIZE;
+                if (in_bounds(my,mx) && pipe_mask[my][mx]) {
+                    // Klick fügt Wasser hinzu
+                    h[my][mx] += 0.8;
+                }
+            }
+        }
+
+        Uint32 now = SDL_GetTicks();
+        double elapsed = (double)(now - last);
+        last = now;
+        accumulator += elapsed;
+
+        // mehrere Simulationsschritte, falls nötig
+        while (accumulator >= sim_step_ms) {
+            // führe mehrere kleine sim-steps aus, um Stabilität zu erhöhen
+            for (int i=0;i<1;i++) step_simulation();
+            accumulator -= sim_step_ms;
+        }
+
+        render(ren);
+        SDL_Delay(8); // kleine Pause, CPU schonen
+    }
+
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+}

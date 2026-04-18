@@ -1,0 +1,2 @@
+/home/josh/visual-studio-workspace/test_struct_init.c:2: struct S s = { 1, 'x', 3 };
+                                                                  ^ token mismatch: expected ;

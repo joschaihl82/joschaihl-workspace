@@ -1,0 +1,2650 @@
+#include<stdbool.h>
+
+typedef enum {
+    TK_RESERVED,
+    TK_TYPE,
+    TK_ID,
+    TK_NUM,
+    TK_CHAR,
+    TK_STRING,
+    TK_EOF,
+} token_kind;
+
+typedef enum {
+    NOHEAD,
+    VOID,
+    BOOL,
+    CHAR,
+    SHORT,
+    INT,
+    LONG,
+    PTR,
+    ARRAY,
+    FUNC,
+    STRUCT,
+    ENUM,
+} type_kind;
+
+typedef enum {
+    SY_VAR,
+    SY_ENUM,
+    SY_TYPE,
+    SY_TAG,
+} symb_kind;https://github.com/season1618/c-compiler/tree/main
+
+typedef enum {
+    // definition
+    ND_FUNC_DEF,
+    ND_GLOBAL_DEF,
+    ND_LOCAL_CONST,
+
+    // statement
+    ND_BLOCK,
+    ND_IF,
+    ND_SWITCH,
+    ND_CASE,
+    ND_DEFAULT,
+    ND_WHILE,
+    ND_FOR,
+    ND_CONTINUE,
+    ND_BREAK,
+    ND_RET,
+
+    // binary operator
+    ND_COMMA,
+    ND_ASSIGN,
+    ND_COND,
+    ND_LOG_OR,
+    ND_LOG_AND,
+    ND_BIT_OR,
+    ND_BIT_XOR,
+    ND_BIT_AND,
+    ND_EQ,
+    ND_NEQ,
+    ND_LT,
+    ND_LEQ,
+    ND_LSHIFT,
+    ND_RSHIFT,
+    ND_ADD,
+    ND_SUB,
+    ND_MUL,
+    ND_DIV,
+    ND_MOD,
+
+    // unary operator
+    ND_NEG,
+    ND_LOG_NOT,
+    ND_ADR,
+    ND_DEREF,
+    ND_CAST,
+
+    // primary
+    ND_GLOBAL,
+    ND_LOCAL,
+    ND_NUM,
+    ND_STRING,
+    ND_FUNC_CALL,
+    ND_DOT,
+    ND_ARROW,
+} node_kind;
+
+typedef struct token token;
+typedef struct type type;
+typedef struct symb symb;
+typedef struct node node;
+typedef struct block block;
+
+struct token {
+    token_kind kind;
+    token *next;
+    char *str;
+    int len;
+    int val;
+};
+
+struct type {
+    type_kind kind;
+    type *ptr_to;
+    symb *head;
+    int size;
+    int align;
+    char *name;
+    int len;
+};
+
+struct symb {
+    symb_kind kind;
+    symb *next;
+    type *ty;
+    char *name;
+    int len;
+    int offset;
+    int val;
+    bool is_func_def;
+};
+
+struct node {
+    node_kind kind;
+    node *op1, *op2, *op3, *op4;
+    node *head;
+    node *next;
+    type *ty;
+    char *name;
+    int len;
+    int offset;
+    int val;
+};
+
+struct block {
+    node_kind kind;
+    block *next;
+    int begin;
+    int end;
+};
+
+extern int size_of();
+extern void error();
+extern token *tokenize();
+extern node *program();
+extern void gen_code();
+
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+char *p;
+token *cur;
+
+int NUM_TYPE = 17;
+int NUM_KEYWORD = 12;
+int NUM_PUNCT = 41;
+int NUM_ESCAPE = 13;
+char *types[17] = {"extern", "const", "volatile", "static", "signed", "unsigned", "void", "_Bool", "char", "short", "int", "long", "float", "double", "struct", "union", "enum"};
+char *keywords[12] = {"include", "typedef", "return", "if", "else", "switch", "case", "while", "for", "continue", "break", "sizeof"};
+char *puncts[41] = {
+    "+=", "-=", "*=", "/=", "%=", "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "++", "--", "->", 
+    "#", "=", "?", ":", "|", "^", "&", "<", ">", "+", "-", "*", "/", "%", "&", "!", ".", ",", ";", "(", ")", "{", "}", "[", "]"
+};
+char escape[2][13] = {
+    { 'a',  'b',  'e',  'f',  'n',  'r',  't',  'v', '\\', '\'', '\"',  '?',  '0'},
+    {'\a', '\b', '\e', '\f', '\n', '\r', '\t', '\v', '\\', '\'', '\"', '\?', '\0'}
+};
+
+bool is_alpha(char c){
+    return c == '_' || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+
+bool is_alnum(char c){
+    return is_alpha(c) || isdigit(c);
+}
+
+void next_token(token_kind kind, int len){
+    token *nxt = calloc(1, sizeof(token));
+    nxt->kind = kind;
+    nxt->str = p;
+    nxt->len = len;
+
+    cur->next = nxt;
+    cur = nxt;
+    p += len;
+}
+
+void next_ident(){
+    token *nxt = calloc(1, sizeof(token));
+    nxt->kind = TK_ID;
+    nxt->str = p;
+    nxt->len = 0;
+    while(is_alnum(*p)){
+        p++;
+        nxt->len++;
+    }
+    cur->next = nxt;
+    cur = nxt;
+}
+
+void next_number(){
+    token *nxt = calloc(1, sizeof(token));
+    nxt->kind = TK_NUM;
+    nxt->str = p;
+    nxt->len = 0;
+    nxt->val = 0;
+    while(isdigit(*p)){
+        nxt->val *= 10;
+        nxt->val += *p - '0';
+        nxt->len++;
+        p++;
+    }
+    cur->next = nxt;
+    cur = nxt;
+}
+
+void next_char(){
+    token *nxt = calloc(1, sizeof(token));
+    nxt->kind = TK_CHAR;
+    nxt->str = p;
+    nxt->len = 1;
+    p++;
+    while(true){
+        if(*p == '\\'){
+            p += 2;
+            nxt->len += 2;
+            continue;
+        }
+        if(*p != '\''){
+            p++;
+            nxt->len++;
+            continue;
+        }
+        p++;
+        nxt->len++;
+        break;
+    }
+
+    if(nxt->len == 3){
+        nxt->val = nxt->str[1];
+    }
+    if(nxt->len == 4 && nxt->str[1] == '\\'){
+        for(int i = 0; i < NUM_ESCAPE; i++){
+            if(nxt->str[2] == escape[0][i]){
+                nxt->val = escape[1][i];
+                break;
+            }
+        }
+    }
+
+    cur->next = nxt;
+    cur = nxt;
+}
+
+void next_string(){
+    token *nxt = calloc(1, sizeof(token));
+    nxt->kind = TK_STRING;
+    nxt->str = p;
+    nxt->len = 1;
+    p++;
+    while(true){
+        if(*p == '\\'){
+            p += 2;
+            nxt->len += 2;
+            continue;
+        }
+        if(*p != '\"'){
+            p++;
+            nxt->len++;
+            continue;
+        }
+        p++;
+        nxt->len++;
+        break;
+    }
+
+    cur->next = nxt;
+    cur = nxt;
+}
+
+bool read_type(){
+    for(int i = 0; i < NUM_TYPE; i++){
+        char *s = types[i];
+        int len = strlen(s);
+        if(memcmp(p, s, len) == 0 && !is_alnum(p[len])){
+            next_token(TK_TYPE, len);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_keyword(){
+    for(int i = 0; i < NUM_KEYWORD; i++){
+        char *s = keywords[i];
+        int len = strlen(s);
+        if(memcmp(p, s, len) == 0 && !is_alnum(p[len])){
+            next_token(TK_RESERVED, len);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool read_punct(){
+    for(int i = 0; i < NUM_PUNCT; i++){
+        char *s = puncts[i];
+        int len = strlen(s);
+        if(memcmp(p, s, len) == 0){
+            next_token(TK_RESERVED, len);
+            return true;
+        }
+    }
+    return false;
+}
+
+token *tokenize(char *code_head){
+    p = code_head;
+    token *token_head = calloc(1, sizeof(token));
+    cur = token_head;
+
+    while(*p){
+        // skip white space
+        if(isspace(*p)){
+            p++;
+            continue;
+        }
+        // skip linemarker
+        if(*p == '#'){
+            while(*p != '\n'){
+                p++;
+            }
+            continue;
+        }
+        // skip line comment
+        if(memcmp(p, "//", 2) == 0){
+            p += 2;
+            while(*p != '\n'){
+                p++;
+            }
+            continue;
+        }
+        // skip block comment
+        if(memcmp(p, "/*", 2) == 0){
+            p += 2;
+            while(memcmp(p, "*/", 2)){
+                p++;
+            }
+            p += 2;
+            continue;
+        }
+        // skip __attribute__
+        if(memcmp(p, "__attribute__", 13) == 0){
+            while(*p != ';') p++;
+            continue;
+        }
+        if(memcmp(p, "__extension__", 13) == 0){
+            p += 13;
+            continue;
+        }
+        if(memcmp(p, "__inline", 8) == 0){
+            p += 8;
+            continue;
+        }
+        if(memcmp(p, "__asm__", 7) == 0){
+            while(*p != '\n') p++;
+            continue;
+        }
+        if(memcmp(p, "__restrict", 10) == 0){
+            p += 10;
+            continue;
+        }
+
+        if(*p == '\''){
+            next_char();
+            continue;
+        }
+        if(*p == '\"'){
+            next_string();
+            continue;
+        }
+        if(read_type()) continue;
+        if(read_keyword()) continue;
+        if(read_punct()) continue;
+        if(isdigit(*p)){
+            next_number();
+            continue;
+        }
+        if(is_alpha(*p)){
+            next_ident();
+            continue;
+        }
+        error(cur, "invalid token");
+    }
+    next_token(TK_EOF, 0);
+    return token_head->next;
+}
+
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+token *cur;
+node *node_head, *node_tail;
+node *switch_head;
+symb *tag_head;
+symb *global_head;
+symb *local_head;
+int lc_num = 0;
+int local_num;
+int max_offset;
+
+void ext();
+node *dcl();
+symb *type_whole();
+type *type_head();
+symb *type_ident();
+node *init_local();
+node *initializer();
+node *stmt();
+node *expr();
+node *assign();
+node *cond();
+node *log_or();
+node *log_and();
+node *bit_or();
+node *bit_xor();
+node *bit_and();
+node *equal();
+node *relational();
+node *shift();
+node *add();
+node *mul();
+node *unary();
+node *primary();
+
+bool expect(char *op){
+    if(strlen(op) == cur->len && memcmp(op, cur->str, cur->len) == 0){
+        cur = cur->next;
+        return true;
+    }
+    return false;
+}
+
+int get_number(){
+    if(cur->kind != TK_NUM){
+        error(cur, "expected number");
+    }
+    int val = cur->val;
+    cur = cur->next;
+    return val;
+}
+
+type *type_base(type_kind kind){
+    type *ty = calloc(1, sizeof(type));
+    ty->kind = kind;
+    return ty;
+}
+
+type *type_ptr(type *base){
+    type *ty = calloc(1, sizeof(type));
+    ty->kind = PTR;
+    ty->ptr_to = base;
+    return ty;
+}
+
+type *type_array(type *base, size_t size){
+    type *ty = calloc(1, sizeof(type));
+    ty->kind = ARRAY;
+    ty->ptr_to = base;
+    ty->size = size;
+    return ty;
+}
+
+bool is_num(type *ty){
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+        case SHORT:
+        case INT:
+        case LONG:
+            return true;
+    }
+    return false;
+}
+
+bool is_int(type *ty){
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+        case SHORT:
+        case INT:
+        case LONG:
+        case PTR:
+            return true;
+    }
+    return false;
+}
+
+bool is_ptr(type *ty){
+    return ty->kind == PTR || ty->kind == ARRAY;
+}
+
+bool match_type(type *t1, type *t2){
+    if(t1->kind != t2->kind){
+        return false;
+    }
+    switch(t1->kind){
+        case VOID:
+        case BOOL:
+        case CHAR:
+        case SHORT:
+        case INT:
+        case LONG:
+            return true;
+        case PTR:
+        case ARRAY:
+            return match_type(t1->ptr_to, t2->ptr_to);
+        case FUNC:
+            if(!match_type(t1->ptr_to, t2->ptr_to)) return false;
+            for(symb *param1 = t1->head, *param2 = t2->head; param1 && param2; param1 = param1->next, param2 = param2->next){
+                if(!match_type(param1->ty, param2->ty)) return false;
+            }
+            return true;
+        case STRUCT:
+            if(!t1->name || !t2->name) return false;
+            return t1->len == t2->len && memcmp(t1->name, t2->name, t2->len) == 0;
+    }
+}
+
+bool castable(type *t1, type *t2){
+    if(is_num(t1) && is_num(t2)) return true;
+    if(is_ptr(t1) && is_ptr(t2)) return true;
+    return t1->kind == t2->kind;
+}
+
+bool find_type(){
+    if(cur->kind == TK_TYPE){
+        return true;
+    }
+    for(symb *var = global_head; var; var = var->next){
+        if(var->kind == SY_TYPE && cur->len == var->len && memcmp(cur->str, var->name, var->len) == 0){
+            return true;
+        }
+    }
+    return false;
+}
+
+bool find_type_next(){
+    if(cur->next->kind == TK_TYPE){
+        return true;
+    }
+    for(symb *var = global_head; var; var = var->next){
+        if(var->kind == SY_TYPE && cur->next->len == var->len && memcmp(cur->next->str, var->name, var->len) == 0){
+            return true;
+        }
+    }
+    return false;
+}
+
+void validate_type(type *ty){
+    if(ty->kind == VOID){
+        error(cur, "variable or field declared void");
+    }
+    type *nested = ty;
+    while(nested){
+        if(nested->ptr_to){
+            if(nested->kind == ARRAY && nested->ptr_to->kind == VOID){
+                error(cur, "declaration as array of voids");
+            }
+            if(nested->kind == FUNC && nested->ptr_to->kind == ARRAY){
+                error(cur, "declaration as function returning an array");
+            }
+        }
+        nested = nested->ptr_to;
+    }
+}
+
+int size_of(type *ty){
+    switch(ty->kind){
+        case VOID:
+        case BOOL:
+        case CHAR:
+        case FUNC:
+            return 1;
+        case SHORT:
+            return 2;
+        case INT:
+        case ENUM:
+            return 4;
+        case LONG:
+        case PTR:
+            return 8;
+        case ARRAY:
+            return size_of(ty->ptr_to) * ty->size;
+        case STRUCT:
+            return ty->size;
+    }
+}
+
+int align_of(type *ty){
+    switch(ty->kind){
+        case VOID:
+        case BOOL:
+        case CHAR:
+        case FUNC:
+            return 1;
+        case SHORT:
+            return 2;
+        case INT:
+        case ENUM:
+            return 4;
+        case LONG:
+        case PTR:
+            return 8;
+        case ARRAY:
+            return size_of(ty->ptr_to);
+        case STRUCT:
+            return ty->align;
+    }
+}
+
+void print_type(type *ty, int num){
+    if(num == 0) return;
+    num--;
+    switch(ty->kind){
+        case NOHEAD:
+            fprintf(stderr, "NOHEAD");
+            break;
+        case VOID:
+            fprintf(stderr, "VOID");
+            break;
+        case BOOL:
+            fprintf(stderr, "BOOL");
+        case CHAR:
+            fprintf(stderr, "CHAR");
+            break;
+        case SHORT:
+            fprintf(stderr, "SHORT");
+            break;
+        case INT:
+            fprintf(stderr, "INT");
+            break;
+        case LONG:
+            fprintf(stderr, "LONG");
+            break;
+        case PTR:
+            fprintf(stderr, "PTR -> ");
+            print_type(ty->ptr_to, num);
+            break;
+        case FUNC:
+            fprintf(stderr, "FUNC -> ");
+            print_type(ty->ptr_to, num);
+            break;
+        case STRUCT:
+            fprintf(stderr, "STRUCT { ");
+            for(symb *sy = ty->head; sy; sy = sy->next){
+                fprintf(stderr, "%.*s ", sy->len, sy->name);
+                print_type(sy->ty, num);
+                fprintf(stderr, ", ");
+            }
+            fprintf(stderr, "}");
+            break;
+        case ENUM:
+            fprintf(stderr, "ENUM");
+            break;
+    }
+}
+
+void push_ext(node *nd){
+    node_tail->next = nd;
+    node_tail = nd;
+}
+
+void push_tag(type *ty){
+    symb *sy = calloc(1, sizeof(symb));
+    sy->kind = SY_TAG;
+    sy->next = tag_head;
+    sy->ty = ty;
+    sy->name = ty->name;
+    sy->len = ty->len;
+
+    tag_head = sy;
+}
+
+void push_global(symb_kind kind, symb *sy){
+    for(symb *var = global_head; var; var = var->next){
+        if(sy->len == var->len && memcmp(sy->name, var->name, var->len) == 0){
+            return;
+        }
+    }
+    symb *var = calloc(1, sizeof(symb));
+    var->kind = kind;
+    var->next = global_head;
+    var->ty = sy->ty;
+    var->name = sy->name;
+    var->len = sy->len;
+
+    global_head = var;
+}
+
+void push_enum(char *name, int len, int val){
+    symb *var = calloc(1, sizeof(symb));
+    var->kind = SY_ENUM;
+    var->next = global_head;
+    var->ty = type_base(ENUM);
+    var->name = name;
+    var->len = len;
+    var->val = val;
+
+    global_head = var;
+}
+
+void push_local(symb *sy){
+    for(symb *var = local_head; var; var = var->next){
+        if(sy->len == var->len && memcmp(sy->name, var->name, var->len) == 0){
+            error(cur, "this variable is already declared");
+        }
+    }
+    symb *var = calloc(1, sizeof(symb));
+    var->next = local_head;
+    var->ty = sy->ty;
+    var->name = sy->name;
+    var->len = sy->len;
+    var->offset = local_head->offset + size_of(sy->ty);
+    var->offset = (var->offset + align_of(sy->ty) - 1) / align_of(sy->ty) * align_of(sy->ty);
+
+    local_head = var;
+    local_num++;
+    if(max_offset < var->offset) max_offset = var->offset;
+}
+
+void pop_local(int num){
+    for(; local_num > num; local_num--){
+        local_head = local_head->next;
+    }
+}
+
+node *node_global_def(symb *var, node *init){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_GLOBAL_DEF;
+    nd->ty = var->ty;
+    nd->name = var->name;
+    nd->len = var->len;
+    nd->head = init;
+    return nd;
+}
+
+node *node_num();
+
+node *node_cond(node *cond, node *lhs, node *rhs){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_COND;
+    nd->op1 = cond;
+    nd->op2 = lhs;
+    nd->op3 = rhs;
+    if(castable(lhs->ty, rhs->ty)) nd->ty = lhs->ty;
+    else error(cur, "invalid operands type to conditional operator");
+    return nd;
+}
+
+node *node_binary(node_kind kind, node *lhs, node *rhs){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = kind;
+    nd->op1 = lhs;
+    nd->op2 = rhs;
+
+    switch(kind){
+        case ND_COMMA:
+            nd->ty = rhs->ty;
+            break;
+        case ND_ASSIGN:
+            if(castable(lhs->ty, rhs->ty)){
+                nd->ty = lhs->ty;
+                break;
+            }
+            error(cur, "invalid operands to assignment operator");
+        case ND_LOG_OR:
+        case ND_LOG_AND:
+            if(is_int(lhs->ty) && is_int(rhs->ty)){
+                nd->ty = type_base(BOOL);
+                break;
+            }
+            error(cur, "invalid operands to logical or/and operator");
+        case ND_BIT_OR:
+        case ND_BIT_XOR:
+        case ND_BIT_AND:
+            if(is_num(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = type_base(INT);
+                break;
+            }
+            error(cur, "invalid operands to bitwise or/xor/and operator");
+        case ND_EQ:
+        case ND_NEQ:
+        case ND_LT:
+        case ND_LEQ:
+            if(castable(lhs->ty, rhs->ty)){
+                nd->ty = type_base(BOOL);
+                break;
+            }
+            error(cur, "invalid operands to relational operator");
+        case ND_LSHIFT:
+        case ND_RSHIFT:
+            if(is_num(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = type_base(INT);
+                break;
+            }
+            error(cur, "invalid operands to bitwise-shift operator");
+        case ND_ADD:
+            if(is_ptr(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = lhs->ty;
+                nd->op2 = node_binary(ND_MUL, rhs, node_num(type_base(INT), size_of(lhs->ty->ptr_to)));
+                break;
+            }
+            if(is_ptr(rhs->ty) && is_num(lhs->ty)){
+                nd->ty = rhs->ty;
+                nd->op1 = node_binary(ND_MUL, lhs, node_num(type_base(INT), size_of(lhs->ty->ptr_to)));
+                break;
+            }
+            if(is_num(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = lhs->ty;
+                break;
+            }
+            error(cur, "invalid operands to binary +");
+        case ND_SUB:
+            if(is_ptr(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = lhs->ty;
+                nd->op2 = node_binary(ND_MUL, rhs, node_num(type_base(INT), size_of(lhs->ty->ptr_to)));
+                break;
+            }
+            if(lhs->ty->kind == PTR && rhs->ty->kind == PTR && match_type(lhs->ty, rhs->ty)){
+                nd->ty = type_base(INT);
+                return node_binary(ND_DIV, nd, node_num(type_base(INT), size_of(lhs->ty->ptr_to)));
+            }
+            if(is_num(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = lhs->ty;
+                break;
+            }
+            error(cur, "invalid operands to binary -");
+        case ND_MUL:
+        case ND_DIV:
+        case ND_MOD:
+            if(is_num(lhs->ty) && is_num(rhs->ty)){
+                nd->ty = type_base(INT);
+                break;
+            }
+            error(cur, "invalid operands to binary * or / or %");
+    }
+    return nd;
+}
+
+node *node_unary(node_kind kind, node *op){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = kind;
+    nd->op1 = op;
+
+    switch(kind){
+        case ND_NEG:
+            if(is_int(op->ty)){
+                nd->ty = op->ty;
+                break;
+            }
+            error(cur, "invalid type argument of unary '-'");
+        case ND_LOG_NOT:
+            if(is_int(op->ty)){
+                nd->ty = op->ty;
+                break;
+            }
+            error(cur, "invalid type argument of unary '!'");
+        case ND_ADR:
+            nd->ty = type_ptr(op->ty);
+            break;
+        case ND_DEREF:
+            if(is_ptr(op->ty)){
+                nd->ty = op->ty->ptr_to;
+                break;
+            }
+            error(cur, "invalid type argument of unary '*'");
+    }
+    return nd;
+}
+
+node *node_cast(type *ty, node *op){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_CAST;
+    nd->ty = ty;
+    nd->op1 = op;
+    return nd;
+}
+
+node *node_num(type *ty, int val){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_NUM;
+    nd->ty = ty;
+    nd->val = val;
+    return nd;
+}
+
+node *node_string(){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_STRING;
+    nd->ty = type_ptr(type_base(CHAR));
+    nd->name = cur->str;
+    nd->len = cur->len;
+    nd->offset = lc_num;
+
+    cur = cur->next;
+    lc_num++;
+
+    return nd;
+}
+
+node *node_var(char *name, int len){
+    node *nd = calloc(1, sizeof(node));
+
+    for(symb *var = local_head; var; var = var->next){
+        if(len == var->len && memcmp(name, var->name, var->len) == 0){
+            nd->kind = ND_LOCAL;
+            nd->ty = var->ty;
+            nd->offset = var->offset;
+            return nd;
+        }
+    }
+    for(symb *var = global_head; var; var = var->next){
+        if(len == var->len && memcmp(name, var->name, var->len) == 0){
+            if(var->ty->kind == ENUM){
+                return node_num(type_base(INT), var->val);
+            }
+            nd->kind = ND_GLOBAL;
+            nd->ty = var->ty;
+            nd->name = var->name;
+            nd->len = var->len;
+            return nd;
+        }
+    }
+    // wip
+    symb *sy = calloc(1, sizeof(symb));
+    sy->ty = type_base(FUNC);
+    sy->ty->ptr_to = type_base(INT);
+    sy->name = name;
+    sy->len = len;
+    push_global(SY_VAR, sy);
+    return node_var(name, len);
+
+    error(cur, "this variable is undeclared");
+}
+
+node *node_func_call(node *var){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_FUNC_CALL;
+    nd->ty = var->ty->ptr_to;
+    nd->name = var->name;
+    nd->len = var->len;
+    nd->val = 0;
+
+    node *arg;
+    while(!expect(")")){
+        arg = assign();
+        arg->next = nd->head;
+        nd->head = arg;
+        nd->val++;
+        if(expect(",")) continue;
+        if(expect(")")) break;
+        error(cur, "expected ',' or ')'");
+    }
+    return nd;
+}
+
+node *node_dot(node *var, char *name, int len){
+    if(var->ty->kind != STRUCT){
+        error(cur, "type of variable is not a structure");
+    }
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_DOT;
+    nd->op1 = var;
+    for(symb *memb = var->ty->head; memb; memb = memb->next){
+        if(len == memb->len && memcmp(name, memb->name, memb->len) == 0){
+            nd->ty = memb->ty;
+            nd->offset = memb->offset;
+            return nd;
+        }
+    }
+    error(cur, "this struct has no member named this");
+}
+
+node *node_arrow(node *var, char *name, int len){
+    if(var->ty->kind != PTR || var->ty->ptr_to->kind != STRUCT){
+        error(cur, "type of variable is not a pointer to structure");
+    }
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_ARROW;
+    nd->op1 = var;
+    for(symb *memb = var->ty->ptr_to->head; memb; memb = memb->next){
+        if(len == memb->len && memcmp(name, memb->name, memb->len) == 0){
+            nd->ty = memb->ty;
+            nd->offset = memb->offset;
+            return nd;
+        }
+    }
+    error(cur, "'this struct has no member named this");
+}
+
+int eval_const(node *nd){
+    switch(nd->kind){
+        case ND_COND:
+            return eval_const(nd->op1) ? eval_const(nd->op2) : eval_const(nd->op3);
+        case ND_NEG:
+            return - eval_const(nd->op1);
+        case ND_LOG_NOT:
+            return !eval_const(nd->op1);
+        case ND_CAST:
+            return eval_const(nd->op1);
+        case ND_NUM:
+            return nd->val;
+    }
+    int lhs = eval_const(nd->op1);
+    int rhs = eval_const(nd->op2);
+    switch(nd->kind){
+        case ND_LOG_OR:
+            return lhs || rhs;
+        case ND_LOG_AND:
+            return lhs && rhs;
+        case ND_BIT_OR:
+            return lhs | rhs;
+        case ND_BIT_XOR:
+            return lhs ^ rhs;
+        case ND_BIT_AND:
+            return lhs & rhs;
+        case ND_EQ:
+            return lhs == rhs;
+        case ND_NEQ:
+            return lhs != rhs;
+        case ND_LT:
+            return lhs < rhs;
+        case ND_LEQ:
+            return lhs <= rhs;
+        case ND_LSHIFT:
+            return lhs << rhs;
+        case ND_RSHIFT:
+            return lhs >> rhs;
+        case ND_ADD:
+            return lhs + rhs;
+        case ND_SUB:
+            return lhs - rhs;
+        case ND_MUL:
+            return lhs * rhs;
+        case ND_DIV:
+            return lhs / rhs;
+        case ND_MOD:
+            return lhs % rhs;
+    }
+}
+
+void add_builtin(symb_kind kind, char *name){
+    symb *sy = calloc(1, sizeof(symb));
+    sy->kind = kind;
+    sy->next = NULL;
+    sy->ty = type_base(NOHEAD);
+    sy->name = name;
+    sy->len = strlen(name);
+    push_global(kind, sy);
+}
+
+node *program(token *token_head){
+    cur = token_head;
+    node_head = calloc(1, sizeof(node));
+    node_tail = node_head;
+
+    // implicit declaration of builtin type or function
+    add_builtin(SY_TYPE, "__builtin_va_list");
+    add_builtin(SY_VAR, "__builtin_va_start");
+    add_builtin(SY_VAR, "__builtin_bswap16");
+    add_builtin(SY_VAR, "__builtin_bswap32");
+    add_builtin(SY_VAR, "__builtin_bswap64");
+
+    while(cur->kind != TK_EOF){
+        ext();
+    }
+    return node_head->next;
+}
+
+void ext(){
+    if(expect("typedef")){
+        symb *var = type_ident();
+        push_global(SY_TYPE, var);
+
+        if(!expect(";")) error(cur, "expected ';'");
+        return;
+    }
+    else{
+        bool is_extern = expect("extern");
+        type *head = type_head();
+        while(true){
+            symb *var = type_ident();
+            var = type_whole(var, head);
+
+            // remove definition of builtin function
+            if(var->len == 10 && memcmp(var->name, "__bswap_16", 10) == 0){ stmt(); return; }
+            if(var->len == 10 && memcmp(var->name, "__bswap_32", 10) == 0){ stmt(); return; }
+            if(var->len == 10 && memcmp(var->name, "__bswap_64", 10) == 0){ stmt(); return; }
+            if(var->len == 17 && memcmp(var->name, "__uint16_identity", 17) == 0){ stmt(); return; }
+            if(var->len == 17 && memcmp(var->name, "__uint32_identity", 17) == 0){ stmt(); return; }
+            if(var->len == 17 && memcmp(var->name, "__uint64_identity", 17) == 0){ stmt(); return; }
+            if(var->ty->kind == FUNC && var->is_func_def){
+                push_global(SY_VAR, var);
+                node *nd = calloc(1, sizeof(node));
+                nd->kind = ND_FUNC_DEF;
+                nd->ty = var->ty;
+                nd->name = var->name;
+                nd->len = var->len;
+                
+                local_head = calloc(1, sizeof(symb));
+                local_num = 0;
+                max_offset = 0;
+                for(symb *param = var->ty->head; param; param = param->next){
+                    if(param->ty->kind == ARRAY) param->ty->kind = PTR;
+                    push_local(param);
+                    param->offset = local_head->offset;
+                }
+                nd->op1 = stmt();
+                nd->offset = max_offset;
+                
+                push_ext(nd);
+                return;
+            }
+
+            if(var->name){
+                push_global(SY_VAR, var);
+                if(var->ty->kind != FUNC && !is_extern){
+                    node *init = NULL;
+                    if(expect("=")) init = initializer();
+                    push_ext(node_global_def(var, init));
+                }
+            }
+            if(expect(",")) continue;
+            if(expect(";")) break;
+            error(cur, "expected ';'");
+        }
+    }
+}
+
+node *dcl(){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_BLOCK;
+    nd->head = calloc(1, sizeof(node));
+    node *item = nd->head;
+    // if(expect("typedef")){
+    //     symb *var = type_ident();
+    //     push_global(TYPE, var);
+
+    //     if(!expect(";")) error(cur, "expected ';'");
+    //     return;
+    // }
+    // else
+    {
+        type *head = type_head();
+        while(true){
+            symb *var = type_ident();
+            var = type_whole(var, head);
+
+            if(var->ty->kind == FUNC && var->is_func_def){
+                error(cur, "a function defined in local scope");
+            }
+
+            if(var->name){
+                push_local(var);
+                if(expect("=")){
+                    item->next = init_local(node_var(var->name, var->len), initializer());
+                    item = item->next;
+                }
+            }
+
+            if(expect(",")) continue;
+            if(expect(";")) break;
+            error(cur, "expected ';'");
+        }
+        nd->head = nd->head->next;
+        return nd;
+    }
+}
+
+symb *type_whole(symb *ident, type *base){
+    if(ident->ty->kind == NOHEAD){
+        ident->ty = base;
+        return ident;
+    }
+    type *ty = ident->ty;
+    while(ty->ptr_to){
+        switch(ty->ptr_to->kind){
+            case NOHEAD:
+                ty->ptr_to = base;
+                return ident;
+            case VOID:
+            case CHAR:
+            case INT:
+                error(cur, "illegal type");
+                break;
+            case PTR:
+            case ARRAY:
+            case FUNC:
+                ty = ty->ptr_to;
+                break;
+        }
+    }
+}
+
+type *type_head(){
+    while(true){
+        if(expect("const")) continue;
+        if(expect("volatile")) continue;
+
+        if(expect("static")) continue;
+        break;
+    }
+    if(expect("void")){
+        return type_base(VOID);
+    }
+    if(expect("_Bool")){
+        return type_base(BOOL);
+    }
+    if(expect("unsigned")){
+        if(expect("char")){
+            return type_base(CHAR);
+        }
+        if(expect("short")){
+            expect("int");
+            return type_base(SHORT);
+        }
+        if(expect("int")){
+            return type_base(INT);
+        }
+        if(expect("long")){
+            expect("long");
+            expect("int");
+            return type_base(LONG);
+        }
+    }
+    if(expect("signed")){
+        if(expect("char")){
+            return type_base(CHAR);
+        }
+        if(expect("short")){
+            expect("int");
+            return type_base(SHORT);
+        }
+        if(expect("int")){
+            return type_base(INT);
+        }
+        if(expect("long")){
+            expect("long");
+            expect("int");
+            return type_base(LONG);
+        }
+    }
+    if(expect("char")){
+        return type_base(CHAR);
+    }
+    if(expect("short")){
+        expect("int");
+        return type_base(SHORT);
+    }
+    if(expect("int")){
+        return type_base(INT);
+    }
+    if(expect("long")){
+        if(expect("double")) return type_base(INT);
+        expect("long");
+        expect("unsigned");
+        expect("int");
+        return type_base(LONG);
+    }
+    
+    if(expect("float")) return type_base(INT);
+    if(expect("double")) return type_base(INT);
+
+    if(expect("struct") || expect("union")){ // parse union as struct
+        type *ty = calloc(1, sizeof(type));
+        ty->kind = STRUCT;
+        
+        if(cur->kind == TK_ID){
+            ty->name = cur->str;
+            ty->len = cur->len;
+            cur = cur->next;
+        }
+        if(expect("{")){
+            ty->head = calloc(1, sizeof(symb));
+            symb *item = ty->head;
+            int offset = 0;
+            int align = 0;
+            while(!expect("}")){
+                type *head = type_head();
+                while(true){
+                    symb *var = type_ident();
+                    var = type_whole(var, head);
+                    var->offset = (offset + align_of(var->ty) - 1) / align_of(var->ty) * align_of(var->ty);
+                    item->next = var;
+                    item = item->next;
+                    offset = var->offset + size_of(var->ty);
+                    if(align < align_of(var->ty)) align = align_of(var->ty);
+
+                    if(expect(",")) continue;
+                    if(expect(";")) break;
+                    error(cur, "expect ';'");
+                }
+            }
+            ty->head = ty->head->next;
+            ty->size = (offset + align - 1) / align * align;
+            ty->align = align;
+        }
+
+        if(ty->name){
+            for(symb *tag = tag_head; tag; tag = tag->next){
+                if(ty->len == tag->len && memcmp(ty->name, tag->name, tag->len) == 0){
+                    if(ty->head){
+                        tag->ty->head = ty->head;
+                        tag->ty->size = ty->size;
+                        tag->ty->align = ty->align;
+                    }
+                    return tag->ty;
+                }
+            }
+            push_tag(ty);
+        }
+        return ty;
+    }
+    if(expect("enum")){
+        type *ty = calloc(1, sizeof(type));
+        ty->kind = ENUM;
+        
+        if(cur->kind == TK_ID){
+            ty->name = cur->str;
+            ty->len = cur->len;
+            cur = cur->next;
+        }
+        if(expect("{")){
+            int i = 0;
+            while(!expect("}")){
+                token *tk = cur;
+                cur = cur->next;
+                if(expect("=")) i = eval_const(cond());
+                push_enum(tk->str, tk->len, i);
+                i++;
+                if(expect(",")) continue;
+                if(expect("}")) break;
+                error(cur, "expected ',' or '}'");
+            }
+        }
+
+        if(ty->name){
+            for(symb *tag = tag_head; tag; tag = tag->next){
+                if(ty->len == tag->len && memcmp(ty->name, tag->name, tag->len) == 0){
+                    return type_base(INT);
+                }
+            }
+            push_tag(ty);
+        }
+        return type_base(INT);
+    }
+
+    for(symb *var = global_head; var; var = var->next){
+        if(var->kind == SY_TYPE && cur->len == var->len && memcmp(cur->str, var->name, var->len) == 0){
+            cur = cur->next;
+            return var->ty;
+        }
+    }
+    return type_base(NOHEAD);
+}
+
+symb *type_ident(){
+    type *base = type_head();
+    while(expect("*")){
+        base = type_ptr(base);
+        while(true){
+            if(expect("const")) continue;
+            if(expect("volatile")) continue;
+            break;
+        }
+    }
+
+    symb *ident = calloc(1, sizeof(symb));
+    if(cur->str[0] == '('){
+        bool is_nest = true;
+        if(cur->next->kind == TK_TYPE) is_nest = false;
+        for(symb *var = global_head; var; var = var->next){
+            if(var->kind == SY_TYPE && cur->next->len == var->len && memcmp(cur->next->str, var->name, var->len) == 0){
+                is_nest = false;
+            }
+        }
+        
+        if(is_nest){
+            expect("(");
+            ident = type_ident();
+            if(!expect(")")) error(cur, "expect ')'");
+        }else{
+            ident->ty = type_base(NOHEAD);
+        }
+    }else{
+        ident->ty = type_base(NOHEAD);
+        if(cur->kind == TK_ID){
+            ident->name = cur->str;
+            ident->len = cur->len;
+            cur = cur->next;
+        }
+    }
+
+    type *tail = calloc(1, sizeof(type));
+    type *ty = tail;
+    while(true){
+        if(expect("[")){
+            if(expect("]")){
+                ty->ptr_to = type_array(type_base(NOHEAD), 0);
+                ty = ty->ptr_to;
+                continue;
+            }else{
+                ty->ptr_to = type_array(type_base(NOHEAD), eval_const(assign()));
+                ty = ty->ptr_to;
+                if(expect("]")) continue;
+            }
+            
+            error(cur, "expected ']'");
+        }
+        if(expect("(")){
+            ty->ptr_to = calloc(1, sizeof(type));
+            ty->ptr_to->kind = FUNC;
+            ty->ptr_to->head = calloc(1, sizeof(symb));
+            symb *param = ty->ptr_to->head;
+
+            while(!expect(")")){
+                if(cur->str[0] == '.'){ // skip variable argument
+                    cur = cur->next->next->next;
+                }else{
+                    param->next = type_ident();
+                    param = param->next;
+                }
+                if(expect(",")) continue;
+                if(expect(")")) break;
+                error(cur, "expected ',' or ')'");
+            }
+            ty->ptr_to->head = ty->ptr_to->head->next;
+            ty = ty->ptr_to;
+        }
+        ty->ptr_to = base;
+        base = tail->ptr_to;
+        break;
+    }
+
+    if(cur->str[0] == '{'){
+        ident->is_func_def = true;
+    }
+
+    return type_whole(ident, base);
+}
+
+node *init_local(node *var, node *init){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = ND_BLOCK;
+    nd->head = calloc(1, sizeof(node));
+    node *st = nd->head;
+
+    if(var->ty->kind == ARRAY){
+        int i = 0;
+        for(node *item = init->head; item; item = item->next){
+            if(i >= var->ty->size) error(cur, "excess elements in array initilizer");
+
+            st->next = init_local(node_unary(ND_DEREF, node_binary(ND_ADD, var, node_num(type_base(INT), i))), item);
+            st = st->next;
+
+            i++;
+        }
+        nd->head = nd->head->next;
+        return nd;
+    }
+    if(var->ty->kind == STRUCT){
+        symb *memb = var->ty->head;
+        for(node *item = init->head; item; item = item->next){
+            if(!memb) error(cur, "excess elements in struct initilizer");
+
+            st->next = init_local(node_dot(var, memb->name, memb->len), item);
+            st = st->next;
+
+            memb = memb->next;
+        }
+        nd->head = nd->head->next;
+        return nd;
+    }
+    nd->head = node_binary(ND_ASSIGN, var, init);
+    return nd;
+}
+
+node *initializer(){
+    if(expect("{")){
+        node *nd = calloc(1, sizeof(node));
+        nd->head = calloc(1, sizeof(node));
+        node *item = nd->head;
+        while(!expect("}")){
+            item->next = initializer();
+            item = item->next;
+
+            if(expect(",")) continue;
+            if(expect("}")) break;
+            error(cur, "expect ',' or '}'");
+        }
+        nd->head = nd->head->next;
+        return nd;
+    }
+    return assign();
+}
+
+node *stmt(){
+    node *nd = calloc(1, sizeof(node));
+    
+    if(expect(";")){
+        nd->kind = ND_BLOCK;
+    }
+    else if(expect("{")){
+        nd->kind = ND_BLOCK;
+        nd->head = calloc(1, sizeof(node));
+        node *item = nd->head;
+        int num = local_num;
+        while(!expect("}")){
+            if(find_type()) item->next = dcl();
+            else item->next = stmt();
+            item = item->next;
+        }
+        nd->head = nd->head->next;
+        pop_local(num);
+    }
+    else if(expect("if")){
+        if(!expect("(")) error(cur, "expected '('");
+
+        nd->kind = ND_IF;
+        nd->op1 = expr();
+
+        if(!expect(")")) error(cur, "expected ')'");
+
+        nd->op2 = stmt();
+
+        if(expect("else")) nd->op3 = stmt();
+    }
+    else if(expect("switch")){
+        if(!expect("(")) error(cur, "expected '('");
+
+        nd->kind = ND_SWITCH;
+        nd->op1 = expr();
+        nd->val = 0;
+        nd->next = switch_head;
+        switch_head = nd;
+
+        if(!expect(")")) error(cur, "expected ')'");
+
+        nd->op2 = stmt();
+        switch_head = switch_head->next;
+    }
+    else if(expect("case")){
+        nd->kind = ND_CASE;
+        nd->op1 = switch_head;
+        nd->offset = switch_head->val;
+        
+        node *con = primary();
+        con->next = switch_head->head;
+        switch_head->head = con;
+        switch_head->val++;
+
+        if(!expect(":")) error(cur, "expected ':'");
+
+        nd->op2 = stmt();
+    }
+    else if(expect("while")){
+        if(!expect("(")) error(cur, "expected '('");
+
+        nd->kind = ND_WHILE;
+        nd->op1 = expr();
+
+        if(!expect(")")) error(cur, "expected ')'");
+
+        nd->op2 = stmt();
+    }
+    else if(expect("for")){
+        if(!expect("(")) error(cur, "expected '('");
+
+        nd->kind = ND_FOR;
+        int num = local_num;
+        if(find_type()){
+            nd->op1 = dcl();
+        }else if(expect(";")){
+            nd->op1 = node_num(type_base(INT), 0);
+        }else{
+            nd->op1 = expr();
+            if(!expect(";")) error(cur, "expected ';'");
+        }
+
+        nd->op2 = expr();
+
+        if(!expect(";")) error(cur, "expected ';'");
+
+        nd->op3 = expr();
+
+        if(!expect(")")) error(cur, "expected ')'");
+
+        nd->op4 = stmt();
+
+        pop_local(num);
+    }
+    else if(expect("continue")){
+        nd->kind = ND_CONTINUE;
+        if(!expect(";")) error(cur, "expected ';'");
+    }
+    else if(expect("break")){
+        nd->kind = ND_BREAK;
+        if(!expect(";")) error(cur, "expected ';'");
+    }
+    else if(expect("return")){
+        nd->kind = ND_RET;
+        if(expect(";")){
+            nd->op1 = node_num(type_base(INT), 0);
+        }else{
+            nd->op1 = expr();
+            if(!expect(";")) error(cur, "expected ';'");
+        }
+    }
+    else{
+        nd = expr();
+        if(!expect(";")) error(cur, "expected ';'");
+    }
+    return nd;
+}
+
+node *expr(){
+    node *nd = assign();
+    while(expect(",")){
+        nd = node_binary(ND_COMMA, nd, assign());
+    }
+    return nd;
+}
+
+node *assign(){
+    node *nd = cond();
+    if(expect("=")){
+        return node_binary(ND_ASSIGN, nd, assign());
+    }
+    if(expect("+=")){
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_ADD, nd, assign()));
+    }
+    if(expect("-=")){
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_SUB, nd, assign()));
+    }
+    if(expect("*=")){
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_MUL, nd, assign()));
+    }
+    if(expect("/=")){
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_DIV, nd, assign()));
+    }
+    if(expect("%=")){
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_MOD, nd, assign()));
+    }
+    return nd;
+}
+
+node *cond(){
+    node *nd = log_or();
+    if(expect("?")){
+        node *lhs = expr();
+        if(!expect(":")) error(cur, "expected ':'");
+        node *rhs = cond();
+        nd = node_cond(nd, lhs, rhs);
+    }
+    return nd;
+}
+
+node *log_or(){
+    node *nd = log_and();
+    while(expect("||")){
+        nd = node_binary(ND_LOG_OR, nd, log_and());
+    }
+    return nd;
+}
+
+node *log_and(){
+    node *nd = bit_or();
+    while(expect("&&")){
+        nd = node_binary(ND_LOG_AND, nd, bit_or());
+    }
+    return nd;
+}
+
+node *bit_or(){
+    node *nd = bit_xor();
+    while(expect("|")){
+        nd = node_binary(ND_BIT_OR, nd, bit_xor());
+    }
+    return nd;
+}
+
+node *bit_xor(){
+    node *nd = bit_and();
+    while(expect("^")){
+        nd = node_binary(ND_BIT_XOR, nd, bit_and());
+    }
+    return nd;
+}
+
+node *bit_and(){
+    node *nd = equal();
+    while(expect("&")){
+        nd = node_binary(ND_BIT_AND, nd, equal());
+    }
+    return nd;
+}
+
+node *equal(){
+    node *nd = relational();
+    while(true){
+        if(expect("==")){
+            nd = node_binary(ND_EQ, nd, relational());
+            continue;
+        }
+        if(expect("!=")){
+            nd = node_binary(ND_NEQ, nd, relational());
+            continue;
+        }
+        return nd;
+    }
+}
+
+node *relational(){
+    node *nd = shift();
+    while(true){
+        if(expect("<")){
+            nd = node_binary(ND_LT, nd, shift());
+            continue;
+        }
+        if(expect("<=")){
+            nd = node_binary(ND_LEQ, nd, shift());
+            continue;
+        }
+        if(expect(">")){
+            nd = node_binary(ND_LT, shift(), nd);
+            continue;
+        }
+        if(expect(">=")){
+            nd = node_binary(ND_LEQ, shift(), nd);
+            continue;
+        }
+        return nd;
+    }
+}
+
+node *shift(){
+    node *nd = add();
+    while(true){
+        if(expect("<<")){
+            nd = node_binary(ND_LSHIFT, nd, add());
+            continue;
+        }
+        if(expect(">>")){
+            nd = node_binary(ND_RSHIFT, nd, add());
+            continue;
+        }
+        return nd;
+    }
+}
+
+node *add(){
+    node *nd = mul();
+    while(true){
+        if(expect("+")){
+            nd = node_binary(ND_ADD, nd, mul());
+            continue;
+        }
+        if(expect("-")){
+            nd = node_binary(ND_SUB, nd, mul());
+            continue;
+        }
+        return nd;
+    }
+}
+
+node *mul(){
+    node *nd = unary();
+    while(true){
+        if(expect("*")){
+            nd = node_binary(ND_MUL, nd, unary());
+            continue;
+        }
+        if(expect("/")){
+            nd = node_binary(ND_DIV, nd, unary());
+            continue;
+        }
+        if(expect("%")){
+            nd = node_binary(ND_MOD, nd, unary());
+            continue;
+        }
+        return nd;
+    }
+}
+
+node *unary(){
+    if(expect("+")){
+        return unary();
+    }
+    if(expect("-")){
+        return node_unary(ND_NEG, unary());
+    }
+    if(expect("&")){
+        return node_unary(ND_ADR, unary());
+    }
+    if(expect("!")){
+        return node_unary(ND_LOG_NOT, unary());
+    }
+    if(expect("*")){
+        return node_unary(ND_DEREF, unary());
+    }
+    if(expect("++")){
+        node *nd = unary();
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_ADD, nd, node_num(type_base(INT), 1)));
+    }
+    if(expect("--")){
+        node *nd = unary();
+        return node_binary(ND_ASSIGN, nd, node_binary(ND_SUB, nd, node_num(type_base(INT), 1)));
+    }
+    if(expect("sizeof")){
+        if(expect("(")){
+            type *ty;
+            if(find_type()) ty = type_ident()->ty;
+            else ty = unary()->ty;
+            if(!expect(")")) error(cur, "expected ')'");
+            return node_num(type_base(INT), size_of(ty));
+        }else{
+            return node_num(type_base(INT), size_of(unary()->ty));
+        }
+    }
+    if(cur->str[0] == '(' && find_type_next()){
+        expect("(");
+        symb *sy = type_ident();
+        if(!expect(")")) error(cur, "expected ')'");
+        return node_cast(sy->ty, unary());
+    }
+    return primary();
+}
+
+node *primary(){
+    node *nd;
+    if(expect("(")){
+        nd = expr();
+        if(!expect(")")) error(cur, "expect ')'");
+    }
+    else if(cur->kind == TK_ID){
+        nd = node_var(cur->str, cur->len);
+        cur = cur->next;
+    }
+    else if(cur->kind == TK_NUM){
+        nd =  node_num(type_base(INT), cur->val);
+        cur = cur->next;
+    }
+    else if(cur->kind == TK_CHAR){
+        nd = node_num(type_base(CHAR), cur->val);
+        cur = cur->next;
+    }
+    else if(cur->kind == TK_STRING){
+        nd = calloc(1, sizeof(node));
+        nd->kind = ND_LOCAL_CONST;
+        nd->name = cur->str;
+        nd->len = cur->len;
+        nd->offset = lc_num;
+        push_ext(nd);
+        nd = node_string();
+    }
+    else{
+        error(cur, "unexpected token");
+    }
+
+    // postfix operation
+    while(true){
+        if(expect("[")){
+            node *size = assign();
+            nd = node_unary(ND_DEREF, node_binary(ND_ADD, nd, size));
+            if(!expect("]")) error(cur, "expect ']'");
+            continue;
+        }
+        if(expect("(")){
+            nd = node_func_call(nd);
+            continue;
+        }
+        if(expect(".")){
+            nd = node_dot(nd, cur->str, cur->len);
+            cur = cur->next;
+            continue;
+        }
+        if(expect("->")){
+            nd = node_arrow(nd, cur->str, cur->len);
+            cur = cur->next;
+            continue;
+        }
+        if(expect("++")){
+            node *one1 = node_num(type_base(INT), 1);
+            node *one2 = node_num(type_base(INT), 1);
+            nd = node_binary(ND_SUB, node_binary(ND_ASSIGN, nd, node_binary(ND_ADD, nd, one1)), one2);
+            continue;
+        }
+        if(expect("--")){
+            node *one1 = node_num(type_base(INT), 1);
+            node *one2 = node_num(type_base(INT), 1);
+            nd = node_binary(ND_ADD, node_binary(ND_ASSIGN, nd, node_binary(ND_SUB, nd, one1)), one2);
+            continue;
+        }
+        return nd;
+    }
+}
+
+#include <stdio.h>
+#include <stdlib.h>
+
+
+int label_num = 2;
+block *block_top;
+
+void push_block(node_kind kind, int begin, int end){
+    block *stmt = calloc(1, sizeof(block));
+    stmt->kind = kind;
+    stmt->next = block_top;
+    stmt->begin = begin;
+    stmt->end = end;
+    
+    block_top = stmt;
+}
+
+void pop_block(){
+    block_top = block_top->next;
+}
+
+char *rax_[4] = { "al",  "ax", "eax", "rax"};
+char *rbx_[4] = { "bl",  "bx", "ebx", "rbx"};
+
+char *rdi_[4] = {"dil",  "di", "edi", "rdi"};
+char *rsi_[4] = {"sil",  "si", "esi", "rsi"};
+char *rdx_[4] = { "dl",  "dx", "edx", "rdx"};
+char *rcx_[4] = { "cl",  "cx", "ecx", "rcx"};
+char  *r8_[4] = {"r8b", "r8w", "r8d", "r8" };
+char  *r9_[4] = {"r9b", "r9w", "r9d", "r9" };
+
+char **int_arg_reg[6] = {rdi_, rsi_, rdx_, rcx_, r8_, r9_};
+
+char *int_arg_register(int ord, int size){
+    switch(size){
+        case 1:
+            return int_arg_reg[ord][0];
+        case 2:
+            return int_arg_reg[ord][1];
+        case 4:
+            return int_arg_reg[ord][2];
+        case 8:
+            return int_arg_reg[ord][3];
+    }
+}
+
+void mov_memory_from_register(char *dest[4], char *src[4], type *ty){
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+            printf("    mov BYTE PTR [%s], %s\n", dest[3], src[0]);
+            break;
+        case SHORT:
+            printf("    mov WORD PTR [%s], %s\n", dest[3], src[1]);
+            break;
+        case INT:
+            printf("    mov DWORD PTR [%s], %s\n", dest[3], src[2]);
+            break;
+        case LONG:
+        case PTR:
+            printf("    mov QWORD PTR [%s], %s\n", dest[3], src[3]);
+            break;
+    }
+}
+
+void mov_register_from_memory(char *dest[4], char *src[4], type *ty){
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+            printf("    movsx %s, BYTE PTR [%s]\n", dest[3], src[3]);
+            break;
+        case SHORT:
+            printf("    movsx %s, WORD PTR [%s]\n", dest[3], src[3]);
+            break;
+        case INT:
+            printf("    movsx %s, DWORD PTR [%s]\n", dest[3], src[3]);
+            break;
+        case LONG:
+        case PTR:
+            printf("    mov %s, QWORD PTR [%s]\n", dest[3], src[3]);
+            break;
+    }
+}
+
+void mov_register_from_register(char *dest[4], char *src[4], type *ty){
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+            printf("    movsx %s, %s\n", dest[3], src[0]);
+            break;
+        case SHORT:
+            printf("    movsx %s, %s\n", dest[3], src[1]);
+            break;
+        case INT:
+            printf("    movsx %s, %s\n", dest[3], src[2]);
+            break;
+        case LONG:
+        case PTR:
+            if(dest != src) printf("    movsx %s, %s\n", dest[3], src[3]);
+            break;
+    }
+}
+
+void gen_ext();
+void gen_alloc();
+void gen_stmt();
+void gen_expr();
+void gen_binary();
+void gen_lval();
+void gen_rval();
+
+void gen_code(node *node_head){
+    printf(".intel_syntax noprefix\n");
+
+    for(node *nd = node_head; nd; nd = nd->next){
+        gen_ext(nd);
+    }
+}
+
+void gen_ext(node *nd){
+    switch(nd->kind){
+        case ND_FUNC_DEF:{
+            printf(".global %.*s\n", nd->len, nd->name);
+            printf(".text\n");
+            printf("%.*s:\n", nd->len, nd->name);
+            
+            printf("    push rbp\n");
+            printf("    mov rbp, rsp\n");
+            printf("    sub rsp, %d\n", (nd->offset + 15)/16 * 16); // region of local variables
+
+            // move arguments from registers or the stack on the rbp to the stack under rbp.
+            int num_param_int = 0;
+            for(symb *param = nd->ty->head; param; param = param->next){
+                if(num_param_int < 6){
+                    printf("    lea rax, [rbp-%d]\n", param->offset);
+                    mov_memory_from_register(rax_, int_arg_reg[num_param_int], param->ty);
+                }else{
+                    printf("    lea rax, [rbp-%d]\n", param->offset);
+                    printf("    mov rbx, [rbp+%d]\n", 8 * (num_param_int - 4));
+                    mov_memory_from_register(rax_, rbx_, param->ty);
+                }
+                num_param_int++;
+            }
+
+            gen_stmt(nd->op1);
+
+            printf("    mov rsp, rbp\n");
+            printf("    mov rax, 0\n");
+            printf("    pop rbp\n");
+            printf("    ret\n");
+
+            break;
+        }
+        case ND_GLOBAL_DEF:
+            printf(".data\n");
+            printf("%.*s:\n", nd->len, nd->name);
+            gen_alloc(nd->ty, nd->head);
+            break;
+        case ND_LOCAL_CONST:
+            printf(".data\n");
+            printf(".LC%d:\n", nd->offset);
+            printf("    .string %.*s\n", nd->len, nd->name);
+            break;
+    }
+}
+
+void gen_alloc(type *ty, node *init){
+    if(!init){
+        printf("    .zero %d\n", size_of(ty));
+        return;
+    }
+    switch(ty->kind){
+        case BOOL:
+        case CHAR:
+            if(init->val == 0) printf("    .zero 1\n");
+            else printf("    .byte %d\n", init->val);
+            break;
+        case SHORT:
+            if(init->val == 0) printf("    .zero 2\n");
+            else printf("    .value %d\n", init->val);
+            break;
+        case INT:
+            if(init->val == 0) printf("    .zero 4\n");
+            else printf("    .long %d\n", init->val);
+            break;
+        case LONG:
+            if(init->val == 0) printf("    .zero 8\n");
+            else printf("    .quad %d\n", init->val);
+            break;
+        case PTR:
+            if(init->kind == ND_GLOBAL && init->ty->kind == ARRAY) printf("    .quad %.*s\n", init->len, init->name);
+            else if(init->kind == ND_ADR) printf("    .quad %.*s\n", init->op1->len, init->op1->name);
+            else if(init->kind == ND_STRING) printf("    .quad .LC%d\n", init->offset);
+            break;
+        case ARRAY:
+            if(ty->ptr_to->kind == CHAR && init->kind == ND_STRING){
+                printf("    .string %.*s\n", init->len, init->name);
+                break;
+            }
+            int i = 0;
+            for(node *item = init->head; item; item = item->next){
+                if(i >= ty->size) fprintf(stderr, "excess elements in array initilizer\n");
+                gen_alloc(ty->ptr_to, item);
+                i++;
+            }
+            int rest = size_of(ty->ptr_to) * (ty->size - i);
+            if(rest) printf("    .zero %d\n", rest);
+            break;
+        case STRUCT:{
+            int offset = 0;
+            symb *memb = ty->head;
+            node *item = init->head;
+            for(; item; memb = memb->next, item = item->next){
+                if(!memb) fprintf(stderr, "excess elements in struct initilizer");
+                if(offset < memb->offset) printf("    .zero %d\n", memb->offset - offset);
+                gen_alloc(memb->ty, item);
+                offset = memb->offset + size_of(memb->ty);
+            }
+            if(offset < size_of(ty)) printf("    .zero %d\n", size_of(ty) - offset);
+            break;
+        }
+    }
+}
+
+void gen_stmt(node *nd){
+    switch(nd->kind){
+        int l1, l2;
+        case ND_BLOCK:
+            for(node *cur = nd->head; cur; cur = cur->next){
+                gen_stmt(cur);
+            }
+            return;
+        case ND_IF:
+            gen_expr(nd->op1);
+            
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            
+            if(nd->op3){
+                l1 = label_num++;
+                l2 = label_num++;
+
+                printf("    je .L%d\n", l1);
+                gen_stmt(nd->op2);
+                printf("    jmp .L%d\n", l2);
+                
+                printf(".L%d:\n", l1);
+                
+                gen_stmt(nd->op3);
+                
+                printf(".L%d:\n", l2);
+            }else{
+                l1 = label_num++;
+
+                printf("    je .L%d\n", l1);
+                gen_stmt(nd->op2);
+
+                printf(".L%d:\n", l1);
+            }
+            return;
+        case ND_SWITCH:
+            nd->offset = label_num;
+            int label_begin = label_num;
+            int label_default = label_num + nd->val;
+            int label_end = label_num + nd->val + 1;
+            push_block(ND_SWITCH, -1, label_end);
+            label_num += nd->val + 2;
+
+            int i = label_begin + nd->val - 1;
+            for(node *con = nd->head; con; con = con->next){
+                gen_expr(nd->op1);
+                gen_expr(con);
+                printf("    pop rdi\n");
+                printf("    pop rax\n");
+                printf("    cmp rax, rdi\n");
+                printf("    je .L%d\n", i);
+                i--;
+            }
+            printf("    jmp .L%d\n", label_end);
+            
+            gen_stmt(nd->op2);
+
+            printf(".L%d:\n", label_end);
+
+            pop_block();
+            return;
+        case ND_CASE:
+            printf(".L%d:\n", nd->op1->offset + nd->offset);
+            gen_stmt(nd->op2);
+            return;
+        case ND_WHILE:
+            l1 = label_num++;
+            l2 = label_num++;
+            push_block(ND_WHILE, l1, l2);
+
+            printf(".L%d:\n", l1);
+
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    je .L%d\n", l2);
+            gen_stmt(nd->op2);
+            printf("    jmp .L%d\n", l1);
+            
+            printf(".L%d:\n", l2);
+
+            pop_block();
+            return;
+        case ND_FOR:
+            l1 = label_num++;
+            l2 = label_num++;
+            push_block(ND_FOR, l1, l2);
+
+            gen_stmt(nd->op1);
+
+            printf(".L%d:\n", l1);
+
+            gen_expr(nd->op2);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    je .L%d\n", l2);
+            gen_stmt(nd->op4);
+            gen_expr(nd->op3);
+            printf("    pop rax\n");
+            printf("    jmp .L%d\n", l1);
+
+            printf(".L%d:\n", l2);
+
+            pop_block();
+            return;
+        case ND_CONTINUE:
+            for(block *blk = block_top; blk; blk = blk->next){
+                if(blk->kind == ND_WHILE || blk->kind == ND_FOR){
+                    printf("    jmp .L%d\n", blk->begin);
+                    return;
+                }
+            }
+            fprintf(stderr, "continue statement not within a loop");
+            return;
+        case ND_BREAK:
+            if(block_top){
+                printf("    jmp .L%d\n", block_top->end);
+                return;
+            }
+            fprintf(stderr, "continue statement not within a loop or switch");
+            return;
+        case ND_RET:
+            gen_expr(nd->op1);
+
+            printf("    pop rax\n");
+            printf("    mov rsp, rbp\n");
+            printf("    pop rbp\n");
+            printf("    ret\n");
+            return;
+    }
+    gen_expr(nd);
+    printf("    pop rax\n");
+}
+
+void gen_expr(node *nd){
+    switch(nd->kind){
+        // assignment
+        case ND_ASSIGN:
+            gen_lval(nd->op1);
+            gen_expr(nd->op2);
+
+            printf("    pop rdi\n");
+            printf("    pop rax\n");
+            mov_memory_from_register(rax_, rdi_, nd->ty);
+            printf("    push rdi\n");
+            break;
+        case ND_COND:{
+            int l1 = label_num++;
+            int l2 = label_num++;
+
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    je .L%d\n", l1);
+            
+            gen_expr(nd->op2);
+            printf("    jmp .L%d\n", l2);
+            
+            printf(".L%d:\n", l1);
+            gen_expr(nd->op3);
+            
+            printf(".L%d:\n", l2);
+            break;
+        }
+            
+        // binary operation
+        case ND_COMMA:
+        case ND_LOG_OR:
+        case ND_LOG_AND:
+        case ND_BIT_OR:
+        case ND_BIT_XOR:
+        case ND_BIT_AND:
+        case ND_EQ:
+        case ND_NEQ:
+        case ND_LT:
+        case ND_LEQ:
+        case ND_LSHIFT:
+        case ND_RSHIFT:
+        case ND_ADD:
+        case ND_SUB:
+        case ND_MUL:
+        case ND_DIV:
+        case ND_MOD:
+            gen_binary(nd);
+            break;
+
+        // unary operation
+        case ND_NEG:
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    neg rax\n");
+            printf("    push rax\n");
+            break;
+        case ND_LOG_NOT:
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    sete al\n");
+            printf("    movsx rax, al\n");
+            printf("    push rax\n");
+            break;
+        case ND_ADR:
+            gen_lval(nd->op1);
+            break;
+        case ND_CAST:
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            mov_register_from_register(rax_, rax_, nd->ty);
+            printf("    push rax\n");
+            break;
+        
+        // right value
+        case ND_GLOBAL:
+        case ND_LOCAL:
+        case ND_DEREF:
+        case ND_DOT:
+        case ND_ARROW:
+            gen_rval(nd);
+            break;
+
+        // primary
+        case ND_NUM:
+            printf("    push %d\n", nd->val);
+            return;
+        case ND_STRING:
+            printf("    lea rax, [rip+.LC%d]\n", nd->offset);
+            printf("    push rax\n");
+            break;
+        case ND_FUNC_CALL:{
+            int num_stack_var;
+            if(nd->val > 6) num_stack_var = nd->val - 6;
+            else num_stack_var = 0;
+
+            // adjust stack alignment
+            printf("    push rsp\n");
+            printf("    push [rsp]\n");
+            if(num_stack_var % 2 == 0){
+                printf("    add rsp, 8\n");
+                printf("    and rsp, -0x10\n");
+            }else{
+                printf("    and rsp, -0x10\n");
+                printf("    add rsp, 8\n");
+            }
+
+            // move arguments to the stack
+            for(node *cur = nd->head; cur; cur = cur->next){
+                gen_expr(cur);
+            }
+
+            // move first 6 arguments to registers
+            for(int i = 0; i < (nd->val < 6 ? nd->val : 6); i++){
+                printf("    pop %s\n", int_arg_reg[i][3]);
+            }
+
+            // variable arguments
+            printf("    mov al, 0\n");
+
+            printf("    call %.*s\n", nd->len, nd->name);
+            for(int i = 0; i < num_stack_var; i++){
+                printf("    pop rdi\n");
+            }
+
+            // adjust stack alignment
+            printf("    mov rsp, [rsp]\n");
+
+            printf("    push rax\n");
+            break;
+        }
+    }
+}
+
+void gen_binary(node *nd){
+    switch(nd->kind){
+        case ND_LOG_OR:{
+            int label_end = label_num++;
+
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    setne al\n");
+            printf("    movzb rax, al\n");
+            printf("    jne .L%d\n", label_end);
+
+            gen_expr(nd->op2);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    setne al\n");
+            printf("    movzb rax, al\n");
+
+            printf(".L%d:\n", label_end);
+            printf("    push rax\n");
+            return;
+        }
+        case ND_LOG_AND:{
+            int label_end = label_num++;
+
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    setne al\n");
+            printf("    movzb rax, al\n");
+            printf("    je .L%d\n", label_end);
+
+            gen_expr(nd->op2);
+            printf("    pop rax\n");
+            printf("    cmp rax, 0\n");
+            printf("    setne al\n");
+            printf("    movzb rax, al\n");
+
+            printf(".L%d:\n", label_end);
+            printf("    push rax\n");
+            return;
+        }
+    }
+
+    gen_expr(nd->op1);
+    gen_expr(nd->op2);
+    printf("    pop rdi\n");
+    printf("    pop rax\n");
+
+    switch(nd->kind){
+        case ND_COMMA:
+            printf("    mov rax, rdi\n");
+            break;
+        case ND_BIT_OR:
+            printf("    or rax, rdi\n");
+            break;
+        case ND_BIT_XOR:
+            printf("    xor rax, rdi\n");
+            break;
+        case ND_BIT_AND:
+            printf("    and rax, rdi\n");
+            break;
+        case ND_EQ:
+            printf("    cmp rax, rdi\n");
+            printf("    sete al\n");
+            printf("    movzb rax, al\n");
+            break;
+        case ND_NEQ:
+            printf("    cmp rax, rdi\n");
+            printf("    setne al\n");
+            printf("    movzb rax, al\n");
+            break;
+        case ND_LT:
+            printf("    cmp rax, rdi\n");
+            printf("    setl al\n");
+            printf("    movzb rax, al\n");
+            break;
+        case ND_LEQ:
+            printf("    cmp rax, rdi\n");
+            printf("    setle al\n");
+            printf("    movzb rax, al\n");
+            break;
+        case ND_LSHIFT:
+            printf("    mov rcx, rdi\n");
+            printf("    sal rax, cl\n");
+            break;
+        case ND_RSHIFT:
+            printf("    mov rcx, rdi\n");
+            printf("    sar rax, cl\n");
+            break;
+        case ND_ADD:
+            printf("    add rax, rdi\n");
+            break;
+        case ND_SUB:
+            printf("    sub rax, rdi\n");
+            break;
+        case ND_MUL:
+            printf("    imul rax, rdi\n");
+            break;
+        case ND_DIV:
+            printf("    cqo\n");
+            printf("    idiv rdi\n");
+            break;
+        case ND_MOD:
+            printf("    cqo\n");
+            printf("    idiv rdi\n");
+            printf("    mov rax, rdx\n");
+            break;
+    }
+    printf("    push rax\n");
+}
+
+void gen_lval(node *nd){
+    switch(nd->kind){
+        case ND_GLOBAL:
+            printf("    lea rax, [rip+%.*s]\n", nd->len, nd->name);
+            printf("    push rax\n");
+            return;
+        case ND_LOCAL:
+            printf("    lea rax, [rbp-%d]\n", nd->offset);
+            printf("    push rax\n");
+            return;
+        case ND_DEREF:
+            gen_expr(nd->op1);
+            return;
+        case ND_DOT:
+            gen_lval(nd->op1);
+            printf("    pop rax\n");
+            printf("    add rax, %d\n", nd->offset);
+            printf("    push rax\n");
+            return;
+        case ND_ARROW:
+            gen_expr(nd->op1);
+            printf("    pop rax\n");
+            printf("    add rax, %d\n", nd->offset);
+            printf("    push rax\n");
+            return;
+    }
+    fprintf(stderr, "it is not lvalue\n");
+}
+
+void gen_rval(node *nd){
+    gen_lval(nd);
+    printf("    pop rax\n");
+    switch(nd->kind){
+        case ND_GLOBAL:
+        case ND_LOCAL:
+            switch(nd->ty->kind){
+                case BOOL:
+                case CHAR:
+                case SHORT:
+                case INT:
+                case LONG:
+                case PTR:
+                    mov_register_from_memory(rax_, rax_, nd->ty);
+                    break;
+            }
+            break;
+        case ND_DEREF:
+        case ND_DOT:
+        case ND_ARROW:
+            mov_register_from_memory(rax_, rax_, nd->ty);
+            break;
+    }
+    printf("    push rax\n");
+}
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+char *file_name;
+char *code_head;
+
+void error(token *tk, char *msg){
+    char *begin = tk->str;
+    char *end = tk->str;
+    while(code_head < begin && *(begin - 1) != '\n') begin--;
+    while(*end != '\n') end++;
+
+    int line_num = 1;
+    for(char *p = code_head; p < begin; p++){
+        if(*p == '\n') line_num++;
+    }
+
+    int indent = fprintf(stderr, "%s:%d: ", file_name, line_num);
+    fprintf(stderr, "%.*s\n", (int)(end - begin), begin);
+
+    int pos = tk->str - begin + indent;
+    fprintf(stderr, "%*s", pos, " ");
+    fprintf(stderr, "^ %s\n", msg);
+    
+    exit(1);
+}
+
+char *read_file(char *path){
+    FILE *fp = fopen(path, "r");
+    if(!fp){
+        fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    if(fseek(fp, 0, SEEK_END) == -1){
+        fprintf(stderr, "%s: fseek: %s\n", path, strerror(errno));
+        exit(1);
+    }
+    size_t size = ftell(fp);
+    if(fseek(fp, 0, SEEK_SET) == -1){
+        fprintf(stderr, "%s: fseek: %s\n", path, strerror(errno));
+        exit(1);
+    }
+
+    char *buf = calloc(1, size + 2);
+    fread(buf, size, 1, fp);
+
+    if(size == 0 || buf[size - 1] != '\n'){
+        buf[size] = '\n';
+        size++;
+    }
+    buf[size] = '\0';
+    fclose(fp);
+
+    return buf;
+}
+
+int main(int argc, char **argv){
+    if(argc != 2){
+        fprintf(stderr, "incorrect number of arguments\n");
+        return 1;
+    }
+
+    file_name = argv[1];
+    code_head = read_file(file_name);
+    token *token_head = tokenize(code_head);
+    node *node_head = program(token_head);
+    gen_code(node_head);
+}

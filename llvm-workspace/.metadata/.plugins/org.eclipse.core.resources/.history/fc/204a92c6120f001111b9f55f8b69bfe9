@@ -1,0 +1,269 @@
+// unused-optimizer1.cpp
+// Conservative whole-project remover of unused static functions.
+// Writes modified files as filename.clean.c
+//
+// Build with a Clang/LLVM dev environment (libclang-cpp or Clang CMake package).
+// Example:
+//   cmake -S . -B build -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+//   cmake --build build -- -j
+//
+// Usage (from project root with compile_commands.json):
+//   ./remove_unused_static_funcs_to_c [source-files...]
+// If no files are passed, files from compile_commands.json are used.
+
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/Tooling.h>
+#include <clang/Tooling/CompilationDatabase.h>
+#include <clang/Frontend/FrontendActions.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/Rewrite/Core/Rewriter.h>
+#include <clang/Frontend/CompilerInstance.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/AST/Decl.h>
+#include <clang/AST/Expr.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Lex/Lexer.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/raw_ostream.h>
+
+#include <set>
+#include <map>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+using namespace clang;
+using namespace clang::tooling;
+using namespace llvm;
+using namespace clang::attr;
+
+static cl::OptionCategory ToolCategory("remove-unused-static-funcs options");
+static cl::opt<std::string> OutputSuffix("suffix",
+    cl::desc("Suffix for cleaned files"),
+    cl::value_desc("suffix"),
+    cl::init(".clean.c"),
+    cl::cat(ToolCategory));
+
+struct FuncRange {
+  std::string file;
+  unsigned startOffset;
+  unsigned endOffset; // exclusive
+  std::string name;
+};
+
+struct GlobalInfo {
+  std::set<const FunctionDecl*> allDefs;
+  std::set<const FunctionDecl*> called;
+  std::set<const FunctionDecl*> addressTaken;
+  std::map<const FunctionDecl*, FuncRange> ranges;
+};
+
+// Global shared info (simpler factory usage)
+static GlobalInfo G;
+
+// Visitor: collect defs, calls, address-of, and compute file offsets for defs
+class CollectorVisitor : public RecursiveASTVisitor<CollectorVisitor> {
+  ASTContext &Ctx;
+  GlobalInfo &GI;
+public:
+  CollectorVisitor(ASTContext &C, GlobalInfo &g) : Ctx(C), GI(g) {}
+
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    if (!FD->isThisDeclarationADefinition()) return true;
+    GI.allDefs.insert(FD);
+
+    SourceManager &SM = Ctx.getSourceManager();
+    LangOptions LO = Ctx.getLangOpts();
+
+    SourceLocation B = FD->getSourceRange().getBegin();
+    SourceLocation E = FD->getSourceRange().getEnd();
+
+    if (Stmt *Body = FD->getBody()) {
+      if (CompoundStmt *CS = dyn_cast<CompoundStmt>(Body)) {
+        E = CS->getRBracLoc();
+      } else {
+        E = Body->getEndLoc();
+      }
+    }
+
+    if (B.isValid() && E.isValid() && SM.isWrittenInSameFile(B, E)) {
+      SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+      if (realEnd.isValid()) {
+        bool invalid = false;
+        unsigned start = SM.getFileOffset(B);
+        unsigned end = SM.getFileOffset(realEnd);
+        std::string file = SM.getFilename(B).str();
+        FuncRange fr{file, start, end, FD->getNameAsString()};
+        GI.ranges[FD] = fr;
+      }
+    }
+    return true;
+  }
+
+  bool VisitCallExpr(CallExpr *CE) {
+    if (FunctionDecl *Callee = CE->getDirectCallee()) {
+      if (Callee->isThisDeclarationADefinition()) GI.called.insert(Callee);
+    }
+    return true;
+  }
+
+  bool VisitUnaryOperator(UnaryOperator *UO) {
+    if (UO->getOpcode() == UO_AddrOf) {
+      Expr *sub = UO->getSubExpr()->IgnoreParenImpCasts();
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(sub)) {
+        if (FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+          if (FD->isThisDeclarationADefinition()) GI.addressTaken.insert(FD);
+        }
+      }
+    }
+    return true;
+  }
+
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    if (ValueDecl *VD = DRE->getDecl()) {
+      if (FunctionDecl *FD = dyn_cast<FunctionDecl>(VD)) {
+        QualType QT = DRE->getType();
+        if (QT->isPointerType() || QT->isFunctionPointerType()) {
+          if (FD->isThisDeclarationADefinition()) GI.addressTaken.insert(FD);
+        }
+      }
+    }
+    return true;
+  }
+};
+
+class CollectorConsumer : public ASTConsumer {
+  ASTContext *Ctx;
+  GlobalInfo &GI;
+public:
+  CollectorConsumer(ASTContext *C, GlobalInfo &g) : Ctx(C), GI(g) {}
+  void HandleTranslationUnit(ASTContext &Context) override {
+    CollectorVisitor V(Context, GI);
+    V.TraverseDecl(Context.getTranslationUnitDecl());
+  }
+};
+
+class CollectorAction : public ASTFrontendAction {
+public:
+  CollectorAction() {}
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef) override {
+    return std::make_unique<CollectorConsumer>(&CI.getASTContext(), G);
+  }
+};
+
+// Utility: remove ranges from file content (ranges are [start,end) offsets)
+static std::string removeRangesFromContent(const std::string &content, std::vector<std::pair<unsigned,unsigned>> ranges) {
+  if (ranges.empty()) return content;
+  std::sort(ranges.begin(), ranges.end(), [](auto &a, auto &b){ return a.first > b.first; });
+  std::string out = content;
+  for (auto &r : ranges) {
+    unsigned s = r.first;
+    unsigned e = r.second;
+    if (s >= e || s >= out.size()) continue;
+    unsigned safeEnd = std::min(e, (unsigned)out.size());
+    out.erase(s, safeEnd - s);
+  }
+  return out;
+}
+
+int main(int argc, const char **argv) {
+  // Use the factory API for CommonOptionsParser
+  auto ExpectedParser = CommonOptionsParser::create(argc, argv, ToolCategory);
+  if (!ExpectedParser) {
+    llvm::errs() << "Error parsing command line: " << llvm::toString(ExpectedParser.takeError()) << "\n";
+    return 1;
+  }
+  CommonOptionsParser &OptionsParser = *ExpectedParser;
+  ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
+
+  // Phase 1: collect info across all TUs
+  int res = Tool.run(newFrontendActionFactory<CollectorAction>().get());
+  if (res != 0) {
+    llvm::errs() << "Error during collection phase\n";
+    return res;
+  }
+
+  // Decide removable functions: internal linkage (static), not called, not address-taken, not used attributes
+  std::map<std::string, std::vector<FuncRange>> removalsByFile;
+  for (const FunctionDecl *FD : G.allDefs) {
+    // Only internal linkage (static)
+	  // new — only keep functions declared `static` at file scope
+	  if (FD->getStorageClass() != SC_Static) continue;
+	  if (G.called.count(FD)) continue;
+    if (G.addressTaken.count(FD)) continue;
+    if (FD->hasAttr<UsedAttr>() || FD->hasAttr<ConstructorAttr>() || FD->hasAttr<DestructorAttr>()) continue;
+    auto it = G.ranges.find(FD);
+    if (it == G.ranges.end()) continue;
+    FuncRange fr = it->second;
+    if (fr.startOffset < fr.endOffset && !fr.file.empty()) {
+      removalsByFile[fr.file].push_back(fr);
+    }
+  }
+
+  if (removalsByFile.empty()) {
+    llvm::outs() << "No removable static functions found.\n";
+    return 0;
+  }
+
+  // For each file, read content, remove ranges, write new file with suffix
+  for (auto &p : removalsByFile) {
+    const std::string &file = p.first;
+    std::ifstream fin(file, std::ios::binary);
+    if (!fin) {
+      llvm::errs() << "Cannot open file: " << file << "\n";
+      continue;
+    }
+    std::stringstream ss;
+    ss << fin.rdbuf();
+    std::string content = ss.str();
+    fin.close();
+
+    // Build ranges vector
+    std::vector<std::pair<unsigned,unsigned>> ranges;
+    for (auto &fr : p.second) {
+      unsigned s = fr.startOffset;
+      unsigned e = fr.endOffset;
+      if (s >= content.size()) continue;
+      e = std::min(e, (unsigned)content.size());
+      ranges.emplace_back(s, e);
+    }
+
+    // Merge overlapping/adjacent ranges
+    if (!ranges.empty()) {
+      std::sort(ranges.begin(), ranges.end());
+      std::vector<std::pair<unsigned,unsigned>> merged;
+      auto cur = ranges[0];
+      for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first <= cur.second) {
+          cur.second = std::max(cur.second, ranges[i].second);
+        } else {
+          merged.push_back(cur);
+          cur = ranges[i];
+        }
+      }
+      merged.push_back(cur);
+      ranges.swap(merged);
+    }
+
+    std::string newContent = removeRangesFromContent(content, ranges);
+
+    // Write to new file with suffix
+    std::string outFile = file + OutputSuffix;
+    std::ofstream fout(outFile, std::ios::binary);
+    if (!fout) {
+      llvm::errs() << "Cannot write output file: " << outFile << "\n";
+      continue;
+    }
+    fout << newContent;
+    fout.close();
+
+    llvm::outs() << "Wrote cleaned file: " << outFile << " (removed " << ranges.size() << " ranges)\n";
+  }
+
+  llvm::outs() << "Done. Review the .clean.c files before replacing originals.\n";
+  return 0;
+}

@@ -1,0 +1,58 @@
+cmake_minimum_required(VERSION 3.16)
+project(WinPaint C)
+
+# ---------------------------------------------------------
+#  Compiler festlegen (für Cross‑Compile mit MinGW‑w64)
+# ---------------------------------------------------------
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_C_COMPILER i686-w64-mingw32-gcc)
+set(CMAKE_RC_COMPILER i686-w64-mingw32-windres)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Optional: falls später C++ benötigt wird
+# set(CMAKE_CXX_COMPILER i686-w64-mingw32-g++)
+
+# ---------------------------------------------------------
+#  Compiler Flags
+# ---------------------------------------------------------
+add_compile_definitions(UNICODE _UNICODE)
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+# ---------------------------------------------------------
+#  Quellen
+# ---------------------------------------------------------
+set(SOURCES
+    paint.c
+)
+
+# ---------------------------------------------------------
+#  Win32 GUI Executable (kein Konsolenfenster)
+# ---------------------------------------------------------
+add_executable(winpaint WIN32 ${SOURCES})
+
+# ---------------------------------------------------------
+#  Linker‑Bibliotheken für Win32 GDI + Common Controls
+# ---------------------------------------------------------
+# ... (deine bisherige Konfiguration)
+
+# 1. Füge comdlg32 zu den Bibliotheken hinzu
+target_link_libraries(winpaint PRIVATE
+    comctl32
+    gdi32
+    user32
+    kernel32
+    uxtheme
+    comdlg32  <-- MUSS HIER STEHEN
+)
+
+# 2. Erzwinge den Unicode-Einstiegspunkt (behebt WinMain@16 Fehler)
+set_target_properties(winpaint PROPERTIES 
+    LINK_FLAGS "-Wl,--subsystem,windows -municode"
+)
+
+
+# ---------------------------------------------------------
+#  Installation (optional)
+# ---------------------------------------------------------
+install(TARGETS winpaint RUNTIME DESTINATION bin)

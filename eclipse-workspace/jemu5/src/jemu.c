@@ -1,0 +1,1939 @@
+// ============================================================================
+// emu.c - Extended x64 emulator core (bare-metal-like, no stdio, no SDL)
+// - Large single-file amalgamation intended for testing and development.
+// - No printf/fprintf; uses a lightweight debug log buffer instead.
+// - Framebuffer allocation without SDL (fb_mem allocated and accessible).
+// - Inline-ASM hotpaths where applicable (x86_64 GCC/Clang).
+// - Many opcode handlers, helpers, and stubs included to expand code size
+//   for testing, instrumentation, and incremental integration.
+// - NOTE: This file contains many simplified placeholders and illustrative
+//   implementations. Replace or integrate with your Part1 code for full
+//   correctness (ModR/M, SIB, full EA, paging, MMIO, etc).
+// ============================================================================
+
+/*
+ Goals for this file:
+ - Provide a large, self-contained emulator core that compiles on x86_64
+ with GCC/Clang and can be used as a development/test harness.
+ - Avoid any use of stdio (printf/fprintf) to keep it suitable for
+ bare-metal-like environments or static linking scenarios.
+ - Offer many helper functions, debug facilities, and opcode handlers
+ to exercise the emulator and to be extended later.
+ */
+
+/* Standard headers (minimal, no stdio) */
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+
+/* ------------------------------------------------------------------------- */
+/* Configuration switches - toggle features for compilation and testing      */
+/* ------------------------------------------------------------------------- */
+
+/* Enable inline-asm fast memory loads/stores (x86_64 only) */
+#ifndef USE_INLINE_ASM_FASTMEM
+#define USE_INLINE_ASM_FASTMEM 1
+#endif
+
+/* Enable inline-asm fast fetch (fetch8/32/64) */
+#ifndef USE_INLINE_ASM_FETCH
+#define USE_INLINE_ASM_FETCH 1
+#endif
+
+/* Enable inline-asm fast push/pop */
+#ifndef USE_INLINE_ASM_STACK
+#define USE_INLINE_ASM_STACK 1
+#endif
+
+/* Enable SSE2 streaming blit helpers (not used for SDL-less mode) */
+#ifndef USE_FB_STREAMING
+#define USE_FB_STREAMING 0
+#endif
+
+/* Default RAM size for standalone testing */
+#ifndef RAM_SIZE
+#define RAM_SIZE (64ULL * 1024 * 1024) /* 64 MiB */
+#endif
+
+/* Debug log size (circular buffer) */
+#ifndef DEBUG_LOG_SIZE
+#define DEBUG_LOG_SIZE 16384
+#endif
+
+/* ------------------------------------------------------------------------- */
+/* Basic emulator state and types                                            */
+/* ------------------------------------------------------------------------- */
+
+/* Minimal XMM type (128-bit split into two 64-bit lanes) */
+typedef struct {
+	uint64_t lo;
+	uint64_t hi;
+} XMM;
+
+/* CPU structure: only fields used by this file are present */
+typedef struct {
+	uint64_t gpr[16]; /* RAX..R15 */
+	uint64_t rflags;
+	uint64_t rip;
+	XMM xmm[16];
+	int op_size; /* 16/32/64 */
+	int addr_size; /* 32/64 */
+	int has_rex;
+	int rex_w, rex_r, rex_x, rex_b;
+	int modrm_mod, modrm_reg, modrm_rm;
+	uint8_t last_opcode;
+	/* Additional fields for instrumentation and tracing */
+	uint64_t instr_count;
+	uint64_t cycles;
+	int halted;
+} X64CPU;
+
+/* Global CPU instance */
+static X64CPU cpu;
+
+/* Memory and framebuffer */
+static uint8_t *ram_mem = NULL;
+static uint8_t *fb_mem = NULL;
+
+/* Framebuffer descriptor */
+typedef struct {
+	int width;
+	int height;
+	int pitch; /* bytes per row */
+} FBDisplay;
+static FBDisplay fbdisp;
+
+/* Debug log (circular) */
+static char debug_log[DEBUG_LOG_SIZE];
+static unsigned int debug_log_pos = 0;
+
+/* ------------------------------------------------------------------------- */
+/* Low-level helpers: debug log, hex conversion, small utilities             */
+/* ------------------------------------------------------------------------- */
+
+/* Append raw bytes to debug log (circular) */
+static inline void debug_log_write_bytes(const char *buf, unsigned int len) {
+	for (unsigned int i = 0; i < len; ++i) {
+		debug_log[debug_log_pos++] = buf[i];
+		if (debug_log_pos >= DEBUG_LOG_SIZE)
+			debug_log_pos = 0;
+	}
+}
+
+/* Append NUL-terminated string to debug log */
+static inline void debug_log_write_str(const char *s) {
+	if (!s)
+		return;
+	while (*s) {
+		debug_log[debug_log_pos++] = *s++;
+		if (debug_log_pos >= DEBUG_LOG_SIZE)
+			debug_log_pos = 0;
+	}
+}
+
+/* Convert 64-bit value to hex string (16 chars) */
+static inline void u64_to_hex(uint64_t v, char *buf) {
+	static const char hex[] = "0123456789ABCDEF";
+	for (int i = 0; i < 16; ++i) {
+		buf[15 - i] = hex[v & 0xF];
+		v >>= 4;
+	}
+	buf[16] = '\0';
+}
+
+/* Convert 32-bit value to hex string (8 chars) */
+static inline void u32_to_hex(uint32_t v, char *buf) {
+	static const char hex[] = "0123456789ABCDEF";
+	for (int i = 0; i < 8; ++i) {
+		buf[7 - i] = hex[v & 0xF];
+		v >>= 4;
+	}
+	buf[8] = '\0';
+}
+
+/* Convert 16-bit value to hex string (4 chars) */
+static inline void u16_to_hex(uint16_t v, char *buf) {
+	static const char hex[] = "0123456789ABCDEF";
+	for (int i = 0; i < 4; ++i) {
+		buf[3 - i] = hex[v & 0xF];
+		v >>= 4;
+	}
+	buf[4] = '\0';
+}
+
+/* Convert 8-bit value to hex string (2 chars) */
+static inline void u8_to_hex(uint8_t v, char *buf) {
+	static const char hex[] = "0123456789ABCDEF";
+	buf[0] = hex[(v >> 4) & 0xF];
+	buf[1] = hex[v & 0xF];
+	buf[2] = '\0';
+}
+
+/* Append a hex representation of a 64-bit value to debug log */
+static inline void trace_hex64(const char *label, uint64_t v) {
+	char tmp[32];
+	if (label)
+		debug_log_write_str(label);
+	u64_to_hex(v, tmp);
+	debug_log_write_str(tmp);
+	debug_log_write_str("\n");
+}
+
+/* Append a simple message to debug log */
+static inline void trace_msg(const char *s) {
+	debug_log_write_str(s);
+	debug_log_write_str("\n");
+}
+
+/* ------------------------------------------------------------------------- */
+/* Memory access helpers (linear mapping)                                    */
+/* ------------------------------------------------------------------------- */
+
+/* Return pointer to linear memory for guest address (simple mapping) */
+uint8_t* get_memory_ptr(uint64_t addr) {
+	if (!ram_mem)
+		return NULL;
+	/* For simplicity, map guest physical address modulo RAM_SIZE */
+	return &ram_mem[addr % RAM_SIZE];
+}
+
+
+/* Read/write helpers (8/16/32/64) with optional inline asm fast paths */
+uint8_t mem_read8(uint64_t addr) {
+	uint8_t *p = get_memory_ptr(addr);
+	return p ? p[0] : 0;
+}
+uint16_t mem_read16(uint64_t addr) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return 0;
+	uint16_t v;
+	memcpy(&v, p, 2);
+	return v;
+}
+uint32_t mem_read32(uint64_t addr) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return 0;
+	uint32_t v;
+	memcpy(&v, p, 4);
+	return v;
+}
+uint64_t mem_read64(uint64_t addr) {
+#if USE_INLINE_ASM_FASTMEM && defined(__x86_64__) && defined(__GNUC__)
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return 0;
+	uint64_t val;
+	asm volatile ("movq (%1), %0" : "=r"(val) : "r"(p) : "memory");
+	return val;
+#else
+    uint8_t *p = get_memory_ptr(addr);
+    if (!p) return 0;
+    uint64_t v;
+    memcpy(&v, p, 8);
+    return v;
+#endif
+}
+
+void mem_write8(uint64_t addr, uint8_t v) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+	p[0] = v;
+}
+void mem_write16(uint64_t addr, uint16_t v) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+	memcpy(p, &v, 2);
+}
+void mem_write32(uint64_t addr, uint32_t v) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+	memcpy(p, &v, 4);
+}
+void mem_write64(uint64_t addr, uint64_t v) {
+#if USE_INLINE_ASM_FASTMEM && defined(__x86_64__) && defined(__GNUC__)
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+	asm volatile ("movq %1, (%0)" : : "r"(p), "r"(v) : "memory");
+#else
+    uint8_t *p = get_memory_ptr(addr);
+    if (!p) return;
+    memcpy(p, &v, 8);
+#endif
+}
+
+/* Exported push: decrement RSP (gpr[4]) and write 64-bit value */
+void push_u64(uint64_t v) {
+    /* Keep behavior consistent with inline variant */
+    cpu.gpr[4] -= 8;
+    mem_write64(cpu.gpr[4], v);
+}
+
+/* Exported pop: read 64-bit value from stack and increment RSP */
+uint64_t pop_u64(void) {
+    uint64_t v = mem_read64(cpu.gpr[4]);
+    cpu.gpr[4] += 8;
+    return v;
+}
+
+/* Bulk memory copy helper (fast path using inline asm rep movsq if available) */
+static inline void mem_copy_fast(void *dst, const void *src, size_t n) {
+#if defined(__x86_64__) && defined(__GNUC__)
+	/* Use rep movsb/movsq depending on size; this is a simple wrapper */
+	if (n == 0)
+		return;
+	/* If both pointers are aligned and n is multiple of 8, use rep movsq */
+	if ((((uintptr_t) dst) % 8 == 0) && (((uintptr_t) src) % 8 == 0)
+			&& (n % 8 == 0)) {
+		size_t q = n / 8;
+		asm volatile (
+				"rep movsq"
+				: "+D"(dst), "+S"(src), "+c"(q)
+				:
+				: "memory"
+		);
+	} else {
+		/* fallback to byte-wise rep movsb */
+		size_t q = n;
+		asm volatile (
+				"rep movsb"
+				: "+D"(dst), "+S"(src), "+c"(q)
+				:
+				: "memory"
+		);
+	}
+#else
+    memcpy(dst, src, n);
+#endif
+}
+
+/* ------------------------------------------------------------------------- */
+/* Instruction fetch helpers                                                  */
+/* ------------------------------------------------------------------------- */
+
+/* Fetch helpers read from memory at RIP and advance RIP.
+ Inline-asm variants use direct pointer loads for speed. */
+uint8_t fetch8(void) {
+#if USE_INLINE_ASM_FETCH && defined(__x86_64__) && defined(__GNUC__)
+	uint8_t b = 0;
+	uint8_t *p = get_memory_ptr(cpu.rip);
+	if (p)
+		asm volatile ("movb (%1), %0" : "=r"(b) : "r"(p) : "memory");
+	cpu.rip += 1;
+	return b;
+#else
+    uint8_t v = mem_read8(cpu.rip);
+    cpu.rip += 1;
+    return v;
+#endif
+}
+
+uint32_t fetch32(void) {
+#if USE_INLINE_ASM_FETCH && defined(__x86_64__) && defined(__GNUC__)
+	uint32_t v = 0;
+	uint8_t *p = get_memory_ptr(cpu.rip);
+	if (p)
+		asm volatile ("movl (%1), %0" : "=r"(v) : "r"(p) : "memory");
+	cpu.rip += 4;
+	return v;
+#else
+    uint32_t v = mem_read32(cpu.rip);
+    cpu.rip += 4;
+    return v;
+#endif
+}
+
+uint64_t fetch64(void) {
+#if USE_INLINE_ASM_FETCH && defined(__x86_64__) && defined(__GNUC__)
+	uint64_t v = 0;
+	uint8_t *p = get_memory_ptr(cpu.rip);
+	if (p)
+		asm volatile ("movq (%1), %0" : "=r"(v) : "r"(p) : "memory");
+	cpu.rip += 8;
+	return v;
+#else
+    uint64_t v = mem_read64(cpu.rip);
+    cpu.rip += 8;
+    return v;
+#endif
+}
+
+/* ------------------------------------------------------------------------- */
+/* ModR/M, SIB, and effective address helpers (simplified placeholders)      */
+/* ------------------------------------------------------------------------- */
+
+/* Decode a ModR/M byte into cpu.modrm_* fields. This is simplified and
+ does not handle SIB or complex addressing; extend as needed. */
+void decode_modrm(void) {
+	uint8_t b = fetch8();
+	cpu.modrm_mod = (b >> 6) & 3;
+	cpu.modrm_reg = (b >> 3) & 7;
+	cpu.modrm_rm = b & 7;
+}
+
+/* Compute a simplified effective address. This placeholder supports:
+ - [reg]
+ - [reg + disp8]
+ - [reg + disp32]
+ - disp32 (when mod==0 and rm==5)
+ It does not support SIB or RIP-relative addressing. */
+uint64_t compute_ea(void) {
+	if (cpu.modrm_mod == 0 && cpu.modrm_rm == 5) {
+		uint32_t d = fetch32();
+		return (uint64_t) (int64_t) (int32_t) d;
+	} else if (cpu.modrm_mod == 0 && cpu.modrm_rm < 8) {
+		return cpu.gpr[cpu.modrm_rm | (cpu.rex_b << 3)];
+	} else if (cpu.modrm_mod == 1) {
+		int8_t d8 = (int8_t) fetch8();
+		return cpu.gpr[cpu.modrm_rm | (cpu.rex_b << 3)] + (int64_t) d8;
+	} else if (cpu.modrm_mod == 2) {
+		uint32_t d32 = fetch32();
+		return cpu.gpr[cpu.modrm_rm | (cpu.rex_b << 3)]
+				+ (int64_t) (int32_t) d32;
+	}
+	return cpu.gpr[cpu.modrm_rm | (cpu.rex_b << 3)];
+}
+
+/* ------------------------------------------------------------------------- */
+/* Flag helpers                                                               */
+/* ------------------------------------------------------------------------- */
+
+/* Compute parity of low byte */
+static inline int parity8(uint8_t x) {
+	x ^= x >> 4;
+	x &= 0xF;
+	return (0x6996 >> x) & 1;
+}
+
+/* Set ZF, SF, PF based on result and width */
+static inline void set_flag_zf_sf_pf8(uint64_t res, int width) {
+	uint64_t mask = (width == 64) ? ~0ULL : ((1ULL << width) - 1);
+	uint64_t v = res & mask;
+	/* ZF (bit 6) */
+	if (v == 0)
+		cpu.rflags |= (1ULL << 6);
+	else
+		cpu.rflags &= ~(1ULL << 6);
+	/* SF (bit 7) */
+	if (v & (1ULL << (width - 1)))
+		cpu.rflags |= (1ULL << 7);
+	else
+		cpu.rflags &= ~(1ULL << 7);
+	/* PF (bit 2) */
+	if (parity8((uint8_t) (v & 0xFF)))
+		cpu.rflags |= (1ULL << 2);
+	else
+		cpu.rflags &= ~(1ULL << 2);
+}
+
+/* Update CF and OF for unsigned addition (64-bit) */
+static inline void update_add_flags_u64(uint64_t a, uint64_t b, uint64_t res,
+		int width) {
+	(void) width;
+	/* CF: carry out of MSB */
+	if (res < a)
+		cpu.rflags |= 1ULL;
+	else
+		cpu.rflags &= ~1ULL;
+	/* OF: signed overflow: signs of a and b same and result sign differs */
+	int sa = (a >> 63) & 1;
+	int sb = (b >> 63) & 1;
+	int sr = (res >> 63) & 1;
+	if ((sa == sb) && (sr != sa))
+		cpu.rflags |= (1ULL << 11);
+	else
+		cpu.rflags &= ~(1ULL << 11);
+}
+
+/* Update CF and OF for unsigned subtraction (64-bit) */
+static inline void update_sub_flags_u64(uint64_t a, uint64_t b, uint64_t res,
+		int width) {
+	(void) width;
+	/* CF: set if borrow -> a < b */
+	if (a < b)
+		cpu.rflags |= 1ULL;
+	else
+		cpu.rflags &= ~1ULL;
+	/* OF: signed overflow: signs of a and b differ and result sign differs from a */
+	int sa = (a >> 63) & 1;
+	int sb = (b >> 63) & 1;
+	int sr = (res >> 63) & 1;
+	if ((sa != sb) && (sr != sa))
+		cpu.rflags |= (1ULL << 11);
+	else
+		cpu.rflags &= ~(1ULL << 11);
+}
+
+/* Clear arithmetic flags CF, OF, SF, ZF, PF */
+static inline void clear_alu_flags(void) {
+	cpu.rflags &= ~((1ULL << 0) | (1ULL << 2) | (1ULL << 6) | (1ULL << 7)
+			| (1ULL << 11));
+}
+
+/* ------------------------------------------------------------------------- */
+/* Inline-ASM optimized handlers for hot arithmetic ops (x86_64)             */
+/* ------------------------------------------------------------------------- */
+
+#if defined(__GNUC__) && defined(__x86_64__)
+
+/* Set a single bit in cpu.rflags based on cond (0/1) */
+static inline void set_flag_bit(int bit, int cond) {
+	if (cond)
+		cpu.rflags |= (1ULL << bit);
+	else
+		cpu.rflags &= ~(1ULL << bit);
+}
+
+/* ADD reg64, reg64 optimized handler */
+static inline void handle_add_reg64(int dst_idx, int src_idx) {
+	uint64_t dst = cpu.gpr[dst_idx];
+	uint64_t src = cpu.gpr[src_idx];
+	unsigned char cf = 0, of = 0, sf = 0, zf = 0, pf_byte = 0;
+	asm volatile (
+			"addq %[src], %[dst]\n\t"
+			"setc %[cf]\n\t"
+			"seto %[of]\n\t"
+			"sets %[sf]\n\t"
+			"setz %[zf]\n\t"
+			"pushfq\n\t"
+			"popq %%rax\n\t"
+			"andq $0xff, %%rax\n\t"
+			"movb %%al, %[pf_byte]\n\t"
+			: [dst] "+r" (dst),
+			[cf] "=r" (cf),
+			[of] "=r" (of),
+			[sf] "=r" (sf),
+			[zf] "=r" (zf),
+			[pf_byte] "=r" (pf_byte)
+			: [src] "r" (src)
+			: "rax", "cc", "memory"
+	);
+	unsigned char pf = (pf_byte >> 2) & 1;
+	cpu.gpr[dst_idx] = dst;
+	set_flag_bit(0, cf);
+	set_flag_bit(2, pf);
+	set_flag_bit(6, zf);
+	set_flag_bit(7, sf);
+	set_flag_bit(11, of);
+}
+
+/* SUB reg64, reg64 optimized handler */
+static inline void handle_sub_reg64(int dst_idx, int src_idx) {
+	uint64_t dst = cpu.gpr[dst_idx];
+	uint64_t src = cpu.gpr[src_idx];
+	unsigned char cf = 0, of = 0, sf = 0, zf = 0, pf_byte = 0;
+	asm volatile (
+			"subq %[src], %[dst]\n\t"
+			"setc %[cf]\n\t"
+			"seto %[of]\n\t"
+			"sets %[sf]\n\t"
+			"setz %[zf]\n\t"
+			"pushfq\n\t"
+			"popq %%rax\n\t"
+			"andq $0xff, %%rax\n\t"
+			"movb %%al, %[pf_byte]\n\t"
+			: [dst] "+r" (dst),
+			[cf] "=r" (cf),
+			[of] "=r" (of),
+			[sf] "=r" (sf),
+			[zf] "=r" (zf),
+			[pf_byte] "=r" (pf_byte)
+			: [src] "r" (src)
+			: "rax", "cc", "memory"
+	);
+	unsigned char pf = (pf_byte >> 2) & 1;
+	cpu.gpr[dst_idx] = dst;
+	set_flag_bit(0, cf);
+	set_flag_bit(2, pf);
+	set_flag_bit(6, zf);
+	set_flag_bit(7, sf);
+	set_flag_bit(11, of);
+}
+
+/* INC reg64 optimized handler */
+static inline void handle_inc_reg64(int dst_idx) {
+	uint64_t dst = cpu.gpr[dst_idx];
+	unsigned char of = 0, sf = 0, zf = 0, pf_byte = 0;
+	asm volatile (
+			"incq %[dst]\n\t"
+			"seto %[of]\n\t"
+			"sets %[sf]\n\t"
+			"setz %[zf]\n\t"
+			"pushfq\n\t"
+			"popq %%rax\n\t"
+			"andq $0xff, %%rax\n\t"
+			"movb %%al, %[pf_byte]\n\t"
+			: [dst] "+r" (dst),
+			[of] "=r" (of),
+			[sf] "=r" (sf),
+			[zf] "=r" (zf),
+			[pf_byte] "=r" (pf_byte)
+			:
+			: "rax", "cc", "memory"
+	);
+	unsigned char pf = (pf_byte >> 2) & 1;
+	cpu.gpr[dst_idx] = dst;
+	/* INC does not affect CF */
+	set_flag_bit(2, pf);
+	set_flag_bit(6, zf);
+	set_flag_bit(7, sf);
+	set_flag_bit(11, of);
+}
+
+/* CMP reg64, reg64 optimized handler (sets flags only) */
+static inline void handle_cmp_reg64(int lhs_idx, int rhs_idx) {
+	uint64_t lhs = cpu.gpr[lhs_idx];
+	uint64_t rhs = cpu.gpr[rhs_idx];
+	unsigned char cf = 0, of = 0, sf = 0, zf = 0, pf_byte = 0;
+	asm volatile (
+			"cmpq %[rhs], %[lhs]\n\t"
+			"setc %[cf]\n\t"
+			"seto %[of]\n\t"
+			"sets %[sf]\n\t"
+			"setz %[zf]\n\t"
+			"pushfq\n\t"
+			"popq %%rax\n\t"
+			"andq $0xff, %%rax\n\t"
+			"movb %%al, %[pf_byte]\n\t"
+			: [lhs] "+r" (lhs),
+			[cf] "=r" (cf),
+			[of] "=r" (of),
+			[sf] "=r" (sf),
+			[zf] "=r" (zf),
+			[pf_byte] "=r" (pf_byte)
+			: [rhs] "r" (rhs)
+			: "rax", "cc"
+	);
+	unsigned char pf = (pf_byte >> 2) & 1;
+	set_flag_bit(0, cf);
+	set_flag_bit(2, pf);
+	set_flag_bit(6, zf);
+	set_flag_bit(7, sf);
+	set_flag_bit(11, of);
+}
+
+#endif /* inline asm handlers */
+
+/* ------------------------------------------------------------------------- */
+/* SSE/MMX/FPU stubs and helpers (illustrative)                              */
+/* ------------------------------------------------------------------------- */
+
+/* Zero an XMM register */
+static inline void xmm_zero(int idx) {
+	cpu.xmm[idx].lo = 0;
+	cpu.xmm[idx].hi = 0;
+}
+
+/* Move 128-bit from memory to XMM (simplified) */
+static inline void xmm_load128_from_mem(int idx, uint64_t addr) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p) {
+		cpu.xmm[idx].lo = cpu.xmm[idx].hi = 0;
+		return;
+	}
+	uint64_t lo, hi;
+	memcpy(&lo, p + 0, 8);
+	memcpy(&hi, p + 8, 8);
+	cpu.xmm[idx].lo = lo;
+	cpu.xmm[idx].hi = hi;
+}
+
+/* Move 128-bit from XMM to memory (simplified) */
+static inline void xmm_store128_to_mem(int idx, uint64_t addr) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+	memcpy(p + 0, &cpu.xmm[idx].lo, 8);
+	memcpy(p + 8, &cpu.xmm[idx].hi, 8);
+}
+
+/* Packed add single-precision floats (ADDPS) simplified */
+static inline void sse_addps_reg_reg(int dst, int src) {
+	float a[4], b[4], r[4];
+	memcpy(a, &cpu.xmm[dst].lo, 16);
+	memcpy(b, &cpu.xmm[src].lo, 16);
+	for (int i = 0; i < 4; ++i)
+		r[i] = a[i] + b[i];
+	memcpy(&cpu.xmm[dst].lo, r, 16);
+}
+
+/* Packed sub single-precision floats (SUBPS) simplified */
+static inline void sse_subps_reg_reg(int dst, int src) {
+	float a[4], b[4], r[4];
+	memcpy(a, &cpu.xmm[dst].lo, 16);
+	memcpy(b, &cpu.xmm[src].lo, 16);
+	for (int i = 0; i < 4; ++i)
+		r[i] = a[i] - b[i];
+	memcpy(&cpu.xmm[dst].lo, r, 16);
+}
+
+/* Packed mul single-precision floats (MULPS) simplified */
+static inline void sse_mulps_reg_reg(int dst, int src) {
+	float a[4], b[4], r[4];
+	memcpy(a, &cpu.xmm[dst].lo, 16);
+	memcpy(b, &cpu.xmm[src].lo, 16);
+	for (int i = 0; i < 4; ++i)
+		r[i] = a[i] * b[i];
+	memcpy(&cpu.xmm[dst].lo, r, 16);
+}
+
+/* Packed div single-precision floats (DIVPS) simplified */
+static inline void sse_divps_reg_reg(int dst, int src) {
+	float a[4], b[4], r[4];
+	memcpy(a, &cpu.xmm[dst].lo, 16);
+	memcpy(b, &cpu.xmm[src].lo, 16);
+	for (int i = 0; i < 4; ++i)
+		r[i] = a[i] / b[i];
+	memcpy(&cpu.xmm[dst].lo, r, 16);
+}
+
+/* Bitwise logical ops on XMM registers */
+static inline void sse_andps_reg_reg(int dst, int src) {
+	cpu.xmm[dst].lo &= cpu.xmm[src].lo;
+	cpu.xmm[dst].hi &= cpu.xmm[src].hi;
+}
+static inline void sse_orps_reg_reg(int dst, int src) {
+	cpu.xmm[dst].lo |= cpu.xmm[src].lo;
+	cpu.xmm[dst].hi |= cpu.xmm[src].hi;
+}
+static inline void sse_xorps_reg_reg(int dst, int src) {
+	cpu.xmm[dst].lo ^= cpu.xmm[src].lo;
+	cpu.xmm[dst].hi ^= cpu.xmm[src].hi;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Opcode dispatch: single-instruction executor (extended)                   */
+/* ------------------------------------------------------------------------- */
+
+/* Execute a single instruction (extended set). This function is intentionally
+ verbose and includes many handlers to increase code size for testing. */
+void execute_one_extended(void) {
+	/* Reset decode state for prefixes */
+	cpu.op_size = 64;
+	cpu.addr_size = 64;
+	cpu.has_rex = 0;
+	cpu.rex_w = cpu.rex_r = cpu.rex_x = cpu.rex_b = 0;
+
+	/* Fetch prefixes and opcode byte */
+	int decoding = 1;
+	uint8_t op = 0;
+	while (decoding) {
+		uint8_t b = fetch8();
+		switch (b) {
+		case 0x66:
+			cpu.op_size = 16;
+			continue;
+		case 0x67:
+			cpu.addr_size = 32;
+			continue;
+		default:
+			if ((b & 0xF0) == 0x40) {
+				cpu.has_rex = 1;
+				cpu.rex_w = (b >> 3) & 1;
+				cpu.rex_r = (b >> 2) & 1;
+				cpu.rex_x = (b >> 1) & 1;
+				cpu.rex_b = b & 1;
+				continue;
+			}
+			op = b;
+			decoding = 0;
+			break;
+		}
+	}
+
+	/* Increment instruction counter */
+	cpu.instr_count++;
+
+	/* Dispatch */
+	switch (op) {
+	/* ADD r/m64, r64 (01 /r) */
+	case 0x01: {
+		decode_modrm();
+		uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))];
+		if (cpu.modrm_mod == 3) {
+#if defined(__GNUC__) && defined(__x86_64__)
+			int dst = cpu.modrm_rm | (cpu.rex_b << 3);
+			handle_add_reg64(dst, (cpu.modrm_reg | (cpu.rex_r << 3)));
+#else
+                uint64_t *dstp = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                uint64_t res = *dstp + src;
+                clear_alu_flags();
+                update_add_flags_u64(*dstp, src, res, 64);
+                *dstp = res;
+                set_flag_zf_sf_pf8(res, 64);
+#endif
+		} else {
+			uint64_t addr = compute_ea();
+			uint64_t val = mem_read64(addr);
+			uint64_t res = val + src;
+			mem_write64(addr, res);
+			clear_alu_flags();
+			update_add_flags_u64(val, src, res, 64);
+			set_flag_zf_sf_pf8(res, 64);
+		}
+		break;
+	}
+
+		/* SUB r/m64, r64 (29 /r) */
+	case 0x29: {
+		decode_modrm();
+		uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))];
+		if (cpu.modrm_mod == 3) {
+#if defined(__GNUC__) && defined(__x86_64__)
+			int dst = cpu.modrm_rm | (cpu.rex_b << 3);
+			handle_sub_reg64(dst, (cpu.modrm_reg | (cpu.rex_r << 3)));
+#else
+                uint64_t *dstp = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                uint64_t res = *dstp - src;
+                clear_alu_flags();
+                update_sub_flags_u64(*dstp, src, res, 64);
+                *dstp = res;
+                set_flag_zf_sf_pf8(res, 64);
+#endif
+		} else {
+			uint64_t addr = compute_ea();
+			uint64_t val = mem_read64(addr);
+			uint64_t res = val - src;
+			mem_write64(addr, res);
+			clear_alu_flags();
+			update_sub_flags_u64(val, src, res, 64);
+			set_flag_zf_sf_pf8(res, 64);
+		}
+		break;
+	}
+
+		/* INC r/m64 (FF /0) and other FF group ops */
+	case 0xFF: {
+		decode_modrm();
+		int subop = cpu.modrm_reg;
+		if (subop == 0) { /* INC r/m64 */
+			if (cpu.modrm_mod == 3) {
+#if defined(__GNUC__) && defined(__x86_64__)
+				int dst = cpu.modrm_rm | (cpu.rex_b << 3);
+				handle_inc_reg64(dst);
+#else
+                    uint64_t *r = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                    uint64_t old = *r; uint64_t res = old + 1;
+                    clear_alu_flags();
+                    update_add_flags_u64(old, 1, res, 64);
+                    *r = res;
+                    set_flag_zf_sf_pf8(res, 64);
+#endif
+			} else {
+				uint64_t addr = compute_ea();
+				uint64_t old = mem_read64(addr);
+				uint64_t res = old + 1;
+				mem_write64(addr, res);
+				clear_alu_flags();
+				update_add_flags_u64(old, 1, res, 64);
+				set_flag_zf_sf_pf8(res, 64);
+			}
+		} else if (subop == 2) { /* CALL r/m64 */
+			if (cpu.modrm_mod == 3) {
+				uint64_t dest = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+				uint64_t ret = cpu.rip;
+				push_u64(ret);
+				cpu.rip = dest;
+			} else {
+				uint64_t addr = compute_ea();
+				uint64_t dest = mem_read64(addr);
+				uint64_t ret = cpu.rip;
+				push_u64(ret);
+				cpu.rip = dest;
+			}
+		} else if (subop == 4) { /* JMP r/m64 */
+			if (cpu.modrm_mod == 3) {
+				cpu.rip = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+			} else {
+				uint64_t addr = compute_ea();
+				uint64_t dest = mem_read64(addr);
+				cpu.rip = dest;
+			}
+		} else {
+			trace_msg("FF group subop unimplemented");
+		}
+		break;
+	}
+
+		/* POP r/m64 (8F /0) */
+	case 0x8F: {
+		decode_modrm();
+		if (cpu.modrm_reg != 0) {
+			trace_msg("8F reg!=0 unimplemented");
+			break;
+		}
+		uint64_t val = pop_u64();
+		if (cpu.modrm_mod == 3) {
+			cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))] = val;
+		} else {
+			uint64_t addr = compute_ea();
+			mem_write64(addr, val);
+		}
+		break;
+	}
+
+		/* PUSH imm8 (6A) */
+	case 0x6A: {
+		int8_t imm = (int8_t) fetch8();
+		push_u64((uint64_t) (int64_t) imm);
+		break;
+	}
+
+		/* PUSH imm32 (68) */
+	case 0x68: {
+		uint32_t imm = fetch32();
+		push_u64((uint64_t) (int64_t) (int32_t) imm);
+		break;
+	}
+
+		/* CMP r/m64, r64 (39 /r) */
+	case 0x39: {
+		decode_modrm();
+		uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))];
+		uint64_t lhs;
+		if (cpu.modrm_mod == 3)
+			lhs = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+		else {
+			uint64_t addr = compute_ea();
+			lhs = mem_read64(addr);
+		}
+		uint64_t res = lhs - src;
+		clear_alu_flags();
+		update_sub_flags_u64(lhs, src, res, 64);
+		set_flag_zf_sf_pf8(res, 64);
+		break;
+	}
+
+		/* TEST r/m64, r64 (85 /r) */
+	case 0x85: {
+		decode_modrm();
+		uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))];
+		uint64_t lhs;
+		if (cpu.modrm_mod == 3)
+			lhs = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+		else {
+			uint64_t addr = compute_ea();
+			lhs = mem_read64(addr);
+		}
+		uint64_t res = lhs & src;
+		cpu.rflags &= ~(1ULL | (1ULL << 11)); /* clear CF & OF */
+		set_flag_zf_sf_pf8(res, 64);
+		break;
+	}
+
+		/* LEA r64, m (8D /r) */
+	case 0x8D: {
+		decode_modrm();
+		if (cpu.modrm_mod == 3) {
+			uint64_t val = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+			cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))] = val;
+		} else {
+			uint64_t addr = compute_ea();
+			cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))] = addr;
+		}
+		break;
+	}
+
+		/* 0x0F two-byte group */
+	case 0x0F: {
+		uint8_t op2 = fetch8();
+		switch (op2) {
+		case 0x6E: { /* MOVD xmm, r/m32 (simplified) */
+			decode_modrm();
+			if (cpu.modrm_mod == 3) {
+				uint32_t v =
+						(uint32_t) cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))];
+				memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].lo, &v, 4);
+				cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].hi = 0;
+			} else {
+				uint64_t addr = compute_ea();
+				uint32_t v = mem_read32(addr);
+				memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].lo, &v, 4);
+				cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].hi = 0;
+			}
+			break;
+		}
+		case 0x7E: { /* MOVD r/m32, xmm (simplified) */
+			decode_modrm();
+			if (cpu.modrm_mod == 3) {
+				uint32_t v = (uint32_t) cpu.xmm[(cpu.modrm_reg
+						| (cpu.rex_r << 3))].lo;
+				cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))] = (uint64_t) v;
+			} else {
+				uint64_t addr = compute_ea();
+				uint32_t v = (uint32_t) cpu.xmm[(cpu.modrm_reg
+						| (cpu.rex_r << 3))].lo;
+				mem_write32(addr, v);
+			}
+			break;
+		}
+		case 0x28: { /* MOVAPS xmm, xmm/m128 */
+			decode_modrm();
+			if (cpu.modrm_mod == 3) {
+				cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].lo =
+						cpu.xmm[(cpu.modrm_rm | (cpu.rex_b << 3))].lo;
+				cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].hi =
+						cpu.xmm[(cpu.modrm_rm | (cpu.rex_b << 3))].hi;
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))], tmp, 16);
+			}
+			break;
+		}
+		case 0x29: { /* MOVAPS xmm/m128, xmm */
+			decode_modrm();
+			if (cpu.modrm_mod == 3) {
+				cpu.xmm[(cpu.modrm_rm | (cpu.rex_b << 3))].lo =
+						cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].lo;
+				cpu.xmm[(cpu.modrm_rm | (cpu.rex_b << 3))].hi =
+						cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))].hi;
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				memcpy(tmp, &cpu.xmm[(cpu.modrm_reg | (cpu.rex_r << 3))], 16);
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(p, tmp, 16);
+			}
+			break;
+		}
+		case 0x58: { /* ADDPS/ADDPD simplified */
+			decode_modrm();
+			int dst = (cpu.modrm_reg | (cpu.rex_r << 3));
+			if (cpu.modrm_mod == 3) {
+				int src = (cpu.modrm_rm | (cpu.rex_b << 3));
+				if (cpu.op_size == 16) {
+					/* ADDPD (double) */
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, &cpu.xmm[src].lo, 8);
+					memcpy(&b_hi, &cpu.xmm[src].hi, 8);
+					double r_lo = a_lo + b_lo;
+					double r_hi = a_hi + b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					sse_addps_reg_reg(dst, src);
+				}
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				if (cpu.op_size == 16) {
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, tmp + 0, 8);
+					memcpy(&b_hi, tmp + 8, 8);
+					double r_lo = a_lo + b_lo;
+					double r_hi = a_hi + b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					float af[4], bf[4], rf[4];
+					memcpy(af, &cpu.xmm[dst].lo, 16);
+					memcpy(bf, tmp, 16);
+					for (int i = 0; i < 4; i++)
+						rf[i] = af[i] + bf[i];
+					memcpy(&cpu.xmm[dst].lo, rf, 16);
+				}
+			}
+			break;
+		}
+		case 0x5C: { /* SUBPS/SUBPD simplified */
+			decode_modrm();
+			int dst = (cpu.modrm_reg | (cpu.rex_r << 3));
+			if (cpu.modrm_mod == 3) {
+				int src = (cpu.modrm_rm | (cpu.rex_b << 3));
+				if (cpu.op_size == 16) {
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, &cpu.xmm[src].lo, 8);
+					memcpy(&b_hi, &cpu.xmm[src].hi, 8);
+					double r_lo = a_lo - b_lo;
+					double r_hi = a_hi - b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					sse_subps_reg_reg(dst, src);
+				}
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				if (cpu.op_size == 16) {
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, tmp + 0, 8);
+					memcpy(&b_hi, tmp + 8, 8);
+					double r_lo = a_lo - b_lo;
+					double r_hi = a_hi - b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					float af[4], bf[4], rf[4];
+					memcpy(af, &cpu.xmm[dst].lo, 16);
+					memcpy(bf, tmp, 16);
+					for (int i = 0; i < 4; i++)
+						rf[i] = af[i] - bf[i];
+					memcpy(&cpu.xmm[dst].lo, rf, 16);
+				}
+			}
+			break;
+		}
+		case 0x5E: { /* DIVPS/DIVPD simplified */
+			decode_modrm();
+			int dst = (cpu.modrm_reg | (cpu.rex_r << 3));
+			if (cpu.modrm_mod == 3) {
+				int src = (cpu.modrm_rm | (cpu.rex_b << 3));
+				if (cpu.op_size == 16) {
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, &cpu.xmm[src].lo, 8);
+					memcpy(&b_hi, &cpu.xmm[src].hi, 8);
+					double r_lo = a_lo / b_lo;
+					double r_hi = a_hi / b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					sse_divps_reg_reg(dst, src);
+				}
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				if (cpu.op_size == 16) {
+					double a_lo, a_hi, b_lo, b_hi;
+					memcpy(&a_lo, &cpu.xmm[dst].lo, 8);
+					memcpy(&a_hi, &cpu.xmm[dst].hi, 8);
+					memcpy(&b_lo, tmp + 0, 8);
+					memcpy(&b_hi, tmp + 8, 8);
+					double r_lo = a_lo / b_lo;
+					double r_hi = a_hi / b_hi;
+					memcpy(&cpu.xmm[dst].lo, &r_lo, 8);
+					memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+				} else {
+					float af[4], bf[4], rf[4];
+					memcpy(af, &cpu.xmm[dst].lo, 16);
+					memcpy(bf, tmp, 16);
+					for (int i = 0; i < 4; i++)
+						rf[i] = af[i] / bf[i];
+					memcpy(&cpu.xmm[dst].lo, rf, 16);
+				}
+			}
+			break;
+		}
+		case 0x54: { /* ANDPS/ANDPD */
+			decode_modrm();
+			int dst = cpu.modrm_reg | (cpu.rex_r << 3);
+			if (cpu.modrm_mod == 3) {
+				int src = cpu.modrm_rm | (cpu.rex_b << 3);
+				sse_andps_reg_reg(dst, src);
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				uint64_t *t64 = (uint64_t*) tmp;
+				cpu.xmm[dst].lo &= t64[0];
+				cpu.xmm[dst].hi &= t64[1];
+			}
+			break;
+		}
+		case 0x56: { /* ORPS/ORPD */
+			decode_modrm();
+			int dst = cpu.modrm_reg | (cpu.rex_r << 3);
+			if (cpu.modrm_mod == 3) {
+				int src = cpu.modrm_rm | (cpu.rex_b << 3);
+				sse_orps_reg_reg(dst, src);
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				uint64_t *t64 = (uint64_t*) tmp;
+				cpu.xmm[dst].lo |= t64[0];
+				cpu.xmm[dst].hi |= t64[1];
+			}
+			break;
+		}
+		case 0x57: { /* XORPS/XORPD */
+			decode_modrm();
+			int dst = cpu.modrm_reg | (cpu.rex_r << 3);
+			if (cpu.modrm_mod == 3) {
+				int src = cpu.modrm_rm | (cpu.rex_b << 3);
+				sse_xorps_reg_reg(dst, src);
+			} else {
+				uint64_t addr = compute_ea();
+				uint8_t tmp[16];
+				uint8_t *p = get_memory_ptr(addr);
+				if (p)
+					memcpy(tmp, p, 16);
+				else
+					memset(tmp, 0, 16);
+				uint64_t *t64 = (uint64_t*) tmp;
+				cpu.xmm[dst].lo ^= t64[0];
+				cpu.xmm[dst].hi ^= t64[1];
+			}
+			break;
+		}
+		case 0xFE: { /* PADDQ (sim) */
+			decode_modrm();
+			int dst = cpu.modrm_reg | (cpu.rex_r << 3);
+			if (cpu.modrm_mod == 3) {
+				int src = cpu.modrm_rm | (cpu.rex_b << 3);
+				uint64_t a0 = cpu.xmm[dst].lo;
+				uint64_t b0 = cpu.xmm[src].lo;
+				cpu.xmm[dst].lo = a0 + b0;
+			} else {
+				uint64_t addr = compute_ea();
+				uint64_t memv = mem_read64(addr);
+				cpu.xmm[dst].lo = cpu.xmm[dst].lo + memv;
+			}
+			break;
+		}
+		default:
+			trace_msg("Unimplemented 0F opcode");
+			break;
+		}
+		break;
+	}
+
+		/* JMP short (EB) */
+	case 0xEB: {
+		int8_t d8 = (int8_t) fetch8();
+		cpu.rip = cpu.rip + d8;
+		break;
+	}
+
+		/* JMP near (E9) */
+	case 0xE9: {
+		uint32_t d32 = fetch32();
+		int32_t s = (int32_t) d32;
+		cpu.rip = cpu.rip + s;
+		break;
+	}
+
+		/* CALL rel32 (E8) */
+	case 0xE8: {
+		uint32_t d32 = fetch32();
+		int32_t s = (int32_t) d32;
+		uint64_t ret = cpu.rip;
+		push_u64(ret);
+		cpu.rip = cpu.rip + s;
+		break;
+	}
+
+		/* RET (C3) */
+	case 0xC3: {
+		uint64_t ret = pop_u64();
+		cpu.rip = ret;
+		break;
+	}
+
+		/* NOP (90) */
+	case 0x90: {
+		/* do nothing */
+		break;
+	}
+
+		/* MOV r64, imm64 (REX.W + B8+rd) - simplified: handle 0xB8..0xBF when rex.w set */
+	case 0xB8:
+	case 0xB9:
+	case 0xBA:
+	case 0xBB:
+	case 0xBC:
+	case 0xBD:
+	case 0xBE:
+	case 0xBF: {
+		/* Determine register from opcode low bits and rex.b */
+		int reg = (op & 0x7);
+		if (cpu.has_rex && cpu.rex_b)
+			reg |= 8;
+		uint64_t imm = fetch64();
+		cpu.gpr[reg] = imm;
+		break;
+	}
+
+		/* MOV r/m64, r64 (89 /r) */
+	case 0x89: {
+		decode_modrm();
+		uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))];
+		if (cpu.modrm_mod == 3) {
+			cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))] = src;
+		} else {
+			uint64_t addr = compute_ea();
+			mem_write64(addr, src);
+		}
+		break;
+	}
+
+		/* MOV r64, r/m64 (8B /r) */
+	case 0x8B: {
+		decode_modrm();
+		if (cpu.modrm_mod == 3) {
+			cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))] = cpu.gpr[(cpu.modrm_rm
+					| (cpu.rex_b << 3))];
+		} else {
+			uint64_t addr = compute_ea();
+			uint64_t val = mem_read64(addr);
+			cpu.gpr[(cpu.modrm_reg | (cpu.rex_r << 3))] = val;
+		}
+		break;
+	}
+
+		/* MOV r64, imm32 sign-extended (C7 /0 with reg field) - simplified */
+	case 0xC7: {
+		decode_modrm();
+		if (cpu.modrm_reg == 0) {
+			if (cpu.modrm_mod == 3) {
+				uint32_t imm = fetch32();
+				cpu.gpr[(cpu.modrm_rm | (cpu.rex_b << 3))] =
+						(uint64_t) (int64_t) (int32_t) imm;
+			} else {
+				uint64_t addr = compute_ea();
+				uint32_t imm = fetch32();
+				mem_write32(addr, imm);
+			}
+		} else {
+			/* other C7 subops not implemented */
+			trace_msg("C7 subop unimplemented");
+		}
+		break;
+	}
+
+		/* LEAVE (C9) - simplified: mov rsp, rbp; pop rbp */
+	case 0xC9: {
+		cpu.gpr[4] = cpu.gpr[5]; /* rsp = rbp (rsp index 4, rbp index 5) */
+		cpu.gpr[5] = pop_u64(); /* rbp = pop */
+		break;
+	}
+
+		/* ENTER/LEAVE and other complex ops omitted for brevity */
+
+	default:
+		trace_msg("Opcode not implemented in extended executor");
+		break;
+	}
+
+	/* Update cycles (very rough) */
+	cpu.cycles += 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Emulator API: framebuffer access, debug log dump, code loader, executor   */
+/* ------------------------------------------------------------------------- */
+
+/* Initialize emulator memory and CPU state */
+int x64emu_init_standalone(void) {
+	if (!ram_mem) {
+		ram_mem = malloc(RAM_SIZE);
+		if (!ram_mem)
+			return -1;
+		memset(ram_mem, 0, RAM_SIZE);
+	}
+	/* default stack pointer near top of RAM */
+	cpu.gpr[4] = RAM_SIZE - 0x1000; /* RSP */
+	cpu.rip = 0;
+	cpu.rflags = 0;
+	cpu.instr_count = 0;
+	cpu.cycles = 0;
+	cpu.halted = 0;
+	memset(debug_log, 0, DEBUG_LOG_SIZE);
+	debug_log_pos = 0;
+	/* zero XMMs */
+	for (int i = 0; i < 16; ++i) {
+		cpu.xmm[i].lo = cpu.xmm[i].hi = 0;
+	}
+	return 0;
+}
+
+/* Allocate framebuffer without SDL (bare-metal-like) */
+int fb_init_display(int width, int height) {
+	fbdisp.width = width;
+	fbdisp.height = height;
+	fbdisp.pitch = width * 4; /* ARGB8888 */
+	if (!fb_mem) {
+		fb_mem = malloc((size_t) fbdisp.pitch * height);
+		if (!fb_mem)
+			return -1;
+		memset(fb_mem, 0, (size_t) fbdisp.pitch * height);
+	}
+	return 0;
+}
+
+/* Free framebuffer */
+void fb_shutdown(void) {
+	if (fb_mem) {
+		free(fb_mem);
+		fb_mem = NULL;
+	}
+	fbdisp.width = fbdisp.height = fbdisp.pitch = 0;
+}
+
+/* Framebuffer accessors */
+uint8_t* emu_get_fb(void) {
+	return fb_mem;
+}
+int emu_get_fb_pitch(void) {
+	return fbdisp.pitch;
+}
+int emu_get_fb_width(void) {
+	return fbdisp.width;
+}
+int emu_get_fb_height(void) {
+	return fbdisp.height;
+}
+
+/* Debug log accessors */
+uint8_t* emu_get_debug_log(void) {
+	return (uint8_t*) debug_log;
+}
+unsigned int emu_get_debug_log_pos(void) {
+	return debug_log_pos;
+}
+
+/* Load a blob of bytes into guest memory at guest physical address */
+int emu_load_code(uint64_t guest_addr, const void *buf, size_t len) {
+	if (!ram_mem)
+		return -1;
+	uint8_t *dst = get_memory_ptr(guest_addr);
+	if (!dst)
+		return -1;
+	memcpy(dst, buf, len);
+	return 0;
+}
+
+/* Execute N instructions (deterministic) */
+int execute_n_instructions(int n) {
+	if (n <= 0)
+		return 0;
+	int executed = 0;
+	for (int i = 0; i < n; ++i) {
+		execute_one_extended();
+		executed++;
+		if (cpu.halted)
+			break;
+	}
+	return executed;
+}
+
+/* Dump debug log into provided buffer (circular copy starting at current pos) */
+size_t emu_dump_debug_log(uint8_t *buf, size_t buf_len) {
+	if (!buf || buf_len == 0)
+		return 0;
+	unsigned int pos = debug_log_pos;
+	size_t copied = 0;
+	for (size_t i = 0; i < buf_len && i < DEBUG_LOG_SIZE; ++i) {
+		buf[i] = (uint8_t) debug_log[(pos + i) % DEBUG_LOG_SIZE];
+		copied++;
+	}
+	return copied;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Utility: hexdump memory region into debug log (no stdio)                  */
+/* ------------------------------------------------------------------------- */
+
+static inline void hexdump_to_log(uint64_t addr, size_t len) {
+	char tmp[64];
+	for (size_t i = 0; i < len; i += 16) {
+		uint64_t a = addr + i;
+		u64_to_hex(a, tmp);
+		debug_log_write_str(tmp);
+		debug_log_write_str(": ");
+		for (size_t j = 0; j < 16 && (i + j) < len; ++j) {
+			uint8_t v = mem_read8(addr + i + j);
+			char h[3];
+			u8_to_hex(v, h);
+			debug_log_write_str(h);
+			if (j != 15)
+				debug_log_write_str(" ");
+		}
+		debug_log_write_str("\n");
+	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* Additional helpers and stubs to enlarge file and provide test hooks       */
+/* ------------------------------------------------------------------------- */
+
+/* Simple CPUID stub: returns zeros except for vendor string "EMU" */
+static inline void cpuid_stub(uint32_t eax_in, uint32_t *eax, uint32_t *ebx,
+		uint32_t *ecx, uint32_t *edx) {
+	(void) eax_in;
+	if (eax)
+		*eax = 0;
+	if (ebx)
+		*ebx = 0x00454D55; /* 'EMU\0' low dword */
+	if (ecx)
+		*ecx = 0;
+	if (edx)
+		*edx = 0;
+}
+
+/* I/O port stubs (inb/outb) - no real hardware, just debug log */
+static inline uint8_t io_in8(uint16_t port) {
+	char tmp[16];
+	u16_to_hex(port, tmp);
+	debug_log_write_str("io_in8 port 0x");
+	debug_log_write_str(tmp);
+	debug_log_write_str("\n");
+	return 0xFF;
+}
+static inline void io_out8(uint16_t port, uint8_t val) {
+	char tmp[16], h[3];
+	u16_to_hex(port, tmp);
+	u8_to_hex(val, h);
+	debug_log_write_str("io_out8 port 0x");
+	debug_log_write_str(tmp);
+	debug_log_write_str(" val 0x");
+	debug_log_write_str(h);
+	debug_log_write_str("\n");
+}
+
+/* MSR read/write stubs */
+static inline uint64_t rdmsr_stub(uint32_t msr) {
+	char tmp[16];
+	u32_to_hex(msr, tmp);
+	debug_log_write_str("rdmsr ");
+	debug_log_write_str(tmp);
+	debug_log_write_str("\n");
+	return 0;
+}
+static inline void wrmsr_stub(uint32_t msr, uint64_t val) {
+	char tmp[16], vtmp[32];
+	u32_to_hex(msr, tmp);
+	u64_to_hex(val, vtmp);
+	debug_log_write_str("wrmsr ");
+	debug_log_write_str(tmp);
+	debug_log_write_str(" val ");
+	debug_log_write_str(vtmp);
+	debug_log_write_str("\n");
+}
+
+/* Simple memory fill helper (like memset) using fast copy if available */
+static inline void mem_fill(uint64_t addr, uint8_t value, size_t len) {
+	uint8_t *p = get_memory_ptr(addr);
+	if (!p)
+		return;
+#if defined(__x86_64__) && defined(__GNUC__)
+	/* Use simple loop; could be optimized with rep stosb */
+	for (size_t i = 0; i < len; ++i)
+		p[i] = value;
+#else
+    memset(p, value, len);
+#endif
+}
+
+/* Simple pattern fill for framebuffer (useful for tests) */
+static inline void fb_fill_pattern(uint32_t pattern) {
+	if (!fb_mem)
+		return;
+	int w = fbdisp.width;
+	int h = fbdisp.height;
+	int pitch = fbdisp.pitch;
+	for (int y = 0; y < h; ++y) {
+		uint32_t *row = (uint32_t*) (fb_mem + (size_t) y * pitch);
+		for (int x = 0; x < w; ++x)
+			row[x] = pattern;
+	}
+}
+
+/* Draw a gradient into framebuffer (ARGB8888) */
+static inline void fb_draw_gradient(void) {
+	if (!fb_mem)
+		return;
+	int w = fbdisp.width;
+	int h = fbdisp.height;
+	int pitch = fbdisp.pitch;
+	for (int y = 0; y < h; ++y) {
+		uint32_t *row = (uint32_t*) (fb_mem + (size_t) y * pitch);
+		for (int x = 0; x < w; ++x) {
+			uint8_t r = (uint8_t) ((x * 255) / (w - 1));
+			uint8_t g = (uint8_t) ((y * 255) / (h - 1));
+			uint8_t b = (uint8_t) (((x + y) * 255) / (w + h - 2));
+			row[x] = (0xFFu << 24) | (r << 16) | (g << 8) | b;
+		}
+	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* More framebuffer helpers: animated rectangle, box draw, line draw         */
+/* ------------------------------------------------------------------------- */
+
+/* Draw a filled rectangle into framebuffer (clipped) */
+static inline void fb_draw_filled_rect(int x0, int y0, int w, int h,
+		uint32_t color) {
+	if (!fb_mem)
+		return;
+	int fbw = fbdisp.width;
+	int fbh = fbdisp.height;
+	int pitch = fbdisp.pitch;
+	if (w <= 0 || h <= 0)
+		return;
+	int x1 = x0 + w;
+	int y1 = y0 + h;
+	if (x0 < 0)
+		x0 = 0;
+	if (y0 < 0)
+		y0 = 0;
+	if (x1 > fbw)
+		x1 = fbw;
+	if (y1 > fbh)
+		y1 = fbh;
+	for (int y = y0; y < y1; ++y) {
+		uint32_t *row = (uint32_t*) (fb_mem + (size_t) y * pitch);
+		for (int x = x0; x < x1; ++x)
+			row[x] = color;
+	}
+}
+
+/* Draw a simple 1-pixel border rectangle */
+static inline void fb_draw_rect_border(int x0, int y0, int w, int h,
+		uint32_t color) {
+	if (w <= 0 || h <= 0)
+		return;
+	fb_draw_filled_rect(x0, y0, w, 1, color); /* top */
+	fb_draw_filled_rect(x0, y0 + h - 1, w, 1, color); /* bottom */
+	fb_draw_filled_rect(x0, y0, 1, h, color); /* left */
+	fb_draw_filled_rect(x0 + w - 1, y0, 1, h, color); /* right */
+}
+
+/* Draw a moving rectangle animation frame into framebuffer */
+static inline void fb_draw_moving_rect_frame(int frame) {
+	if (!fb_mem)
+		return;
+	int w = fbdisp.width;
+	int h = fbdisp.height;
+	/* background fade: slightly darken everything */
+	int pitch = fbdisp.pitch;
+	for (int y = 0; y < h; ++y) {
+		uint32_t *row = (uint32_t*) (fb_mem + (size_t) y * pitch);
+		for (int x = 0; x < w; ++x) {
+			uint32_t p = row[x];
+			uint8_t a = (p >> 24) & 0xFF;
+			uint8_t r = (p >> 16) & 0xFF;
+			uint8_t g = (p >> 8) & 0xFF;
+			uint8_t b = (p >> 0) & 0xFF;
+			/* darken by 2% */
+			r = (uint8_t) ((r * 98) / 100);
+			g = (uint8_t) ((g * 98) / 100);
+			b = (uint8_t) ((b * 98) / 100);
+			row[x] = (a << 24) | (r << 16) | (g << 8) | b;
+		}
+	}
+
+	/* moving rectangle */
+	int rw = w / 6;
+	int rh = h / 6;
+	int cx = (frame * 6) % (w + rw) - rw / 2;
+	int cy = (frame * 3) % (h + rh) - rh / 2;
+	uint32_t color = (0xFFu << 24) | (0x20 << 16) | (0xA0 << 8) | 0x40;
+	fb_draw_filled_rect(cx, cy, rw, rh, color);
+	fb_draw_rect_border(cx, cy, rw, rh, 0xFFFFFFFFu);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Framebuffer dump: write raw ARGB8888 to file (POSIX write)                */
+/* ------------------------------------------------------------------------- */
+
+/* Dump framebuffer to a raw file path (returns 0 on success, -1 on error) */
+static inline int fb_dump_to_file(const char *path) {
+	if (!fb_mem || !path)
+		return -1;
+	int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	if (fd < 0)
+		return -1;
+	int w = fbdisp.width;
+	int h = fbdisp.height;
+	int pitch = fbdisp.pitch;
+	for (int y = 0; y < h; ++y) {
+		uint8_t *row = fb_mem + (size_t) y * pitch;
+		size_t to_write = (size_t) w * 4;
+		ssize_t wrote = write(fd, row, to_write);
+		(void) wrote; /* ignore partial write handling for brevity */
+	}
+	close(fd);
+	return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Small test code generator: writes a simple sequence of instructions into  */
+/* memory to exercise basic emulator functionality (mov, add, store to mem)  */
+/* ------------------------------------------------------------------------- */
+
+/* Example: generate a tiny program that writes a color pattern into framebuffer
+ using simple mov/store instructions. This is x86-64 machine code and is
+ intentionally minimal; it assumes the emulator maps guest physical addresses
+ linearly and that RDI/RAX etc are usable. The code below is illustrative
+ and may need adaptation for your exact emulator semantics. */
+
+/* Helper to write a 64-bit little-endian value into a buffer */
+static inline void write_u64_le(uint8_t *buf, uint64_t v) {
+	for (int i = 0; i < 8; ++i)
+		buf[i] = (uint8_t) (v >> (i * 8));
+}
+
+/* Create a simple machine-code blob that stores a few 64-bit values into
+ guest memory starting at fb_addr. The blob is returned in a malloc'd buffer
+ and its length is written to out_len. Caller must free the buffer. */
+static uint8_t* generate_simple_fb_writer(uint64_t fb_addr, int width,
+		int height, size_t *out_len) {
+	/* This is a synthetic sequence of pseudo-instructions encoded as data
+	 because generating correct x86-64 machine code by hand is error-prone.
+	 Instead, we create a "data-driven" pseudo-program that our emulator
+	 can interpret via a small helper in C: the test harness will load this
+	 blob and then the harness will interpret it by copying patterns into
+	 framebuffer using emu_load_code + execute_n_instructions. For the
+	 purposes of this file, we return a simple pattern buffer. */
+
+	size_t pixels = (size_t) width * (size_t) height;
+	size_t buf_bytes = pixels * 4;
+	uint8_t *buf = malloc(buf_bytes);
+	if (!buf) {
+		if (out_len)
+			*out_len = 0;
+		return NULL;
+	}
+
+	/* Fill with a checkerboard-like ARGB pattern */
+	for (int y = 0; y < height; ++y) {
+		for (int x = 0; x < width; ++x) {
+			uint8_t r = (uint8_t) ((x * 255) / (width - 1));
+			uint8_t g = (uint8_t) ((y * 255) / (height - 1));
+			uint8_t b = (uint8_t) (((x ^ y) * 255) / (width + height - 2));
+			uint32_t pixel = (0xFFu << 24) | (r << 16) | (g << 8) | b;
+			size_t idx = (size_t) y * (size_t) width + (size_t) x;
+			uint8_t *p = buf + idx * 4;
+			p[0] = (uint8_t) (pixel & 0xFF);
+			p[1] = (uint8_t) ((pixel >> 8) & 0xFF);
+			p[2] = (uint8_t) ((pixel >> 16) & 0xFF);
+			p[3] = (uint8_t) ((pixel >> 24) & 0xFF);
+		}
+	}
+	if (out_len)
+		*out_len = buf_bytes;
+	return buf;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Simple test harness functions to exercise emulator from C (no stdio)     */
+/* ------------------------------------------------------------------------- */
+
+/* Run a simple framebuffer test:
+ - initialize emulator and framebuffer if needed
+ - draw gradient, animate a few frames, dump fb.raw
+ - load a generated pattern into guest memory and copy into fb_mem via emu_load_code
+ */
+static inline void run_simple_fb_test(void) {
+	/* Ensure emulator and framebuffer are initialized */
+	if (!ram_mem)
+		x64emu_init_standalone();
+	if (!fb_mem)
+		fb_init_display(640, 480);
+
+	/* Draw initial gradient and dump */
+	fb_draw_gradient();
+	fb_dump_to_file("fb_gradient.raw");
+
+	/* Animate a few frames */
+	for (int f = 0; f < 30; ++f) {
+		fb_draw_moving_rect_frame(f);
+		/* small delay using nanosleep */
+		struct timespec ts = { 0, 20000000 }; /* 20 ms */
+		nanosleep(&ts, NULL);
+	}
+	fb_dump_to_file("fb_anim.raw");
+
+	/* Generate a pattern and load it into guest memory at a chosen address,
+	 then copy it into the emulator framebuffer region using emu_load_code.
+	 For this example, we assume the framebuffer is mapped at a guest address
+	 we choose (e.g., 0x100000). In a real emulator, the framebuffer mapping
+	 would be part of the guest memory map. */
+	uint64_t guest_fb_addr = 0x00100000ULL; /* example guest address */
+	size_t pattern_len = 0;
+	uint8_t *pattern = generate_simple_fb_writer(guest_fb_addr, fbdisp.width,
+			fbdisp.height, &pattern_len);
+	if (pattern) {
+		/* Load pattern into guest memory at guest_fb_addr */
+		emu_load_code(guest_fb_addr, pattern, pattern_len);
+
+		/* Now copy guest memory into host fb_mem by reading guest memory bytes */
+		/* This simulates a guest program writing to the framebuffer region */
+		uint8_t *dst = fb_mem;
+		for (size_t i = 0; i < pattern_len; ++i) {
+			uint8_t v = mem_read8(guest_fb_addr + i);
+			dst[i] = v;
+		}
+
+		/* Dump the result */
+		fb_dump_to_file("fb_from_guest.raw");
+		free(pattern);
+	} else {
+		trace_msg("pattern generation failed");
+	}
+
+	/* Dump debug log for inspection */
+	uint8_t dbg[4096];
+	size_t got = emu_dump_debug_log(dbg, sizeof(dbg));
+	int fd = open("debug_from_test.log", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+	if (fd >= 0) {
+		write(fd, dbg, got);
+		close(fd);
+	}
+}
+
+/* ------------------------------------------------------------------------- */
+/* Additional instrumentation helpers                                        */
+/* ------------------------------------------------------------------------- */
+
+/* Simple instruction tracer: record last N instruction pointers into debug log */
+static inline void trace_rip_snapshot(int count) {
+	char tmp[32];
+	for (int i = 0; i < count; ++i) {
+		u64_to_hex(cpu.rip + (uint64_t) i, tmp);
+		debug_log_write_str("RIP+");
+		/* convert i to decimal string without printf */
+		char dec[16];
+		int di = i;
+		int pos = 0;
+		if (di == 0) {
+			dec[pos++] = '0';
+		} else {
+			int rev[16];
+			int rc = 0;
+			while (di > 0) {
+				rev[rc++] = di % 10;
+				di /= 10;
+			}
+			for (int j = rc - 1; j >= 0; --j)
+				dec[pos++] = '0' + rev[j];
+		}
+		dec[pos] = '\0';
+		debug_log_write_str(dec);
+		debug_log_write_str(": ");
+		debug_log_write_str(tmp);
+		debug_log_write_str("\n");
+	}
+}
+
+/* Simple memory validator: check that a region is non-zero and log summary */
+static inline void mem_region_summary(uint64_t addr, size_t len) {
+	size_t nonzero = 0;
+	for (size_t i = 0; i < len; ++i) {
+		if (mem_read8(addr + i) != 0)
+			nonzero++;
+	}
+	char tmp[32];
+	u64_to_hex(addr, tmp);
+	debug_log_write_str("mem_region ");
+	debug_log_write_str(tmp);
+	debug_log_write_str(" len ");
+	/* convert len to decimal */
+	char dec[32];
+	int pos = 0;
+	size_t t = len;
+	if (t == 0) {
+		dec[pos++] = '0';
+	} else {
+		char rev[32];
+		int rc = 0;
+		while (t > 0) {
+			rev[rc++] = '0' + (t % 10);
+			t /= 10;
+		}
+		for (int j = rc - 1; j >= 0; --j)
+			dec[pos++] = rev[j];
+	}
+	dec[pos] = '\0';
+	debug_log_write_str(dec);
+	debug_log_write_str(" nonzero ");
+	/* convert nonzero to decimal */
+	pos = 0;
+	t = nonzero;
+	if (t == 0) {
+		dec[pos++] = '0';
+	} else {
+		char rev[32];
+		int rc = 0;
+		while (t > 0) {
+			rev[rc++] = '0' + (t % 10);
+			t /= 10;
+		}
+		for (int j = rc - 1; j >= 0; --j)
+			dec[pos++] = rev[j];
+	}
+	dec[pos] = '\0';
+	debug_log_write_str(dec);
+	debug_log_write_str("\n");
+}
+
+
+
+/* Minimal main: initialize emulator, run a simple framebuffer test, exit.
+   This main is intentionally tiny and uses only the emulator's internal
+   functions (no stdio). If you already have a main in another file,
+   remove or ignore this block. */
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    /* Initialize emulator memory and CPU */
+    if (x64emu_init_standalone() != 0) {
+        /* cannot print; return non-zero to indicate failure */
+        return 1;
+    }
+
+    /* Initialize framebuffer (bare-metal mode: allocates fb_mem) */
+    if (fb_init_display(640, 480) != 0) {
+        return 2;
+    }
+
+    /* Run the simple framebuffer test harness included in this file */
+    run_simple_fb_test();
+
+    /* Clean up and exit */
+    fb_shutdown();
+
+    return 0;
+}
+

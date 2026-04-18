@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.16)
+
+# FORCE Cross-Compiling-Einstellungen
+set(CMAKE_SYSTEM_NAME Windows)
+set(TOOLCHAIN_PREFIX x86_64-w64-mingw32)
+
+# Compiler-Pfade explizit setzen
+set(CMAKE_C_COMPILER ${TOOLCHAIN_PREFIX}-gcc)
+set(CMAKE_CXX_COMPILER ${TOOLCHAIN_PREFIX}-g++)
+set(CMAKE_RC_COMPILER ${TOOLCHAIN_PREFIX}-windres)
+
+project(WinPaint C)
+
+# Verhindert, dass CMake versucht, Linux-Bibliotheken zu finden
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+
+add_compile_definitions(UNICODE _UNICODE)
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static-libgcc -static")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--subsystem,windows -static")
+
+add_executable(winpaint WIN32 paint.c)
+
+target_link_libraries(winpaint PRIVATE
+    comctl32
+    gdi32
+    user32
+    kernel32
+    comdlg32
+    msimg32
+)

@@ -1,0 +1,626 @@
+// notepad_editor_saveprompt.c
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <commdlg.h>
+#include <richedit.h>
+#include <stdio.h>
+#include <wchar.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <shlwapi.h>
+
+#pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Shlwapi.lib")
+
+#define IDM_FILE_NEW      101
+#define IDM_FILE_OPEN     102
+#define IDM_FILE_SAVE     103
+#define IDM_FILE_SAVEAS   104
+#define IDM_FILE_EXIT     105
+#define IDM_EDIT_CUT      201
+#define IDM_EDIT_COPY     202
+#define IDM_EDIT_PASTE    203
+#define IDM_EDIT_FIND     204
+#define IDM_EDIT_REPLACE  205
+#define IDM_EDIT_GOTOLINE 206
+#define IDM_BUILD_COMPILE 301
+#define IDM_HELP_ABOUT    401
+
+static HWND hEdit;
+static HWND hLineNums;
+static HWND hMainWnd;
+static HWND hStatus;
+static wchar_t currentFile[MAX_PATH] = L"";
+static const wchar_t gClassName[] = L"MiniNotepadClassV3";
+static HFONT hMonoFont = NULL;
+
+/* --- Keywords (gekürzt) --- */
+static const wchar_t *c_keywords[] = {
+    L"auto", L"break", L"case", L"char", L"const", L"continue", L"default", L"do",
+    L"double", L"else", L"enum", L"extern", L"float", L"for", L"goto", L"if",
+    L"inline", L"int", L"long", L"register", L"restrict", L"return", L"short",
+    L"signed", L"sizeof", L"static", L"struct", L"switch", L"typedef", L"union",
+    L"unsigned", L"void", L"volatile", L"while", L"bool", L"true", L"false", NULL
+};
+
+enum {
+    COLOR_DEFAULT = RGB(0,0,0),
+    COLOR_KEYWORD = RGB(0,0,255),
+    COLOR_STRING  = RGB(163,21,21),
+    COLOR_COMMENT = RGB(0,128,0),
+    COLOR_NUMBER  = RGB(128,0,128)
+};
+
+static bool is_ident_char(wchar_t c) {
+    return (c == L'_') || (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || (c >= 0x80);
+}
+
+static bool is_keyword(const wchar_t *s, int len) {
+    for (const wchar_t **k = c_keywords; *k; ++k) {
+        if ((int)wcslen(*k) == len && wcsncmp(*k, s, len) == 0) return true;
+    }
+    return false;
+}
+
+static void set_format_range(HWND edit, int start, int end, COLORREF color, bool bold) {
+    CHARFORMAT2W cf;
+    ZeroMemory(&cf, sizeof(cf));
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR;
+    if (bold) cf.dwMask |= CFM_BOLD;
+    cf.crTextColor = color;
+    cf.dwEffects = 0;
+    if (bold) cf.dwEffects &= ~CFE_BOLD;
+    SendMessageW(edit, EM_SETSEL, (WPARAM)start, (LPARAM)end);
+    SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+/* Syntax Highlighting (leicht optimiert) */
+static void HighlightSyntax(HWND edit) {
+    int len = GetWindowTextLengthW(edit);
+    wchar_t *text = (wchar_t*)GlobalAlloc(GPTR, (len + 1) * sizeof(wchar_t));
+    if (!text) return;
+    GetWindowTextW(edit, text, len + 1);
+
+    CHARRANGE oldRange;
+    SendMessageW(edit, EM_EXGETSEL, 0, (LPARAM)&oldRange);
+    SendMessageW(edit, WM_SETREDRAW, FALSE, 0);
+
+    // Default color
+    {
+        CHARFORMAT2W cf;
+        ZeroMemory(&cf, sizeof(cf));
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = COLOR_DEFAULT;
+        SendMessageW(edit, EM_SETSEL, 0, len);
+        SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+
+    int i = 0;
+    while (i < len) {
+        wchar_t c = text[i];
+
+        // // comment
+        if (c == L'/' && i + 1 < len && text[i+1] == L'/') {
+            int start = i;
+            i += 2;
+            while (i < len && text[i] != L'\r' && text[i] != L'\n') i++;
+            set_format_range(edit, start, i, COLOR_COMMENT, false);
+            continue;
+        }
+
+        // /* comment */
+        if (c == L'/' && i + 1 < len && text[i+1] == L'*') {
+            int start = i;
+            i += 2;
+            while (i + 1 < len && !(text[i] == L'*' && text[i+1] == L'/')) i++;
+            if (i + 1 < len) i += 2;
+            set_format_range(edit, start, i, COLOR_COMMENT, false);
+            continue;
+        }
+
+        // string
+        if (c == L'"') {
+            int start = i++;
+            while (i < len) {
+                if (text[i] == L'\\' && i + 1 < len) { i += 2; continue; }
+                if (text[i] == L'"') { i++; break; }
+                i++;
+            }
+            set_format_range(edit, start, i, COLOR_STRING, false);
+            continue;
+        }
+
+        // char literal
+        if (c == L'\'') {
+            int start = i++;
+            while (i < len) {
+                if (text[i] == L'\\' && i + 1 < len) { i += 2; continue; }
+                if (text[i] == L'\'') { i++; break; }
+                i++;
+            }
+            set_format_range(edit, start, i, COLOR_STRING, false);
+            continue;
+        }
+
+        // number
+        if ((c >= L'0' && c <= L'9') || (c == L'.' && i + 1 < len && text[i+1] >= L'0' && text[i+1] <= L'9')) {
+            int start = i;
+            if (c == L'0' && i + 1 < len && (text[i+1] == L'x' || text[i+1] == L'X')) {
+                i += 2;
+                while (i < len && ((text[i] >= L'0' && text[i] <= L'9') || (text[i] >= L'a' && text[i] <= L'f') || (text[i] >= L'A' && text[i] <= L'F'))) i++;
+            } else {
+                while (i < len && ((text[i] >= L'0' && text[i] <= L'9') || text[i] == L'.' || text[i] == L'e' || text[i] == L'E' || text[i] == L'+' || text[i] == L'-')) i++;
+            }
+            set_format_range(edit, start, i, COLOR_NUMBER, false);
+            continue;
+        }
+
+        // identifier / keyword
+        if ((c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || c == L'_') {
+            int start = i++;
+            while (i < len && is_ident_char(text[i])) i++;
+            int toklen = i - start;
+            if (is_keyword(&text[start], toklen)) {
+                set_format_range(edit, start, i, COLOR_KEYWORD, true);
+            }
+            continue;
+        }
+
+        i++;
+    }
+
+    SendMessageW(edit, EM_EXSETSEL, 0, (LPARAM)&oldRange);
+    SendMessageW(edit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(edit, NULL, FALSE);
+    GlobalFree(text);
+}
+
+/* Update Zeilennummern */
+static void UpdateLineNumbers() {
+    int lines = (int)SendMessageW(hEdit, EM_GETLINECOUNT, 0, 0);
+    wchar_t buf[64];
+    SetWindowTextW(hLineNums, L"");
+    for (int i = 0; i < lines; ++i) {
+        wsprintfW(buf, L"%4d\r\n", i + 1);
+        SendMessageW(hLineNums, EM_REPLACESEL, FALSE, (LPARAM)buf);
+    }
+}
+
+/* Update Statusbar: Dateiname (+ * wenn modifiziert) und Zeile/Spalte */
+static void UpdateStatusBar() {
+    CHARRANGE cr;
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&cr);
+    int pos = (int)SendMessageW(hEdit, EM_GETSEL, NULL, NULL);
+    int line = (int)SendMessageW(hEdit, EM_LINEFROMCHAR, pos, 0);
+    int col = pos - (int)SendMessageW(hEdit, EM_LINEINDEX, line, 0);
+    wchar_t status[512];
+    wchar_t fname[MAX_PATH];
+    if (currentFile[0]) {
+        wcscpy_s(fname, MAX_PATH, currentFile);
+    } else {
+        wcscpy_s(fname, MAX_PATH, L"(untitled)");
+    }
+    BOOL modified = (BOOL)SendMessageW(hEdit, EM_GETMODIFY, 0, 0);
+    if (modified) {
+        // Sternchen anzeigen wie Notepad
+        wsprintfW(status, L"* %s    Ln %d, Col %d", fname, line + 1, col + 1);
+    } else {
+        wsprintfW(status, L"%s    Ln %d, Col %d", fname, line + 1, col + 1);
+    }
+    SendMessageW(hStatus, SB_SETTEXT, 0, (LPARAM)status);
+}
+
+/* Save file with UTF-8 or UTF-16LE BOM */
+static bool SaveFileAs(HWND hwnd, const wchar_t *filename, bool utf8) {
+    int len = GetWindowTextLengthW(hEdit);
+    wchar_t *buf = (wchar_t*)GlobalAlloc(GPTR, (len + 1) * sizeof(wchar_t));
+    if (!buf) return false;
+    GetWindowTextW(hEdit, buf, len + 1);
+
+    HANDLE hFile = CreateFileW(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        GlobalFree(buf);
+        return false;
+    }
+    DWORD written;
+    if (utf8) {
+        // Write UTF-8 BOM
+        BYTE bom[3] = {0xEF,0xBB,0xBF};
+        WriteFile(hFile, bom, 3, &written, NULL);
+        int needed = WideCharToMultiByte(CP_UTF8, 0, buf, len, NULL, 0, NULL, NULL);
+        char *mb = (char*)GlobalAlloc(GPTR, needed);
+        WideCharToMultiByte(CP_UTF8, 0, buf, len, mb, needed, NULL, NULL);
+        WriteFile(hFile, mb, needed, &written, NULL);
+        GlobalFree(mb);
+    } else {
+        // UTF-16LE BOM
+        WORD bom = 0xFEFF;
+        WriteFile(hFile, &bom, sizeof(bom), &written, NULL);
+        WriteFile(hFile, buf, len * sizeof(wchar_t), &written, NULL);
+    }
+    CloseHandle(hFile);
+    GlobalFree(buf);
+    // Nach erfolgreichem Speichern Modify-Flag zurücksetzen
+    SendMessageW(hEdit, EM_SETMODIFY, FALSE, 0);
+    UpdateStatusBar();
+    return true;
+}
+
+/* Open file with BOM detection */
+static bool OpenFileToEditor(HWND hwnd, const wchar_t *filename) {
+    HANDLE hFile = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD size = GetFileSize(hFile, NULL);
+    BYTE *buf = (BYTE*)GlobalAlloc(GPTR, size + 4);
+    if (!buf) { CloseHandle(hFile); return false; }
+    DWORD read = 0;
+    ReadFile(hFile, buf, size, &read, NULL);
+    CloseHandle(hFile);
+
+    if (read >= 3 && buf[0] == 0xEF && buf[1] == 0xBB && buf[2] == 0xBF) {
+        // UTF-8
+        int needed = MultiByteToWideChar(CP_UTF8, 0, (char*)(buf + 3), read - 3, NULL, 0);
+        wchar_t *wbuf = (wchar_t*)GlobalAlloc(GPTR, (needed + 1) * sizeof(wchar_t));
+        MultiByteToWideChar(CP_UTF8, 0, (char*)(buf + 3), read - 3, wbuf, needed);
+        wbuf[needed] = 0;
+        SetWindowTextW(hEdit, wbuf);
+        GlobalFree(wbuf);
+    } else if (read >= 2 && buf[0] == 0xFF && buf[1] == 0xFE) {
+        // UTF-16LE
+        SetWindowTextW(hEdit, (wchar_t*)(buf + 2));
+    } else {
+        // ANSI -> Wide
+        int needed = MultiByteToWideChar(CP_ACP, 0, (char*)buf, read, NULL, 0);
+        wchar_t *wbuf = (wchar_t*)GlobalAlloc(GPTR, (needed + 1) * sizeof(wchar_t));
+        MultiByteToWideChar(CP_ACP, 0, (char*)buf, read, wbuf, needed);
+        wbuf[needed] = 0;
+        SetWindowTextW(hEdit, wbuf);
+        GlobalFree(wbuf);
+    }
+    GlobalFree(buf);
+    // Nach Laden Highlight anwenden
+    HighlightSyntax(hEdit);
+    // Modify-Flag zurücksetzen (Datei frisch geladen)
+    SendMessageW(hEdit, EM_SETMODIFY, FALSE, 0);
+    UpdateLineNumbers();
+    UpdateStatusBar();
+    return true;
+}
+
+/* Prompt Save If Modified: 0=Cancel, 1=Proceed without save, 2=Saved and proceed */
+static int PromptSaveIfModified(HWND hwnd) {
+    LRESULT modified = SendMessageW(hEdit, EM_GETMODIFY, 0, 0);
+    if (!modified) return 1; // nicht geändert -> fortfahren
+
+    // MessageBox mit drei Buttons: Yes = Speichern, No = Nicht speichern, Cancel = Abbrechen
+    int res = MessageBoxW(hwnd,
+        L"Die Datei wurde geändert. Möchten Sie die Änderungen speichern?",
+        L"Speichern",
+        MB_YESNOCANCEL | MB_ICONQUESTION);
+
+    if (res == IDCANCEL) {
+        return 0; // Abbrechen
+    } else if (res == IDNO) {
+        return 1; // Fortfahren ohne speichern
+    } else if (res == IDYES) {
+        // Wenn kein Dateiname vorhanden, Save As aufrufen
+        if (!currentFile[0]) {
+            wchar_t szFile[MAX_PATH] = L"";
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFile = szFile;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrFilter = L"C Source\0*.c;*.h\0All Files\0*.*\0";
+            ofn.Flags = OFN_PATHMUSTEXIST;
+            ofn.lpstrDefExt = L"c";
+            if (!GetSaveFileNameW(&ofn)) {
+                // Benutzer hat SaveAs abgebrochen -> Abbrechen des Schließens
+                return 0;
+            }
+            wcscpy_s(currentFile, MAX_PATH, szFile);
+            // Standardmäßig als UTF-8 speichern
+            if (!SaveFileAs(hwnd, currentFile, true)) {
+                MessageBoxW(hwnd, L"Fehler beim Speichern der Datei.", L"Fehler", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            return 2;
+        } else {
+            if (!SaveFileAs(hwnd, currentFile, true)) {
+                MessageBoxW(hwnd, L"Fehler beim Speichern der Datei.", L"Fehler", MB_OK | MB_ICONERROR);
+                return 0;
+            }
+            return 2;
+        }
+    }
+    return 0;
+}
+
+/* Build using gcc and capture output to temporary file (simple) */
+static void BuildProject(HWND hwnd) {
+    if (!currentFile[0]) {
+        MessageBoxW(hwnd, L"Bitte zuerst die Datei speichern.", L"Build", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    wchar_t cmd[MAX_PATH * 2];
+    wchar_t outFile[MAX_PATH];
+    wcscpy_s(outFile, MAX_PATH, currentFile);
+    PathRemoveExtensionW(outFile);
+    // Redirect stderr to file
+    wsprintfW(cmd, L"gcc \"%s\" -o \"%s.exe\" 2> build_output.txt", currentFile, outFile);
+    _wsystem(cmd);
+    HANDLE h = CreateFileW(L"build_output.txt", GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD size = GetFileSize(h, NULL);
+        char *buf = (char*)GlobalAlloc(GPTR, size + 1);
+        DWORD read = 0;
+        ReadFile(h, buf, size, &read, NULL);
+        buf[read] = 0;
+        MessageBoxA(hwnd, buf, "Build Output", MB_OK | MB_ICONINFORMATION);
+        CloseHandle(h);
+        GlobalFree(buf);
+    } else {
+        MessageBoxW(hwnd, L"Build abgeschlossen. Keine Ausgabe gefunden.", L"Build", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+/* Create menus and controls */
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_CREATE: {
+        LoadLibraryW(L"Msftedit.dll");
+
+        // Create monospace font (Consolas preferred)
+        LOGFONTW lf;
+        ZeroMemory(&lf, sizeof(lf));
+        lf.lfHeight = -MulDiv(10, GetDeviceCaps(GetDC(hwnd), LOGPIXELSY), 72); // 10pt
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Consolas");
+        hMonoFont = CreateFontIndirectW(&lf);
+        if (!hMonoFont) {
+            // Fallback
+            wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Courier New");
+            hMonoFont = CreateFontIndirectW(&lf);
+        }
+
+        // Line numbers control (read-only RichEdit)
+        hLineNums = CreateWindowExW(0, MSFTEDIT_CLASS, NULL,
+            WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+            0, 0, 60, 0, hwnd, (HMENU)2, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+        SendMessageW(hLineNums, WM_SETFONT, (WPARAM)hMonoFont, TRUE);
+        SendMessageW(hLineNums, EM_SETREADONLY, TRUE, 0);
+
+        // Main editor
+        hEdit = CreateWindowExW(0, MSFTEDIT_CLASS, NULL,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+            60, 0, 0, 0, hwnd, (HMENU)1, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+        SendMessageW(hEdit, WM_SETFONT, (WPARAM)hMonoFont, TRUE);
+
+        // Status bar
+        hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, NULL, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+
+        // Menu
+        HMENU hMenubar = CreateMenu();
+        HMENU hFile = CreatePopupMenu();
+        HMENU hEditMenu = CreatePopupMenu();
+        HMENU hBuild = CreatePopupMenu();
+        HMENU hHelp = CreatePopupMenu();
+
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_NEW, L"&Neu\tCtrl+N");
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_OPEN, L"&Öffnen...\tCtrl+O");
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_SAVE, L"&Speichern\tCtrl+S");
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_SAVEAS, L"Speichern &unter...");
+        AppendMenuW(hFile, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hFile, MF_STRING, IDM_FILE_EXIT, L"&Beenden");
+
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_CUT, L"Ausschneiden\tCtrl+X");
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_COPY, L"Kopieren\tCtrl+C");
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_PASTE, L"Einfügen\tCtrl+V");
+        AppendMenuW(hEditMenu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_FIND, L"&Suchen\tCtrl+F");
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_REPLACE, L"&Ersetzen\tCtrl+H");
+        AppendMenuW(hEditMenu, MF_STRING, IDM_EDIT_GOTOLINE, L"&Gehe zu Zeile\tCtrl+G");
+
+        AppendMenuW(hBuild, MF_STRING, IDM_BUILD_COMPILE, L"&Kompilieren\tCtrl+Shift+B");
+
+        AppendMenuW(hHelp, MF_STRING, IDM_HELP_ABOUT, L"&Über");
+
+        AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hFile, L"&Datei");
+        AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hEditMenu, L"&Bearbeiten");
+        AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hBuild, L"&Build");
+        AppendMenuW(hMenubar, MF_POPUP, (UINT_PTR)hHelp, L"&Hilfe");
+
+        SetMenu(hwnd, hMenubar);
+        break;
+    }
+    case WM_SIZE: {
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int statusHeight = 20;
+        MoveWindow(hStatus, 0, rc.bottom - statusHeight, rc.right, statusHeight, TRUE);
+        MoveWindow(hLineNums, 0, 0, 60, rc.bottom - statusHeight, TRUE);
+        MoveWindow(hEdit, 60, 0, rc.right - 60, rc.bottom - statusHeight, TRUE);
+        break;
+    }
+    case WM_COMMAND:
+        if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == hEdit) {
+            // Update line numbers and syntax highlight
+            SetWindowTextW(hLineNums, L"");
+            UpdateLineNumbers();
+            HighlightSyntax(hEdit);
+            UpdateStatusBar();
+            break;
+        }
+        switch (LOWORD(wParam)) {
+        case IDM_FILE_NEW:
+            SetWindowTextW(hEdit, L"");
+            currentFile[0] = 0;
+            SendMessageW(hEdit, EM_SETMODIFY, FALSE, 0);
+            UpdateStatusBar();
+            break;
+        case IDM_FILE_OPEN: {
+            OPENFILENAMEW ofn;
+            wchar_t szFile[MAX_PATH] = L"";
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFile = szFile;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrFilter = L"C Source\0*.c;*.h\0All Files\0*.*\0";
+            ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+            ofn.lpstrDefExt = L"c";
+            if (GetOpenFileNameW(&ofn)) {
+                wcscpy_s(currentFile, MAX_PATH, szFile);
+                OpenFileToEditor(hwnd, szFile);
+                UpdateStatusBar();
+            }
+            break;
+        }
+        case IDM_FILE_SAVE: {
+            if (!currentFile[0]) {
+                wchar_t szFile[MAX_PATH] = L"";
+                OPENFILENAMEW ofn;
+                ZeroMemory(&ofn, sizeof(ofn));
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFile = szFile;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrFilter = L"C Source\0*.c;*.h\0All Files\0*.*\0";
+                ofn.Flags = OFN_PATHMUSTEXIST;
+                ofn.lpstrDefExt = L"c";
+                if (GetSaveFileNameW(&ofn)) {
+                    wcscpy_s(currentFile, MAX_PATH, szFile);
+                    SaveFileAs(hwnd, currentFile, true);
+                }
+            } else {
+                SaveFileAs(hwnd, currentFile, true);
+            }
+            UpdateStatusBar();
+            break;
+        }
+        case IDM_FILE_SAVEAS: {
+            wchar_t szFile[MAX_PATH] = L"";
+            OPENFILENAMEW ofn;
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFile = szFile;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrFilter = L"C Source\0*.c;*.h\0All Files\0*.*\0";
+            ofn.Flags = OFN_PATHMUSTEXIST;
+            ofn.lpstrDefExt = L"c";
+            if (GetSaveFileNameW(&ofn)) {
+                wcscpy_s(currentFile, MAX_PATH, szFile);
+                SaveFileAs(hwnd, currentFile, true);
+            }
+            UpdateStatusBar();
+            break;
+        }
+        case IDM_FILE_EXIT: {
+            // Trigger WM_CLOSE to reuse prompt logic
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            break;
+        }
+        case IDM_EDIT_CUT:
+            SendMessageW(hEdit, WM_CUT, 0, 0);
+            break;
+        case IDM_EDIT_COPY:
+            SendMessageW(hEdit, WM_COPY, 0, 0);
+            break;
+        case IDM_EDIT_PASTE:
+            SendMessageW(hEdit, WM_PASTE, 0, 0);
+            break;
+        case IDM_EDIT_FIND:
+            MessageBoxW(hwnd, L"Suchen: Platzhalter (implementierbar)", L"Suchen", MB_OK | MB_ICONINFORMATION);
+            break;
+        case IDM_EDIT_REPLACE:
+            MessageBoxW(hwnd, L"Ersetzen: Platzhalter (implementierbar)", L"Ersetzen", MB_OK | MB_ICONINFORMATION);
+            break;
+        case IDM_EDIT_GOTOLINE:
+            MessageBoxW(hwnd, L"Gehe zu Zeile: Platzhalter (implementierbar)", L"Gehe zu Zeile", MB_OK | MB_ICONINFORMATION);
+            break;
+        case IDM_BUILD_COMPILE:
+            BuildProject(hwnd);
+            break;
+        case IDM_HELP_ABOUT:
+            MessageBoxW(hwnd, L"Mini Notepad Editor\nErweiterter C-Quellcodeditor mit Syntax-Highlighting und Build-Funktion", L"Über", MB_OK | MB_ICONINFORMATION);
+            break;
+        default:
+            break;
+        }
+        break;
+    case WM_KEYDOWN:
+        // Handle shortcuts
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'F')) {
+            MessageBoxW(hwnd, L"Suchen: Platzhalter", L"Suchen", MB_OK);
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'H')) {
+            MessageBoxW(hwnd, L"Ersetzen: Platzhalter", L"Ersetzen", MB_OK);
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && (wParam == 'G')) {
+            MessageBoxW(hwnd, L"Gehe zu Zeile: Platzhalter", L"Gehe zu Zeile", MB_OK);
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) && (GetKeyState(VK_SHIFT) & 0x8000) && (wParam == 'B')) {
+            BuildProject(hwnd);
+        }
+        break;
+    case WM_CLOSE: {
+        int prompt = PromptSaveIfModified(hwnd);
+        if (prompt == 0) {
+            // Abbrechen: nichts tun
+            break;
+        }
+        // prompt == 1 (fortfahren ohne speichern) oder 2 (gespeichert) -> schließen
+        DestroyWindow(hwnd);
+        break;
+    }
+    case WM_DESTROY:
+        if (hMonoFont) DeleteObject(hMonoFont);
+        PostQuitMessage(0);
+        break;
+    default:
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+/* WinMain */
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR pCmdLine, int nCmdShow) {
+    LoadLibraryW(L"Msftedit.dll");
+
+    WNDCLASSW wc = {0};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = gClassName;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    if (!RegisterClassW(&wc)) {
+        MessageBoxW(NULL, L"Registrierung der Fensterklasse fehlgeschlagen.", L"Fehler", MB_ICONERROR);
+        return 0;
+    }
+
+    hMainWnd = CreateWindowExW(0, gClassName, L"Mini Notepad Editor", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 1000, 700, NULL, NULL, hInstance, NULL);
+
+    if (!hMainWnd) {
+        MessageBoxW(NULL, L"Fenster konnte nicht erstellt werden.", L"Fehler", MB_ICONERROR);
+        return 0;
+    }
+
+    ShowWindow(hMainWnd, nCmdShow);
+    UpdateWindow(hMainWnd);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}

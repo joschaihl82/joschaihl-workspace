@@ -1,0 +1,970 @@
+/*
+ * btrfs_undelete_safe.c
+ *
+ * Safe, read-only Btrfs listing and limited restore prototype.
+ * Expanded version: additional checks, logging, helpers, and comments.
+ *
+ * - --list is strictly read-only and safe for block devices.
+ * - Robust device-size detection (BLKGETSIZE64 fallback).
+ * - Threaded read loops with per-thread buffers for speed.
+ * - TTY progress bar with ETA (smoothed).
+ * - Explicit --confirm-restore required to write recovered files to outdir.
+ *
+ * Limitations:
+ * - Heuristic, partial Btrfs parser (inode_item and dir_item detection).
+ * - No compression, extent-tree traversal, reflink handling, multi-device support.
+ *
+ * Build:
+ *   gcc -O2 -pthread -o btrfs_undelete_safe btrfs_undelete_safe.c
+ *
+ * Usage:
+ *   sudo ./btrfs_undelete_safe --device DEVICE --threads N --list PATH_PREFIX
+ *   sudo ./btrfs_undelete_safe --device DEVICE --threads N --restore PATH --outdir OUTDIR --confirm-restore
+ *
+ * Notes:
+ * - This expanded file adds many defensive checks, helper utilities, and
+ *   optional verbose diagnostics to aid auditing and testing.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <time.h>
+#include <ctype.h>
+#include <signal.h>
+#include <stdarg.h>
+
+/* ---------------------------------------------------------------------------
+ * Configuration and constants
+ * --------------------------------------------------------------------------- */
+
+#define MAGIC "BTRFS"
+#define MAGIC_LEN 5
+#define HEADER_SIZE 0x40
+#define LEAF_WINDOW (64 * 1024)        /* parse up to 64KiB around a node */
+#define DEFAULT_THREADS 4
+#define DEFAULT_SCRATCH (2 * 1024 * 1024) /* 2 MiB per-thread buffer */
+#define PROGRESS_SAMPLE_MS 500         /* progress update interval in ms */
+#define ETA_SMOOTH_ALPHA 0.15          /* smoothing factor for speed EMA */
+#define INODE_BUCKETS 16384            /* hash buckets for inode map */
+#define MAX_NAME_LEN 1024
+#define SAFE_PATH_MAX PATH_MAX
+
+/* Btrfs key types (simplified) */
+#define BTRFS_INODE_ITEM_KEY 1
+#define BTRFS_EXTENT_DATA_KEY 5
+#define BTRFS_DIR_ITEM_KEY   6
+
+/* ---------------------------------------------------------------------------
+ * Data structures for in-memory maps
+ * --------------------------------------------------------------------------- */
+
+typedef struct inode_info {
+    uint64_t ino;
+    uint64_t size;
+    uint64_t nlink;
+    struct inode_info *next;
+} inode_info_t;
+
+typedef struct dir_entry {
+    uint64_t parent_ino;   /* directory inode that contained the entry */
+    uint64_t ino;          /* referenced inode */
+    char *name;            /* filename (heap-allocated) */
+    struct dir_entry *next;
+} dir_entry_t;
+
+/* Hash buckets for inode_info */
+static inode_info_t *inode_buckets[INODE_BUCKETS];
+static pthread_mutex_t inode_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Linked list of dir entries */
+static dir_entry_t *dir_head = NULL;
+static pthread_mutex_t dir_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ---------------------------------------------------------------------------
+ * Global options and state
+ * --------------------------------------------------------------------------- */
+
+static const char *g_device_path = NULL;
+static size_t g_threads = DEFAULT_THREADS;
+static int g_do_list = 0;
+static int g_do_restore = 0;
+static const char *g_list_prefix = NULL;
+static const char *g_restore_path = NULL;
+static const char *g_outdir = NULL;
+static int g_confirm_restore = 0;
+static int g_verbose = 0;
+
+/* Progress counters */
+static volatile unsigned long long g_scanned_bytes = 0ULL;
+static unsigned long long g_total_bytes = 0ULL;
+
+/* Smoothed speed (MB/s) for ETA */
+static double g_speed_ema = 0.0;
+
+/* Signal handling to allow graceful termination */
+static volatile sig_atomic_t g_terminate = 0;
+
+/* ---------------------------------------------------------------------------
+ * Utility helpers
+ * --------------------------------------------------------------------------- */
+
+static void handle_sigint(int sig) {
+    (void)sig;
+    g_terminate = 1;
+}
+
+/* safe strdup wrapper */
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    return p;
+}
+
+/* print verbose messages when requested */
+static void vprintf_dbg(const char *fmt, ...) {
+    if (!g_verbose) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+/* format bytes to human readable string (caller buffer must be large enough) */
+static void format_bytes(char *buf, size_t bufsz, unsigned long long bytes) {
+    const char *units[] = {"B","KB","MB","GB","TB"};
+    double v = (double)bytes;
+    int u = 0;
+    while (v >= 1024.0 && u < 4) { v /= 1024.0; u++; }
+    snprintf(buf, bufsz, "%.2f %s", v, units[u]);
+}
+
+/* little-endian parsing helpers */
+static inline uint16_t le16(const void *p) {
+    const uint8_t *b = (const uint8_t*)p;
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static inline uint32_t le32(const void *p) {
+    const uint8_t *b = (const uint8_t*)p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+static inline uint64_t le64(const void *p) {
+    const uint8_t *b = (const uint8_t*)p;
+    return (uint64_t)b[0] | ((uint64_t)b[1] << 8) | ((uint64_t)b[2] << 16) | ((uint64_t)b[3] << 24)
+         | ((uint64_t)b[4] << 32) | ((uint64_t)b[5] << 40) | ((uint64_t)b[6] << 48) | ((uint64_t)b[7] << 56);
+}
+
+/* safe min/max */
+static inline size_t min_sz(size_t a, size_t b) { return a < b ? a : b; }
+static inline off_t min_off(off_t a, off_t b) { return a < b ? a : b; }
+
+/* check if running as root (useful for diagnostics) */
+static int running_as_root(void) {
+    return geteuid() == 0;
+}
+
+/* check read permission on device path (best-effort) */
+static int check_device_readable(const char *path) {
+    if (!path) return 0;
+    if (access(path, R_OK) == 0) return 1;
+    return 0;
+}
+
+/* validate outdir: ensure it exists or create it; return 0 on success */
+static int validate_outdir(const char *outdir) {
+    if (!outdir) return -1;
+    struct stat st;
+    if (stat(outdir, &st) == 0) {
+        if (!S_ISDIR(st.st_mode)) return -1;
+        return 0;
+    }
+    if (mkdir(outdir, 0700) < 0) return -1;
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * In-memory maps: store/find helpers (thread-safe)
+ * --------------------------------------------------------------------------- */
+
+static inline uint64_t inode_bucket_idx(uint64_t ino) {
+    return ino % INODE_BUCKETS;
+}
+
+static void store_inode_info(uint64_t ino, uint64_t size, uint64_t nlink) {
+    uint64_t idx = inode_bucket_idx(ino);
+    pthread_mutex_lock(&inode_lock);
+    inode_info_t *p = inode_buckets[idx];
+    while (p) {
+        if (p->ino == ino) {
+            /* update */
+            p->size = size;
+            p->nlink = nlink;
+            pthread_mutex_unlock(&inode_lock);
+            return;
+        }
+        p = p->next;
+    }
+    inode_info_t *n = malloc(sizeof(*n));
+    if (!n) { pthread_mutex_unlock(&inode_lock); return; }
+    n->ino = ino;
+    n->size = size;
+    n->nlink = nlink;
+    n->next = inode_buckets[idx];
+    inode_buckets[idx] = n;
+    pthread_mutex_unlock(&inode_lock);
+}
+
+static inode_info_t *find_inode_info(uint64_t ino) {
+    uint64_t idx = inode_bucket_idx(ino);
+    inode_info_t *p = inode_buckets[idx];
+    while (p) {
+        if (p->ino == ino) return p;
+        p = p->next;
+    }
+    return NULL;
+}
+
+static void add_dir_entry(uint64_t parent_ino, uint64_t ino, const char *name) {
+    if (!name) return;
+    dir_entry_t *e = malloc(sizeof(*e));
+    if (!e) return;
+    e->parent_ino = parent_ino;
+    e->ino = ino;
+    e->name = xstrdup(name);
+    e->next = NULL;
+    pthread_mutex_lock(&dir_lock);
+    e->next = dir_head;
+    dir_head = e;
+    pthread_mutex_unlock(&dir_lock);
+}
+
+/* free maps (best-effort) */
+static void free_maps(void) {
+    for (size_t i = 0; i < INODE_BUCKETS; ++i) {
+        inode_info_t *p = inode_buckets[i];
+        while (p) {
+            inode_info_t *n = p->next;
+            free(p);
+            p = n;
+        }
+        inode_buckets[i] = NULL;
+    }
+    dir_entry_t *d = dir_head;
+    while (d) {
+        dir_entry_t *n = d->next;
+        free(d->name);
+        free(d);
+        d = n;
+    }
+    dir_head = NULL;
+}
+
+/* dump a small diagnostic summary (only when verbose) */
+static void dump_maps_summary(void) {
+    if (!g_verbose) return;
+    size_t inode_count = 0;
+    size_t dir_count = 0;
+    for (size_t i = 0; i < INODE_BUCKETS; ++i) {
+        inode_info_t *p = inode_buckets[i];
+        while (p) { inode_count++; p = p->next; }
+    }
+    for (dir_entry_t *d = dir_head; d; d = d->next) dir_count++;
+    fprintf(stderr, "DEBUG: inode_count=%zu dir_count=%zu\n", inode_count, dir_count);
+}
+
+/* ---------------------------------------------------------------------------
+ * Parsing: heuristic leaf window parser
+ *
+ * This function is intentionally conservative: it only reads small windows
+ * and extracts a few fields heuristically. It is not a full Btrfs parser.
+ * --------------------------------------------------------------------------- */
+
+static void parse_leaf_window(const uint8_t *node_ptr, size_t available) {
+    if (!node_ptr || available < HEADER_SIZE) return;
+
+    /* header: level at offset 0x18 (uint32), nritems at 0x1C (uint32) */
+    uint32_t level = le32(node_ptr + 0x18);
+    uint32_t nritems = le32(node_ptr + 0x1C);
+
+    /* we only care about leaf nodes (level == 0) */
+    if (level != 0) return;
+
+    /* heuristic scan: look for sequences that look like keys */
+    const uint8_t *p = node_ptr + HEADER_SIZE;
+    const uint8_t *end = node_ptr + available;
+
+    /* guard: avoid runaway loops */
+    size_t items_parsed = 0;
+    while (p + 24 < end && items_parsed < nritems + 1024) {
+        uint64_t objid = le64(p);
+        uint32_t type = le32(p + 8);
+        /* offset/key offset is p+12 (we don't use it here) */
+        /* basic sanity checks */
+        if (objid == 0 || objid > (1ULL << 48)) {
+            p += 8;
+            continue;
+        }
+
+        if (type == BTRFS_INODE_ITEM_KEY) {
+            /* heuristic: read nlink and size from nearby bytes if present */
+            if (p + 40 < end) {
+                uint64_t nlink = le64(p + 12);
+                uint64_t size = le64(p + 20);
+                store_inode_info(objid, size, nlink);
+            }
+            p += 24;
+        } else if (type == BTRFS_DIR_ITEM_KEY) {
+            /* heuristic: dir_item contains inode ref and name after it */
+            if (p + 24 < end) {
+                uint64_t inode_ref = le64(p + 12);
+                /* name likely follows; clamp to remaining bytes */
+                size_t maxn = (size_t)(end - (p + 20));
+                if (maxn > MAX_NAME_LEN - 1) maxn = MAX_NAME_LEN - 1;
+                char namebuf[MAX_NAME_LEN];
+                memset(namebuf, 0, sizeof(namebuf));
+                memcpy(namebuf, p + 20, maxn);
+                /* sanitize: stop at first non-printable or null */
+                for (size_t i = 0; i < maxn; ++i) {
+                    unsigned char c = (unsigned char)namebuf[i];
+                    if (c == 0) break;
+                    if (c < 0x20 || c == '\n' || c == '\r') { namebuf[i] = 0; break; }
+                }
+                if (namebuf[0]) add_dir_entry(objid, inode_ref, namebuf);
+            }
+            p += 24;
+        } else {
+            /* unknown type: advance conservatively */
+            p += 8;
+        }
+        items_parsed++;
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Threaded scanning: read-loop mode for block devices and mmap mode for files
+ * --------------------------------------------------------------------------- */
+
+/* Thread context for read-loop mode */
+typedef struct {
+    size_t id;
+    int fd;
+    off_t start;
+    off_t end;
+    uint8_t *scratch;
+    size_t scratch_size;
+} reader_ctx_t;
+
+/* Thread context for mmap mode */
+typedef struct {
+    size_t id;
+    const uint8_t *base;
+    size_t start;
+    size_t end;
+} mmap_ctx_t;
+
+/* Reader thread: read assigned range with pread into scratch and scan */
+static void *reader_thread(void *arg) {
+    reader_ctx_t *ctx = (reader_ctx_t*)arg;
+    if (!ctx || ctx->scratch_size == 0) return NULL;
+
+    off_t pos = ctx->start;
+    const size_t CHUNK = ctx->scratch_size;
+
+    while (!g_terminate && pos < ctx->end) {
+        size_t toread = (size_t)min_off((off_t)CHUNK, ctx->end - pos);
+        ssize_t r = pread(ctx->fd, ctx->scratch, toread, pos);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        /* update global progress */
+        __sync_fetch_and_add(&g_scanned_bytes, (unsigned long long)r);
+
+        /* scan buffer for MAGIC occurrences */
+        uint8_t *buf = ctx->scratch;
+        size_t bufsz = (size_t)r;
+        uint8_t *p = buf;
+        while (!g_terminate) {
+            void *found = memmem(p, bufsz - (p - buf), MAGIC, MAGIC_LEN);
+            if (!found) break;
+            size_t off_in_buf = (size_t)((uint8_t*)found - buf);
+            off_t node_off = pos + off_in_buf;
+
+            /* read a small window around node_off into a local buffer */
+            size_t avail = LEAF_WINDOW;
+            uint8_t local_win[LEAF_WINDOW];
+            ssize_t got = pread(ctx->fd, local_win, avail, node_off);
+            if (got > 0) parse_leaf_window(local_win, (size_t)got);
+
+            p = (uint8_t*)found + MAGIC_LEN;
+        }
+
+        pos += r;
+    }
+    return NULL;
+}
+
+/* Scanner thread for mmap mode */
+static void *mmap_scanner_thread(void *arg) {
+    mmap_ctx_t *ctx = (mmap_ctx_t*)arg;
+    const uint8_t *base = ctx->base;
+    size_t s = ctx->start;
+    size_t e = ctx->end;
+    const size_t overlap = MAGIC_LEN;
+    if (e > overlap) e -= overlap;
+    const uint8_t *ptr = base + s;
+    const uint8_t *limit = base + e;
+
+    while (!g_terminate && ptr < limit) {
+        void *found = memmem((void*)ptr, (size_t)(limit - ptr), MAGIC, MAGIC_LEN);
+        if (!found) {
+            /* account remaining bytes scanned */
+            size_t rem = (size_t)(limit - ptr);
+            if (rem) __sync_fetch_and_add(&g_scanned_bytes, (unsigned long long)rem);
+            break;
+        }
+        uint8_t *f = (uint8_t*)found;
+        size_t advance = (size_t)(f - ptr);
+        if (advance) __sync_fetch_and_add(&g_scanned_bytes, (unsigned long long)advance);
+
+        size_t node_off = (size_t)(f - base);
+        size_t avail = LEAF_WINDOW;
+        if (node_off + avail > g_total_bytes) avail = (size_t)(g_total_bytes - node_off);
+        parse_leaf_window(base + node_off, avail);
+
+        ptr = f + MAGIC_LEN;
+        __sync_fetch_and_add(&g_scanned_bytes, (unsigned long long)MAGIC_LEN);
+    }
+    return NULL;
+}
+
+/* ---------------------------------------------------------------------------
+ * Device size detection and scanning orchestration
+ * --------------------------------------------------------------------------- */
+
+/* check if fd is a block device */
+static int fd_is_block_device(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) return 0;
+    return S_ISBLK(st.st_mode);
+}
+
+/* robust fast_scan: choose mmap for regular files, read-loop for block devices */
+static int fast_scan_and_populate(const char *device, size_t threads) {
+    int fd = open(device, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "open(%s): %s\n", device, strerror(errno));
+        return -1;
+    }
+
+    unsigned long long size64 = 0;
+    int isblk = fd_is_block_device(fd);
+    if (isblk) {
+        /* block device: use ioctl to get size */
+        if (ioctl(fd, BLKGETSIZE64, &size64) < 0) {
+            fprintf(stderr, "BLKGETSIZE64 failed: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+    } else {
+        struct stat st;
+        if (fstat(fd, &st) < 0) {
+            fprintf(stderr, "fstat failed: %s\n", strerror(errno));
+            close(fd);
+            return -1;
+        }
+        size64 = (unsigned long long)st.st_size;
+    }
+
+    if (size64 == 0) {
+        fprintf(stderr, "empty device\n");
+        close(fd);
+        return -1;
+    }
+
+    g_total_bytes = size64;
+    vprintf_dbg("Device size: %" PRIu64 " bytes\n", (uint64_t)g_total_bytes);
+
+    /* If regular file, try mmap whole file for best speed */
+    if (!isblk) {
+        /* attempt to mmap whole file */
+        void *map = mmap(NULL, (size_t)g_total_bytes, PROT_READ, MAP_SHARED, fd, 0);
+        if (map != MAP_FAILED) {
+            vprintf_dbg("mmap succeeded, using mmap scanning mode\n");
+            /* advise kernel */
+            madvise(map, (size_t)g_total_bytes, MADV_SEQUENTIAL | MADV_WILLNEED);
+
+            /* spawn threads to scan ranges */
+            pthread_t *tids = calloc(threads, sizeof(pthread_t));
+            mmap_ctx_t *ctxs = calloc(threads, sizeof(mmap_ctx_t));
+            size_t chunk = (size_t)g_total_bytes / threads;
+            for (size_t i = 0; i < threads; ++i) {
+                ctxs[i].id = i;
+                ctxs[i].base = (const uint8_t*)map;
+                ctxs[i].start = i * chunk;
+                ctxs[i].end = (i == threads - 1) ? (size_t)g_total_bytes : (i + 1) * chunk;
+                if (pthread_create(&tids[i], NULL, mmap_scanner_thread, &ctxs[i]) != 0) {
+                    fprintf(stderr, "pthread_create failed for thread %zu\n", i);
+                }
+            }
+
+            /* progress monitor */
+            struct timespec t_start, t_now;
+            clock_gettime(CLOCK_MONOTONIC, &t_start);
+            while (1) {
+                /* sample */
+                struct timespec ts;
+                ts.tv_sec = PROGRESS_SAMPLE_MS / 1000;
+                ts.tv_nsec = (PROGRESS_SAMPLE_MS % 1000) * 1000000;
+                nanosleep(&ts, NULL);
+
+                unsigned long long cur = __sync_fetch_and_add(&g_scanned_bytes, 0ULL);
+                clock_gettime(CLOCK_MONOTONIC, &t_now);
+                double elapsed = (t_now.tv_sec - t_start.tv_sec) + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+                double speed = (elapsed > 0.0) ? (cur / (1024.0 * 1024.0)) / elapsed : 0.0;
+                /* smooth speed */
+                if (g_speed_ema == 0.0) g_speed_ema = speed;
+                else g_speed_ema = ETA_SMOOTH_ALPHA * speed + (1.0 - ETA_SMOOTH_ALPHA) * g_speed_ema;
+
+                double pct = (double)cur * 100.0 / (double)g_total_bytes;
+                unsigned long long remaining = (cur >= g_total_bytes) ? 0ULL : (g_total_bytes - cur);
+                double eta = (g_speed_ema > 0.0) ? (remaining / (1024.0 * 1024.0)) / g_speed_ema : -1.0;
+
+                /* print progress to stderr */
+                int barw = 40;
+                int filled = (int)((pct / 100.0) * barw);
+                if (filled < 0) filled = 0; if (filled > barw) filled = barw;
+                fprintf(stderr, "\r[");
+                for (int i = 0; i < barw; ++i) fputc(i < filled ? '=' : ' ', stderr);
+                fprintf(stderr, "] %6.2f%%  %6.2fMB/%6.2fMB  %5.2fMB/s  ETA: ",
+                        pct,
+                        cur / (1024.0 * 1024.0),
+                        g_total_bytes / (1024.0 * 1024.0),
+                        g_speed_ema);
+                if (eta >= 0.0) {
+                    int hh = (int)(eta / 3600);
+                    int mm = (int)((eta - hh*3600) / 60);
+                    int ss = (int)eta % 60;
+                    if (hh > 0) fprintf(stderr, "%02dh%02dm%02ds", hh, mm, ss);
+                    else fprintf(stderr, "%02dm%02ds", mm, ss);
+                } else {
+                    fprintf(stderr, "--:--:--");
+                }
+                fflush(stderr);
+
+                /* break when done or termination requested */
+                if (cur >= g_total_bytes || g_terminate) break;
+            }
+
+            /* join threads */
+            for (size_t i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
+
+            /* final newline */
+            fprintf(stderr, "\n");
+
+            /* cleanup */
+            munmap(map, (size_t)g_total_bytes);
+            free(tids);
+            free(ctxs);
+            close(fd);
+            return 0;
+        } else {
+            vprintf_dbg("mmap failed (%s), falling back to read-loop mode\n", strerror(errno));
+            /* fall through to read-loop mode */
+        }
+    }
+
+    /* Read-loop mode (works for block devices and mmap fallback) */
+    /* choose per-thread chunk sizes aligned to 4MiB */
+    const off_t CHUNK_ALIGN = 4 * 1024 * 1024;
+    off_t chunk = (off_t)g_total_bytes / (off_t)threads;
+    if (chunk < CHUNK_ALIGN) chunk = CHUNK_ALIGN;
+
+    pthread_t *tids = calloc(threads, sizeof(pthread_t));
+    reader_ctx_t *rctx = calloc(threads, sizeof(reader_ctx_t));
+    if (!tids || !rctx) {
+        fprintf(stderr, "allocation failed\n");
+        close(fd);
+        free(tids);
+        free(rctx);
+        return -1;
+    }
+
+    for (size_t i = 0; i < threads; ++i) {
+        off_t start = (off_t)i * chunk;
+        off_t end = (i == threads - 1) ? (off_t)g_total_bytes : start + chunk;
+        if (end > (off_t)g_total_bytes) end = (off_t)g_total_bytes;
+        rctx[i].id = i;
+        rctx[i].fd = fd;
+        rctx[i].start = start;
+        rctx[i].end = end;
+        rctx[i].scratch_size = DEFAULT_SCRATCH;
+        rctx[i].scratch = malloc(rctx[i].scratch_size);
+        if (!rctx[i].scratch) {
+            fprintf(stderr, "malloc scratch failed for thread %zu\n", i);
+            rctx[i].scratch_size = 0;
+        }
+        if (pthread_create(&tids[i], NULL, reader_thread, &rctx[i]) != 0) {
+            fprintf(stderr, "pthread_create failed for thread %zu\n", i);
+        }
+    }
+
+    /* progress monitor */
+    struct timespec t_start, t_now;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+    while (1) {
+        struct timespec ts;
+        ts.tv_sec = PROGRESS_SAMPLE_MS / 1000;
+        ts.tv_nsec = (PROGRESS_SAMPLE_MS % 1000) * 1000000;
+        nanosleep(&ts, NULL);
+
+        unsigned long long cur = __sync_fetch_and_add(&g_scanned_bytes, 0ULL);
+        clock_gettime(CLOCK_MONOTONIC, &t_now);
+        double elapsed = (t_now.tv_sec - t_start.tv_sec) + (t_now.tv_nsec - t_start.tv_nsec) / 1e9;
+        double speed = (elapsed > 0.0) ? (cur / (1024.0 * 1024.0)) / elapsed : 0.0;
+        if (g_speed_ema == 0.0) g_speed_ema = speed;
+        else g_speed_ema = ETA_SMOOTH_ALPHA * speed + (1.0 - ETA_SMOOTH_ALPHA) * g_speed_ema;
+
+        double pct = (double)cur * 100.0 / (double)g_total_bytes;
+        unsigned long long remaining = (cur >= g_total_bytes) ? 0ULL : (g_total_bytes - cur);
+        double eta = (g_speed_ema > 0.0) ? (remaining / (1024.0 * 1024.0)) / g_speed_ema : -1.0;
+
+        int barw = 40;
+        int filled = (int)((pct / 100.0) * barw);
+        if (filled < 0) filled = 0; if (filled > barw) filled = barw;
+        fprintf(stderr, "\r[");
+        for (int i = 0; i < barw; ++i) fputc(i < filled ? '=' : ' ', stderr);
+        fprintf(stderr, "] %6.2f%%  %6.2fMB/%6.2fMB  %5.2fMB/s  ETA: ",
+                pct,
+                cur / (1024.0 * 1024.0),
+                g_total_bytes / (1024.0 * 1024.0),
+                g_speed_ema);
+        if (eta >= 0.0) {
+            int hh = (int)(eta / 3600);
+            int mm = (int)((eta - hh*3600) / 60);
+            int ss = (int)eta % 60;
+            if (hh > 0) fprintf(stderr, "%02dh%02dm%02ds", hh, mm, ss);
+            else fprintf(stderr, "%02dm%02ds", mm, ss);
+        } else {
+            fprintf(stderr, "--:--:--");
+        }
+        fflush(stderr);
+
+        if (cur >= g_total_bytes || g_terminate) break;
+    }
+
+    /* join threads */
+    for (size_t i = 0; i < threads; ++i) pthread_join(tids[i], NULL);
+
+    /* final newline */
+    fprintf(stderr, "\n");
+
+    /* cleanup */
+    for (size_t i = 0; i < threads; ++i) free(rctx[i].scratch);
+    free(rctx);
+    free(tids);
+    close(fd);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Listing and restore helpers
+ * --------------------------------------------------------------------------- */
+
+/* List deleted candidates under prefix.
+ * This function only reads in-memory maps populated by the scanner.
+ * It prints inode numbers with nlink==0 and any dir_item names referencing them.
+ */
+static int list_deleted_candidates(const char *prefix) {
+    if (!prefix) prefix = "/";
+    printf("Deleted inode candidates and known names under prefix '%s':\n", prefix);
+    int found = 0;
+    for (size_t b = 0; b < INODE_BUCKETS; ++b) {
+        inode_info_t *p = inode_buckets[b];
+        while (p) {
+            if (p->nlink == 0) {
+                int printed = 0;
+                /* search dir entries */
+                for (dir_entry_t *d = dir_head; d; d = d->next) {
+                    if (d->ino == p->ino) {
+                        /* we only have parent inode and name; print heuristic path */
+                        char pathbuf[2048];
+                        snprintf(pathbuf, sizeof(pathbuf), "(parent_ino=%" PRIu64 ")/%s", d->parent_ino, d->name);
+                        if (strstr(pathbuf, prefix)) {
+                            printf("inode %" PRIu64 " size=%" PRIu64 " bytes: %s\n", p->ino, p->size, pathbuf);
+                            printed = 1;
+                            found = 1;
+                        }
+                    }
+                }
+                if (!printed) {
+                    /* no dir_item found; print inode only if prefix is root or empty */
+                    if (strcmp(prefix, "/") == 0 || prefix[0] == '\0') {
+                        printf("inode %" PRIu64 " size=%" PRIu64 " bytes: (no dir_item found)\n", p->ino, p->size);
+                        found = 1;
+                    }
+                }
+            }
+            p = p->next;
+        }
+    }
+    if (!found) printf("(no candidates found)\n");
+    return 0;
+}
+
+/* Very limited restore: find a dir_entry matching basename of path, then attempt to find extent_data items
+ * by scanning the device for extent_data keys referencing the inode. This is heuristic and may fail.
+ *
+ * Safety: this function reads the device read-only and writes only to outdir. It requires g_confirm_restore.
+ */
+static int restore_by_path(const char *device, const char *path, const char *outdir) {
+    if (!g_confirm_restore) {
+        fprintf(stderr, "Restore requires --confirm-restore to proceed. Aborting.\n");
+        return 1;
+    }
+    if (!path || !outdir) {
+        fprintf(stderr, "restore_by_path: invalid args\n");
+        return 1;
+    }
+
+    /* find basename */
+    const char *basename = strrchr(path, '/');
+    if (basename) basename++; else basename = path;
+    if (!basename || basename[0] == '\0') {
+        fprintf(stderr, "Invalid restore path\n");
+        return 1;
+    }
+
+    /* find matching dir_entry */
+    uint64_t target_ino = 0;
+    for (dir_entry_t *d = dir_head; d; d = d->next) {
+        if (strcmp(d->name, basename) == 0) {
+            target_ino = d->ino;
+            break;
+        }
+    }
+    if (target_ino == 0) {
+        fprintf(stderr, "Could not find dir_item matching '%s' in scanned metadata\n", basename);
+        return 1;
+    }
+
+    inode_info_t *ii = find_inode_info(target_ino);
+    if (!ii) {
+        fprintf(stderr, "Found dir_item for inode %" PRIu64 " but no inode_item present\n", target_ino);
+        return 1;
+    }
+
+    /* ensure outdir exists and is a directory */
+    if (validate_outdir(outdir) != 0) {
+        fprintf(stderr, "Failed to create or validate outdir '%s'\n", outdir);
+        return 1;
+    }
+
+    /* open device read-only and scan for extent_data keys referencing target_ino */
+    int fd = open(device, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "open(%s): %s\n", device, strerror(errno));
+        return 1;
+    }
+
+    /* get device size robustly */
+    unsigned long long size64 = 0;
+    if (fd_is_block_device(fd)) {
+        if (ioctl(fd, BLKGETSIZE64, &size64) < 0) {
+            fprintf(stderr, "BLKGETSIZE64 failed: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+    } else {
+        struct stat stf;
+        if (fstat(fd, &stf) < 0) {
+            fprintf(stderr, "fstat failed: %s\n", strerror(errno));
+            close(fd);
+            return 1;
+        }
+        size64 = (unsigned long long)stf.st_size;
+    }
+
+    /* create output file path */
+    char outpath[PATH_MAX];
+    snprintf(outpath, sizeof(outpath), "%s/recovered_ino_%" PRIu64 ".bin", outdir, target_ino);
+    int outfd = open(outpath, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (outfd < 0) {
+        fprintf(stderr, "open(outpath) failed: %s\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+
+    /* scanning loop: read in large windows and parse leaf windows for extent_data items */
+    const size_t SCAN_BUF = 4 * 1024 * 1024; /* 4 MiB */
+    uint8_t *buf = malloc(SCAN_BUF);
+    if (!buf) {
+        fprintf(stderr, "malloc failed\n");
+        close(fd);
+        close(outfd);
+        return 1;
+    }
+
+    off_t pos = 0;
+    size_t total_written = 0;
+    while (!g_terminate && (unsigned long long)pos < size64) {
+        size_t toread = (size_t)min_off((off_t)SCAN_BUF, (off_t)(size64 - (unsigned long long)pos));
+        ssize_t r = pread(fd, buf, toread, pos);
+        if (r <= 0) {
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        /* scan buffer for MAGIC */
+        uint8_t *p = buf;
+        size_t bufsz = (size_t)r;
+        while (!g_terminate) {
+            void *found = memmem(p, bufsz - (p - buf), MAGIC, MAGIC_LEN);
+            if (!found) break;
+            size_t off_in_buf = (size_t)((uint8_t*)found - buf);
+            off_t node_off = pos + off_in_buf;
+            /* read leaf window */
+            size_t avail = LEAF_WINDOW;
+            uint8_t local_win[LEAF_WINDOW];
+            ssize_t got = pread(fd, local_win, avail, node_off);
+            if (got > 0) {
+                /* parse local_win for extent_data keys referencing target_ino */
+                const uint8_t *q = local_win;
+                const uint8_t *end = local_win + (size_t)got;
+                while (q + 24 < end) {
+                    uint64_t objid = le64(q);
+                    uint32_t type = le32(q + 8);
+                    q += 24;
+                    if (type == BTRFS_EXTENT_DATA_KEY && objid == target_ino) {
+                        /* heuristic: next bytes contain physical address and length */
+                        if (q + 16 <= end) {
+                            uint64_t phys = le64(q);
+                            uint64_t len = le64(q + 8);
+                            if (phys && len && phys + len <= size64) {
+                                /* read physical data and write to outfd */
+                                uint8_t *dat = malloc((size_t)len);
+                                if (!dat) { q += 16; continue; }
+                                ssize_t got2 = pread(fd, dat, (size_t)len, (off_t)phys);
+                                if (got2 == (ssize_t)len) {
+                                    ssize_t w = write(outfd, dat, (size_t)len);
+                                    if (w == (ssize_t)len) total_written += (size_t)len;
+                                }
+                                free(dat);
+                            }
+                        }
+                    }
+                }
+            }
+            p = (uint8_t*)found + MAGIC_LEN;
+        }
+        pos += r;
+    }
+
+    free(buf);
+    close(fd);
+    close(outfd);
+
+    if (total_written == 0) {
+        fprintf(stderr, "No extent_data found for inode %" PRIu64 " or extents not in supported format\n", target_ino);
+        unlink(outpath);
+        return 1;
+    }
+
+    printf("Wrote %zu bytes to %s\n", total_written, outpath);
+    return 0;
+}
+
+/* ---------------------------------------------------------------------------
+ * Command-line parsing and main
+ * --------------------------------------------------------------------------- */
+
+static void usage(const char *p) {
+    fprintf(stderr,
+        "Usage:\n"
+        "  %s --device DEVICE [--threads N] --list PATH_PREFIX [--verbose]\n"
+        "  %s --device DEVICE [--threads N] --restore PATH --outdir OUTDIR --confirm-restore [--verbose]\n"
+        "\nExamples:\n"
+        "  %s --device /dev/nvme0n1p2 --threads 8 --list /home/josh\n"
+        "  %s --device /dev/nvme0n1p2 --threads 8 --restore /home/josh/secret.txt --outdir ./recovered --confirm-restore\n",
+        p, p, p, p);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) { usage(argv[0]); return 1; }
+
+    /* parse args */
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) { g_device_path = argv[++i]; continue; }
+        if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) { g_threads = (size_t)atoi(argv[++i]); if (g_threads < 1) g_threads = 1; continue; }
+        if (strcmp(argv[i], "--list") == 0 && i + 1 < argc) { g_do_list = 1; g_list_prefix = argv[++i]; continue; }
+        if (strcmp(argv[i], "--restore") == 0 && i + 1 < argc) { g_do_restore = 1; g_restore_path = argv[++i]; continue; }
+        if (strcmp(argv[i], "--outdir") == 0 && i + 1 < argc) { g_outdir = argv[++i]; continue; }
+        if (strcmp(argv[i], "--confirm-restore") == 0) { g_confirm_restore = 1; continue; }
+        if (strcmp(argv[i], "--verbose") == 0) { g_verbose = 1; continue; }
+        if (strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
+        fprintf(stderr, "Unknown arg: %s\n", argv[i]);
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (!g_device_path) { fprintf(stderr, "--device is required\n"); return 1; }
+    if (g_do_list && g_do_restore) { fprintf(stderr, "Choose either --list or --restore\n"); return 1; }
+    if (!g_do_list && !g_do_restore) { usage(argv[0]); return 1; }
+    if (g_do_restore && !g_outdir) { fprintf(stderr, "--outdir is required for --restore\n"); return 1; }
+
+    /* safety checks */
+    if (!check_device_readable(g_device_path)) {
+        fprintf(stderr, "Warning: device '%s' is not readable by this user. Run as root or adjust permissions.\n", g_device_path);
+    }
+    if (!running_as_root()) {
+        vprintf_dbg("Not running as root; read access to raw devices may be restricted.\n");
+    }
+
+    /* install signal handler for graceful termination */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_sigint;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    /* zero maps */
+    memset(inode_buckets, 0, sizeof(inode_buckets));
+    dir_head = NULL;
+
+    /* run fast scan to populate maps (and show progress) */
+    if (fast_scan_and_populate(g_device_path, g_threads) != 0) {
+        fprintf(stderr, "scan failed\n");
+        free_maps();
+        return 1;
+    }
+
+    /* optional diagnostic dump */
+    dump_maps_summary();
+
+    /* list or restore */
+    int rc = 0;
+    if (g_do_list) {
+        rc = list_deleted_candidates(g_list_prefix ? g_list_prefix : "/");
+    } else if (g_do_restore) {
+        rc = restore_by_path(g_device_path, g_restore_path, g_outdir);
+    }
+
+    free_maps();
+    return rc;
+}

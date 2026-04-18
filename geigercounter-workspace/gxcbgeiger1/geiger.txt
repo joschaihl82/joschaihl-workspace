@@ -1,0 +1,986 @@
+/*
+ * geiger.c
+ *
+ * Pure xcb version (no Xlib / no Xft) — resizable, backbuffer pixmap, V4L2 or simulated input, ALSA sound.
+ * Per-pixel neon multiplication for radioactively detected pixels.
+ *
+ * Build:
+ *   cc -std=c99 -O2 -march=native geiger.c -o geiger -pthread -ljpeg -lasound -lxcb -lm
+ *
+ * Notes:
+ * - Radioaktive Pixel (Luminanz >= Y_HOT_THRESH) werden pro Pixel mit Neonfarbe des dominanten Isotops multipliziert.
+ * - MULTIPLY_BLEND steuert, wie stark das Ergebnis mit dem Original gemischt wird (0 = nur multipliziert, 1 = nur original).
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <unistd.h>
+#include <errno.h>
+#include <signal.h>
+#include <pthread.h>
+
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <fcntl.h>
+
+#include <xcb/xcb.h>
+#include <xcb/xcb_icccm.h>
+
+#include <alsa/asoundlib.h>
+#include <linux/videodev2.h>
+#include <jpeglib.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <emmintrin.h>
+#endif
+
+/* ---------- config ---------- */
+#define DEVICE_NODE "/dev/video0"
+#define SRC_WIDTH 640
+#define SRC_HEIGHT 480
+#define FPS 25
+#define Y_HOT_THRESH 200
+#define RAD_SCALE 0.00005
+#define ALERT_THRESHOLD 0.05
+#define ALARM_COOLDOWN_MS 1000
+
+#define ALPHA_MIN 0.05
+#define ALPHA_MAX 0.50
+#define AEMA_SCALE_FACTOR 1.0
+
+#define NUM_ISOTOPES 20
+#define HIGH_RISK_CHANCE_TOTAL 5
+#define MEDIUM_RISK_CHANCE_TOTAL 15
+
+#define LD50_LOW_RISK_THRESHOLD 100.0
+#define LD50_MEDIUM_RISK_THRESHOLD 50.0
+#define LD50_HIGH_RISK_THRESHOLD 10.0
+#define LD50_ALARM_FREQ 440.0
+#define LD50_ALARM_DURATION 0.5
+
+#define MAX_INTENSITY_FOR_PITCH 0.1
+#define BASE_PITCH_HZ 150.0
+#define ISOTOPE_FREQ_STEP_HZ 12.0
+#define ALARM_FREQ 1000.0
+#define ALARM_DURATION 0.05
+
+#define ALSA_DEVICE "default"
+#define ALSA_RATE 44100
+#define ALSA_CHANNELS 1
+#define ALERT_VOLUME 16000.0
+
+#define PANEL_RATIO 0.33
+#define PANEL_MIN_W 280
+#define PANEL_MAX_W 900
+
+#define FRAME_QUEUE_SIZE 8
+
+#define LSBFirst 0
+
+/* edge detection / outline defaults (still available) */
+#define EDGE_THRESH 280
+#define OUTLINE_THICKNESS 1
+
+/* neon brightness scaling defaults */
+#define MAX_NEON_MULT 3.0
+#define RATE_SCALE 10.0
+#define GLOBAL_SCALE 2.0
+#define NEON_GAMMA 1.0
+
+/* per-pixel blend: 0.0 = use only multiplied color, 1.0 = keep original
+   We'll use a small blend toward original to keep structure visible */
+#define MULTIPLY_BLEND 0.1
+
+/* ---------- globals & types ---------- */
+static volatile bool running = true;
+static bool cam_mjpeg = false;
+
+typedef struct { int width, height; bool simulated; } video_state_t;
+static video_state_t vstate;
+
+typedef struct { unsigned char *buf; size_t len; bool mjpeg; long long ts_ms; } frame_item_t;
+typedef struct {
+    frame_item_t items[FRAME_QUEUE_SIZE];
+    int head, tail, count;
+    pthread_mutex_t mtx;
+    pthread_cond_t cv;
+} frame_queue_t;
+static frame_queue_t fqueue = { .head=0, .tail=0, .count=0, .mtx=PTHREAD_MUTEX_INITIALIZER, .cv=PTHREAD_COND_INITIALIZER };
+
+typedef struct {
+    xcb_connection_t *conn;
+    const xcb_setup_t *setup;
+    xcb_screen_t *screen;
+    xcb_window_t win;
+    xcb_gcontext_t gc_text;
+    xcb_gcontext_t gc_blit;
+    xcb_gcontext_t gc_white;
+    xcb_gcontext_t gc_orange;
+    xcb_gcontext_t gc_red;
+    xcb_pixmap_t back_buffer;
+    int win_w, win_h;
+    int depth;
+    xcb_atom_t atom_wm_protocols;
+    xcb_atom_t atom_wm_delete_window;
+    xcb_colormap_t colormap;
+} xcb_state_t;
+static xcb_state_t xstate;
+
+typedef struct {
+    double current_rad_value;
+    double filtered_rad_value;
+    double accumulated_dosage;
+    double dynamic_alpha;
+    int hot_pixels;
+    long long start_time_ms;
+    long long last_alert_time_ms;
+    bool ld50_exceeded;
+    double ld50_threshold;
+    double isotope_rad_rate[NUM_ISOTOPES];
+    double isotope_accumulated_dosage[NUM_ISOTOPES];
+    double isotope_ld50_threshold[NUM_ISOTOPES];
+    bool isotope_ld50_exceeded[NUM_ISOTOPES];
+    double alert_on_threshold;
+    double alert_off_threshold;
+    bool alert_active;
+    long long alert_hold_ms;
+    long long alert_last_change_ms;
+    double ld50_on_ratio;
+    double ld50_off_ratio;
+} geiger_state_t;
+static geiger_state_t gstate;
+
+typedef struct { snd_pcm_t *pcm; unsigned int rate; int channels; pthread_mutex_t mtx; } alsa_state_t;
+static alsa_state_t astate = { NULL, ALSA_RATE, ALSA_CHANNELS, PTHREAD_MUTEX_INITIALIZER };
+
+static const char *isotope_abbr[NUM_ISOTOPES] = {
+    "K-40","C-14","H-3","Ra-226","Rn-222","U-238","Po-210",
+    "Cs-137","Sr-90","I-131","Tc-99m","Ba-137m","Cl-36","Na-22",
+    "Pu-239","Am-241","Co-60","U-235","Th-232","I-129"
+};
+static const char *isotope_name[NUM_ISOTOPES] = {
+    "Potassium-40","Carbon-14","Tritium (H-3)","Radium-226","Radon-222","Uranium-238","Polonium-210",
+    "Cesium-137","Strontium-90","Iodine-131","Technetium-99m","Barium-137m","Chlorine-36","Sodium-22",
+    "Plutonium-239","Americium-241","Cobalt-60","Uranium-235","Thorium-232","Iodine-129"
+};
+static int isotope_count[NUM_ISOTOPES];
+
+/* Neon palette (RGB 0-255) */
+static const uint8_t neon_rgb[NUM_ISOTOPES][3] = {
+    {57, 255, 20},{58, 227, 255},{255, 20, 147},{255, 158, 0},{180, 0, 255},
+    {0, 255, 200},{255, 0, 96},{0, 255, 64},{0, 120, 255},{255, 255, 0},
+    {255, 0, 200},{120, 255, 180},{200, 100, 255},{255, 90, 20},{0, 255, 128},
+    {255, 50, 50},{60, 255, 240},{255, 200, 0},{180, 255, 60},{220, 100, 255}
+};
+static uint32_t neon_pixel[NUM_ISOTOPES];
+
+/* video temporary buffer (RGB24) */
+static uint8_t *video_rgb24 = NULL;
+static int video_stride_rgb24 = 0;
+
+/* ---------- utils ---------- */
+static double now_seconds(void) { struct timeval tv; gettimeofday(&tv, NULL); return tv.tv_sec + tv.tv_usec*1e-6; }
+static void sigint_handler(int s){ (void)s; running = false; }
+static void format_time_ms(long long ms, char *buf, size_t len) {
+    long long totalSeconds = ms/1000;
+    long long totalMinutes = totalSeconds/60;
+    long long totalHours = totalMinutes/60;
+    long long totalDays = totalHours/24;
+    long long currentMS = ms % 1000;
+    long long currentSeconds = totalSeconds % 60;
+    long long currentMinutes = totalMinutes % 60;
+    long long currentHours = totalHours % 24;
+    snprintf(buf,len,"%02lld:%02lld:%02lld:%02lld:%03lld", totalDays, currentHours, currentMinutes, currentSeconds, currentMS);
+}
+
+/* ---------- ALSA ---------- */
+static short *generate_click(double freq, double duration, size_t *frames_out) {
+    size_t n = (size_t)(duration * astate.rate);
+    if (n == 0) { *frames_out = 0; return NULL; }
+    short *buf = malloc(n * sizeof(short));
+    if (!buf) return NULL;
+    double phase = 0.0, inc = 2.0 * M_PI * freq / (double)astate.rate;
+    for (size_t i = 0; i < n; ++i) {
+        double t = (double)i / (double)astate.rate;
+        double env = exp(-t * 500.0);
+        double s = sin(phase) * env;
+        buf[i] = (short)(s * ALERT_VOLUME);
+        phase += inc;
+    }
+    *frames_out = n;
+    return buf;
+}
+static bool alsa_init_persistent(void) {
+    snd_pcm_t *pcm; snd_pcm_hw_params_t *params;
+    if (snd_pcm_open(&pcm, ALSA_DEVICE, SND_PCM_STREAM_PLAYBACK, 0) < 0) { astate.pcm = NULL; return false; }
+    snd_pcm_hw_params_malloc(&params);
+    snd_pcm_hw_params_any(pcm, params);
+    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(pcm, params, astate.channels);
+    unsigned int r = astate.rate; snd_pcm_hw_params_set_rate_near(pcm, params, &r, 0);
+    snd_pcm_hw_params(pcm, params); snd_pcm_hw_params_free(params);
+    astate.pcm = pcm; pthread_mutex_init(&astate.mtx, NULL);
+    return true;
+}
+static void alsa_close_persistent(void) {
+    pthread_mutex_lock(&astate.mtx);
+    if (astate.pcm) { snd_pcm_drain(astate.pcm); snd_pcm_close(astate.pcm); astate.pcm = NULL; }
+    pthread_mutex_unlock(&astate.mtx);
+    pthread_mutex_destroy(&astate.mtx);
+}
+static void play_click(double freq, double duration) {
+    size_t frames; short *buf = generate_click(freq, duration, &frames); if (!buf) return;
+    pthread_mutex_lock(&astate.mtx);
+    if (astate.pcm) {
+        snd_pcm_sframes_t rc = snd_pcm_writei(astate.pcm, buf, frames);
+        if (rc < 0) snd_pcm_recover(astate.pcm, rc, 1);
+    } else {
+        snd_pcm_t *pcm = NULL;
+        if (snd_pcm_open(&pcm, ALSA_DEVICE, SND_PCM_STREAM_PLAYBACK, 0) == 0) {
+            snd_pcm_hw_params_t *params; snd_pcm_hw_params_malloc(&params); snd_pcm_hw_params_any(pcm, params);
+            snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+            snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
+            snd_pcm_hw_params_set_channels(pcm, params, astate.channels);
+            unsigned int r = astate.rate; snd_pcm_hw_params_set_rate_near(pcm, params, &r, 0);
+           snd_pcm_hw_params(pcm, params); snd_pcm_hw_params_free(params);
+            snd_pcm_writei(pcm, buf, frames); snd_pcm_drain(pcm); snd_pcm_close(pcm);
+        }
+    }
+    pthread_mutex_unlock(&astate.mtx); free(buf);
+}
+
+/* ---------- JPEG decode ---------- */
+static bool mjpeg_to_rgb(unsigned char *jpeg_buf, size_t jpeg_len, uint8_t *rgb_buf, int w, int h, int stride) {
+    (void)w; (void)h;
+    if (jpeg_len == 0 || !jpeg_buf) return false;
+    struct jpeg_decompress_struct cinfo; struct jpeg_error_mgr jerr; JSAMPARRAY buffer;
+    cinfo.err = jpeg_std_error(&jerr); jpeg_create_decompress(&cinfo);
+    jpeg_mem_src(&cinfo, jpeg_buf, (unsigned long)jpeg_len);
+    if (jpeg_read_header(&cinfo, TRUE) != JPEG_HEADER_OK) { jpeg_destroy_decompress(&cinfo); return false; }
+    jpeg_start_decompress(&cinfo);
+    int row_stride = cinfo.output_width * cinfo.output_components;
+    buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, buffer, 1);
+        unsigned char *src = buffer[0];
+        unsigned char *dst = rgb_buf + (cinfo.output_scanline - 1) * stride;
+        if (cinfo.out_color_space == JCS_RGB && cinfo.output_components >= 3) memcpy(dst, src, (size_t)row_stride);
+        else for (JDIMENSION x = 0; x < cinfo.output_width; ++x) {
+            if (cinfo.output_components >= 3) {
+                dst[3 * x + 0] = src[3 * x + 0];
+                dst[3 * x + 1] = src[3 * x + 1];
+                dst[3 * x + 2] = src[3 * x + 2];
+            } else {
+                unsigned char v = src[x];
+                dst[3 * x + 0] = dst[3 * x + 1] = dst[3 * x + 2] = v;
+            }
+        }
+    }
+    jpeg_finish_decompress(&cinfo); jpeg_destroy_decompress(&cinfo); return true;
+}
+
+/* ---------- scaling (nearest) & hot counting ---------- */
+#if defined(__x86_64__) || defined(__i386__)
+static inline int sse2_count_hot_rgb24(const uint8_t* src, int pixels, int y_hot_thresh) {
+    const __m128 rW = _mm_set1_ps(0.299f), gW = _mm_set1_ps(0.587f), bW = _mm_set1_ps(0.114f), th = _mm_set1_ps((float)y_hot_thresh);
+    int hot = 0, i = 0;
+    for (; i + 4 <= pixels; i += 4) {
+        float r0 = src[3*(i+0)+0], g0 = src[3*(i+0)+1], b0 = src[3*(i+0)+2];
+        float r1 = src[3*(i+1)+0], g1 = src[3*(i+1)+1], b1 = src[3*(i+1)+2];
+        float r2 = src[3*(i+2)+0], g2 = src[3*(i+2)+1], b2 = src[3*(i+2)+2];
+        float r3 = src[3*(i+3)+0], g3 = src[3*(i+3)+1], b3 = src[3*(i+3)+2];
+        __m128 r = _mm_set_ps(r3,r2,r1,r0), g = _mm_set_ps(g3,g2,g1,g0), b = _mm_set_ps(b3,b2,b1,b0);
+        __m128 y = _mm_add_ps(_mm_add_ps(_mm_mul_ps(r,rW), _mm_mul_ps(g,gW)), _mm_mul_ps(b,bW));
+        __m128 mask = _mm_cmpge_ps(y, th);
+        int m = _mm_movemask_ps(mask);
+        hot += (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1);
+    }
+    for (; i < pixels; ++i) {
+        int Y = (int)(src[3*i+0]*0.299f + src[3*i+1]*0.587f + src[3*i+2]*0.114f);
+        if (Y >= y_hot_thresh) hot++;
+    }
+    return hot;
+}
+#endif
+
+static void scale_rgb24_to_rgb24_and_count(const uint8_t *src, int src_w, int src_h, int src_stride,
+                                           uint8_t *dst, int dst_w, int dst_h, int dst_stride,
+                                           int *hot_pixels_out) {
+    int hot = 0;
+    for (int y = 0; y < dst_h; ++y) {
+        int sy = (y * src_h) / dst_h;
+        const uint8_t *srow = src + sy * src_stride;
+        uint8_t *drow = dst + y * dst_stride;
+#if defined(__x86_64__) || defined(__i386__)
+        hot += sse2_count_hot_rgb24(srow, dst_w, Y_HOT_THRESH);
+#else
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = (x * src_w) / dst_w;
+            const uint8_t *sp = srow + 3 * sx;
+            int Y = (int)(sp[0]*0.299 + sp[1]*0.587 + sp[2]*0.114);
+            if (Y >= Y_HOT_THRESH) hot++;
+        }
+#endif
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = (x * src_w) / dst_w;
+            const uint8_t *sp = srow + 3 * sx;
+            uint8_t *dp = drow + 3 * x;
+            dp[0] = sp[0]; dp[1] = sp[1]; dp[2] = sp[2];
+        }
+    }
+    if (hot_pixels_out) *hot_pixels_out = hot;
+}
+
+static void scale_yuyv_to_rgb24_and_count(const uint8_t *yuyv, int src_w, int src_h,
+                                          uint8_t *dst, int dst_w, int dst_h, int dst_stride,
+                                          int *hot_pixels_out) {
+    int hot = 0;
+    for (int y = 0; y < dst_h; ++y) {
+        int sy = (y * src_h) / dst_h;
+        const uint8_t *srow = yuyv + sy * src_w * 2;
+        uint8_t *drow = dst + y * dst_stride;
+        for (int x = 0; x < dst_w; ++x) {
+            int sx = (x * src_w) / dst_w;
+            int pair = (sx / 2) * 4;
+            int Y = srow[pair + ((sx & 1) ? 2 : 0)];
+            drow[3*x+0] = drow[3*x+1] = drow[3*x+2] = (uint8_t)Y;
+            if (Y >= Y_HOT_THRESH) hot++;
+        }
+    }
+    if (hot_pixels_out) *hot_pixels_out = hot;
+}
+
+/* pack RGB24 to XRGB32 respecting server byte order */
+static void pack_rgb24_to_xrgb32(const uint8_t *src, uint8_t *dst, int width, int height, int src_stride, int dst_stride) {
+    bool lsb = (xcb_get_setup(xstate.conn)->image_byte_order == LSBFirst);
+    for (int y=0;y<height;++y) {
+        const uint8_t *srow = src + y * src_stride;
+        uint8_t *drow = dst + y * dst_stride;
+        for (int x=0;x<width;++x) {
+            uint8_t r=srow[3*x+0], g=srow[3*x+1], b=srow[3*x+2];
+            uint32_t px = (0x00U<<24) | ((uint32_t)r<<16) | ((uint32_t)g<<8) | (uint32_t)b;
+            if (lsb) memcpy(drow + 4*x, &px, 4);
+            else { drow[4*x+0]=(uint8_t)((px>>24)&0xFF); drow[4*x+1]=(uint8_t)((px>>16)&0xFF); drow[4*x+2]=(uint8_t)((px>>8)&0xFF); drow[4*x+3]=(uint8_t)(px&0xFF); }
+        }
+    }
+}
+
+/* ---------- edge detection helpers ---------- */
+/* compute luminance into gray buffer (0..255) */
+static void compute_luminance_from_rgb24(const uint8_t *rgb24, int width, int height, int stride_rgb24, uint8_t *gray, int gray_stride) {
+    for (int y=0;y<height;++y) {
+        const uint8_t *rrow = rgb24 + y * stride_rgb24;
+        uint8_t *grow = gray + y * gray_stride;
+        for (int x=0;x<width;++x) {
+            uint8_t r = rrow[3*x+0];
+            uint8_t g = rrow[3*x+1];
+            uint8_t b = rrow[3*x+2];
+            uint8_t L = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+            grow[x] = L;
+        }
+    }
+}
+
+/* simple Sobel edge detector producing gradient magnitude (0..1024-ish) */
+static void sobel_edges_uint8(const uint8_t *gray, int w, int h, int stride_in, uint16_t *out_grad, int stride_out) {
+    for (int y=0;y<h;++y) {
+        for (int x=0;x<w;++x) {
+            if (y==0 || y==h-1 || x==0 || x==w-1) { out_grad[y*stride_out + x] = 0; continue; }
+            int gx = 0, gy = 0;
+            int idx = (y-1)*stride_in + (x-1);
+            gx += -gray[idx+0];      gx += -2*gray[idx+1];      gx += -gray[idx+2];
+            idx = y*stride_in + (x-1);
+            gx += 0;
+            idx = (y+1)*stride_in + (x-1);
+            gx += gray[idx+0];       gx += 2*gray[idx+1];       gx += gray[idx+2];
+
+            idx = (y-1)*stride_in + (x-1);
+            gy += -gray[idx+0];      gy += 0;                   gy += gray[idx+2];
+            idx = (y*stride_in + (x-1));
+            gy += -2*gray[idx];
+            idx = (y+1)*stride_in + (x-1);
+            gy += -gray[idx+0];      gy += 0;                   gy += gray[idx+2];
+
+            int mag = abs(gx) + abs(gy);
+            if (mag > 65535) mag = 65535;
+            out_grad[y*stride_out + x] = (uint16_t)mag;
+        }
+    }
+}
+
+/* threshold gradient to binary edge map */
+static void grad_to_binary(const uint16_t *grad, int w, int h, int stride_grad, uint8_t *out_mask, int stride_mask, int thresh) {
+    for (int y=0;y<h;++y) {
+        const uint16_t *g = grad + y*stride_grad;
+        uint8_t *m = out_mask + y*stride_mask;
+        for (int x=0;x<w;++x) {
+            m[x] = (g[x] >= (uint16_t)thresh) ? 1 : 0;
+        }
+    }
+}
+
+/* dilate binary mask with square kernel of radius 'r' into out_dilated */
+static void dilate_mask_box(const uint8_t *mask, int w, int h, int stride, uint8_t *out, int stride_out, int r) {
+    memset(out, 0, (size_t)stride_out * (size_t)h);
+    for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+        if (mask[y*stride + x]) {
+            int y0 = y - r; if (y0 < 0) y0 = 0;
+            int y1 = y + r; if (y1 > h-1) y1 = h-1;
+            int x0 = x - r; if (x0 < 0) x0 = 0;
+            int x1 = x + r; if (x1 > w-1) x1 = w-1;
+            for (int yy=y0; yy<=y1; ++yy) {
+                uint8_t *row = out + yy*stride_out;
+                for (int xx=x0; xx<=x1; ++xx) row[xx] = 1;
+            }
+        }
+    }
+}
+
+/* ---------- xcb color allocation ---------- */
+static uint32_t alloc_neon_pixel(uint8_t r, uint8_t g, uint8_t b) {
+    xcb_alloc_color_cookie_t c = xcb_alloc_color(xstate.conn, xstate.colormap, (uint16_t)r * 257, (uint16_t)g * 257, (uint16_t)b * 257);
+    xcb_alloc_color_reply_t *rply = xcb_alloc_color_reply(xstate.conn, c, NULL);
+    uint32_t pixel = (rply) ? rply->pixel : xstate.screen->white_pixel;
+    if (rply) free(rply);
+    return pixel;
+}
+
+/* ---------- xcb init/close ---------- */
+static bool xcb_init(int initial_w, int initial_h) {
+    xstate.conn = xcb_connect(NULL, NULL);
+    if (xcb_connection_has_error(xstate.conn)) { fprintf(stderr,"xcb_connect failed\n"); return false; }
+    xstate.setup = xcb_get_setup(xstate.conn);
+    xcb_screen_iterator_t it = xcb_setup_roots_iterator(xstate.setup);
+    xstate.screen = it.data;
+    xstate.win_w = initial_w; xstate.win_h = initial_h;
+    xstate.depth = xstate.screen->root_depth;
+    xstate.win = xcb_generate_id(xstate.conn);
+    xstate.colormap = xstate.screen->default_colormap;
+    uint32_t mask = XCB_CW_EVENT_MASK | XCB_CW_BACK_PIXEL;
+    uint32_t values[2] = { XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS, xstate.screen->black_pixel };
+    xcb_create_window(xstate.conn, xstate.depth, xstate.win, xstate.screen->root, 0,0, xstate.win_w, xstate.win_h, 0,
+                      XCB_WINDOW_CLASS_INPUT_OUTPUT, xstate.screen->root_visual, mask, values);
+    xcb_change_property(xstate.conn, XCB_PROP_MODE_REPLACE, xstate.win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, strlen("geiger"), "geiger");
+
+    xcb_change_window_attributes(xstate.conn, xstate.win, XCB_CW_EVENT_MASK,
+        (uint32_t[]){ XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_KEY_PRESS });
+
+    xstate.gc_blit = xcb_generate_id(xstate.conn); xcb_create_gc(xstate.conn, xstate.gc_blit, xstate.win, 0, NULL);
+    xstate.gc_text = xcb_generate_id(xstate.conn); xcb_create_gc(xstate.conn, xstate.gc_text, xstate.win, 0, NULL);
+
+    xstate.gc_white = xstate.gc_text;
+    xstate.gc_red = xstate.gc_text;
+    xstate.gc_orange = xstate.gc_text;
+
+    {
+        xcb_intern_atom_cookie_t c1 = xcb_intern_atom(xstate.conn, 0, strlen("WM_PROTOCOLS"), "WM_PROTOCOLS");
+        xcb_intern_atom_cookie_t c2 = xcb_intern_atom(xstate.conn, 0, strlen("WM_DELETE_WINDOW"), "WM_DELETE_WINDOW");
+        xcb_intern_atom_reply_t *r1 = xcb_intern_atom_reply(xstate.conn, c1, NULL);
+        xcb_intern_atom_reply_t *r2 = xcb_intern_atom_reply(xstate.conn, c2, NULL);
+        if (r1) { xstate.atom_wm_protocols = r1->atom; free(r1); } else xstate.atom_wm_protocols = XCB_ATOM_NONE;
+        if (r2) { xstate.atom_wm_delete_window = r2->atom; free(r2); } else xstate.atom_wm_delete_window = XCB_ATOM_NONE;
+        if (xstate.atom_wm_protocols != XCB_ATOM_NONE && xstate.atom_wm_delete_window != XCB_ATOM_NONE) {
+            xcb_change_property(xstate.conn, XCB_PROP_MODE_REPLACE, xstate.win,
+                                xstate.atom_wm_protocols, XCB_ATOM_ATOM, 32, 1, &xstate.atom_wm_delete_window);
+        }
+    }
+
+    xcb_map_window(xstate.conn, xstate.win);
+    xcb_flush(xstate.conn);
+
+    xstate.back_buffer = xcb_generate_id(xstate.conn);
+    xcb_create_pixmap(xstate.conn, xstate.depth, xstate.back_buffer, xstate.win, xstate.win_w, xstate.win_h);
+
+    for (int i = 0; i < NUM_ISOTOPES; ++i) neon_pixel[i] = alloc_neon_pixel(neon_rgb[i][0], neon_rgb[i][1], neon_rgb[i][2]);
+
+    return true;
+}
+static void xcb_recreate_buffers(int w, int h) {
+    if (xstate.back_buffer) { xcb_free_pixmap(xstate.conn, xstate.back_buffer); xstate.back_buffer = 0; }
+    xstate.back_buffer = xcb_generate_id(xstate.conn);
+    xcb_create_pixmap(xstate.conn, xstate.depth, xstate.back_buffer, xstate.win, w, h);
+    {
+        uint32_t bg = xstate.screen->black_pixel;
+        xcb_change_gc(xstate.conn, xstate.gc_blit, XCB_GC_FOREGROUND, &bg);
+        xcb_rectangle_t rect = { .x = 0, .y = 0, .width = (uint16_t)w, .height = (uint16_t)h };
+        xcb_poly_fill_rectangle(xstate.conn, xstate.back_buffer, xstate.gc_blit, 1, &rect);
+        uint32_t fg = xstate.screen->white_pixel;
+        xcb_change_gc(xstate.conn, xstate.gc_blit, XCB_GC_FOREGROUND, &fg);
+    }
+    xstate.win_w = w; xstate.win_h = h;
+}
+static void xcb_close(void) {
+    if (video_rgb24) { free(video_rgb24); video_rgb24 = NULL; }
+    if (xstate.back_buffer) { xcb_free_pixmap(xstate.conn, xstate.back_buffer); xstate.back_buffer = 0; }
+    if (xstate.gc_text) { xcb_free_gc(xstate.conn, xstate.gc_text); xstate.gc_text = 0; }
+    if (xstate.gc_blit) { xcb_free_gc(xstate.conn, xstate.gc_blit); xstate.gc_blit = 0; }
+    if (xstate.conn) { xcb_disconnect(xstate.conn); xstate.conn = NULL; }
+}
+
+/* ---------- frame queue ---------- */
+static void queue_push_frame(unsigned char *cpy, size_t len, bool mjpeg, long long ts_ms) {
+    pthread_mutex_lock(&fqueue.mtx);
+    if (fqueue.count < FRAME_QUEUE_SIZE) {
+        int idx = fqueue.head;
+        fqueue.items[idx].buf = cpy;
+        fqueue.items[idx].len = len;
+        fqueue.items[idx].mjpeg = mjpeg;
+        fqueue.items[idx].ts_ms = ts_ms;
+        fqueue.head = (fqueue.head + 1) % FRAME_QUEUE_SIZE;
+        fqueue.count++;
+        pthread_cond_signal(&fqueue.cv);
+    } else {
+        free(cpy);
+    }
+    pthread_mutex_unlock(&fqueue.mtx);
+}
+static bool queue_pop_frame(unsigned char **buf, size_t *len, bool *mjpeg, long long *ts_ms) {
+    pthread_mutex_lock(&fqueue.mtx);
+    while (running && fqueue.count == 0) pthread_cond_wait(&fqueue.cv, &fqueue.mtx);
+    if (!running) { pthread_mutex_unlock(&fqueue.mtx); return false; }
+    int idx = fqueue.tail;
+    *buf = fqueue.items[idx].buf;
+    *len = fqueue.items[idx].len;
+    *mjpeg = fqueue.items[idx].mjpeg;
+    *ts_ms = fqueue.items[idx].ts_ms;
+    fqueue.tail = (fqueue.tail + 1) % FRAME_QUEUE_SIZE;
+    fqueue.count--;
+    pthread_mutex_unlock(&fqueue.mtx);
+    return true;
+}
+
+/* ---------- capture thread (V4L2 or simulated) ---------- */
+struct mmap_buffer { void *start; size_t length; };
+static void *capture_thread(void *arg) {
+    (void)arg;
+    int fd = -1; bool streaming = false; struct mmap_buffer *mbufs = NULL; int nbuf = 0; bool cam_mjpeg_local = false;
+    fd = open(DEVICE_NODE, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) { vstate.simulated = true; fprintf(stderr, "open %s failed: %s -> simulated\n", DEVICE_NODE, strerror(errno)); }
+    else {
+        struct v4l2_capability cap;
+        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { fprintf(stderr,"VIDIOC_QUERYCAP failed -> simulated\n"); close(fd); fd=-1; vstate.simulated=true; }
+        else {
+            struct v4l2_format fmt; memset(&fmt,0,sizeof(fmt));
+            fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            fmt.fmt.pix.width = SRC_WIDTH; fmt.fmt.pix.height = SRC_HEIGHT;
+            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV; fmt.fmt.pix.field = V4L2_FIELD_ANY;
+            if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+                fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+                if (ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) { fprintf(stderr,"VIDIOC_S_FMT failed -> simulated\n"); close(fd); fd=-1; vstate.simulated=true; }
+                else cam_mjpeg_local = (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG);
+            } else cam_mjpeg_local = (fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_MJPEG);
+
+            if (fd >= 0) {
+                struct v4l2_requestbuffers req; memset(&req,0,sizeof(req));
+                req.count = 4; req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; req.memory = V4L2_MEMORY_MMAP;
+                if (ioctl(fd, VIDIOC_REQBUFS, &req) < 0) { fprintf(stderr,"VIDIOC_REQBUFS failed -> simulated\n"); close(fd); fd=-1; vstate.simulated=true; }
+                else {
+                    mbufs = calloc(req.count, sizeof(*mbufs));
+                    if (!mbufs) { close(fd); fd=-1; vstate.simulated=true; }
+                    else {
+                        for (unsigned i=0;i<req.count;++i) {
+                            struct v4l2_buffer buf; memset(&buf,0,sizeof(buf));
+                            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP; buf.index = i;
+                            if (ioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) { fprintf(stderr,"VIDIOC_QUERYBUF idx %u failed\n", i); mbufs[i].start = NULL; mbufs[i].length = 0; continue; }
+                            mbufs[i].length = buf.length;
+                            mbufs[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+                            if (mbufs[i].start == MAP_FAILED) { fprintf(stderr,"mmap idx %u failed\n", i); mbufs[i].start = NULL; mbufs[i].length = 0; }
+                        }
+                        for (unsigned i=0;i<req.count;++i) { struct v4l2_buffer buf; memset(&buf,0,sizeof(buf)); buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP; buf.index = i; ioctl(fd, VIDIOC_QBUF, &buf); }
+                        enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                        if (ioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+                            fprintf(stderr,"VIDIOC_STREAMON failed: %s -> simulated\n", strerror(errno));
+                            for (unsigned i=0;i<req.count;++i) if (mbufs[i].start) munmap(mbufs[i].start, mbufs[i].length);
+                            free(mbufs); mbufs = NULL; close(fd); fd = -1; vstate.simulated=true;
+                        } else { streaming = true; nbuf = (int)req.count; vstate.simulated = false; cam_mjpeg = cam_mjpeg_local; fprintf(stderr,"V4L2 streaming started (MJPEG=%d)\n", cam_mjpeg?1:0); }
+                    }
+                }
+            }
+        }
+    }
+
+    srand((unsigned)time(NULL) ^ getpid());
+    while (running) {
+        double t0 = now_seconds();
+        if (streaming && fd >= 0 && mbufs) {
+            fd_set fds; FD_ZERO(&fds); FD_SET(fd,&fds);
+            struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+            int r = select(fd+1,&fds,NULL,NULL,&tv);
+            if (r <= 0) { if (r == 0) continue; if (errno == EINTR) continue; break; }
+            struct v4l2_buffer buf; memset(&buf,0,sizeof(buf)); buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; buf.memory = V4L2_MEMORY_MMAP;
+            if (ioctl(fd, VIDIOC_DQBUF, &buf) < 0) { if (errno == EAGAIN) continue; break; }
+            if (buf.index >= (unsigned)nbuf) { ioctl(fd, VIDIOC_QBUF, &buf); continue; }
+            size_t copy_len = (size_t)buf.bytesused;
+            if (!cam_mjpeg) {
+                size_t expected = (size_t)SRC_WIDTH * (size_t)SRC_HEIGHT * 2;
+                if (copy_len < expected) copy_len = expected;
+            }
+            long long ts_ms = (long long)(now_seconds() * 1000.0);
+            unsigned char *cpy = malloc(copy_len);
+            if (cpy) memcpy(cpy, mbufs[buf.index].start, copy_len);
+            queue_push_frame(cpy, copy_len, cam_mjpeg, ts_ms);
+            ioctl(fd, VIDIOC_QBUF, &buf);
+        } else {
+            size_t expected = (size_t)SRC_WIDTH * (size_t)SRC_HEIGHT * 2;
+            unsigned char *cpy = malloc(expected);
+            if (cpy) {
+                unsigned char *p = cpy;
+                for (int y=0;y<SRC_HEIGHT;++y) for (int x=0;x<SRC_WIDTH;x+=2) {
+                    unsigned char y0 = (unsigned char)((rand()%40)+70);
+                    unsigned char y1 = (unsigned char)((rand()%40)+70);
+                    if ((rand()%1000) < 6) { y0 = 255; }
+                    if ((rand()%1000) < 6) { y1 = 255; }
+                    unsigned char u = (unsigned char)(128 + (rand()%24 - 12));
+                    unsigned char v = (unsigned char)(128 + (rand()%24 - 12));
+                    *p++ = y0; *p++ = u; *p++ = y1; *p++ = v;
+                }
+                long long ts_ms = (long long)(now_seconds() * 1000.0);
+                queue_push_frame(cpy, expected, false, ts_ms);
+            }
+            usleep(1000000 / FPS);
+        }
+        double t1 = now_seconds(); double elapsed = t1 - t0; double target = 1.0/(double)FPS;
+        if (elapsed < target) { double rem = target - elapsed; struct timespec ts; ts.tv_sec = (time_t)rem; ts.tv_nsec = (long)((rem - ts.tv_sec) * 1e9); nanosleep(&ts, NULL); }
+    }
+
+    if (streaming && fd >= 0) { enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE; ioctl(fd, VIDIOC_STREAMOFF, &type); }
+    if (mbufs) { for (int i=0;i<nbuf;++i) if (mbufs[i].start) munmap(mbufs[i].start, mbufs[i].length); free(mbufs); }
+    if (fd >= 0) close(fd);
+    return NULL;
+}
+
+/* ---------- text helper via xcb_image_text_8 ---------- */
+static inline void draw_text_with_gc(int x, int y, const char *s, xcb_gcontext_t gc) {
+    size_t n = strlen(s);
+    if (n > 255) n = 255;
+    xcb_image_text_8(xstate.conn, (uint8_t)n, xstate.back_buffer, gc, x, y, s);
+}
+
+/* ---------- main ---------- */
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    signal(SIGINT, sigint_handler);
+    srand((unsigned)time(NULL));
+
+    vstate.width = SRC_WIDTH; vstate.height = SRC_HEIGHT; vstate.simulated = true;
+
+    memset(&gstate, 0, sizeof(gstate));
+    (void)isotope_name;
+    gstate.start_time_ms = (long long)(now_seconds() * 1000.0);
+    gstate.dynamic_alpha = ALPHA_MIN;
+    gstate.ld50_exceeded = false;
+    gstate.ld50_threshold = LD50_LOW_RISK_THRESHOLD;
+    for (int i=0;i<NUM_ISOTOPES;++i) {
+        isotope_count[i]=0; gstate.isotope_ld50_exceeded[i]=false;
+        if (i>=14) gstate.isotope_ld50_threshold[i]=LD50_HIGH_RISK_THRESHOLD;
+        else if (i>=7) gstate.isotope_ld50_threshold[i]=LD50_MEDIUM_RISK_THRESHOLD;
+        else gstate.isotope_ld50_threshold[i]=LD50_LOW_RISK_THRESHOLD;
+    }
+    gstate.alert_on_threshold = ALERT_THRESHOLD; gstate.alert_off_threshold = ALERT_THRESHOLD * 0.8;
+    gstate.alert_active = false; gstate.alert_hold_ms = 1500; gstate.alert_last_change_ms = gstate.start_time_ms;
+    gstate.ld50_on_ratio = 1.0; gstate.ld50_off_ratio = 0.95;
+
+    alsa_init_persistent();
+
+    int initial_w = SRC_WIDTH + (int)(SRC_WIDTH * PANEL_RATIO);
+    int initial_h = SRC_HEIGHT;
+    if (!xcb_init(initial_w, initial_h)) { fprintf(stderr,"xcb_init failed\n"); return 1; }
+
+    uint32_t white = xstate.screen->white_pixel;
+    uint32_t black = xstate.screen->black_pixel;
+    xcb_change_gc(xstate.conn, xstate.gc_text, XCB_GC_FOREGROUND | XCB_GC_BACKGROUND, (uint32_t[]){ white, black });
+    xstate.gc_white = xstate.gc_text;
+    xstate.gc_red = xstate.gc_text;
+    xstate.gc_orange = xstate.gc_text;
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, capture_thread, NULL) != 0) { fprintf(stderr,"pthread_create failed\n"); xcb_close(); return 1; }
+
+    double last_frame_time_sec = now_seconds();
+
+    while (running) {
+        xcb_generic_event_t *ev;
+        while ((ev = xcb_poll_for_event(xstate.conn)) != NULL) {
+            uint8_t type = ev->response_type & ~0x80;
+            if (type == XCB_KEY_PRESS) { running = false; }
+            else if (type == XCB_EXPOSE) { }
+            else if (type == XCB_CONFIGURE_NOTIFY) {
+                xcb_configure_notify_event_t *cfg = (xcb_configure_notify_event_t*)ev;
+                int nw = cfg->width, nh = cfg->height;
+                if (nw != xstate.win_w || nh != xstate.win_h) { xcb_recreate_buffers(nw, nh); xcb_flush(xstate.conn); }
+            } else if (type == XCB_CLIENT_MESSAGE) {
+                xcb_client_message_event_t *cm = (xcb_client_message_event_t*)ev;
+                if (cm->type == xstate.atom_wm_protocols && cm->data.data32[0] == xstate.atom_wm_delete_window) running = false;
+            }
+            free(ev);
+        }
+        if (!running) break;
+
+        unsigned char *local_buf = NULL; size_t local_len = 0; bool local_mjpeg = false; long long frame_ts_ms = 0;
+        if (!queue_pop_frame(&local_buf, &local_len, &local_mjpeg, &frame_ts_ms)) break;
+        if (!local_buf || local_len == 0) continue;
+
+        double now_sec = now_seconds();
+        double frame_delta_sec = now_sec - last_frame_time_sec; if (frame_delta_sec < 0.0) frame_delta_sec = 0.0; if (frame_delta_sec > 0.25) frame_delta_sec = 0.25;
+        last_frame_time_sec = now_sec; long long current_time_ms = (long long)(now_sec * 1000.0);
+
+        /* layout */
+        int panel_w = (int)(xstate.win_w * PANEL_RATIO);
+        if (panel_w < PANEL_MIN_W) panel_w = PANEL_MIN_W;
+        if (panel_w > PANEL_MAX_W) panel_w = PANEL_MAX_W;
+        if (panel_w > xstate.win_w - 40) panel_w = xstate.win_w - 40;
+        int left_w = xstate.win_w - panel_w;
+        if (left_w < 64) left_w = 64;
+
+        bool preserve_aspect = true;
+        int vid_w = left_w;
+        int vid_h = xstate.win_h;
+        if (preserve_aspect) {
+            double src_aspect = (double)SRC_WIDTH / (double)SRC_HEIGHT;
+            double dst_aspect = (double)left_w / (double)xstate.win_h;
+            if (dst_aspect > src_aspect) {
+                vid_h = xstate.win_h; vid_w = (int)lrint(src_aspect * vid_h); if (vid_w > left_w) vid_w = left_w;
+            } else {
+                vid_w = left_w; vid_h = (int)lrint(vid_w / src_aspect); if (vid_h > xstate.win_h) vid_h = xstate.win_h;
+            }
+        }
+        int video_x = (left_w - vid_w) / 2; if (video_x < 0) video_x = 0;
+        int video_y = (xstate.win_h - vid_h) / 2; if (video_y < 0) video_y = 0;
+
+        /* scale into RGB24 buffer sized vid_w x vid_h */
+        int hot = 0;
+        int required_stride_rgb24 = vid_w * 3;
+        if (video_rgb24 == NULL || video_stride_rgb24 != required_stride_rgb24) {
+            if (video_rgb24) { free(video_rgb24); video_rgb24 = NULL; }
+            video_stride_rgb24 = required_stride_rgb24;
+            video_rgb24 = malloc((size_t)video_stride_rgb24 * (size_t)vid_h);
+            if (!video_rgb24) { fprintf(stderr,"malloc video_rgb24 failed\n"); video_stride_rgb24 = 0; }
+        }
+        if (video_rgb24) {
+            if (!local_mjpeg) {
+                if (local_len >= (size_t)(vstate.width * vstate.height * 2)) {
+                    scale_yuyv_to_rgb24_and_count(local_buf, vstate.width, vstate.height, video_rgb24, vid_w, vid_h, video_stride_rgb24, &hot);
+                }
+            } else {
+                uint8_t *tmp_rgb = malloc((size_t)vstate.height * (size_t)vstate.width * 3);
+                if (tmp_rgb) {
+                    if (mjpeg_to_rgb(local_buf, local_len, tmp_rgb, vstate.width, vstate.height, vstate.width * 3)) {
+                        scale_rgb24_to_rgb24_and_count(tmp_rgb, vstate.width, vstate.height, vstate.width * 3, video_rgb24, vid_w, vid_h, video_stride_rgb24, &hot);
+                    }
+                    free(tmp_rgb);
+                }
+            }
+        }
+        gstate.hot_pixels = hot;
+        free(local_buf);
+
+        /* logic (unchanged AEMA filter etc.) */
+        double measuredRadValue = (double)gstate.hot_pixels * RAD_SCALE; if (measuredRadValue < 0.00001) measuredRadValue = 0.00001;
+        gstate.current_rad_value = measuredRadValue;
+        double radValue;
+        if (gstate.filtered_rad_value == 0.0) { radValue = measuredRadValue; gstate.dynamic_alpha = ALPHA_MIN; }
+        else {
+            double diff = fabs(measuredRadValue - gstate.filtered_rad_value);
+            double alphaRange = ALPHA_MAX - ALPHA_MIN;
+            double changeRate = diff / AEMA_SCALE_FACTOR;
+            if (changeRate > 1.0) { changeRate = 1.0; }
+            if (changeRate < 0.02) { changeRate = 0.0; }
+            gstate.dynamic_alpha = ALPHA_MIN + (alphaRange * changeRate);
+            radValue = (measuredRadValue * gstate.dynamic_alpha) + (gstate.filtered_rad_value * (1.0 - gstate.dynamic_alpha));
+        }
+        gstate.filtered_rad_value = radValue;
+        gstate.accumulated_dosage += radValue * frame_delta_sec;
+        long long time_elapsed_ms = current_time_ms - gstate.start_time_ms;
+
+        int chance = rand()%100; int isotopeId;
+        if (chance < HIGH_RISK_CHANCE_TOTAL) isotopeId = 14 + (rand()%6);
+        else if (chance < (HIGH_RISK_CHANCE_TOTAL + MEDIUM_RISK_CHANCE_TOTAL)) isotopeId = 7 + (rand()%7);
+        else isotopeId = rand()%7;
+        isotope_count[isotopeId]++;
+
+        long long total_detections=0; for (int i=0;i<NUM_ISOTOPES;++i) total_detections += isotope_count[i];
+        if (total_detections > 0) {
+            double per = gstate.filtered_rad_value / (double)total_detections;
+            for (int i=0;i<NUM_ISOTOPES;++i) {
+                if (isotope_count[i]>0) { gstate.isotope_rad_rate[i] = per * isotope_count[i]; gstate.isotope_accumulated_dosage[i] += gstate.isotope_rad_rate[i] * frame_delta_sec; }
+                else gstate.isotope_rad_rate[i]=0.0;
+            }
+        }
+
+        for (int i=0;i<NUM_ISOTOPES;++i) {
+            double iso_ld50 = gstate.isotope_ld50_threshold[i];
+            double iso_dose = gstate.isotope_accumulated_dosage[i];
+            double iso_ratio = (iso_ld50>0.0) ? (iso_dose/iso_ld50) : 0.0;
+            if (!gstate.isotope_ld50_exceeded[i] && iso_ratio >= gstate.ld50_on_ratio) { gstate.isotope_ld50_exceeded[i]=true; play_click(LD50_ALARM_FREQ + i*7.0, LD50_ALARM_DURATION); }
+            else if (gstate.isotope_ld50_exceeded[i] && iso_ratio <= gstate.ld50_off_ratio) { gstate.isotope_ld50_exceeded[i]=false; }
+        }
+        double lowest_ld50_threshold = LD50_LOW_RISK_THRESHOLD;
+        for (int i=0;i<NUM_ISOTOPES;++i) if (isotope_count[i] > 0 && gstate.isotope_ld50_threshold[i] < lowest_ld50_threshold) lowest_ld50_threshold = gstate.isotope_ld50_threshold[i];
+        gstate.ld50_threshold = lowest_ld50_threshold;
+        if (!gstate.ld50_exceeded && gstate.accumulated_dosage >= gstate.ld50_threshold) { play_click(LD50_ALARM_FREQ, LD50_ALARM_DURATION); gstate.ld50_exceeded=true; gstate.last_alert_time_ms = current_time_ms; }
+
+        bool want_on = (gstate.filtered_rad_value >= gstate.alert_on_threshold);
+        bool want_off = (gstate.filtered_rad_value <= gstate.alert_off_threshold);
+        if (!gstate.alert_active && want_on) { gstate.alert_active=true; gstate.alert_last_change_ms=current_time_ms; play_click(ALARM_FREQ, ALARM_DURATION); }
+        else if (gstate.alert_active && want_off) { if (current_time_ms - gstate.alert_last_change_ms >= gstate.alert_hold_ms) { gstate.alert_active=false; gstate.alert_last_change_ms=current_time_ms; } }
+        if (gstate.alert_active && current_time_ms - gstate.last_alert_time_ms >= ALARM_COOLDOWN_MS) { play_click(ALARM_FREQ, ALARM_DURATION); gstate.last_alert_time_ms = current_time_ms; }
+
+        double normalizedIntensity = radValue / MAX_INTENSITY_FOR_PITCH; if (normalizedIntensity > 1.0) normalizedIntensity = 1.0;
+        double clickDuration, riskFactor, dangerPitchShift;
+        if (isotopeId >= 14) { riskFactor=1.0; clickDuration=0.003; dangerPitchShift=300.0; }
+        else if (isotopeId >=7) { riskFactor=0.7; clickDuration=0.008; dangerPitchShift=100.0; }
+        else { riskFactor=0.5; clickDuration=0.01; dangerPitchShift=0.0; }
+        double uniqueBaseFreq = BASE_PITCH_HZ + (isotopeId * ISOTOPE_FREQ_STEP_HZ);
+        double finalBaseFreq = uniqueBaseFreq + dangerPitchShift;
+        double intensityRange = 15000.0 - finalBaseFreq; if (intensityRange < 1000.0) intensityRange = 1000.0;
+        double finalFreq = finalBaseFreq + (intensityRange * normalizedIntensity * riskFactor);
+        play_click(finalFreq, clickDuration);
+
+        /* render: per-pixel neon multiplication for radioaktive pixels */
+        if (video_rgb24) {
+            int tmp32_stride = vid_w * 4;
+            uint8_t *tmp32 = malloc((size_t)tmp32_stride * (size_t)vid_h);
+            if (tmp32) {
+                /* pack original pixels into tmp32 (XRGB32) so we can blit later */
+                pack_rgb24_to_xrgb32(video_rgb24, tmp32, vid_w, vid_h, video_stride_rgb24, tmp32_stride);
+
+                /* compute luminance (gray) of the RGB24 buffer to detect radioactive pixels per-pixel */
+                uint8_t *gray = malloc((size_t)vid_h * (size_t)vid_w);
+                if (gray) {
+                    compute_luminance_from_rgb24(video_rgb24, vid_w, vid_h, video_stride_rgb24, gray, vid_w);
+
+                    /* determine dominant isotope color (as before) */
+                    int dominant = -1; int maxc = 0;
+                    for (int i=0;i<NUM_ISOTOPES;++i) if (isotope_count[i] > maxc) { maxc = isotope_count[i]; dominant = i; }
+                    /* If none detected, skip per-pixel multiply */
+                    if (dominant >= 0 && maxc > 0) {
+                        /* dynamic neon brightness scaling as before */
+                        double base_r = (double)neon_rgb[dominant][0];
+                        double base_g = (double)neon_rgb[dominant][1];
+                        double base_b = (double)neon_rgb[dominant][2];
+
+                        double iso_rate = gstate.isotope_rad_rate[dominant];
+                        double global = gstate.filtered_rad_value;
+
+                        double iso_norm = iso_rate * RATE_SCALE;
+                        double global_norm = global * GLOBAL_SCALE;
+                        double raw_mult = 1.0 + iso_norm + global_norm;
+                        if (raw_mult < 1.0) raw_mult = 1.0;
+                        if (raw_mult > MAX_NEON_MULT) raw_mult = MAX_NEON_MULT;
+                        double mult = pow(raw_mult, 1.0 / NEON_GAMMA);
+
+                        /* Precompute neon-scale per-channel in 0..1 */
+                        double neon_r_scale = (base_r * mult) / 255.0;
+                        double neon_g_scale = (base_g * mult) / 255.0;
+                        double neon_b_scale = (base_b * mult) / 255.0;
+
+                        /* Iterate pixels; for each pixel with gray >= Y_HOT_THRESH apply multiplication tint */
+                        bool lsb = (xcb_get_setup(xstate.conn)->image_byte_order == LSBFirst);
+                        for (int y=0;y<vid_h;++y) {
+                            uint8_t *row_rgb = video_rgb24 + y * video_stride_rgb24;
+                            uint8_t *row_tmp32 = tmp32 + y * tmp32_stride;
+                            uint8_t *row_gray = gray + y * vid_w;
+                            for (int x=0;x<vid_w;++x) {
+                                if (row_gray[x] < (uint8_t)Y_HOT_THRESH) continue; /* not radioactive */
+                                /* original RGB from rgb24 */
+                                uint8_t orr = row_rgb[3*x+0];
+                                uint8_t ogg = row_rgb[3*x+1];
+                                uint8_t obb = row_rgb[3*x+2];
+
+                                /* multiply per-channel by neon scale (preserves structure) */
+                                double mr = (double)orr * neon_r_scale;
+                                double mg = (double)ogg * neon_g_scale;
+                                double mb = (double)obb * neon_b_scale;
+
+                                /* clamp to 0..255 */
+                                if (mr > 255.0) mr = 255.0; if (mg > 255.0) mg = 255.0; if (mb > 255.0) mb = 255.0;
+
+                                /* blend with original according to MULTIPLY_BLEND to keep texture */
+                                double final_r = MULTIPLY_BLEND * (double)orr + (1.0 - MULTIPLY_BLEND) * mr;
+                                double final_g = MULTIPLY_BLEND * (double)ogg + (1.0 - MULTIPLY_BLEND) * mg;
+                                double final_b = MULTIPLY_BLEND * (double)obb + (1.0 - MULTIPLY_BLEND) * mb;
+
+                                uint8_t dr = (uint8_t)fmin(255.0, final_r + 0.5);
+                                uint8_t dg = (uint8_t)fmin(255.0, final_g + 0.5);
+                                uint8_t db = (uint8_t)fmin(255.0, final_b + 0.5);
+
+                                /* write back into tmp32 pixel (XRGB32) */
+                                if (lsb) {
+                                    uint32_t outpx = (0x00U<<24) | ((uint32_t)dr<<16) | ((uint32_t)dg<<8) | (uint32_t)db;
+                                    memcpy(row_tmp32 + 4*x, &outpx, 4);
+                                } else {
+                                    row_tmp32[4*x+0] = 0x00;
+                                    row_tmp32[4*x+1] = dr;
+                                    row_tmp32[4*x+2] = dg;
+                                    row_tmp32[4*x+3] = db;
+                                }
+                            }
+                        }
+                    }
+                    free(gray);
+                }
+
+                /* put image into back_buffer */
+                xcb_put_image(xstate.conn, XCB_IMAGE_FORMAT_Z_PIXMAP, xstate.back_buffer, xstate.gc_blit,
+                              vid_w, vid_h, video_x, video_y, 0, xstate.depth,
+                              (uint32_t)(tmp32_stride * vid_h), tmp32);
+                free(tmp32);
+            }
+        }
+
+        /* HUD text (left) */
+        int hud_margin = 10;
+        int hud_x = video_x + hud_margin;
+        int hud_y = video_y + 20;
+        int y_step = (xstate.win_h > 1200) ? 28 : ((xstate.win_h > 600) ? 20 : 16);
+
+        char buf[512], timebuf[64];
+        snprintf(buf,sizeof(buf),"Mode: %s", vstate.simulated ? "SIM" : "V4L2"); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text); hud_y += y_step;
+        snprintf(buf,sizeof(buf),"Hot pixels: %d", gstate.hot_pixels); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text); hud_y += y_step;
+        snprintf(buf,sizeof(buf),"Rad (AEMA): %.6f", gstate.filtered_rad_value); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text); hud_y += y_step;
+        snprintf(buf,sizeof(buf),"Filter-Alpha: %.2f", gstate.dynamic_alpha); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text); hud_y += y_step;
+        snprintf(buf,sizeof(buf),"Dosage: %.6f", gstate.accumulated_dosage); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text); hud_y += y_step;
+        format_time_ms(time_elapsed_ms, timebuf, sizeof(timebuf)); snprintf(buf,sizeof(buf),"Elapsed: %s", timebuf); draw_text_with_gc(hud_x, hud_y, buf, xstate.gc_text);
+
+        /* right panel */
+        int panel_x = left_w + 10;
+        draw_text_with_gc(panel_x, 20, "Isotope | LD50 | Rate | Dose | Ratio", xstate.gc_text);
+        int list_y = 38; int line_h = y_step - 2;
+        int lines_available = (xstate.win_h - list_y - 10) / line_h;
+        int to_draw = NUM_ISOTOPES; if (to_draw > lines_available) to_draw = lines_available;
+        for (int i=0;i<to_draw;++i) {
+            double ld = gstate.isotope_ld50_threshold[i];
+            double rate = gstate.isotope_rad_rate[i];
+            double dose = gstate.isotope_accumulated_dosage[i];
+            double ratio = (ld>0.0) ? (dose/ld) : 0.0;
+            uint32_t save_fg = xstate.screen->white_pixel;
+            xcb_change_gc(xstate.conn, xstate.gc_text, XCB_GC_FOREGROUND, (uint32_t[]){ neon_pixel[i] });
+            int y = list_y + i * line_h;
+            if (isotope_count[i] == 0) snprintf(buf,sizeof(buf), "%-5s | %5.1f |   --  |    --   |  --", isotope_abbr[i], ld);
+            else snprintf(buf,sizeof(buf), "%-5s | %5.1f | %5.3f | %7.3f | %5.2f", isotope_abbr[i], ld, rate, dose, ratio);
+            draw_text_with_gc(panel_x, y, buf, xstate.gc_text);
+            xcb_change_gc(xstate.conn, xstate.gc_text, XCB_GC_FOREGROUND, (uint32_t[]){ save_fg });
+        }
+
+        /* copy back_buffer to window and flush */
+        xcb_copy_area(xstate.conn, xstate.back_buffer, xstate.win, xstate.gc_blit, 0,0, 0,0, xstate.win_w, xstate.win_h);
+        xcb_flush(xstate.conn);
+    }
+
+    pthread_join(tid, NULL);
+    xcb_close();
+    alsa_close_persistent();
+    if (video_rgb24) free(video_rgb24);
+    return 0;
+}
+
+

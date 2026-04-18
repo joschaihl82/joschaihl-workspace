@@ -1,0 +1,7 @@
+/home/joscha/ui-workspace/notepad2/CMakeFiles/MiniNotepad.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/edit_cache.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/rebuild_cache.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/list_install_components.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/install.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/install/local.dir
+/home/joscha/ui-workspace/notepad2/CMakeFiles/install/strip.dir

@@ -1,0 +1,78 @@
+# Makefile for exectrace1 kernel module
+# Usage:
+#   make				# build (verbose if V=1)
+#   make V=1			# verbose kernel build
+#   make CC=/path/to/gcc  # force a specific compiler (optional)
+#   make clean
+#   make install		# copy .ko to ./out/
+#
+# If your kernel was built with a specific compiler binary (e.g. x86_64-linux-gnu-gcc),
+# pass it as CC=/usr/bin/x86_64-linux-gnu-gcc to reduce the "compiler differs" warning.
+
+MODULE := exectrace1
+obj-m := $(MODULE).o
+
+# Default kernel build directory (auto-detect)
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+# Allow overriding the compiler used by the kernel build system
+# Example: make CC=/usr/bin/x86_64-linux-gnu-gcc
+ifeq ($(origin CC), command line)
+  KBUILD_CC := CC=$(CC)
+else
+  KBUILD_CC :=
+endif
+
+# Output directory for the built .ko
+OUTDIR ?= $(CURDIR)/out
+
+# Default make program (use gmake if available)
+MAKEPROG ?= $(shell command -v gmake 2>/dev/null || command -v make)
+
+.PHONY: all default kbuild clean install check_kdir
+default: all
+
+all: kbuild
+
+# Ensure KDIR exists before invoking kernel build
+check_kdir:
+	@if [ ! -d "$(KDIR)" ]; then \
+	  echo "ERROR: kernel build directory '$(KDIR)' not found."; \
+	  echo "Set KDIR to your kernel build dir, e.g. /lib/modules/$(shell uname -r)/build"; \
+	  exit 1; \
+	fi
+
+# Build the module using the kernel build system.
+# Pass V=1 for verbose build output: make V=1
+kbuild: check_kdir
+	@echo "Invoking kernel build: $(MAKEPROG) -C '$(KDIR)' M='$(CURDIR)' modules"
+	@$(MAKEPROG) -C "$(KDIR)" M="$(CURDIR)" $(KBUILD_CC) modules V=$(V)
+	@if [ -f "$(CURDIR)/$(MODULE).ko" ]; then \
+	  mkdir -p "$(OUTDIR)"; \
+	  cp -u "$(CURDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"; \
+	  echo "Built: $(OUTDIR)/$(MODULE).ko"; \
+	else \
+	  echo "ERROR: $(MODULE).ko not found after kernel build."; \
+	  echo "See build_kernel.log by running:"; \
+	  echo "  $(MAKEPROG) -C $(KDIR) M=$(CURDIR) modules V=1 2>&1 | tee build_kernel.log"; \
+	  exit 1; \
+	fi
+
+# Clean build artifacts via kernel build system and remove out/
+clean: check_kdir
+	@$(MAKEPROG) -C "$(KDIR)" M="$(CURDIR)" clean
+	@rm -rf "$(OUTDIR)" build_kernel.log
+	@echo "Cleaned."
+
+# Install (copy) the .ko to OUTDIR (runs build first)
+install: kbuild
+	@mkdir -p "$(OUTDIR)"
+	@cp -u "$(CURDIR)/$(MODULE).ko" "$(OUTDIR)/$(MODULE).ko"
+	@echo "Installed: $(OUTDIR)/$(MODULE).ko"
+
+# Convenience target to show configuration
+show:
+	@echo "MODULE: $(MODULE)"
+	@echo "KDIR:   $(KDIR)"
+	@echo "CC:	 $(CC)"
+	@echo "OUTDIR: $(OUTDIR)"

@@ -1,0 +1,2 @@
+#define ext4recover_VERSION_MAJOR @ext4recover_VERSION_MAJOR@
+#define ext4recover_VERSION_MINOR @ext4recover_VERSION_MINOR@

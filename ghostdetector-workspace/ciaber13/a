@@ -1,0 +1,89 @@
+In file included from main.c:10:
+/usr/include/linux/videodev2.h:2546:41: error: field ‘timestamp’ has incomplete type
+ 2546 |         struct timespec                 timestamp;
+      |                                         ^~~~~~~~~
+main.c: In function ‘v4l2_read_frame’:
+main.c:131:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  131 |         if (errno == EAGAIN) return 1; perror("VIDIOC_DQBUF"); return -1;
+      |         ^~
+main.c:131:40: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  131 |         if (errno == EAGAIN) return 1; perror("VIDIOC_DQBUF"); return -1;
+      |                                        ^~~~~~
+main.c: In function ‘clamp_u8’:
+main.c:152:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  152 |     if (val < 0) return 0; if (val > 255) return 255; return (uint8_t)val;
+      |     ^~
+main.c:152:28: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  152 |     if (val < 0) return 0; if (val > 255) return 255; return (uint8_t)val;
+      |                            ^~
+main.c: In function ‘process_radionullon’:
+main.c:181:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  181 |     if (!gray || !residue || !edge) return; memset(edge, 0, size); memcpy(img_out, img_in, size * sizeof(uint32_t));
+      |     ^~
+main.c:181:45: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  181 |     if (!gray || !residue || !edge) return; memset(edge, 0, size); memcpy(img_out, img_in, size * sizeof(uint32_t));
+      |                                             ^~~~~~
+main.c: In function ‘x11_init’:
+main.c:255:45: error: passing argument 5 of ‘XCreateImage’ makes integer from pointer without a cast [-Wint-conversion]
+  255 |                                    ZPixmap, (char*)original_frame_buffer, IMG_W, IMG_H, 32, 0);
+      |                                             ^~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                             |
+      |                                             char *
+In file included from main.c:18:
+/usr/pkg/include/X11/Xlib.h:1442:5: note: expected ‘int’ but argument is of type ‘char *’
+ 1442 |     int                 /* offset */,
+      |     ^~~
+main.c:24:15: error: passing argument 6 of ‘XCreateImage’ makes pointer from integer without a cast [-Wint-conversion]
+   24 | #define IMG_W 640
+      |               ^~~
+      |               |
+      |               int
+main.c:255:75: note: in expansion of macro ‘IMG_W’
+  255 |                                    ZPixmap, (char*)original_frame_buffer, IMG_W, IMG_H, 32, 0);
+      |                                                                           ^~~~~
+/usr/pkg/include/X11/Xlib.h:1443:5: note: expected ‘char *’ but argument is of type ‘int’
+ 1443 |     char*               /* data */,
+      |     ^~~~~
+main.c:254:23: error: too few arguments to function ‘XCreateImage’
+  254 |     ximage_original = XCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+      |                       ^~~~~~~~~~~~
+/usr/pkg/include/X11/Xlib.h:1437:16: note: declared here
+ 1437 | extern XImage *XCreateImage(
+      |                ^~~~~~~~~~~~
+main.c:260:46: error: passing argument 5 of ‘XCreateImage’ makes integer from pointer without a cast [-Wint-conversion]
+  260 |                                     ZPixmap, (char*)processed_frame_buffer, IMG_W, IMG_H, 32, 0);
+      |                                              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                              |
+      |                                              char *
+/usr/pkg/include/X11/Xlib.h:1442:5: note: expected ‘int’ but argument is of type ‘char *’
+ 1442 |     int                 /* offset */,
+      |     ^~~
+main.c:24:15: error: passing argument 6 of ‘XCreateImage’ makes pointer from integer without a cast [-Wint-conversion]
+   24 | #define IMG_W 640
+      |               ^~~
+      |               |
+      |               int
+main.c:260:77: note: in expansion of macro ‘IMG_W’
+  260 |                                     ZPixmap, (char*)processed_frame_buffer, IMG_W, IMG_H, 32, 0);
+      |                                                                             ^~~~~
+/usr/pkg/include/X11/Xlib.h:1443:5: note: expected ‘char *’ but argument is of type ‘int’
+ 1443 |     char*               /* data */,
+      |     ^~~~~
+main.c:259:24: error: too few arguments to function ‘XCreateImage’
+  259 |     ximage_processed = XCreateImage(display, DefaultVisual(display, screen), DefaultDepth(display, screen),
+      |                        ^~~~~~~~~~~~
+/usr/pkg/include/X11/Xlib.h:1437:16: note: declared here
+ 1437 | extern XImage *XCreateImage(
+      |                ^~~~~~~~~~~~
+main.c: In function ‘sigint_handler’:
+main.c:286:25: warning: unused parameter ‘sig’ [-Wunused-parameter]
+  286 | void sigint_handler(int sig) {
+      |                     ~~~~^~~
+main.c: In function ‘main’:
+main.c:297:14: warning: unused parameter ‘argc’ [-Wunused-parameter]
+  297 | int main(int argc, char *argv[]) {
+      |          ~~~~^~~~
+main.c:297:26: warning: unused parameter ‘argv’ [-Wunused-parameter]
+  297 | int main(int argc, char *argv[]) {
+      |                    ~~~~~~^~~~~~
+make: *** [makefile:24: qgeister1] Error 1

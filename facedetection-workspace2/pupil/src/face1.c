@@ -1,0 +1,457 @@
+// pupil_darkseg.c
+// Compile: gcc pupil_darkseg.c -o pupil_darkseg -lm -lSDL2
+// Run: ./pupil_darkseg [device] [width] [height]
+// Defaults: /dev/video0 640 480
+//
+// Simple pupil localization via dark-region segmentation.
+// - Draw an ROI with the mouse (click-drag) to focus on an eye region.
+// - Press 'i' to start detection (or leave ROI empty to use full frame).
+// - Press 'r' to reset ROI/tracking, 'q' to quit.
+// - Detected pupil is shown as a green circle.
+
+#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE /* or _DEFAULT_SOURCE */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <math.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
+#include <SDL2/SDL.h>
+#include <sys/select.h>
+
+struct buffer { void *start; size_t length; };
+
+static int xioctl(int fd, int request, void *arg) {
+    int r;
+    do { r = ioctl(fd, request, arg); } while (r == -1 && errno == EINTR);
+    return r;
+}
+
+int open_device(const char *devname) {
+    int fd = open(devname, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) { perror("open device"); exit(1); }
+    return fd;
+}
+
+void init_v4l2(int fd, int width, int height, struct buffer **out_bufs, int *out_n) {
+    struct v4l2_format fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = width;
+    fmt.fmt.pix.height = height;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) { perror("VIDIOC_S_FMT"); exit(1); }
+
+    struct v4l2_requestbuffers req = {0};
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) { perror("VIDIOC_REQBUFS"); exit(1); }
+
+    struct buffer *bufs = calloc(req.count, sizeof(*bufs));
+    if (!bufs) { perror("calloc"); exit(1); }
+
+    for (int i = 0; i < (int)req.count; ++i) {
+        struct v4l2_buffer buf = {0};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) { perror("VIDIOC_QUERYBUF"); exit(1); }
+        bufs[i].length = buf.length;
+        bufs[i].start = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, buf.m.offset);
+        if (bufs[i].start == MAP_FAILED) { perror("mmap"); exit(1); }
+    }
+
+    for (int i = 0; i < (int)req.count; ++i) {
+        struct v4l2_buffer buf = {0};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); exit(1); }
+    }
+
+    enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMON, &t) < 0) { perror("VIDIOC_STREAMON"); exit(1); }
+
+    *out_bufs = bufs;
+    *out_n = req.count;
+}
+
+int read_frame(int fd, struct buffer *bufs, int nbufs, void **out_ptr, size_t *out_len) {
+    (void)nbufs;
+    struct v4l2_buffer buf = {0};
+    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+        if (errno == EAGAIN) return 0;
+        perror("VIDIOC_DQBUF"); exit(1);
+    }
+    *out_ptr = bufs[buf.index].start;
+    *out_len = buf.bytesused;
+    if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) { perror("VIDIOC_QBUF"); exit(1); }
+    return 1;
+}
+
+/* Color conversions */
+static inline void clamp255(int *v){ if(*v<0)*v=0; else if(*v>255)*v=255; }
+
+/* YUYV -> RGB24 */
+void yuyv_to_rgb(const uint8_t *yuyv, uint8_t *rgb, int w, int h) {
+    int idx = 0;
+    int total = w*h*2;
+    for (int i = 0; i < total; i += 4) {
+        int y0 = (int)yuyv[i+0], u = (int)yuyv[i+1], y1 = (int)yuyv[i+2], v = (int)yuyv[i+3];
+        int c0 = y0 - 16, c1 = y1 - 16, d = u - 128, e = v - 128;
+        int r0 = (298*c0 + 409*e + 128) >> 8;
+        int g0 = (298*c0 - 100*d - 208*e + 128) >> 8;
+        int b0 = (298*c0 + 516*d + 128) >> 8;
+        int r1 = (298*c1 + 409*e + 128) >> 8;
+        int g1 = (298*c1 - 100*d - 208*e + 128) >> 8;
+        int b1 = (298*c1 + 516*d + 128) >> 8;
+        clamp255(&r0); clamp255(&g0); clamp255(&b0);
+        clamp255(&r1); clamp255(&g1); clamp255(&b1);
+        rgb[idx++] = (uint8_t)r0; rgb[idx++] = (uint8_t)g0; rgb[idx++] = (uint8_t)b0;
+        rgb[idx++] = (uint8_t)r1; rgb[idx++] = (uint8_t)g1; rgb[idx++] = (uint8_t)b1;
+    }
+}
+
+/* RGB -> Gray */
+void rgb_to_gray(const uint8_t *rgb, uint8_t *gray, int w, int h) {
+    int n = w*h;
+    for (int i = 0; i < n; ++i) {
+        int r = rgb[3*i+0], g = rgb[3*i+1], b = rgb[3*i+2];
+        gray[i] = (uint8_t)(0.299f*r + 0.587f*g + 0.114f*b);
+    }
+}
+
+/* Binary threshold */
+void threshold_otsu_or_fixed(const uint8_t *gray, int w, int h, uint8_t *bin, int use_otsu, uint8_t fixed_t) {
+    int hist[256] = {0};
+    int n = w*h;
+    for (int i=0;i<n;++i) hist[gray[i]]++;
+    if (use_otsu) {
+        int total = n;
+        float sum = 0;
+        for (int t=0;t<256;++t) sum += t * hist[t];
+        float sumB = 0;
+        int wB = 0;
+        int wF = 0;
+        float varMax = 0;
+        int threshold = 0;
+        for (int t=0;t<256;++t) {
+            wB += hist[t];
+            if (wB == 0) continue;
+            wF = total - wB;
+            if (wF == 0) break;
+            sumB += (float)(t * hist[t]);
+            float mB = sumB / wB;
+            float mF = (sum - sumB) / wF;
+            float varBetween = (float)wB * (float)wF * (mB - mF) * (mB - mF);
+            if (varBetween > varMax) {
+                varMax = varBetween;
+                threshold = t;
+            }
+        }
+        for (int i=0;i<n;++i) bin[i] = (gray[i] <= threshold) ? 255 : 0;
+    } else {
+        for (int i=0;i<n;++i) bin[i] = (gray[i] <= fixed_t) ? 255 : 0;
+    }
+}
+
+/* Morphological operations: 3x3 erosion then dilation (opening) */
+void morph_open_3x3(uint8_t *bin, uint8_t *tmp, int w, int h) {
+    // erosion -> tmp
+    for (int y=0;y<h;++y) {
+        for (int x=0;x<w;++x) {
+            int ok = 1;
+            for (int dy=-1; dy<=1; ++dy) {
+                int yy = y+dy;
+                if (yy < 0 || yy >= h) { ok = 0; break; }
+                for (int dx=-1; dx<=1; ++dx) {
+                    int xx = x+dx;
+                    if (xx < 0 || xx >= w) { ok = 0; break; }
+                    if (bin[yy*w + xx] == 0) { ok = 0; break; }
+                }
+                if (!ok) break;
+            }
+            tmp[y*w + x] = ok ? 255 : 0;
+        }
+    }
+    // dilation tmp -> bin
+    for (int y=0;y<h;++y) {
+        for (int x=0;x<w;++x) {
+            int any = 0;
+            for (int dy=-1; dy<=1; ++dy) {
+                int yy = y+dy;
+                if (yy < 0 || yy >= h) continue;
+                for (int dx=-1; dx<=1; ++dx) {
+                    int xx = x+dx;
+                    if (xx < 0 || xx >= w) continue;
+                    if (tmp[yy*w + xx]) { any = 1; break; }
+                }
+                if (any) break;
+            }
+            bin[y*w + x] = any ? 255 : 0;
+        }
+    }
+}
+
+/* Connected components (4-neighbor). Returns number of components found.
+   labels must be int array size w*h, initialized to 0 by caller.
+   For each component, we compute area and centroid. We return the index of the largest component. */
+int find_largest_blob(const uint8_t *bin, int w, int h, int *labels, int *out_cx, int *out_cy, int *out_area, int roi_x, int roi_y, int roi_w, int roi_h) {
+    int n = w*h;
+    for (int i=0;i<n;++i) labels[i] = 0;
+    int cur_label = 0;
+    int *stack = malloc(n * sizeof(int));
+    if (!stack) return 0;
+    int best_label = 0;
+    int best_area = 0;
+    long best_sumx = 0, best_sumy = 0;
+
+    for (int y = roi_y; y < roi_y + roi_h; ++y) {
+        if (y < 0 || y >= h) continue;
+        for (int x = roi_x; x < roi_x + roi_w; ++x) {
+            if (x < 0 || x >= w) continue;
+            int idx = y*w + x;
+            if (bin[idx] == 0 || labels[idx] != 0) continue;
+            cur_label++;
+            int sp = 0;
+            stack[sp++] = idx;
+            labels[idx] = cur_label;
+            int area = 0;
+            long sumx = 0, sumy = 0;
+            while (sp > 0) {
+                int p = stack[--sp];
+                int px = p % w, py = p / w;
+                area++; sumx += px; sumy += py;
+                // 4-neighbors
+                int nx, ny, ni;
+                nx = px+1; ny = py; if (nx < w) { ni = ny*w + nx; if (bin[ni] && labels[ni]==0) { labels[ni]=cur_label; stack[sp++]=ni; } }
+                nx = px-1; ny = py; if (nx >=0) { ni = ny*w + nx; if (bin[ni] && labels[ni]==0) { labels[ni]=cur_label; stack[sp++]=ni; } }
+                nx = px; ny = py+1; if (ny < h) { ni = ny*w + nx; if (bin[ni] && labels[ni]==0) { labels[ni]=cur_label; stack[sp++]=ni; } }
+                nx = px; ny = py-1; if (ny >=0) { ni = ny*w + nx; if (bin[ni] && labels[ni]==0) { labels[ni]=cur_label; stack[sp++]=ni; } }
+            }
+            if (area > best_area) {
+                best_area = area;
+                best_sumx = sumx;
+                best_sumy = sumy;
+                best_label = cur_label;
+            }
+        }
+    }
+    free(stack);
+    if (best_area > 0) {
+        *out_area = best_area;
+        *out_cx = (int)round((double)best_sumx / best_area);
+        *out_cy = (int)round((double)best_sumy / best_area);
+        return best_label;
+    } else {
+        *out_area = 0;
+        *out_cx = *out_cy = 0;
+        return 0;
+    }
+}
+
+/* draw circle on rgb buffer */
+void draw_circle(uint8_t *rgb, int w, int h, int cx, int cy, int r, uint8_t R, uint8_t G, uint8_t B) {
+    int r2 = r*r;
+    for (int dy=-r; dy<=r; ++dy) {
+        int y = cy + dy; if (y<0||y>=h) continue;
+        for (int dx=-r; dx<=r; ++dx) {
+            int x = cx + dx; if (x<0||x>=w) continue;
+            int d2 = dx*dx + dy*dy;
+            if (d2 <= r2) {
+                int idx = (y*w + x)*3;
+                rgb[idx+0] = R; rgb[idx+1] = G; rgb[idx+2] = B;
+            }
+        }
+    }
+}
+
+/* draw rectangle */
+void draw_rect(uint8_t *rgb, int w, int h, int rx, int ry, int rw, int rh, uint8_t R, uint8_t G, uint8_t B) {
+    if (rw <= 0 || rh <= 0) return;
+    int x0 = rx, y0 = ry, x1 = rx + rw - 1, y1 = ry + rh - 1;
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 >= w) x1 = w-1; if (y1 >= h) y1 = h-1;
+    for (int x = x0; x <= x1; ++x) {
+        int i1 = (y0*w + x)*3;
+        int i2 = (y1*w + x)*3;
+        rgb[i1+0]=R; rgb[i1+1]=G; rgb[i1+2]=B;
+        rgb[i2+0]=R; rgb[i2+1]=G; rgb[i2+2]=B;
+    }
+    for (int y = y0; y <= y1; ++y) {
+        int i1 = (y*w + x0)*3;
+        int i2 = (y*w + x1)*3;
+        rgb[i1+0]=R; rgb[i1+1]=G; rgb[i1+2]=B;
+        rgb[i2+0]=R; rgb[i2+1]=G; rgb[i2+2]=B;
+    }
+}
+
+/* -------------------- Main -------------------- */
+
+int main(int argc, char **argv) {
+    const char *default_dev = "/dev/video0";
+    int default_w = 640, default_h = 480;
+
+    const char *dev = default_dev;
+    int width = default_w, height = default_h;
+    if (argc >= 2) dev = argv[1];
+    if (argc >= 3) width = atoi(argv[2]);
+    if (argc >= 4) height = atoi(argv[3]);
+
+    int fd = open_device(dev);
+    struct buffer *vbufs = NULL;
+    int nbufs = 0;
+    init_v4l2(fd, width, height, &vbufs, &nbufs);
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    SDL_Window *win = SDL_CreateWindow("Pupil Dark-Segmentation",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, width, height, 0);
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, width, height);
+
+    uint8_t *rgb = malloc(width*height*3);
+    uint8_t *gray = malloc(width*height);
+    uint8_t *bin = malloc(width*height);
+    uint8_t *tmp = malloc(width*height);
+    int *labels = malloc(width*height * sizeof(int));
+    if (!rgb || !gray || !bin || !tmp || !labels) {
+        fprintf(stderr, "Allocation failed\n");
+        return 1;
+    }
+
+    /* ROI selection */
+    int selecting = 0;
+    int sel_x0 = 0, sel_y0 = 0, sel_x1 = 0, sel_y1 = 0;
+    int roi_rx = 0, roi_ry = 0, roi_rw = 0, roi_rh = 0;
+    int detecting = 0;
+
+    SDL_Event e;
+    void *frame_ptr = NULL; size_t frame_len = 0;
+
+    printf("Pupil localization (dark-region). Draw ROI, press i to detect, r reset, q quit\n");
+
+    while (1) {
+        fd_set fds; FD_ZERO(&fds); FD_SET(fd, &fds);
+        struct timeval tv = {2,0};
+        if (select(fd+1, &fds, NULL, NULL, &tv) <= 0) continue;
+        if (!read_frame(fd, vbufs, nbufs, &frame_ptr, &frame_len)) continue;
+
+        yuyv_to_rgb((uint8_t*)frame_ptr, rgb, width, height);
+        rgb_to_gray(rgb, gray, width, height);
+
+        /* If selecting, draw selection rectangle */
+        if (selecting) {
+            int rx = sel_x0 < sel_x1 ? sel_x0 : sel_x1;
+            int ry = sel_y0 < sel_y1 ? sel_y0 : sel_y1;
+            int rw = abs(sel_x1 - sel_x0);
+            int rh = abs(sel_y1 - sel_y0);
+            draw_rect(rgb, width, height, rx, ry, rw>0?rw:1, rh>0?rh:1, 255, 0, 0);
+        }
+
+        /* If detecting, run dark-region segmentation inside ROI (or full frame) */
+        if (detecting) {
+            int rx = roi_rx, ry = roi_ry, rw = roi_rw, rh = roi_rh;
+            if (rw <= 0 || rh <= 0) { rx = 0; ry = 0; rw = width; rh = height; }
+
+            /* threshold: use fixed low threshold (tuned for visible light); also try Otsu fallback */
+            threshold_otsu_or_fixed(gray, width, height, bin, 0, 50); // fixed threshold 50
+            // optional: refine by computing local threshold in ROI (skipped for speed)
+
+            /* morphological opening to remove noise */
+            morph_open_3x3(bin, tmp, width, height);
+
+            /* find largest connected dark blob within ROI */
+            int cx, cy, area;
+            int label = find_largest_blob(bin, width, height, labels, &cx, &cy, &area, rx, ry, rw, rh);
+            if (label != 0 && area > 10) {
+                /* estimate radius from area */
+                int radius = (int)round(sqrt((double)area / M_PI));
+                if (radius < 2) radius = 2;
+                if (radius > 100) radius = 100;
+                draw_circle(rgb, width, height, cx, cy, radius, 0, 255, 0);
+                draw_rect(rgb, width, height, rx, ry, rw, rh, 0, 255, 0);
+            } else {
+                /* no blob found: draw ROI in yellow */
+                draw_rect(rgb, width, height, rx, ry, rw, rh, 255, 255, 0);
+            }
+        }
+
+        SDL_UpdateTexture(tex, NULL, rgb, width*3);
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+        SDL_RenderPresent(ren);
+
+        /* handle events */
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) goto done;
+            if (e.type == SDL_KEYDOWN) {
+                if (e.key.keysym.sym == SDLK_q) goto done;
+                if (e.key.keysym.sym == SDLK_r) {
+                    selecting = 0;
+                    detecting = 0;
+                    sel_x0 = sel_x1 = sel_y0 = sel_y1 = 0;
+                    roi_rx = roi_ry = roi_rw = roi_rh = 0;
+                }
+                if (e.key.keysym.sym == SDLK_i) {
+                    /* set ROI from selection if present */
+                    if (sel_x0 != sel_x1 && sel_y0 != sel_y1) {
+                        roi_rx = sel_x0 < sel_x1 ? sel_x0 : sel_x1;
+                        roi_ry = sel_y0 < sel_y1 ? sel_y0 : sel_y1;
+                        roi_rw = abs(sel_x1 - sel_x0);
+                        roi_rh = abs(sel_y1 - sel_y0);
+                        if (roi_rw < 4) roi_rw = 4;
+                        if (roi_rh < 4) roi_rh = 4;
+                    } else {
+                        roi_rx = roi_ry = 0; roi_rw = width; roi_rh = height;
+                    }
+                    detecting = 1;
+                }
+            }
+            if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                selecting = 1;
+                sel_x0 = e.button.x; sel_y0 = e.button.y;
+                sel_x1 = sel_x0; sel_y1 = sel_y0;
+            }
+            if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT) {
+                selecting = 0;
+                sel_x1 = e.button.x; sel_y1 = e.button.y;
+            }
+            if (e.type == SDL_MOUSEMOTION && selecting) {
+                sel_x1 = e.motion.x; sel_y1 = e.motion.y;
+            }
+        }
+    }
+
+done:
+    {
+        enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        xioctl(fd, VIDIOC_STREAMOFF, &t);
+    }
+    close(fd);
+
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+
+    free(vbufs);
+    free(rgb);
+    free(gray);
+    free(bin);
+    free(tmp);
+    free(labels);
+
+    return 0;
+}

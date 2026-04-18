@@ -1,0 +1,321 @@
+// editor_vertical_only.c
+// gcc -o editor_vertical_only editor_vertical_only.c -lSDL2 -lSDL2_ttf
+// Klick mit der Maus setzt den Caret; Schrift 18px; weißer Hintergrund; schwarze Schrift; nur vertikale Scrollbar.
+
+#include <SDL.h>
+#include <SDL_ttf.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define WINW 1024
+#define WINH 768
+#define FONT_SIZE 18            // 18 px requested
+#define MARGIN 8
+#define LINE_SPACING 4
+#define SCROLLBAR_THICK 16
+#define CURSOR_W 2
+#define BLINK_MS 500
+
+typedef struct { char *text; int len, cap; } Line;
+typedef struct { Line *a; int n, cap; } Doc;
+
+static void doc_init(Doc *d) {
+    d->cap = 64;
+    d->n = 1;
+    d->a = calloc(d->cap, sizeof(Line));
+    d->a[0].cap = 128;
+    d->a[0].text = calloc(d->a[0].cap, 1);
+    d->a[0].len = 0;
+}
+static void doc_free(Doc *d) {
+    for (int i = 0; i < d->n; ++i) free(d->a[i].text);
+    free(d->a);
+}
+static void ensure(Line *ln, int need) {
+    if (ln->cap >= need) return;
+    while (ln->cap < need) ln->cap *= 2;
+    ln->text = realloc(ln->text, ln->cap);
+}
+static void insert_text(Line *ln, int pos, const char *s) {
+    int add = (int)strlen(s);
+    ensure(ln, ln->len + add + 1);
+    memmove(ln->text + pos + add, ln->text + pos, ln->len - pos + 1);
+    memcpy(ln->text + pos, s, add);
+    ln->len += add;
+}
+static void delete_back(Line *ln, int pos) {
+    if (pos <= 0) return;
+    memmove(ln->text + pos - 1, ln->text + pos, ln->len - pos + 1);
+    ln->len -= 1;
+}
+static void doc_split_line(Doc *d, int idx, int pos) {
+    if (d->n + 1 > d->cap) { d->cap *= 2; d->a = realloc(d->a, d->cap * sizeof(Line)); }
+    for (int i = d->n; i > idx + 1; --i) d->a[i] = d->a[i-1];
+    Line *cur = &d->a[idx];
+    Line *nxt = &d->a[idx+1];
+    int rest = cur->len - pos;
+    nxt->cap = rest + 8;
+    nxt->text = malloc(nxt->cap);
+    memcpy(nxt->text, cur->text + pos, rest);
+    nxt->text[rest] = '\0';
+    nxt->len = rest;
+    cur->text[pos] = '\0';
+    cur->len = pos;
+    d->n++;
+}
+static void doc_join_line(Doc *d, int idx) {
+    if (idx + 1 >= d->n) return;
+    Line *a = &d->a[idx], *b = &d->a[idx+1];
+    ensure(a, a->len + b->len + 1);
+    memcpy(a->text + a->len, b->text, b->len + 1);
+    a->len += b->len;
+    free(b->text);
+    for (int i = idx + 1; i < d->n - 1; ++i) d->a[i] = d->a[i+1];
+    d->n--;
+}
+
+// UTF-8 helper: length of next codepoint by leading byte
+static int utf8_char_len(unsigned char lead) {
+    if ((lead & 0x80) == 0x00) return 1;
+    if ((lead & 0xE0) == 0xC0) return 2;
+    if ((lead & 0xF0) == 0xE0) return 3;
+    if ((lead & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+// Find byte offset that best matches target_x (pixel) by measuring prefixes.
+// This iterates codepoint by codepoint (not full grapheme clusters).
+static int find_byte_offset_for_x(TTF_Font *font, const char *utf8, int byte_len, int target_x) {
+    if (byte_len <= 0) return 0;
+    int pos = 0;
+    int last_good = 0;
+    while (pos <= byte_len) {
+        char *tmp = malloc(pos + 1);
+        if (pos > 0) memcpy(tmp, utf8, pos);
+        tmp[pos] = '\0';
+        int w = 0, h = 0;
+        TTF_SizeUTF8(font, tmp, &w, &h);
+        free(tmp);
+        if (w >= target_x) {
+            return last_good;
+        }
+        if (pos == byte_len) break;
+        int step = utf8_char_len((unsigned char)utf8[pos]);
+        last_good = pos + step;
+        pos += step;
+    }
+    return byte_len;
+}
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); return 1; }
+    if (TTF_Init() != 0) { fprintf(stderr, "TTF_Init: %s\n", TTF_GetError()); SDL_Quit(); return 1; }
+
+    SDL_Window *win = SDL_CreateWindow("Editor (vertical scrollbar, 18px, white bg)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WINW, WINH, SDL_WINDOW_RESIZABLE);
+    if (!win) { fprintf(stderr, "CreateWindow: %s\n", SDL_GetError()); TTF_Quit(); SDL_Quit(); return 1; }
+    SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!ren) { fprintf(stderr, "CreateRenderer: %s\n", SDL_GetError()); SDL_DestroyWindow(win); TTF_Quit(); SDL_Quit(); return 1; }
+
+    const char *font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+    TTF_Font *font = TTF_OpenFont(font_path, FONT_SIZE);
+    if (!font) {
+        fprintf(stderr, "TTF_OpenFont failed for %s: %s\n", font_path, TTF_GetError());
+        SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); TTF_Quit(); SDL_Quit();
+        return 1;
+    }
+
+    Doc doc; doc_init(&doc);
+    int cx = 0, cy = 0;            // byte offset and line index
+    int running = 1;
+    SDL_StartTextInput();
+    Uint32 last_blink = SDL_GetTicks();
+    int show_cursor = 1;
+
+    int scroll_y = 0;
+    int dragging_v = 0;
+    int drag_start_y = 0;
+    int drag_thumb_offset = 0;
+
+    // Colors: white background, black text
+    SDL_Color bg = {255, 255, 255, 255};
+    SDL_Color fg = {0, 0, 0, 255};
+    SDL_Color sb_bg = {230, 230, 230, 255};
+    SDL_Color sb_thumb = {120, 120, 120, 255};
+
+    while (running) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) { running = 0; break; }
+            else if (e.type == SDL_KEYDOWN) {
+                SDL_Keycode k = e.key.keysym.sym;
+                if (k == SDLK_ESCAPE) { running = 0; break; }
+                else if (k == SDLK_BACKSPACE) {
+                    if (cx > 0) { delete_back(&doc.a[cy], cx); cx--; }
+                    else if (cy > 0) { int prevlen = doc.a[cy-1].len; doc_join_line(&doc, cy-1); cy--; cx = prevlen; }
+                } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                    doc_split_line(&doc, cy, cx);
+                    cy++; cx = 0;
+                } else if (k == SDLK_LEFT) {
+                    if (cx > 0) cx--;
+                    else if (cy > 0) { cy--; cx = doc.a[cy].len; }
+                } else if (k == SDLK_RIGHT) {
+                    if (cx < doc.a[cy].len) cx++;
+                    else if (cy < doc.n - 1) { cy++; cx = 0; }
+                } else if (k == SDLK_UP) {
+                    if (cy > 0) { cy--; if (cx > doc.a[cy].len) cx = doc.a[cy].len; }
+                } else if (k == SDLK_DOWN) {
+                    if (cy < doc.n - 1) { cy++; if (cx > doc.a[cy].len) cx = doc.a[cy].len; }
+                }
+            }
+            else if (e.type == SDL_TEXTINPUT) {
+                insert_text(&doc.a[cy], cx, e.text.text);
+                cx += (int)strlen(e.text.text);
+            }
+            else if (e.type == SDL_MOUSEWHEEL) {
+                scroll_y -= e.wheel.y * (FONT_SIZE + LINE_SPACING);
+            }
+            else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                int mx = e.button.x, my = e.button.y;
+                int sbx = WINW - SCROLLBAR_THICK;
+                int sby_top = MARGIN;
+                int sby_bottom = WINH - SCROLLBAR_THICK - MARGIN;
+                // click on vertical scrollbar?
+                if (mx >= sbx && my >= sby_top && my <= sby_bottom) {
+                    // start dragging thumb (approximate)
+                    dragging_v = 1;
+                    drag_start_y = my;
+                    drag_thumb_offset = 0;
+                } else {
+                    // click in text area -> set caret
+                    int click_x = mx - MARGIN;
+                    int click_y = my + scroll_y - MARGIN;
+                    int line_h = FONT_SIZE + LINE_SPACING;
+                    int clicked_line = click_y / line_h;
+                    if (clicked_line < 0) clicked_line = 0;
+                    if (clicked_line >= doc.n) clicked_line = doc.n - 1;
+                    cy = clicked_line;
+                    int byte_len = doc.a[cy].len;
+                    if (byte_len <= 0) { cx = 0; }
+                    else {
+                        int target_x = click_x;
+                        if (target_x < 0) target_x = 0;
+                        int off = find_byte_offset_for_x(font, doc.a[cy].text, byte_len, target_x);
+                        if (off < 0) off = 0;
+                        if (off > byte_len) off = byte_len;
+                        cx = off;
+                    }
+                    // ensure caret visible vertically
+                    int caret_ypix = cy * (FONT_SIZE + LINE_SPACING);
+                    int view_h = WINH - SCROLLBAR_THICK - 2 * MARGIN;
+                    if (caret_ypix - scroll_y < 0) scroll_y = caret_ypix - 10;
+                    if (caret_ypix - scroll_y > view_h - (FONT_SIZE + LINE_SPACING) + 10) scroll_y = caret_ypix - (view_h - (FONT_SIZE + LINE_SPACING) + 10);
+                    if (scroll_y < 0) scroll_y = 0;
+                }
+            }
+            else if (e.type == SDL_MOUSEBUTTONUP) {
+                dragging_v = 0;
+            }
+            else if (e.type == SDL_MOUSEMOTION) {
+                if (dragging_v) {
+                    // map mouse dy to scroll_y change
+                    int dy = e.motion.yrel;
+                    // scale movement to content height proportionally
+                    scroll_y += dy * 4;
+                }
+            }
+        }
+
+        // compute content size
+        int maxw = 0;
+        for (int i = 0; i < doc.n; ++i) {
+            const char *t = doc.a[i].len ? doc.a[i].text : " ";
+            int w = 0, h = 0;
+            TTF_SizeUTF8(font, t, &w, &h);
+            if (w > maxw) maxw = w;
+        }
+        int content_h = doc.n * (FONT_SIZE + LINE_SPACING);
+        int view_h = WINH - SCROLLBAR_THICK - 2 * MARGIN;
+
+        // clamp scroll_y
+        if (scroll_y < 0) scroll_y = 0;
+        if (content_h > view_h && scroll_y > content_h - view_h) scroll_y = content_h - view_h;
+        if (content_h <= view_h) scroll_y = 0;
+
+        // caret blink
+        Uint32 now = SDL_GetTicks();
+        if (now - last_blink >= BLINK_MS) { show_cursor = !show_cursor; last_blink = now; }
+
+        // render background (white)
+        SDL_SetRenderDrawColor(ren, bg.r, bg.g, bg.b, bg.a);
+        SDL_RenderClear(ren);
+
+        // render text lines (black)
+        SDL_Color fgcol = fg;
+        int y = MARGIN - scroll_y;
+        // set clip so long lines are clipped by view width
+        SDL_Rect clip = { MARGIN, MARGIN, WINW - SCROLLBAR_THICK - 2 * MARGIN, WINH - SCROLLBAR_THICK - 2 * MARGIN };
+        SDL_RenderSetClipRect(ren, &clip);
+
+        for (int i = 0; i < doc.n; ++i) {
+            const char *txt = doc.a[i].len ? doc.a[i].text : " ";
+            SDL_Surface *surf = TTF_RenderUTF8_Blended(font, txt, fgcol);
+            SDL_Texture *tex = SDL_CreateTextureFromSurface(ren, surf);
+            SDL_Rect dst = { MARGIN, y, surf->w, surf->h };
+            SDL_RenderCopy(ren, tex, NULL, &dst);
+            SDL_FreeSurface(surf); SDL_DestroyTexture(tex);
+
+            // caret
+            if (i == cy && show_cursor) {
+                int cxpix = 0, h = 0;
+                if (cx > 0) {
+                    char *tmp = malloc(cx + 1);
+                    memcpy(tmp, doc.a[i].text, cx);
+                    tmp[cx] = '\0';
+                    TTF_SizeUTF8(font, tmp, &cxpix, &h);
+                    free(tmp);
+                } else {
+                    cxpix = 0;
+                    TTF_SizeUTF8(font, " ", NULL, &h);
+                }
+                SDL_Rect caret = { MARGIN + cxpix, y, CURSOR_W, FONT_SIZE };
+                SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+                SDL_RenderFillRect(ren, &caret);
+            }
+
+            y += FONT_SIZE + LINE_SPACING;
+            if (y > WINH) break;
+        }
+
+        SDL_RenderSetClipRect(ren, NULL);
+
+        // draw vertical scrollbar background
+        SDL_Rect vbg = { WINW - SCROLLBAR_THICK, MARGIN, SCROLLBAR_THICK, WINH - SCROLLBAR_THICK - MARGIN };
+        SDL_SetRenderDrawColor(ren, sb_bg.r, sb_bg.g, sb_bg.b, sb_bg.a);
+        SDL_RenderFillRect(ren, &vbg);
+
+        // draw vertical thumb
+        if (content_h > 0 && view_h > 0) {
+            float vh = (float)(vbg.h);
+            float thumb_h = (view_h >= content_h) ? vh : (vh * ((float)view_h / (float)content_h));
+            if (thumb_h < 20) thumb_h = 20;
+            float pos = (content_h <= view_h) ? 0.0f : ((float)scroll_y / (float)(content_h - view_h));
+            SDL_Rect vthumb = { vbg.x + 2, vbg.y + 2 + (int)(pos * (vh - thumb_h - 4)), vbg.w - 4, (int)thumb_h - 4 };
+            SDL_SetRenderDrawColor(ren, sb_thumb.r, sb_thumb.g, sb_thumb.b, sb_thumb.a);
+            SDL_RenderFillRect(ren, &vthumb);
+        }
+
+        SDL_RenderPresent(ren);
+        SDL_Delay(10);
+    }
+
+    SDL_StopTextInput();
+    doc_free(&doc);
+    TTF_CloseFont(font);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    TTF_Quit();
+    SDL_Quit();
+    return 0;
+}

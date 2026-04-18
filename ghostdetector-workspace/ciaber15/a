@@ -1,0 +1,46 @@
+main.c:142:1: warning: variably modified ‘click_buffers’ at file scope
+  142 | short click_buffers[NUM_SCALE_NOTES][CLICK_SAMPLES];
+      | ^~~~~
+main.c: In function ‘draw_single_graph’:
+main.c:255:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  255 |         if (y1 < y) y1 = y; if (y1 > y + height) y1 = y + height;
+      |         ^~
+main.c:255:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  255 |         if (y1 < y) y1 = y; if (y1 > y + height) y1 = y + height;
+      |                             ^~
+main.c:256:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  256 |         if (y2 < y) y2 = y; if (y2 > y + height) y2 = y + height;
+      |         ^~
+main.c:256:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  256 |         if (y2 < y) y2 = y; if (y2 > y + height) y2 = y + height;
+      |                             ^~
+main.c:267:55: error: too many arguments to function ‘XftTextExtents8’
+  267 |     XftDrawStringUtf8(xft_d, color, font, x + width - XftTextExtents8(d, font, (XftChar8*)max_val_str, strlen(max_val_str), NULL, NULL), y - 2, (XftChar8*)max_val_str, strlen(max_val_str));
+      |                                                       ^~~~~~~~~~~~~~~
+In file included from main.c:32:
+/usr/include/X11/Xft/Xft.h:300:1: note: declared here
+  300 | XftTextExtents8 (Display            *dpy,
+      | ^~~~~~~~~~~~~~~
+main.c:267:55: error: void value not ignored as it ought to be
+  267 |     XftDrawStringUtf8(xft_d, color, font, x + width - XftTextExtents8(d, font, (XftChar8*)max_val_str, strlen(max_val_str), NULL, NULL), y - 2, (XftChar8*)max_val_str, strlen(max_val_str));
+      |                                                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.c: In function ‘process_radionullon’:
+main.c:724:22: warning: unused variable ‘alpha’ [-Wunused-variable]
+  724 |              uint8_t alpha = (uint8_t)(flicker_ratio * 128 + 127);
+      |                      ^~~~~
+main.c: In function ‘sigint_handler’:
+main.c:860:25: warning: unused parameter ‘sig’ [-Wunused-parameter]
+  860 | void sigint_handler(int sig) {
+      |                     ~~~~^~~
+main.c: In function ‘main’:
+main.c:869:14: warning: unused parameter ‘argc’ [-Wunused-parameter]
+  869 | int main(int argc, char *argv[]) {
+      |          ~~~~^~~~
+main.c:869:26: warning: unused parameter ‘argv’ [-Wunused-parameter]
+  869 | int main(int argc, char *argv[]) {
+      |                    ~~~~~~^~~~~~
+main.c: At top level:
+main.c:86:22: warning: ‘ISOTOPES’ defined but not used [-Wunused-const-variable=]
+   86 | static const Isotope ISOTOPES[NUM_ISOTOPES] = {
+      |                      ^~~~~~~~
+make: *** [makefile:30: qgeister1] Error 1

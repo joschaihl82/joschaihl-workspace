@@ -1,0 +1,2 @@
+#define lz4packer1_VERSION_MAJOR @lz4packer1_VERSION_MAJOR@
+#define lz4packer1_VERSION_MINOR @lz4packer1_VERSION_MINOR@

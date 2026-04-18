@@ -1,0 +1,22 @@
+# makefile for exectrace1
+modobj := exectrace1.o
+obj-m := $(modobj)
+
+# 3.5 rule compliant variables
+makbin := make
+knddir := /lib/modules/$(shell uname -r)/build
+curdir := $(shell pwd)
+
+.phony: all clean load unld
+
+all:
+	$(makbin) -C $(knddir) M=$(curdir) modules
+
+clean:
+	$(makbin) -C $(knddir) M=$(curdir) clean
+
+load: all
+	sudo insmod ./exectrace1.ko
+
+unld:
+	sudo rmmod exectrace1

@@ -1,0 +1,201 @@
+/*
+ * ccompress.c
+ *
+ * Simple C source "compressor" with convention-over-configuration:
+ *  - Accepts exactly two arguments: input-file and output-file
+ *  - Removes C-style comments: // line comments and /* block comments *\/
+ *  - Preserves string and character literals (comments inside them are NOT removed)
+ *  - Replaces every space character ' ' with a tab '\t'
+ *  - Preserves all newlines
+ *
+ * Usage:
+ *   ccompress input.c output.c
+ *
+ * Build:
+ *   gcc -O2 -Wall -o ccompress ccompress.c
+ *
+ * Notes:
+ *  - This is a single-pass state machine. It handles escaped quotes and
+ *    escaped backslashes inside strings/chars. It does not implement a full
+ *    C preprocessor (trigraphs, universal character names not specially handled).
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+typedef enum {
+    S_NORMAL,
+    S_IN_STRING,
+    S_IN_CHAR,
+    S_IN_LINE_COMMENT,
+    S_IN_BLOCK_COMMENT,
+    S_IN_BLOCK_COMMENT_ASTERISK
+} state_t;
+
+static int process_stream(FILE *in, FILE *out) {
+    state_t state = S_NORMAL;
+    int c;
+
+    while ((c = fgetc(in)) != EOF) {
+        if (state == S_NORMAL) {
+            if (c == '/') {
+                int n = fgetc(in);
+                if (n == '/') {
+                    /* start line comment: skip until newline (but keep newline) */
+                    state = S_IN_LINE_COMMENT;
+                } else if (n == '*') {
+                    /* start block comment */
+                    state = S_IN_BLOCK_COMMENT;
+                } else {
+                    /* not a comment: output '/' and push back n */
+                    if (fputc('/', out) == EOF) return -1;
+                    if (n != EOF) ungetc(n, in);
+                }
+            } else if (c == '"') {
+                if (fputc('"', out) == EOF) return -1;
+                state = S_IN_STRING;
+            } else if (c == '\'') {
+                if (fputc('\'', out) == EOF) return -1;
+                state = S_IN_CHAR;
+            } else if (c == ' ') {
+                if (fputc('\t', out) == EOF) return -1;
+            } else {
+                if (fputc(c, out) == EOF) return -1;
+            }
+        } else if (state == S_IN_STRING) {
+            if (c == '\\') {
+                /* escape: copy backslash and next char (if any) */
+                if (fputc('\\', out) == EOF) return -1;
+                int n = fgetc(in);
+                if (n == EOF) break;
+                if (n == ' ') {
+                    /* keep spaces inside escapes as-is (but user requested spaces->tabs globally;
+                       however escaped sequences should remain literal, so keep the original char) */
+                    if (fputc(' ', out) == EOF) return -1;
+                } else {
+                    if (fputc(n, out) == EOF) return -1;
+                }
+            } else if (c == '"') {
+                if (fputc('"', out) == EOF) return -1;
+                state = S_NORMAL;
+            } else {
+                if (c == ' ') {
+                    if (fputc('\t', out) == EOF) return -1;
+                } else {
+                    if (fputc(c, out) == EOF) return -1;
+                }
+            }
+        } else if (state == S_IN_CHAR) {
+            if (c == '\\') {
+                if (fputc('\\', out) == EOF) return -1;
+                int n = fgetc(in);
+                if (n == EOF) break;
+                if (n == ' ') {
+                    if (fputc(' ', out) == EOF) return -1;
+                } else {
+                    if (fputc(n, out) == EOF) return -1;
+                }
+            } else if (c == '\'') {
+                if (fputc('\'', out) == EOF) return -1;
+                state = S_NORMAL;
+            } else {
+                if (c == ' ') {
+                    if (fputc('\t', out) == EOF) return -1;
+                } else {
+                    if (fputc(c, out) == EOF) return -1;
+                }
+            }
+        } else if (state == S_IN_LINE_COMMENT) {
+            /* skip until newline, then output newline and return to normal */
+            if (c == '\n') {
+                if (fputc('\n', out) == EOF) return -1;
+                state = S_NORMAL;
+            } else {
+                /* drop character */
+            }
+        } else if (state == S_IN_BLOCK_COMMENT) {
+            if (c == '*') {
+                state = S_IN_BLOCK_COMMENT_ASTERISK;
+            } else if (c == '\n') {
+                /* preserve newlines inside block comments to keep line structure */
+                if (fputc('\n', out) == EOF) return -1;
+            } else {
+                /* drop */
+            }
+        } else if (state == S_IN_BLOCK_COMMENT_ASTERISK) {
+            if (c == '/') {
+                /* end of block comment */
+                state = S_NORMAL;
+            } else if (c == '*') {
+                /* stay in asterisk-seen state */
+                state = S_IN_BLOCK_COMMENT_ASTERISK;
+            } else {
+                /* not end yet */
+                if (c == '\n') {
+                    if (fputc('\n', out) == EOF) return -1;
+                }
+                state = S_IN_BLOCK_COMMENT;
+            }
+        }
+    }
+
+    /* If EOF reached while in line comment, nothing to output */
+    /* If EOF reached while in block comment, we simply finish (unterminated comment removed) */
+
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s input-file output-file\n", argv[0]);
+        return 2;
+    }
+
+    const char *inpath = argv[1];
+    const char *outpath = argv[2];
+
+    FILE *in = fopen(inpath, "rb");
+    if (!in) {
+        fprintf(stderr, "ccompress: cannot open input '%s': %s\n", inpath, strerror(errno));
+        return 3;
+    }
+
+    /* write to temporary file first to avoid truncating input on same-file mistakes */
+    char tmp[4096];
+    if (snprintf(tmp, sizeof(tmp), "%s.tmp", outpath) >= (int)sizeof(tmp)) {
+        fprintf(stderr, "ccompress: output path too long\n");
+        fclose(in);
+        return 4;
+    }
+
+    FILE *out = fopen(tmp, "wb");
+    if (!out) {
+        fprintf(stderr, "ccompress: cannot open output '%s': %s\n", tmp, strerror(errno));
+        fclose(in);
+        return 5;
+    }
+
+    int rc = process_stream(in, out);
+    fclose(in);
+    if (fflush(out) != 0) rc = -1;
+    if (fclose(out) != 0) rc = -1;
+
+    if (rc != 0) {
+        fprintf(stderr, "ccompress: processing failed\n");
+        remove(tmp);
+        return 6;
+    }
+
+    /* move temp to final output */
+    if (rename(tmp, outpath) != 0) {
+        fprintf(stderr, "ccompress: cannot rename '%s' -> '%s': %s\n", tmp, outpath, strerror(errno));
+        remove(tmp);
+        return 7;
+    }
+
+    return 0;
+}
+

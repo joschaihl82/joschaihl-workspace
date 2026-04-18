@@ -1,0 +1,930 @@
+/*
+ * Improved single-file webcrawler in C
+ * - No libcurl
+ * - Supports HTTP and HTTPS (OpenSSL)
+ * - Uses POSIX sockets, OpenSSL, libxml2
+ * - Handles redirects, chunked transfer decoding, basic gzip passthrough (no decompression)
+ * - Extracts links and visible assets (href/src, link rel=stylesheet, script, img, audio, video, source)
+ * - Parses CSS url(...) patterns for assets
+ * - Respects robots.txt (basic disallow parsing)
+ * - Politeness: per-host rate limiting and concurrent worker threads
+ * - Persistent in-memory URL set implemented as a chained hash table with crawled flag
+ * - Saves files under output/<host>/<path> preserving directory structure
+ *
+ * Build:
+ *   gcc -O2 -pthread -o crawler crawler.c -lxml2 -lssl -lcrypto
+ *
+ * Usage:
+ *   ./crawler <start-url> [max-threads]
+ *
+ * Notes and limitations:
+ * - This is an educational example, not production-grade.
+ * - TLS certificate verification is minimal (hostname check is not fully robust).
+ * - No HTTP/2 support.
+ * - No automatic gzip/deflate decompression (content saved as received).
+ * - robots.txt parsing is simplistic and may not cover all rules.
+ * - Error handling is improved but still simplified.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <ctype.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+#include <libxml/HTMLparser.h>
+#include <libxml/xpath.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <strings.h>
+
+#define BUF_SIZE 16384
+#define OUTPUT_DIR "output"
+#define USER_AGENT "improved-crawler/1.0"
+#define DEFAULT_PORT_HTTP "80"
+#define DEFAULT_PORT_HTTPS "443"
+#define MAX_URL_LEN 2048
+#define HASH_SIZE 4096
+#define DEFAULT_DELAY_MS 250
+
+/* ---------- Utilities ---------- */
+
+static void die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    exit(1);
+}
+
+static void *xmalloc(size_t n) {
+    void *p = malloc(n);
+    if (!p) die("Out of memory\n");
+    return p;
+}
+
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    char *r = strdup(s);
+    if (!r) die("Out of memory\n");
+    return r;
+}
+
+static void mkdir_p(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len == 0) return;
+    if (tmp[len-1] == '/') tmp[len-1] = 0;
+    for (char *p = tmp + 1; *p; ++p) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+/* URL components */
+typedef struct {
+    char *scheme;
+    char *host;
+    char *port;
+    char *path;
+} url_t;
+
+static void free_url(url_t *u) {
+    if (!u) return;
+    free(u->scheme); free(u->host); free(u->port); free(u->path);
+}
+
+/* Basic URL parse (handles http/https, host:port, path) */
+static int parse_url(const char *url, url_t *out) {
+    memset(out, 0, sizeof(*out));
+    const char *p = strstr(url, "://");
+    if (!p) return -1;
+    out->scheme = strndup(url, p - url);
+    p += 3;
+    const char *path = strchr(p, '/');
+    const char *hostend = path ? path : p + strlen(p);
+    const char *colon = memchr(p, ':', hostend - p);
+    if (colon) {
+        out->host = strndup(p, colon - p);
+        out->port = strndup(colon + 1, hostend - colon - 1);
+    } else {
+        out->host = strndup(p, hostend - p);
+        out->port = strdup(strcmp(out->scheme, "https") == 0 ? DEFAULT_PORT_HTTPS : DEFAULT_PORT_HTTP);
+    }
+    out->path = path ? strdup(path) : strdup("/");
+    return 0;
+}
+
+/* Normalize path: remove ./ and resolve ../ (simple) */
+static char *normalize_path(const char *path) {
+    if (!path) return xstrdup("/");
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    char *parts[1024];
+    int pc = 0;
+    char *tok = strtok(tmp, "/");
+    while (tok && pc < 1023) {
+        if (strcmp(tok, ".") == 0) { tok = strtok(NULL, "/"); continue; }
+        if (strcmp(tok, "..") == 0) { if (pc > 0) pc--; tok = strtok(NULL, "/"); continue; }
+        parts[pc++] = tok;
+        tok = strtok(NULL, "/");
+    }
+    char out[4096] = "/";
+    for (int i = 0; i < pc; ++i) {
+        strcat(out, parts[i]);
+        if (i < pc-1) strcat(out, "/");
+    }
+    return xstrdup(out);
+}
+
+/* Resolve relative link against base URL */
+static char *resolve_url(const char *base, const char *link) {
+    if (!link || strlen(link) == 0) return NULL;
+    if (strstr(link, "://")) return xstrdup(link);
+    url_t u;
+    if (parse_url(base, &u) != 0) return NULL;
+    char *result = NULL;
+    if (link[0] == '/') {
+        result = malloc(strlen(u.scheme) + 3 + strlen(u.host) + strlen(link) + 10);
+        snprintf(result, MAX_URL_LEN, "%s://%s%s", u.scheme, u.host, link);
+    } else {
+        /* remove filename from path */
+        char *last = strrchr(u.path, '/');
+        char basepath[2048];
+        if (last) {
+            size_t len = last - u.path + 1;
+            strncpy(basepath, u.path, len);
+            basepath[len] = 0;
+        } else strcpy(basepath, "/");
+        char combined[4096];
+        snprintf(combined, sizeof(combined), "%s%s", basepath, link);
+        char *norm = normalize_path(combined);
+        result = malloc(strlen(u.scheme) + 3 + strlen(u.host) + strlen(norm) + 10);
+        snprintf(result, MAX_URL_LEN, "%s://%s%s", u.scheme, u.host, norm);
+        free(norm);
+    }
+    free_url(&u);
+    return result;
+}
+
+/* Extract host for same-origin checks */
+static char *get_host_from_url(const char *url) {
+    url_t u;
+    if (parse_url(url, &u) != 0) return NULL;
+    char *h = xstrdup(u.host);
+    free_url(&u);
+    return h;
+}
+
+/* ---------- Hash set for URLs ---------- */
+
+typedef struct url_entry {
+    char *url;
+    int crawled;
+    struct url_entry *next;
+} url_entry_t;
+
+typedef struct {
+    url_entry_t *buckets[HASH_SIZE];
+    pthread_mutex_t lock;
+} url_set_t;
+
+static url_set_t urlset;
+
+static unsigned long hash_str(const char *s) {
+    unsigned long h = 5381;
+    while (*s) h = ((h << 5) + h) + (unsigned char)*s++;
+    return h % HASH_SIZE;
+}
+
+static void urlset_init(url_set_t *s) {
+    memset(s->buckets, 0, sizeof(s->buckets));
+    pthread_mutex_init(&s->lock, NULL);
+}
+
+static int urlset_contains(url_set_t *s, const char *url) {
+    unsigned long h = hash_str(url);
+    url_entry_t *e = s->buckets[h];
+    while (e) {
+        if (strcmp(e->url, url) == 0) return 1;
+        e = e->next;
+    }
+    return 0;
+}
+
+static void urlset_add(url_set_t *s, const char *url) {
+    pthread_mutex_lock(&s->lock);
+    if (urlset_contains(s, url)) { pthread_mutex_unlock(&s->lock); return; }
+    unsigned long h = hash_str(url);
+    url_entry_t *e = xmalloc(sizeof(*e));
+    e->url = xstrdup(url);
+    e->crawled = 0;
+    e->next = s->buckets[h];
+    s->buckets[h] = e;
+    pthread_mutex_unlock(&s->lock);
+}
+
+static url_entry_t *urlset_pop_uncrawled(url_set_t *s) {
+    pthread_mutex_lock(&s->lock);
+    for (int i = 0; i < HASH_SIZE; ++i) {
+        url_entry_t *e = s->buckets[i];
+        while (e) {
+            if (!e->crawled) {
+                e->crawled = 1; /* mark now to avoid races */
+                pthread_mutex_unlock(&s->lock);
+                return e;
+            }
+            e = e->next;
+        }
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+/* ---------- Networking: sockets + OpenSSL ---------- */
+
+typedef struct {
+    int sockfd;
+    SSL *ssl;
+    SSL_CTX *ctx;
+    int use_ssl;
+} conn_t;
+
+/* Create TCP connection to host:port with timeout (blocking connect) */
+static int tcp_connect(const char *host, const char *port, int timeout_sec) {
+    struct addrinfo hints, *res, *rp;
+    int sfd = -1;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
+    for (rp = res; rp; rp = rp->ai_next) {
+        sfd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sfd == -1) continue;
+        if (connect(sfd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(sfd);
+        sfd = -1;
+    }
+    freeaddrinfo(res);
+    return sfd;
+}
+
+/* Initialize OpenSSL once */
+static void openssl_init_once(void) {
+    static int inited = 0;
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&m);
+    if (!inited) {
+        SSL_library_init();
+        SSL_load_error_strings();
+        OpenSSL_add_all_algorithms();
+        inited = 1;
+    }
+    pthread_mutex_unlock(&m);
+}
+
+/* Establish connection (TCP + optional SSL handshake) */
+static conn_t *conn_open(const char *host, const char *port, int use_ssl) {
+    conn_t *c = xmalloc(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->use_ssl = use_ssl;
+    c->sockfd = tcp_connect(host, port, 10);
+    if (c->sockfd < 0) { free(c); return NULL; }
+    if (use_ssl) {
+        openssl_init_once();
+        c->ctx = SSL_CTX_new(SSLv23_client_method());
+        if (!c->ctx) { close(c->sockfd); free(c); return NULL; }
+        SSL_CTX_set_options(c->ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+        c->ssl = SSL_new(c->ctx);
+        SSL_set_fd(c->ssl, c->sockfd);
+        if (SSL_connect(c->ssl) <= 0) {
+            SSL_free(c->ssl);
+            SSL_CTX_free(c->ctx);
+            close(c->sockfd);
+            free(c);
+            return NULL;
+        }
+    }
+    return c;
+}
+
+static void conn_close(conn_t *c) {
+    if (!c) return;
+    if (c->use_ssl && c->ssl) {
+        SSL_shutdown(c->ssl);
+        SSL_free(c->ssl);
+    }
+    if (c->ctx) SSL_CTX_free(c->ctx);
+    if (c->sockfd >= 0) close(c->sockfd);
+    free(c);
+}
+
+/* Send data over connection */
+static ssize_t conn_send(conn_t *c, const char *buf, size_t len) {
+    if (c->use_ssl) return SSL_write(c->ssl, buf, (int)len);
+    return send(c->sockfd, buf, len, 0);
+}
+
+/* Receive data into buffer, returns bytes read or -1 */
+static ssize_t conn_recv(conn_t *c, char *buf, size_t len) {
+    if (c->use_ssl) return SSL_read(c->ssl, buf, (int)len);
+    return recv(c->sockfd, buf, len, 0);
+}
+
+/* ---------- HTTP helpers ---------- */
+
+/* Build GET request with headers */
+static char *build_get_request(const char *host, const char *path) {
+    char *req = xmalloc(8192);
+    snprintf(req, 8192,
+             "GET %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "User-Agent: %s\r\n"
+             "Accept: */*\r\n"
+             "Connection: close\r\n"
+             "\r\n",
+             path, host, USER_AGENT);
+    return req;
+}
+
+/* Read full response into dynamically allocated buffer.
+ * Handles chunked transfer decoding into a contiguous body buffer.
+ * Returns body buffer and sets content_length and headers (allocated).
+ * Caller must free body and headers.
+ */
+static char *http_fetch(conn_t *c, size_t *out_body_len, char **out_headers, int *out_status) {
+    char buf[BUF_SIZE];
+    size_t cap = BUF_SIZE, len = 0;
+    char *resp = xmalloc(cap);
+    ssize_t r;
+    while ((r = conn_recv(c, buf, sizeof(buf))) > 0) {
+        if (len + r + 1 > cap) {
+            cap = (cap + r + 1) * 2;
+            resp = realloc(resp, cap);
+        }
+        memcpy(resp + len, buf, r);
+        len += r;
+    }
+    if (len == 0) { free(resp); return NULL; }
+    resp[len] = 0;
+
+    /* Split headers and body */
+    char *hdr_end = strstr(resp, "\r\n\r\n");
+    if (!hdr_end) {
+        /* No headers? treat entire as body */
+        *out_headers = NULL;
+        *out_body_len = len;
+        *out_status = 200;
+        return resp;
+    }
+    size_t headers_len = hdr_end - resp + 4;
+    *out_headers = malloc(headers_len + 1);
+    memcpy(*out_headers, resp, headers_len);
+    (*out_headers)[headers_len] = 0;
+
+    /* parse status code */
+    int status = 200;
+    char *status_line_end = strstr(resp, "\r\n");
+    if (status_line_end) {
+        char status_line[256];
+        size_t slen = status_line_end - resp;
+        if (slen > sizeof(status_line)-1) slen = sizeof(status_line)-1;
+        memcpy(status_line, resp, slen);
+        status_line[slen] = 0;
+        char *sp = strchr(status_line, ' ');
+        if (sp) status = atoi(sp+1);
+    }
+    *out_status = status;
+
+    char *body = resp + headers_len;
+    size_t body_len = len - headers_len;
+
+    /* Check for Transfer-Encoding: chunked */
+    if (strcasecmpr(*out_headers, "Transfer-Encoding: chunked")) {
+        /* decode chunked */
+        size_t outcap = body_len + 1, outlen = 0;
+        char *out = xmalloc(outcap);
+        char *p = body;
+        char *end = resp + len;
+        while (p < end) {
+            /* read chunk size line */
+            char *line_end = strstr(p, "\r\n");
+            if (!line_end) break;
+            char sizebuf[64];
+            size_t sl = line_end - p;
+            if (sl >= sizeof(sizebuf)) sl = sizeof(sizebuf)-1;
+            memcpy(sizebuf, p, sl);
+            sizebuf[sl] = 0;
+            unsigned int chunk_size = 0;
+            sscanf(sizebuf, "%x", &chunk_size);
+            if (chunk_size == 0) { p = line_end + 2; break; }
+            p = line_end + 2;
+            if (p + chunk_size > end) break;
+            if (outlen + chunk_size + 1 > outcap) {
+                outcap = (outlen + chunk_size + 1) * 2;
+                out = realloc(out, outcap);
+            }
+            memcpy(out + outlen, p, chunk_size);
+            outlen += chunk_size;
+            p += chunk_size + 2; /* skip CRLF */
+        }
+        out[outlen] = 0;
+        free(resp);
+        *out_body_len = outlen;
+        return out;
+    } else {
+        /* Not chunked: return body pointer copy */
+        char *out = xmalloc(body_len + 1);
+        memcpy(out, body, body_len);
+        out[body_len] = 0;
+        free(resp);
+        *out_body_len = body_len;
+        return out;
+    }
+}
+
+/* Extract header value (case-insensitive) */
+static char *get_header_value(const char *headers, const char *name) {
+    if (!headers) return NULL;
+    const char *p = headers;
+    size_t nlen = strlen(name);
+    while (*p) {
+        const char *line_end = strstr(p, "\r\n");
+        if (!line_end) line_end = p + strlen(p);
+        if (strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            const char *val = p + nlen + 1;
+            while (*val == ' ') val++;
+            size_t vlen = line_end - val;
+            char *out = malloc(vlen + 1);
+            memcpy(out, val, vlen);
+            out[vlen] = 0;
+            return out;
+        }
+        if (*line_end == 0) break;
+        p = line_end + 2;
+    }
+    return NULL;
+}
+
+/* ---------- File saving ---------- */
+
+/* Create safe filename from URL path */
+static void save_to_disk(const char *host, const char *url_path, const char *data, size_t len, const char *content_type) {
+    char dirpath[1024];
+    snprintf(dirpath, sizeof(dirpath), "%s/%s", OUTPUT_DIR, host);
+    mkdir_p(dirpath);
+
+    /* Build full path */
+    char pathcopy[2048];
+    snprintf(pathcopy, sizeof(pathcopy), "%s", url_path);
+    if (strlen(pathcopy) == 0) strcpy(pathcopy, "/");
+    /* If path ends with '/', treat as directory and use index.html */
+    char filename[512];
+    if (pathcopy[strlen(pathcopy)-1] == '/') {
+        snprintf(filename, sizeof(filename), "%sindex.html", pathcopy);
+    } else {
+        snprintf(filename, sizeof(filename), "%s", pathcopy);
+    }
+    /* Remove leading slash for concatenation */
+    char *rel = filename;
+    if (rel[0] == '/') rel++;
+
+    char outpath[4096];
+    snprintf(outpath, sizeof(outpath), "%s/%s", dirpath, rel);
+
+    /* Ensure parent dir exists */
+    char parent[4096];
+    strncpy(parent, outpath, sizeof(parent));
+    char *ps = strrchr(parent, '/');
+    if (ps) { *ps = 0; mkdir_p(parent); }
+
+    int fd = open(outpath, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "Failed to open %s: %s\n", outpath, strerror(errno));
+        return;
+    }
+    ssize_t w = write(fd, data, len);
+    if (w < 0) fprintf(stderr, "Write error %s\n", strerror(errno));
+    close(fd);
+    printf("[saved] %s (%zu bytes) type=%s\n", outpath, len, content_type ? content_type : "unknown");
+}
+
+/* ---------- robots.txt (basic) ---------- */
+
+/* Fetch robots.txt for host and parse Disallow lines for User-agent: * */
+typedef struct {
+    char **disallow;
+    int count;
+} robots_t;
+
+static void robots_free(robots_t *r) {
+    if (!r) return;
+    for (int i = 0; i < r->count; ++i) free(r->disallow[i]);
+    free(r->disallow);
+    r->disallow = NULL;
+    r->count = 0;
+}
+
+static robots_t robots_parse_from_body(const char *body, size_t len) {
+    robots_t r = {0};
+    const char *p = body;
+    while (p && *p) {
+        const char *line_end = strstr(p, "\n");
+        size_t l = line_end ? (size_t)(line_end - p) : strlen(p);
+        char line[1024];
+        size_t copylen = l < sizeof(line)-1 ? l : sizeof(line)-1;
+        memcpy(line, p, copylen);
+        line[copylen] = 0;
+        /* trim */
+        char *s = line;
+        while (*s && isspace((unsigned char)*s)) s++;
+        if (strncasecmp(s, "User-agent:", 11) == 0) {
+            /* we only care about global rules; skip until Disallow lines */
+        } else if (strncasecmp(s, "Disallow:", 9) == 0) {
+            char *val = s + 9;
+            while (*val && isspace((unsigned char)*val)) val++;
+            if (*val) {
+                r.disallow = realloc(r.disallow, sizeof(char*) * (r.count + 1));
+                r.disallow[r.count++] = xstrdup(val);
+            }
+        }
+        if (!line_end) break;
+        p = line_end + 1;
+    }
+    return r;
+}
+
+static int robots_is_allowed(robots_t *r, const char *path) {
+    if (!r || r->count == 0) return 1;
+    for (int i = 0; i < r->count; ++i) {
+        if (strncmp(path, r->disallow[i], strlen(r->disallow[i])) == 0) return 0;
+    }
+    return 1;
+}
+
+/* ---------- HTML/CSS parsing for links/assets ---------- */
+
+/* Extract attributes via XPath and add to set */
+static void extract_with_xpath(htmlDocPtr doc, const char *expr, const char *base_url) {
+    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
+    if (!ctx) return;
+    xmlXPathObjectPtr obj = xmlXPathEvalExpression((xmlChar*)expr, ctx);
+    if (!obj) { xmlXPathFreeContext(ctx); return; }
+    xmlNodeSetPtr nodes = obj->nodesetval;
+    if (!nodes) { xmlXPathFreeObject(obj); xmlXPathFreeContext(ctx); return; }
+    for (int i = 0; i < nodes->nodeNr; ++i) {
+        xmlNodePtr attr = nodes->nodeTab[i];
+        if (!attr || !attr->children) continue;
+        char *val = (char*)xmlNodeGetContent(attr);
+        if (!val) continue;
+        char *abs = resolve_url(base_url, val);
+        if (abs) urlset_add(&urlset, abs);
+        xmlFree(val);
+        free(abs);
+    }
+    xmlXPathFreeObject(obj);
+    xmlXPathFreeContext(ctx);
+}
+
+/* Extract CSS url(...) patterns */
+static void extract_css_urls(const char *css, const char *base_url) {
+    const char *p = css;
+    while ((p = strstr(p, "url(")) != NULL) {
+        p += 4;
+        while (*p && isspace((unsigned char)*p)) p++;
+        char quote = 0;
+        if (*p == '\'' || *p == '"') { quote = *p; p++; }
+        const char *start = p;
+        while (*p && ((quote && *p != quote) || (!quote && *p != ')'))) p++;
+        size_t len = p - start;
+        if (len > 0 && len < 1024) {
+            char tmp[1024];
+            memcpy(tmp, start, len);
+            tmp[len] = 0;
+            char *abs = resolve_url(base_url, tmp);
+            if (abs) urlset_add(&urlset, abs);
+            free(abs);
+        }
+        if (quote && *p == quote) p++;
+        if (*p == ')') p++;
+    }
+}
+
+/* Parse HTML and extract links/assets */
+static void extract_links_and_assets(const char *base_url, const char *html) {
+    htmlDocPtr doc = htmlReadMemory(html, strlen(html), base_url, NULL, HTML_PARSE_NOERROR | HTML_PARSE_NOWARNING);
+    if (!doc) return;
+    /* Common attributes */
+    const char *xpaths[] = {
+        "//a/@href",
+        "//img/@src",
+        "//script/@src",
+        "//link[@rel='stylesheet']/@href",
+        "//link[@rel='icon']/@href",
+        "//audio/@src",
+        "//video/@src",
+        "//source/@src",
+        NULL
+    };
+    for (int i = 0; xpaths[i]; ++i) extract_with_xpath(doc, xpaths[i], base_url);
+
+    /* Extract inline style attributes and style tags for url(...) */
+    xmlXPathContextPtr ctx = xmlXPathNewContext(doc);
+    if (ctx) {
+        xmlXPathObjectPtr obj = xmlXPathEvalExpression((xmlChar*)"//@style", ctx);
+        if (obj && obj->nodesetval) {
+            for (int i = 0; i < obj->nodesetval->nodeNr; ++i) {
+                xmlNodePtr attr = obj->nodesetval->nodeTab[i];
+                if (!attr || !attr->children) continue;
+                char *val = (char*)xmlNodeGetContent(attr);
+                if (val) { extract_css_urls(val, base_url); xmlFree(val); }
+            }
+        }
+        if (obj) xmlXPathFreeObject(obj);
+        /* style tags */
+        obj = xmlXPathEvalExpression((xmlChar*)"//style/text()", ctx);
+        if (obj && obj->nodesetval) {
+            for (int i = 0; i < obj->nodesetval->nodeNr; ++i) {
+                xmlNodePtr node = obj->nodesetval->nodeTab[i];
+                if (!node || !node->children) continue;
+                char *val = (char*)xmlNodeGetContent(node);
+                if (val) { extract_css_urls(val, base_url); xmlFree(val); }
+            }
+        }
+        if (obj) xmlXPathFreeObject(obj);
+        xmlXPathFreeContext(ctx);
+    }
+    xmlFreeDoc(doc);
+}
+
+/* ---------- Per-host politeness and robots cache ---------- */
+
+typedef struct host_info {
+    char *host;
+    robots_t robots;
+    struct timespec last_access;
+    pthread_mutex_t lock;
+    struct host_info *next;
+} host_info_t;
+
+static host_info_t *hosts = NULL;
+static pthread_mutex_t hosts_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static host_info_t *get_host_info(const char *host) {
+    pthread_mutex_lock(&hosts_lock);
+    host_info_t *h = hosts;
+    while (h) {
+        if (strcmp(h->host, host) == 0) { pthread_mutex_unlock(&hosts_lock); return h; }
+        h = h->next;
+    }
+    h = xmalloc(sizeof(*h));
+    h->host = xstrdup(host);
+    h->robots.disallow = NULL;
+    h->robots.count = 0;
+    clock_gettime(CLOCK_REALTIME, &h->last_access);
+    pthread_mutex_init(&h->lock, NULL);
+    h->next = hosts;
+    hosts = h;
+    pthread_mutex_unlock(&hosts_lock);
+    return h;
+}
+
+/* Fetch robots.txt for host (if not already fetched) */
+static void ensure_robots_for_host(const char *scheme, const char *host) {
+    host_info_t *hi = get_host_info(host);
+    pthread_mutex_lock(&hi->lock);
+    if (hi->robots.count > 0) { pthread_mutex_unlock(&hi->lock); return; }
+    /* build robots URL */
+    char robots_url[1024];
+    snprintf(robots_url, sizeof(robots_url), "%s://%s/robots.txt", scheme, host);
+    /* fetch */
+    url_t u;
+    if (parse_url(robots_url, &u) != 0) { pthread_mutex_unlock(&hi->lock); return; }
+    int use_ssl = (strcmp(u.scheme, "https") == 0);
+    conn_t *c = conn_open(u.host, u.port, use_ssl);
+    if (!c) { free_url(&u); pthread_mutex_unlock(&hi->lock); return; }
+    char *req = build_get_request(u.host, u.path);
+    conn_send(c, req, strlen(req));
+    free(req);
+    char *headers = NULL;
+    size_t body_len = 0;
+    int status = 0;
+    char *body = http_fetch(c, &body_len, &headers, &status);
+    if (body && body_len > 0 && status == 200) {
+        hi->robots = robots_parse_from_body(body, body_len);
+    }
+    free(body);
+    free(headers);
+    conn_close(c);
+    free_url(&u);
+    pthread_mutex_unlock(&hi->lock);
+}
+
+/* Politeness: ensure at least DEFAULT_DELAY_MS between requests to same host */
+static void enforce_politeness(const char *host) {
+    host_info_t *hi = get_host_info(host);
+    pthread_mutex_lock(&hi->lock);
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    long elapsed_ms = (now.tv_sec - hi->last_access.tv_sec) * 1000 + (now.tv_nsec - hi->last_access.tv_nsec) / 1000000;
+    if (elapsed_ms < DEFAULT_DELAY_MS) {
+        long wait = DEFAULT_DELAY_MS - elapsed_ms;
+        pthread_mutex_unlock(&hi->lock);
+        usleep(wait * 1000);
+        pthread_mutex_lock(&hi->lock);
+    }
+    clock_gettime(CLOCK_REALTIME, &hi->last_access);
+    pthread_mutex_unlock(&hi->lock);
+}
+
+/* ---------- Worker thread and crawl logic ---------- */
+
+typedef struct {
+    int id;
+    int max_redirects;
+} worker_arg_t;
+
+static int max_threads = 4;
+
+/* Crawl a single URL entry */
+static void crawl_url_entry(url_entry_t *entry) {
+    if (!entry || !entry->url) return;
+    printf("[worker] crawling %s\n", entry->url);
+
+    url_t u;
+    if (parse_url(entry->url, &u) != 0) {
+        fprintf(stderr, "Invalid URL: %s\n", entry->url);
+        return;
+    }
+
+    /* robots.txt check */
+    ensure_robots_for_host(u.scheme, u.host);
+    host_info_t *hi = get_host_info(u.host);
+    pthread_mutex_lock(&hi->lock);
+    int allowed = robots_is_allowed(&hi->robots, u.path);
+    pthread_mutex_unlock(&hi->lock);
+    if (!allowed) {
+        printf("[robots] disallowed: %s\n", entry->url);
+        free_url(&u);
+        return;
+    }
+
+    enforce_politeness(u.host);
+
+    int redirects = 0;
+    char *current_url = xstrdup(entry->url);
+    char *last_content_type = NULL;
+
+    while (redirects < 8) {
+        url_t cur;
+        if (parse_url(current_url, &cur) != 0) break;
+        int use_ssl = (strcmp(cur.scheme, "https") == 0);
+        conn_t *c = conn_open(cur.host, cur.port, use_ssl);
+        if (!c) {
+            fprintf(stderr, "Connection failed: %s\n", current_url);
+            free_url(&cur);
+            break;
+        }
+        char *req = build_get_request(cur.host, cur.path);
+        conn_send(c, req, strlen(req));
+        free(req);
+
+        char *headers = NULL;
+        size_t body_len = 0;
+        int status = 0;
+        char *body = http_fetch(c, &body_len, &headers, &status);
+        conn_close(c);
+
+        if (!headers) {
+            fprintf(stderr, "No headers for %s\n", current_url);
+            free(body);
+            free_url(&cur);
+            break;
+        }
+
+        char *ctype = get_header_value(headers, "Content-Type");
+        if (last_content_type) free(last_content_type);
+        last_content_type = ctype ? xstrdup(ctype) : xstrdup("application/octet-stream");
+
+        /* Handle redirects (3xx) */
+        if (status >= 300 && status < 400) {
+            char *loc = get_header_value(headers, "Location");
+            if (loc) {
+                char *next = resolve_url(current_url, loc);
+                free(loc);
+                free(body);
+                free(headers);
+                free_url(&cur);
+                free(current_url);
+                current_url = next ? next : NULL;
+                if (!current_url) break;
+                redirects++;
+                continue;
+            }
+        }
+
+        /* Save to disk */
+        save_to_disk(cur.host, cur.path, body, body_len, ctype);
+
+        /* If HTML, parse and extract links/assets */
+        if (ctype && strcasestr(ctype, "text/html")) {
+            extract_links_and_assets(current_url, body);
+        } else if (ctype && strcasestr(ctype, "text/css")) {
+            /* parse CSS for url(...) */
+            extract_css_urls(body, current_url);
+        }
+
+        free(body);
+        free(headers);
+        free_url(&cur);
+        break;
+    }
+
+    free(last_content_type);
+    free(current_url);
+    free_url(&u);
+}
+
+/* Worker thread main loop */
+static void *worker_main(void *arg) {
+    worker_arg_t *wa = arg;
+    while (1) {
+        url_entry_t *e = urlset_pop_uncrawled(&urlset);
+        if (!e) break;
+        crawl_url_entry(e);
+        /* continue until no uncrawled entries */
+    }
+    return NULL;
+}
+
+/* ---------- Main ---------- */
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <start-url> [max-threads]\n", argv[0]);
+        return 1;
+    }
+    if (argc >= 3) max_threads = atoi(argv[2]) > 0 ? atoi(argv[2]) : max_threads;
+
+    /* init */
+    urlset_init(&urlset);
+    mkdir_p(OUTPUT_DIR);
+    xmlInitParser();
+    SSL_library_init();
+
+    urlset_add(&urlset, argv[1]);
+
+    /* Start worker threads */
+    pthread_t *threads = xmalloc(sizeof(pthread_t) * max_threads);
+    worker_arg_t *args = xmalloc(sizeof(worker_arg_t) * max_threads);
+    for (int i = 0; i < max_threads; ++i) {
+        args[i].id = i;
+        args[i].max_redirects = 8;
+        pthread_create(&threads[i], NULL, worker_main, &args[i]);
+    }
+
+    for (int i = 0; i < max_threads; ++i) pthread_join(threads[i], NULL);
+
+    /* cleanup */
+    /* free urlset entries */
+    for (int i = 0; i < HASH_SIZE; ++i) {
+        url_entry_t *e = urlset.buckets[i];
+        while (e) {
+            url_entry_t *n = e->next;
+            free(e->url);
+            free(e);
+            e = n;
+        }
+    }
+    free(threads);
+    free(args);
+
+    /* free hosts and robots */
+    host_info_t *h = hosts;
+    while (h) {
+        host_info_t *n = h->next;
+        robots_free(&h->robots);
+        free(h->host);
+        free(h);
+        h = n;
+    }
+
+    xmlCleanupParser();
+    printf("Crawl finished.\n");
+    return 0;
+}

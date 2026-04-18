@@ -1,0 +1,2 @@
+set(__QT_DEPLOY_TARGET_cia-antivirus_FILE /wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus)
+set(__QT_DEPLOY_TARGET_cia-antivirus_TYPE EXECUTABLE)

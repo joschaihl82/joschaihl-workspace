@@ -1,0 +1,14 @@
+[
+{
+  "directory": "/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local -I/wrk/cia-antivirus-workspace/cia-antivirus4 -I/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -O3 -DNDEBUG -std=gnu++17 -fPIE -Wall -Wextra -Wpedantic -o CMakeFiles/cia-antivirus.dir/cia-antivirus_autogen/mocs_compilation.cpp.o -c /wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/mocs_compilation.cpp",
+  "file": "/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/mocs_compilation.cpp",
+  "output": "CMakeFiles/cia-antivirus.dir/cia-antivirus_autogen/mocs_compilation.cpp.o"
+},
+{
+  "directory": "/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -I/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local -I/wrk/cia-antivirus-workspace/cia-antivirus4 -I/wrk/cia-antivirus-workspace/cia-antivirus4/build/cmake.run.linux.x86_64.Local/cia-antivirus_autogen/include -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -O3 -DNDEBUG -std=gnu++17 -fPIE -Wall -Wextra -Wpedantic -o CMakeFiles/cia-antivirus.dir/cia-antivirus4.cpp.o -c /wrk/cia-antivirus-workspace/cia-antivirus4/cia-antivirus4.cpp",
+  "file": "/wrk/cia-antivirus-workspace/cia-antivirus4/cia-antivirus4.cpp",
+  "output": "CMakeFiles/cia-antivirus.dir/cia-antivirus4.cpp.o"
+}
+]

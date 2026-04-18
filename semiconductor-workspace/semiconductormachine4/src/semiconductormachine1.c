@@ -1,0 +1,488 @@
+// File: semiconductor_ca.c
+// Compile: see instructions below
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_ttf.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+// Initiale Gittergröße (logische Zellen)
+#define GRID_W 160
+#define GRID_H 120
+
+// Zoom Grenzen (Pixel pro Zelle)
+#define CELL_MIN 2
+#define CELL_MAX 20
+#define CELL_DEFAULT 5
+
+// Toolbox Breite in Pixel (logische)
+#define TOOLBOX_W 160
+
+// Zelltypen
+typedef enum {
+    I = 0, // Isolator
+    S = 1, // Halbleiter
+    C = 2, // Leiter
+    P = 3, // Pluspol
+    M = 4  // Minuspol
+} CellType;
+
+typedef struct {
+    unsigned char type;   // CellType
+    unsigned char p_dop;  // p-dotierung counter
+    unsigned char n_dop;  // n-dotierung counter
+} Cell;
+
+static SDL_Color COLORS[] = {
+    {80, 80, 80, 255},    // I Grau
+    {0, 180, 0, 255},     // S Grün
+    {255, 255, 0, 255},   // C Gelb
+    {255, 0, 0, 255},     // P Rot
+    {0, 0, 255, 255}      // M Blau
+};
+
+const char* TOOL_LABELS[] = {
+    "Isolator",
+    "Halbleiter",
+    "Leiter",
+    "Pluspol",
+    "Minuspol"
+};
+
+typedef struct {
+    int cell_size;
+    int window_w;
+    int window_h;
+    SDL_Window* win;
+    SDL_Renderer* ren;
+    TTF_Font* font;
+    Cell grid[GRID_H][GRID_W];
+    int current_tool;
+    bool running;
+} AppState;
+
+// Hilfsfunktionen
+static void init_grid(AppState* app) {
+    for (int y = 0; y < GRID_H; ++y)
+        for (int x = 0; x < GRID_W; ++x) {
+            app->grid[y][x].type = S;
+            app->grid[y][x].p_dop = 0;
+            app->grid[y][x].n_dop = 0;
+        }
+    // Beispiel: setze zwei Polstreifen
+    for (int y = 0; y < GRID_H; ++y) {
+        app->grid[y][5].type = P;
+        app->grid[y][GRID_W - 6].type = M;
+    }
+    // zufällige Isolatoren
+    srand((unsigned)time(NULL));
+    for (int i = 0; i < 2000; ++i) {
+        int x = rand() % GRID_W;
+        int y = rand() % GRID_H;
+        app->grid[y][x].type = I;
+    }
+}
+
+static void update_window_size(AppState* app) {
+    app->window_w = GRID_W * app->cell_size + TOOLBOX_W;
+    app->window_h = GRID_H * app->cell_size;
+    SDL_SetWindowSize(app->win, app->window_w, app->window_h);
+}
+
+static void draw_text(AppState* app, const char* text, int x, int y, SDL_Color color) {
+    if (!app->font) return;
+    SDL_Surface* surf = TTF_RenderUTF8_Blended(app->font, text, color);
+    if (!surf) return;
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(app->ren, surf);
+    SDL_Rect dst = { x, y, surf->w, surf->h };
+    SDL_FreeSurface(surf);
+    if (tex) {
+        SDL_RenderCopy(app->ren, tex, NULL, &dst);
+        SDL_DestroyTexture(tex);
+    }
+}
+
+// Nachbarn zählen
+static void count_neighbors(AppState* app, int x, int y, int* cntP, int* cntM, int* cntC) {
+    *cntP = *cntM = *cntC = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = x + dx, ny = y + dy;
+            if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+            unsigned char t = app->grid[ny][nx].type;
+            if (t == P) (*cntP)++;
+            else if (t == M) (*cntM)++;
+            else if (t == C) (*cntC)++;
+        }
+    }
+}
+
+// Eine Simulationsiteration
+static void step_simulation(AppState* app) {
+    // Kopie des Gitters für synchrone Updates
+    Cell copy[GRID_H][GRID_W];
+    memcpy(copy, app->grid, sizeof(copy));
+
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            Cell* c = &copy[y][x];
+            Cell* orig = &app->grid[y][x];
+            // feste Zustände bleiben (Pol, Isolator)
+            if (orig->type == I || orig->type == P || orig->type == M) {
+                // keine Änderung
+                continue;
+            }
+            int cntP, cntM, cntC;
+            count_neighbors(app, x, y, &cntP, &cntM, &cntC);
+
+            if (orig->type == S) {
+                // Dotierung: erhöhe counters wenn Pole in Nachbarschaft
+                if (cntP > 0) {
+                    c->p_dop = (c->p_dop < 255) ? c->p_dop + cntP : 255;
+                }
+                if (cntM > 0) {
+                    c->n_dop = (c->n_dop < 255) ? c->n_dop + cntM : 255;
+                }
+                // Wenn sowohl p als auch n Dotierung über Schwelle, wird Leiter
+                if (c->p_dop >= 6 && c->n_dop >= 6) {
+                    c->type = C;
+                    c->p_dop = c->n_dop = 0;
+                } else if (cntC >= 2 && (rand() % 100) < 30) {
+                    // Leiter breitet sich in Halbleiter aus mit Wahrscheinlichkeit
+                    c->type = C;
+                    c->p_dop = c->n_dop = 0;
+                }
+            } else if (orig->type == C) {
+                // Leiter kann sich stabilisieren wenn nahe Pole oder andere Leiter
+                if (cntP == 0 && cntM == 0 && cntC == 0) {
+                    // ohne Unterstützung kann Leiter wieder zu Halbleiter werden
+                    if ((rand() % 100) < 5) {
+                        c->type = S;
+                        c->p_dop = c->n_dop = 0;
+                    }
+                } else {
+                    // Leiter bleibt
+                    c->type = C;
+                }
+            }
+            // Schreibe zurück
+            app->grid[y][x] = *c;
+        }
+    }
+}
+
+// Robustere Bresenham-Implementierung (integriert und getestet)
+static void paint_line_bresenham(AppState* app, int x0, int y0, int x1, int y1) {
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy; // err = dx - dy in sign-flipped variant
+
+    while (1) {
+        if (x0 >= 0 && x0 < GRID_W && y0 >= 0 && y0 < GRID_H) {
+            app->grid[y0][x0].type = app->current_tool;
+            app->grid[y0][x0].p_dop = app->grid[y0][x0].n_dop = 0;
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+// Mappe Fenster-Koordinaten auf logische Gitter-Koordinaten
+// Liefert logical_x/y (Pixel in logischem Koordinatensystem) und gx/gy (Zellen)
+static void window_to_logical_and_grid(AppState* app, int mx, int my,
+                                       int *logical_x, int *logical_y,
+                                       int *gx, int *gy) {
+    // logische Größe (ohne Skalierung)
+    int logical_w = GRID_W * app->cell_size + TOOLBOX_W;
+    int logical_h = GRID_H * app->cell_size;
+
+    // aktuelle Fenstergröße (in Fenster-Koordinaten)
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(app->win, &win_w, &win_h);
+    if (win_w <= 0) win_w = 1;
+    if (win_h <= 0) win_h = 1;
+
+    // Mappe Maus (Fenster-Koordinaten) auf logische Pixel
+    float sx = (float)logical_w / (float)win_w;
+    float sy = (float)logical_h / (float)win_h;
+
+    float lx = mx * sx;
+    float ly = my * sy;
+
+    if (logical_x) *logical_x = (int)lx;
+    if (logical_y) *logical_y = (int)ly;
+
+    if (gx) *gx = (int)(lx) / app->cell_size;
+    if (gy) *gy = (int)(ly) / app->cell_size;
+}
+
+// Zeichnen
+static void render(AppState* app) {
+    SDL_SetRenderDrawColor(app->ren, 20, 20, 20, 255);
+    SDL_RenderClear(app->ren);
+
+    // Gitter zeichnen
+    for (int y = 0; y < GRID_H; ++y) {
+        for (int x = 0; x < GRID_W; ++x) {
+            Cell* c = &app->grid[y][x];
+            SDL_Color col = COLORS[c->type];
+            // leichte Helligkeitsvariation bei Halbleiter je nach Dop
+            if (c->type == S) {
+                int shade = (c->p_dop + c->n_dop) / 2;
+                int g = col.g + (shade > 0 ? (shade > 50 ? 50 : shade) : 0);
+                if (g > 255) g = 255;
+                SDL_SetRenderDrawColor(app->ren, col.r, g, col.b, 255);
+            } else {
+                SDL_SetRenderDrawColor(app->ren, col.r, col.g, col.b, 255);
+            }
+            SDL_Rect r = { x * app->cell_size, y * app->cell_size, app->cell_size, app->cell_size };
+            SDL_RenderFillRect(app->ren, &r);
+        }
+    }
+
+    // Toolbox Hintergrund
+    SDL_SetRenderDrawColor(app->ren, 40, 40, 40, 255);
+    SDL_Rect toolbox = { GRID_W * app->cell_size, 0, TOOLBOX_W, app->window_h };
+    SDL_RenderFillRect(app->ren, &toolbox);
+
+    // Tools (farbige Kästchen) und Labels
+    for (int i = 0; i < 5; ++i) {
+        SDL_Color c = COLORS[i];
+        SDL_SetRenderDrawColor(app->ren, c.r, c.g, c.b, 255);
+        SDL_Rect r = { GRID_W * app->cell_size + 16, 16 + i * 56, 40, 40 };
+        SDL_RenderFillRect(app->ren, &r);
+        // Rahmen wenn ausgewählt
+        if (i == app->current_tool) {
+            SDL_SetRenderDrawColor(app->ren, 255, 255, 255, 255);
+            SDL_Rect br = { r.x - 2, r.y - 2, r.w + 4, r.h + 4 };
+            SDL_RenderDrawRect(app->ren, &br);
+        }
+        // Label
+        SDL_Color white = { 230, 230, 230, 255 };
+        draw_text(app, TOOL_LABELS[i], GRID_W * app->cell_size + 64, 24 + i * 56, white);
+    }
+
+    // Buttons: Start/Pause, Zoom In, Zoom Out, Clear, Step
+    SDL_Rect btn_start = { GRID_W * app->cell_size + 16, app->window_h - 160, 120, 36 };
+    SDL_Rect btn_step  = { GRID_W * app->cell_size + 16, app->window_h - 116, 120, 36 };
+    SDL_Rect btn_zoom_in  = { GRID_W * app->cell_size + 16, app->window_h - 72, 56, 36 };
+    SDL_Rect btn_zoom_out = { GRID_W * app->cell_size + 80, app->window_h - 72, 56, 36 };
+    SDL_Rect btn_clear = { GRID_W * app->cell_size + 16, app->window_h - 32, 120, 24 };
+
+    SDL_SetRenderDrawColor(app->ren, 70, 70, 70, 255);
+    SDL_RenderFillRect(app->ren, &btn_start);
+    SDL_RenderFillRect(app->ren, &btn_step);
+    SDL_RenderFillRect(app->ren, &btn_zoom_in);
+    SDL_RenderFillRect(app->ren, &btn_zoom_out);
+    SDL_RenderFillRect(app->ren, &btn_clear);
+
+    SDL_Color white = { 230, 230, 230, 255 };
+    draw_text(app, app->running ? "Pause" : "Start", btn_start.x + 18, btn_start.y + 8, white);
+    draw_text(app, "Step", btn_step.x + 40, btn_step.y + 8, white);
+    draw_text(app, "Zoom+", btn_zoom_in.x + 6, btn_zoom_in.y + 8, white);
+    draw_text(app, "Zoom-", btn_zoom_out.x + 6, btn_zoom_out.y + 8, white);
+    draw_text(app, "Clear", btn_clear.x + 36, btn_clear.y + 2, white);
+
+    SDL_RenderPresent(app->ren);
+}
+
+// Hilf: Button Hit Test
+static bool point_in_rect(int px, int py, SDL_Rect* r) {
+    return (px >= r->x && px < r->x + r->w && py >= r->y && py < r->y + r->h);
+}
+
+int main(int argc, char* argv[]) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (TTF_Init() != 0) {
+        fprintf(stderr, "TTF_Init error: %s\n", TTF_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    AppState app;
+    app.cell_size = CELL_DEFAULT;
+    app.current_tool = S;
+    app.running = false;
+    app.font = TTF_OpenFont("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14);
+    if (!app.font) {
+        // fallback: continue without text
+        app.font = NULL;
+    }
+
+    app.window_w = GRID_W * app.cell_size + TOOLBOX_W;
+    app.window_h = GRID_H * app.cell_size;
+
+    app.win = SDL_CreateWindow("Zellularautomat Halbleiter", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                               app.window_w, app.window_h, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    app.ren = SDL_CreateRenderer(app.win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+
+    init_grid(&app);
+
+    bool quit = false;
+    bool mouse_down = false;
+    bool painting = false;      // true wenn wir gerade auf dem Gitter malen
+    int paint_button = 0;       // welche Maustaste gemalt hat
+    int mouse_button = 0;
+    int last_gx = -1, last_gy = -1; // letzte gemalte Gitterkoordinate
+
+    Uint32 last_step = SDL_GetTicks();
+    const Uint32 step_interval = 100; // ms pro Simulationsschritt
+
+    while (!quit) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                quit = true;
+            } else if (e.type == SDL_WINDOWEVENT) {
+                if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+                    // Fenstergröße anpassen, aber wir behalten logische Größe
+                    int w = e.window.data1;
+                    int h = e.window.data2;
+                    app.window_w = w;
+                    app.window_h = h;
+                }
+            } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                mouse_down = true;
+                mouse_button = e.button.button;
+                paint_button = e.button.button;
+                int mx = e.button.x;
+                int my = e.button.y;
+
+                int logical_x = 0, logical_y = 0;
+                int gx = -1, gy = -1;
+                window_to_logical_and_grid(&app, mx, my, &logical_x, &logical_y, &gx, &gy);
+
+                // Prüfe, ob Klick im Gitter war (logische Koordinate)
+                if (logical_x >= 0 && logical_x < GRID_W * app.cell_size &&
+                    logical_y >= 0 && logical_y < GRID_H * app.cell_size) {
+                    painting = true;
+                    if (gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H) {
+                        // direkt malen und Startpunkt setzen
+                        app.grid[gy][gx].type = app.current_tool;
+                        app.grid[gy][gx].p_dop = app.grid[gy][gx].n_dop = 0;
+                        last_gx = gx;
+                        last_gy = gy;
+                    } else {
+                        last_gx = last_gy = -1;
+                    }
+                } else {
+                    // Klick in Toolbox/Buttons: handle wie bisher (nutze logische_x/logical_y für Tests)
+                    for (int i = 0; i < 5; ++i) {
+                        SDL_Rect r = { GRID_W * app.cell_size + 16, 16 + i * 56, 40, 40 };
+                        if (point_in_rect(logical_x, logical_y, &r)) {
+                            app.current_tool = i;
+                        }
+                    }
+                    SDL_Rect btn_start = { GRID_W * app.cell_size + 16, app.window_h - 160, 120, 36 };
+                    SDL_Rect btn_step  = { GRID_W * app.cell_size + 16, app.window_h - 116, 120, 36 };
+                    SDL_Rect btn_zoom_in  = { GRID_W * app.cell_size + 16, app.window_h - 72, 56, 36 };
+                    SDL_Rect btn_zoom_out = { GRID_W * app.cell_size + 80, app.window_h - 72, 56, 36 };
+                    SDL_Rect btn_clear = { GRID_W * app.cell_size + 16, app.window_h - 32, 120, 24 };
+
+                    if (point_in_rect(logical_x, logical_y, &btn_start)) {
+                        app.running = !app.running;
+                    } else if (point_in_rect(logical_x, logical_y, &btn_step)) {
+                        step_simulation(&app);
+                    } else if (point_in_rect(logical_x, logical_y, &btn_zoom_in)) {
+                        if (app.cell_size < CELL_MAX) {
+                            app.cell_size++;
+                            update_window_size(&app);
+                        }
+                    } else if (point_in_rect(logical_x, logical_y, &btn_zoom_out)) {
+                        if (app.cell_size > CELL_MIN) {
+                            app.cell_size--;
+                            update_window_size(&app);
+                        }
+                    } else if (point_in_rect(logical_x, logical_y, &btn_clear)) {
+                        init_grid(&app);
+                    }
+                    // Klick in Toolbox beendet Malmodus
+                    painting = false;
+                    last_gx = last_gy = -1;
+                }
+            } else if (e.type == SDL_MOUSEBUTTONUP) {
+                mouse_down = false;
+                painting = false; // Stoppe Malen beim Loslassen
+                paint_button = 0;
+                last_gx = last_gy = -1;
+            } else if (e.type == SDL_MOUSEMOTION) {
+                int mx = e.motion.x;
+                int my = e.motion.y;
+
+                // Mappe Mausposition auf logische Koordinaten und Zellen
+                int logical_x = 0, logical_y = 0;
+                int gx = -1, gy = -1;
+                window_to_logical_and_grid(&app, mx, my, &logical_x, &logical_y, &gx, &gy);
+
+                // Prüfe Maustastenstatus direkt aus motion event (robuster)
+                bool left_pressed = (e.motion.state & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+
+                // Wenn linke Taste gedrückt und Maus über Gitter -> malen
+                if (left_pressed &&
+                    logical_x >= 0 && logical_x < GRID_W * app.cell_size &&
+                    logical_y >= 0 && logical_y < GRID_H * app.cell_size) {
+
+                    if (gx >= 0 && gx < GRID_W && gy >= 0 && gy < GRID_H) {
+                        if (last_gx >= 0 && last_gy >= 0) {
+                            // Bresenham-Linie zwischen letztem und aktuellem Punkt
+                            paint_line_bresenham(&app, last_gx, last_gy, gx, gy);
+                        } else {
+                            app.grid[gy][gx].type = app.current_tool;
+                            app.grid[gy][gx].p_dop = app.grid[gy][gx].n_dop = 0;
+                        }
+                        last_gx = gx;
+                        last_gy = gy;
+                        painting = true;
+                    }
+                } else {
+                    // Wenn keine Taste gedrückt, reset last coords so next press starts fresh
+                    painting = false;
+                    last_gx = last_gy = -1;
+                }
+            } else if (e.type == SDL_KEYDOWN) {
+                if (e.key.keysym.sym == SDLK_SPACE) {
+                    app.running = !app.running;
+                } else if (e.key.keysym.sym == SDLK_c) {
+                    init_grid(&app);
+                } else if (e.key.keysym.sym == SDLK_EQUALS || e.key.keysym.sym == SDLK_PLUS) {
+                    if (app.cell_size < CELL_MAX) { app.cell_size++; update_window_size(&app); }
+                } else if (e.key.keysym.sym == SDLK_MINUS) {
+                    if (app.cell_size > CELL_MIN) { app.cell_size--; update_window_size(&app); }
+                }
+            }
+        }
+
+        Uint32 now = SDL_GetTicks();
+        if (app.running && now - last_step >= step_interval) {
+            step_simulation(&app);
+            last_step = now;
+        }
+
+        render(&app);
+        SDL_Delay(8);
+    }
+
+    if (app.font) TTF_CloseFont(app.font);
+    TTF_Quit();
+    SDL_DestroyRenderer(app.ren);
+    SDL_DestroyWindow(app.win);
+    SDL_Quit();
+    return 0;
+}

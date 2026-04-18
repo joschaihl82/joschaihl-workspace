@@ -1,0 +1,293 @@
+/* record_monitor_trace.c
+   Compile:
+     gcc $(pkg-config --cflags --libs gstreamer-1.0 glib-2.0) record_monitor_trace.c -o record_monitor_trace
+
+   Usage:
+     ./record_monitor_trace         # interaktiv Monitor-Auswahl falls vorhanden
+     ./record_monitor_trace 10      # 10 Sekunden Aufnahme
+     ./record_monitor_trace <device> 10  # erzwinge pulsesrc device string
+*/
+
+#include <gst/gst.h>
+#include <gst/gstdevicemonitor.h>
+#include <glib.h>
+#if GLIB_CHECK_VERSION(2, 30, 0)
+#include <glib-unix.h>
+#endif
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+
+static GstElement *pipeline = NULL;
+static GMainLoop *loop = NULL;
+
+/* send EOS in mainloop context */
+static gboolean send_eos_idle(gpointer user_data) {
+  (void)user_data;
+  if (pipeline) {
+    g_print("[INFO] send EOS to pipeline\n");
+    gst_element_send_event(pipeline, gst_event_new_eos());
+  }
+  return G_SOURCE_REMOVE;
+}
+
+#if GLIB_CHECK_VERSION(2, 30, 0)
+static gboolean on_unix_signal(gpointer user_data) {
+  (void)user_data;
+  g_idle_add(send_eos_idle, NULL);
+  return G_SOURCE_REMOVE;
+}
+#endif
+
+static volatile sig_atomic_t sigint_received = 0;
+static void fallback_sigint_handler(int sig) {
+  (void)sig;
+  sigint_received = 1;
+}
+static gboolean poll_sigint_cb(gpointer user_data) {
+  (void)user_data;
+  if (sigint_received) {
+    sigint_received = 0;
+    g_idle_add(send_eos_idle, NULL);
+    return G_SOURCE_REMOVE;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+/* filesink handoff callback: reports buffer sizes */
+static void filesink_handoff(GstElement *filesink, GstBuffer *buffer, GstPad *pad, gpointer user_data) {
+  (void)filesink; (void)pad; (void)user_data;
+  if (!buffer) return;
+  gsize size = gst_buffer_get_size(buffer);
+  GstClockTime pts = GST_BUFFER_PTS(buffer);
+  g_print("[HANDOFF] buffer size=%zu pts=%" GST_TIME_FORMAT "\n", (size_t)size, GST_TIME_ARGS(pts));
+}
+
+/* Bus callback: handle EOS, ERROR and element messages (level) */
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer data) {
+  GMainLoop *loop_local = (GMainLoop*)data;
+  switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_EOS:
+      g_print("[BUS] EOS received\n");
+      g_main_loop_quit(loop_local);
+      break;
+    case GST_MESSAGE_ERROR: {
+      GError *err = NULL;
+      gchar *dbg = NULL;
+      gst_message_parse_error(msg, &err, &dbg);
+      g_printerr("[BUS] ERROR: %s\n", err ? err->message : "unknown");
+      if (dbg) g_printerr("[BUS] DEBUG: %s\n", dbg);
+      g_clear_error(&err);
+      g_free(dbg);
+      g_main_loop_quit(loop_local);
+      break;
+    }
+    case GST_MESSAGE_ELEMENT: {
+      GstStructure *s = gst_message_get_structure(msg);
+      if (s && gst_structure_has_name(s, "level")) {
+        gchar *str = gst_structure_to_string(s);
+        g_print("[BUS] level message: %s\n", str);
+        g_free(str);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+/* helper: build pipeline description (filesink named 'sink') */
+static gchar *build_pipeline_desc(const char *source_element, const char *device_string) {
+  if (device_string && g_strcmp0(source_element, "pulsesrc") == 0) {
+    return g_strdup_printf(
+      "pulsesrc device=\"%s\" ! audioconvert ! audioresample ! level name=lev interval=100000000 ! "
+      "audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink name=sink location=out.wav",
+      device_string);
+  } else if (g_strcmp0(source_element, "pipewiresrc") == 0) {
+    return g_strdup(
+      "pipewiresrc ! audioconvert ! audioresample ! level name=lev interval=100000000 ! "
+      "audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink name=sink location=out.wav");
+  } else {
+    return g_strdup_printf(
+      "%s ! audioconvert ! audioresample ! level name=lev interval=100000000 ! "
+      "audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink name=sink location=out.wav",
+      source_element);
+  }
+}
+
+/* interactive chooser (same as before) */
+static int choose_index_interactive(char **names, int count) {
+  if (count <= 0) return -1;
+  if (count == 1) return 0;
+  g_print("Gefundene Monitor-Quellen:\n");
+  for (int i = 0; i < count; ++i) g_print("  %d) %s\n", i+1, names[i]);
+  g_print("Wähle Quelle (1-%d) oder Enter für 1: ", count);
+  fflush(stdout);
+  char buf[32];
+  if (!fgets(buf, sizeof(buf), stdin)) return 0;
+  int sel = atoi(buf);
+  if (sel < 1 || sel > count) return 0;
+  return sel - 1;
+}
+
+int main(int argc, char *argv[]) {
+  gst_init(&argc, &argv);
+
+  const char *forced = NULL;
+  int duration = 0;
+  if (argc >= 2) forced = argv[1];
+  if (argc >= 3) duration = atoi(argv[2]);
+
+  gchar *pipeline_desc = NULL;
+  gchar *chosen_device_string = NULL;
+  const char *chosen_source = NULL;
+
+  if (forced) {
+    if (strstr(forced, "src")) {
+      chosen_source = forced;
+      pipeline_desc = build_pipeline_desc(chosen_source, NULL);
+    } else {
+      chosen_source = "pulsesrc";
+      chosen_device_string = g_strdup(forced);
+      pipeline_desc = build_pipeline_desc(chosen_source, chosen_device_string);
+    }
+  } else {
+    GstDeviceMonitor *monitor = gst_device_monitor_new();
+    GstCaps *caps = gst_caps_new_empty_simple("audio/x-raw");
+    gst_device_monitor_add_filter(monitor, "Audio/Source", caps);
+    gst_caps_unref(caps);
+
+    if (!gst_device_monitor_start(monitor)) {
+      g_printerr("[WARN] DeviceMonitor konnte nicht gestartet werden\n");
+    }
+
+    GList *devices = gst_device_monitor_get_devices(monitor);
+    char **candidates = NULL;
+    char **display_names = NULL;
+    int cand_count = 0;
+
+    for (GList *l = devices; l; l = l->next) {
+      GstDevice *dev = GST_DEVICE(l->data);
+      const gchar *display = gst_device_get_display_name(dev);
+      if (!display) display = "(unknown)";
+      gboolean looks_like_monitor = (g_strrstr(display, ".monitor") != NULL) || (g_strrstr(display, "monitor") != NULL);
+
+      GstStructure *props = gst_device_get_properties(dev);
+      const gchar *devstr = NULL;
+      if (props) {
+        devstr = gst_structure_get_string(props, "device");
+        if (!devstr) devstr = gst_structure_get_string(props, "device.string");
+        if (!devstr) devstr = gst_structure_get_string(props, "device.name");
+        if (!devstr) devstr = gst_structure_get_string(props, "node.name");
+        gst_structure_free(props);
+      }
+
+      if (looks_like_monitor) {
+        const char *use = devstr ? devstr : display;
+        candidates = g_realloc(candidates, sizeof(char*) * (cand_count + 1));
+        display_names = g_realloc(display_names, sizeof(char*) * (cand_count + 1));
+        candidates[cand_count] = g_strdup(use);
+        display_names[cand_count] = g_strdup(display);
+        cand_count++;
+      }
+    }
+
+    for (GList *l = devices; l; l = l->next) gst_object_unref(l->data);
+    g_list_free(devices);
+    gst_device_monitor_stop(monitor);
+    gst_object_unref(monitor);
+
+    if (cand_count > 0) {
+      int idx = choose_index_interactive(display_names, cand_count);
+      chosen_source = "pulsesrc";
+      chosen_device_string = g_strdup(candidates[idx]);
+      for (int i = 0; i < cand_count; ++i) {
+        g_free(candidates[i]);
+        g_free(display_names[i]);
+      }
+      g_free(candidates);
+      g_free(display_names);
+    } else {
+      if (gst_element_factory_find("pipewiresrc")) {
+        chosen_source = "pipewiresrc";
+      } else if (gst_element_factory_find("pulsesrc")) {
+        chosen_source = "pulsesrc";
+      } else if (gst_element_factory_find("alsasrc")) {
+        chosen_source = "alsasrc";
+      } else if (gst_element_factory_find("autoaudiosrc")) {
+        chosen_source = "autoaudiosrc";
+      } else {
+        g_printerr("[ERROR] Keine geeignete Audioquelle gefunden (fehlende GStreamer-Elemente?)\n");
+        return 1;
+      }
+    }
+
+    pipeline_desc = build_pipeline_desc(chosen_source ? chosen_source : "pulsesrc", chosen_device_string);
+  }
+
+  g_print("[INFO] Pipeline: %s\n", pipeline_desc ? pipeline_desc : "(null)");
+  pipeline = gst_parse_launch(pipeline_desc, NULL);
+  g_free(pipeline_desc);
+
+  if (!pipeline) {
+    g_printerr("[ERROR] Pipeline konnte nicht erstellt werden\n");
+    if (chosen_device_string) g_free(chosen_device_string);
+    return 1;
+  }
+
+  /* attach handoff to filesink */
+  GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+  if (sink) {
+    /* enable handoffs */
+    g_object_set(sink, "signal-handoffs", TRUE, NULL);
+    g_signal_connect(sink, "handoff", G_CALLBACK(filesink_handoff), NULL);
+    gst_object_unref(sink);
+  } else {
+    g_printerr("[WARN] filesink 'sink' nicht gefunden\n");
+  }
+
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+  /* main loop + bus watch */
+  loop = g_main_loop_new(NULL, FALSE);
+  GstBus *bus = gst_element_get_bus(pipeline);
+  gst_bus_add_watch(bus, (GstBusFunc)bus_call, loop);
+  gst_object_unref(bus);
+
+#if GLIB_CHECK_VERSION(2, 30, 0)
+  g_unix_signal_add(SIGINT, on_unix_signal, NULL);
+#else
+  signal(SIGINT, fallback_sigint_handler);
+  g_timeout_add(200, poll_sigint_cb, NULL);
+#endif
+
+  if (duration > 0) {
+    g_print("[INFO] Aufnahme für %d Sekunden...\n", duration);
+    g_timeout_add_seconds(duration, (GSourceFunc)send_eos_idle, NULL);
+  } else {
+    g_print("[INFO] Aufnahme läuft (Ctrl+C zum Beenden)...\n");
+  }
+
+  g_main_loop_run(loop);
+
+  /* cleanup and report file size */
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
+
+  struct stat st;
+  if (stat("out.wav", &st) == 0) {
+    g_print("[INFO] out.wav Größe: %lld bytes\n", (long long)st.st_size);
+    if (st.st_size == 0) {
+      g_printerr("[WARN] out.wav ist 0 Bytes groß — keine Daten aufgenommen.\n");
+    }
+  } else {
+    g_printerr("[ERROR] Konnte out.wav nicht statten\n");
+  }
+
+  if (chosen_device_string) g_free(chosen_device_string);
+  g_main_loop_unref(loop);
+  return 0;
+}

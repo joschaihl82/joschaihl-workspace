@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.10)
+project(MiniNotepad C)
+
+# Verwende C11 (kann bei Bedarf angepasst werden)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Quellen
+set(SRC_FILES
+    notepad1.c
+)
+
+# Erstelle GUI-Executable (WIN32 verhindert Konsolenfenster)
+add_executable(notepad_clone WIN32 ${SRC_FILES})
+
+# Definiere UNICODE für WinAPI
+target_compile_definitions(notepad_clone PRIVATE UNICODE _UNICODE)
+
+# Spezifische Compiler-Optionen für MinGW/GCC
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # -municode sorgt dafür, dass wWinMain korrekt behandelt wird (optional)
+    target_compile_options(notepad_clone PRIVATE -Wall -Wextra)
+    if (MINGW)
+        target_compile_options(notepad_clone PRIVATE -municode)
+    endif()
+endif()
+
+# Linke die benötigten Windows-Bibliotheken
+target_link_libraries(notepad_clone PRIVATE
+    user32
+    gdi32
+    comdlg32
+    kernel32
+)
+
+# Optional: Install-Regeln
+install(TARGETS notepad_clone RUNTIME DESTINATION bin)

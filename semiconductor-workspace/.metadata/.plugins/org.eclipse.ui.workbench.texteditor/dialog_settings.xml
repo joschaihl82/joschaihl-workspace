@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<section name="java.lang.Class">
+		<item key="replaceBarOpen" value="false"/>
+		<list key="findhistory">
+			<item value="fullscreen"/>
+			<item value="zoom_in_centered"/>
+			<item value="nice_multiplier_for_px"/>
+			<item value="20"/>
+			<item value="init_particles"/>
+			<item value="rand"/>
+			<item value="rauschen"/>
+			<item value="particle_count"/>
+			<item value="count_neighbors_bitmap"/>
+			<item value="step_sim"/>
+		</list>
+	</section>
+</section>

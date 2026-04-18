@@ -1,0 +1,2 @@
+#define wtcrawler_VERSION_MAJOR @wtcrawler_VERSION_MAJOR@
+#define wtcrawler_VERSION_MINOR @wtcrawler_VERSION_MINOR@

@@ -1,0 +1,156 @@
+/* main.c
+ *
+ * Minimaler Browser mit GTK3 + WebKit2GTK 4.1
+ *
+ * Kompilieren:
+ *   gcc main.c -o browser $(pkg-config --cflags --libs gtk+-3.0 webkit2gtk-4.1)
+ */
+
+#include <gtk/gtk.h>
+#include <webkit2/webkit2.h>
+
+static void
+load_uri_from_entry(GtkEntry *entry, WebKitWebView *web_view)
+{
+    const char *text = gtk_entry_get_text(entry);
+    if (!text || *text == '\0') return;
+
+    if (!g_str_has_prefix(text, "http://") && !g_str_has_prefix(text, "https://")) {
+        char *uri = g_strdup_printf("http://%s", text);
+        webkit_web_view_load_uri(web_view, uri);
+        g_free(uri);
+    } else {
+        webkit_web_view_load_uri(web_view, text);
+    }
+}
+
+static void
+on_back_clicked(GtkButton *button, WebKitWebView *web_view)
+{
+    if (webkit_web_view_can_go_back(web_view))
+        webkit_web_view_go_back(web_view);
+}
+
+static void
+on_forward_clicked(GtkButton *button, WebKitWebView *web_view)
+{
+    if (webkit_web_view_can_go_forward(web_view))
+        webkit_web_view_go_forward(web_view);
+}
+
+static void
+on_reload_clicked(GtkButton *button, WebKitWebView *web_view)
+{
+    webkit_web_view_reload(web_view);
+}
+
+static void
+on_title_changed(WebKitWebView *web_view, GParamSpec *pspec, gpointer user_data)
+{
+    GtkWindow *window = GTK_WINDOW(user_data);
+    const gchar *title = webkit_web_view_get_title(web_view);
+    if (title && *title)
+        gtk_window_set_title(window, title);
+    else
+        gtk_window_set_title(window, "Mini WebKit Browser");
+}
+
+static void
+on_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_event, gpointer user_data)
+{
+    GtkEntry *entry = GTK_ENTRY(user_data);
+    const gchar *uri = webkit_web_view_get_uri(web_view);
+
+    switch (load_event) {
+    case WEBKIT_LOAD_STARTED:
+        if (uri) gtk_entry_set_text(entry, uri);
+        break;
+    case WEBKIT_LOAD_FINISHED:
+        if (uri) gtk_entry_set_text(entry, uri);
+        break;
+    default:
+        break;
+    }
+}
+
+static void
+activate(GtkApplication *app, gpointer user_data)
+{
+    GtkWidget *window;
+    GtkWidget *header;
+    GtkWidget *toolbar_box;
+    GtkWidget *back_btn, *forward_btn, *reload_btn;
+    GtkWidget *entry;
+    GtkWidget *scrolled;
+    GtkWidget *vbox;
+    WebKitWebView *web_view;
+
+    window = gtk_application_window_new(app);
+    gtk_window_set_default_size(GTK_WINDOW(window), 1024, 700);
+    gtk_window_set_title(GTK_WINDOW(window), "Mini WebKit Browser");
+
+    /* Header bar */
+    header = gtk_header_bar_new();
+    gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(header), TRUE);
+    gtk_header_bar_set_title(GTK_HEADER_BAR(header), "Mini WebKit Browser");
+    gtk_window_set_titlebar(GTK_WINDOW(window), header);
+
+    /* Toolbar */
+    toolbar_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+    /* GTK3: gtk_button_new_from_icon_name braucht 2 Argumente */
+    back_btn    = gtk_button_new_from_icon_name("go-previous", GTK_ICON_SIZE_BUTTON);
+    forward_btn = gtk_button_new_from_icon_name("go-next",     GTK_ICON_SIZE_BUTTON);
+    reload_btn  = gtk_button_new_from_icon_name("view-refresh", GTK_ICON_SIZE_BUTTON);
+
+    entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(entry), "https://example.org");
+    gtk_widget_set_hexpand(entry, TRUE);
+
+    gtk_box_pack_start(GTK_BOX(toolbar_box), back_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), forward_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), reload_btn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar_box), entry, TRUE, TRUE, 0);
+
+    gtk_container_add(GTK_CONTAINER(header), toolbar_box);
+
+    /* WebView */
+    scrolled = gtk_scrolled_window_new(NULL, NULL);
+    web_view = WEBKIT_WEB_VIEW(webkit_web_view_new());
+    gtk_container_add(GTK_CONTAINER(scrolled), GTK_WIDGET(web_view));
+
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), scrolled, TRUE, TRUE, 0);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+
+    /* Signals */
+    g_signal_connect(back_btn, "clicked",   G_CALLBACK(on_back_clicked),  web_view);
+    g_signal_connect(forward_btn, "clicked",G_CALLBACK(on_forward_clicked), web_view);
+    g_signal_connect(reload_btn, "clicked", G_CALLBACK(on_reload_clicked),  web_view);
+
+    g_signal_connect(entry, "activate", G_CALLBACK(load_uri_from_entry), web_view);
+
+    g_signal_connect(web_view, "notify::title", G_CALLBACK(on_title_changed), window);
+    g_signal_connect(web_view, "load-changed",  G_CALLBACK(on_load_changed),  entry);
+
+    gtk_widget_show_all(window);
+
+    webkit_web_view_load_uri(web_view, "https://www.example.org");
+}
+
+int
+main(int argc, char **argv)
+{
+    GtkApplication *app;
+    int status;
+
+    /* G_APPLICATION_FLAGS_NONE ist deprecated, funktioniert aber noch.
+       Optional: G_APPLICATION_DEFAULT_FLAGS verwenden. */
+    app = gtk_application_new("org.example.minibrowser", G_APPLICATION_FLAGS_NONE);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
+
+    status = g_application_run(G_APPLICATION(app), argc, argv);
+    g_object_unref(app);
+
+    return status;
+}

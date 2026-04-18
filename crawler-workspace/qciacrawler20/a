@@ -1,0 +1,96 @@
+crawler.cpp: In static member function ‘static QRegularExpression& CrawlerWorker::emailRegex()’:
+crawler.cpp:85:54: error: ‘OptimizeOnFirstUsageOption’ is not a member of ‘QRegularExpression’
+   85 |                                  QRegularExpression::OptimizeOnFirstUsageOption);
+      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~
+crawler.cpp: In static member function ‘static QRegularExpression& CrawlerWorker::linkRegex()’:
+crawler.cpp:90:54: error: ‘OptimizeOnFirstUsageOption’ is not a member of ‘QRegularExpression’
+   90 |                                  QRegularExpression::OptimizeOnFirstUsageOption);
+      |                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~
+crawler.cpp: In member function ‘void CrawlerWorker::executeTask(const QString&, int)’:
+crawler.cpp:173:39: error: ‘FollowRedirectsAttribute’ is not a member of ‘QNetworkRequest’
+  173 |     req.setAttribute(QNetworkRequest::FollowRedirectsAttribute, true);
+      |                                       ^~~~~~~~~~~~~~~~~~~~~~~~
+crawler.cpp: In member function ‘void VisualCommandCenter::coordinator()’:
+crawler.cpp:301:21: error: expected unqualified-id before ‘=’ token
+  301 |     const int slots = m_availableNodes.size();
+      |                     ^
+crawler.cpp:312:89: error: no matching function for call to ‘QString::arg()’
+  312 |     QString qstr = QString("SELECT url, depth FROM queue WHERE status = 0 LIMIT %1").arg(slots);
+      |                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/qt6/QtCore/qcoreapplication.h:8,
+                 from /usr/include/x86_64-linux-gnu/qt6/QtWidgets/qapplication.h:8,
+                 from /usr/include/x86_64-linux-gnu/qt6/QtWidgets/QApplication:1,
+                 from crawler.cpp:2:
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:290:5: note: candidate: ‘template<class ... Args> typename std::enable_if<((sizeof... (Args) >= 2) && std::is_same<QtPrivate::BoolList<std::disjunction<std::is_convertible<Args, QString>, std::is_convertible<Args, QStringView>, std::is_convertible<Args, QLatin1String> >::value ..., true>, QtPrivate::BoolList<true, std::disjunction<std::is_convertible<Args, QString>, std::is_convertible<Args, QStringView>, std::is_convertible<Args, QLatin1String> >::value ...> >::value), QString>::type QString::arg(Args&& ...) const’
+  290 |     arg(Args &&...args) const
+      |     ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:290:5: note:   template argument deduction/substitution failed:
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h: In substitution of ‘template<class ... Args> typename std::enable_if<((sizeof... (Args) >= 2) && std::is_same<QtPrivate::BoolList<std::disjunction<std::is_convertible<Args, QString>, std::is_convertible<Args, QStringView>, std::is_convertible<Args, QLatin1String> >::value ..., true>, QtPrivate::BoolList<true, std::disjunction<std::is_convertible<Args, QString>, std::is_convertible<Args, QStringView>, std::is_convertible<Args, QLatin1String> >::value ...> >::value), QString>::type QString::arg(Args&& ...) const [with Args = {}]’:
+crawler.cpp:312:89:   required from here
+  312 |     QString qstr = QString("SELECT url, depth FROM queue WHERE status = 0 LIMIT %1").arg(slots);
+      |                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:290:5: error: no type named ‘type’ in ‘struct std::enable_if<false, QString>’
+  290 |     arg(Args &&...args) const
+      |     ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:241:27: note: candidate: ‘QString QString::arg(qlonglong, int, int, QChar) const’
+  241 |     [[nodiscard]] QString arg(qlonglong a, int fieldwidth=0, int base=10,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:241:27: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:243:27: note: candidate: ‘QString QString::arg(qulonglong, int, int, QChar) const’
+  243 |     [[nodiscard]] QString arg(qulonglong a, int fieldwidth=0, int base=10,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:243:27: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1282:9: note: candidate: ‘QString QString::arg(long int, int, int, QChar) const’
+ 1282 | QString QString::arg(long a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1282:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1284:9: note: candidate: ‘QString QString::arg(ulong, int, int, QChar) const’
+ 1284 | QString QString::arg(ulong a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1284:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1278:9: note: candidate: ‘QString QString::arg(int, int, int, QChar) const’
+ 1278 | QString QString::arg(int a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1278:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1280:9: note: candidate: ‘QString QString::arg(uint, int, int, QChar) const’
+ 1280 | QString QString::arg(uint a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1280:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1286:9: note: candidate: ‘QString QString::arg(short int, int, int, QChar) const’
+ 1286 | QString QString::arg(short a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1286:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1288:9: note: candidate: ‘QString QString::arg(ushort, int, int, QChar) const’
+ 1288 | QString QString::arg(ushort a, int fieldWidth, int base, QChar fillChar) const
+      |         ^~~~~~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:1288:9: note:   candidate expects 4 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:257:27: note: candidate: ‘QString QString::arg(double, int, char, int, QChar) const’
+  257 |     [[nodiscard]] QString arg(double a, int fieldWidth = 0, char format = 'g', int precision = -1,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:257:27: note:   candidate expects 5 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:259:27: note: candidate: ‘QString QString::arg(char, int, QChar) const’
+  259 |     [[nodiscard]] QString arg(char a, int fieldWidth = 0,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:259:27: note:   candidate expects 3 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:261:27: note: candidate: ‘QString QString::arg(QChar, int, QChar) const’
+  261 |     [[nodiscard]] QString arg(QChar a, int fieldWidth = 0,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:261:27: note:   candidate expects 3 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:263:27: note: candidate: ‘QString QString::arg(const QString&, int, QChar) const’
+  263 |     [[nodiscard]] QString arg(const QString &a, int fieldWidth = 0,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:263:27: note:   candidate expects 3 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:265:27: note: candidate: ‘QString QString::arg(QStringView, int, QChar) const’
+  265 |     [[nodiscard]] QString arg(QStringView a, int fieldWidth = 0,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:265:27: note:   candidate expects 3 arguments, 0 provided
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:267:27: note: candidate: ‘QString QString::arg(QLatin1StringView, int, QChar) const’
+  267 |     [[nodiscard]] QString arg(QLatin1StringView a, int fieldWidth = 0,
+      |                           ^~~
+/usr/include/x86_64-linux-gnu/qt6/QtCore/qstring.h:267:27: note:   candidate expects 3 arguments, 0 provided
+crawler.cpp: In member function ‘void VisualCommandCenter::setupVisualUI()’:
+crawler.cpp:367:35: error: ‘class QWebEngineProfile’ has no member named ‘setRequestInterceptor’; did you mean ‘setUrlRequestInterceptor’?
+  367 |     m_browser->page()->profile()->setRequestInterceptor(new ImageBlocker(this));
+      |                                   ^~~~~~~~~~~~~~~~~~~~~
+      |                                   setUrlRequestInterceptor
+make: *** [Makefile:1069: crawler.o] Fehler 1

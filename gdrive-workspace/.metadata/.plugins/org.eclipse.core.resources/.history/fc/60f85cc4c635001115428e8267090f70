@@ -1,0 +1,294 @@
+// gdrive.c
+// Compile: gcc -o gdrive gdrive.c -lcurl -ljansson
+// WARNING: This file contains placeholders only. Do NOT commit real credentials.
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <curl/curl.h>
+#include <jansson.h>
+#include <errno.h>
+
+#define BASE_DIR_ENV "HOME"
+#define TARGET_SUBDIR "google_drive"
+#define DRIVE_API "https://www.googleapis.com/drive/v3"
+#define OAUTH2_TOKEN_URL "https://oauth2.googleapis.com/token"
+#define OAUTH2_DEVICE_URL "https://oauth2.googleapis.com/device/code"
+#define SCOPE "https://www.googleapis.com/auth/drive.readonly"
+
+/* -------------------------
+   HARTKODIERTE PLACEHOLDER
+   Ersetze diese Werte NUR lokal.
+   ------------------------- */
+#define CLIENT_ID     "487363744399-g0h02noep3qgc2q7b5co0undhdoau0ir.apps.googleusercontent.com"
+#define CLIENT_SECRET "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"
+
+/* NOTE: Do NOT hardcode your Google account email/password here.
+   Use OAuth2 client_id/client_secret or a Service Account instead. */
+
+struct mem { char *data; size_t size; };
+
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t realsize = size * nmemb;
+    struct mem *m = (struct mem*)userdata;
+    char *p = realloc(m->data, m->size + realsize + 1);
+    if (!p) return 0;
+    m->data = p;
+    memcpy(&(m->data[m->size]), ptr, realsize);
+    m->size += realsize;
+    m->data[m->size] = 0;
+    return realsize;
+}
+
+static int http_post(const char *url, const char *postfields, struct mem *out, struct curl_slist *headers) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postfields);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+    if (headers) curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? 0 : -1;
+}
+
+static int http_get_auth(const char *url, const char *bearer, struct mem *out) {
+    CURL *curl = curl_easy_init();
+    if (!curl) return -1;
+    struct curl_slist *hdrs = NULL;
+    char auth[1024];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", bearer);
+    hdrs = curl_slist_append(hdrs, auth);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, out);
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    return (res == CURLE_OK) ? 0 : -1;
+}
+
+static int save_file(const char *path, const char *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    if (fwrite(data, 1, len, f) != len) { fclose(f); return -1; }
+    fclose(f);
+    return 0;
+}
+
+static int ensure_dir_recursive(const char *path) {
+    char tmp[4096];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            if (mkdir(tmp, 0755) && errno != EEXIST) return -1;
+            *p = '/';
+        }
+    }
+    if (mkdir(tmp, 0755) && errno != EEXIST) return -1;
+    return 0;
+}
+
+/* Device Flow using hardcoded CLIENT_ID/CLIENT_SECRET (placeholders).
+   Tokens are kept in memory only (no token file). */
+static int oauth_device_flow(char **access_token, char **refresh_token, int *expires_in) {
+    if (strcmp(CLIENT_ID, "REPLACE_WITH_YOUR_CLIENT_ID") == 0) {
+        fprintf(stderr, "CLIENT_ID not set. Edit the source to add your OAuth client_id.\n");
+        return -1;
+    }
+
+    struct mem out = {0};
+    char post[1024];
+    snprintf(post, sizeof(post), "client_id=%s&scope=%s", CLIENT_ID, SCOPE);
+    struct curl_slist *hdrs = curl_slist_append(NULL, "Content-Type: application/x-www-form-urlencoded");
+    if (http_post(OAUTH2_DEVICE_URL, post, &out, hdrs) != 0) { curl_slist_free_all(hdrs); return -1; }
+    curl_slist_free_all(hdrs);
+
+    json_error_t err;
+    json_t *resp = json_loads(out.data, 0, &err);
+    free(out.data);
+    if (!resp) { fprintf(stderr, "Device flow response parse error\n"); return -1; }
+
+    const char *user_code = json_string_value(json_object_get(resp, "user_code"));
+    const char *verification_url = json_string_value(json_object_get(resp, "verification_url"));
+    int interval = json_integer_value(json_object_get(resp, "interval"));
+    const char *device_code = json_string_value(json_object_get(resp, "device_code"));
+
+    if (!user_code || !verification_url || !device_code) { json_decref(resp); fprintf(stderr, "Device flow missing fields\n"); return -1; }
+
+    printf("Open the following URL in your browser and enter the code:\n%s\nCode: %s\n", verification_url, user_code);
+    printf("Waiting for authorization...\n");
+
+    int max_tries = 600 / (interval>0?interval:5);
+    for (int i=0;i<max_tries;i++) {
+        sleep(interval>0?interval:5);
+        struct mem out2 = {0};
+        char post2[2048];
+        snprintf(post2, sizeof(post2),
+                 "client_id=%s&client_secret=%s&device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code",
+                 CLIENT_ID, CLIENT_SECRET, device_code);
+        if (http_post(OAUTH2_TOKEN_URL, post2, &out2, NULL) != 0) { json_decref(resp); return -1; }
+        json_t *r2 = json_loads(out2.data, 0, &err);
+        free(out2.data);
+        if (!r2) { json_decref(resp); return -1; }
+        json_t *errj = json_object_get(r2, "error");
+        if (!errj) {
+            const char *at = json_string_value(json_object_get(r2, "access_token"));
+            const char *rt = json_string_value(json_object_get(r2, "refresh_token"));
+            int ex = json_integer_value(json_object_get(r2, "expires_in"));
+            if (at) *access_token = strdup(at);
+            if (rt) *refresh_token = strdup(rt);
+            if (expires_in) *expires_in = ex;
+            json_decref(r2);
+            json_decref(resp);
+            return 0;
+        } else {
+            const char *errstr = json_string_value(errj);
+            if (strcmp(errstr, "authorization_pending") == 0) {
+                json_decref(r2);
+                continue;
+            } else if (strcmp(errstr, "slow_down") == 0) {
+                interval += 5;
+                json_decref(r2);
+                continue;
+            } else {
+                fprintf(stderr, "OAuth error: %s\n", errstr);
+                json_decref(r2);
+                json_decref(resp);
+                return -1;
+            }
+        }
+    }
+    json_decref(resp);
+    fprintf(stderr, "Timeout waiting for authorization\n");
+    return -1;
+}
+
+/* Map Google Workspace mimeTypes to export mimeTypes (simple) */
+static const char *export_mime_for(const char *mime) {
+    if (strcmp(mime, "application/vnd.google-apps.document") == 0) return "application/pdf";
+    if (strcmp(mime, "application/vnd.google-apps.spreadsheet") == 0) return "text/csv";
+    if (strcmp(mime, "application/vnd.google-apps.presentation") == 0) return "application/pdf";
+    return NULL;
+}
+
+static int download_file_content(const char *fileId, const char *mimeType, const char *bearer, struct mem *out) {
+    char url[1024];
+    const char *export_mime = export_mime_for(mimeType);
+    if (export_mime) {
+        char *esc = curl_easy_escape(NULL, export_mime, 0);
+        snprintf(url, sizeof(url), DRIVE_API "/files/%s/export?mimeType=%s", fileId, esc);
+        curl_free(esc);
+    } else {
+        snprintf(url, sizeof(url), DRIVE_API "/files/%s?alt=media", fileId);
+    }
+    return http_get_auth(url, bearer, out);
+}
+
+static int write_downloaded_file(const char *base_dir, const char *rel_path, const char *data, size_t len) {
+    char full[4096];
+    snprintf(full, sizeof(full), "%s/%s", base_dir, rel_path);
+    char *dir = strdup(full);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = 0;
+        if (ensure_dir_recursive(dir) != 0) { free(dir); return -1; }
+    }
+    free(dir);
+    return save_file(full, data, len);
+}
+
+static int traverse_and_download(const char *parentId, const char *base_dir, const char *path_prefix, const char *bearer) {
+    char q[1024];
+    snprintf(q, sizeof(q), "('%s' in parents) and trashed=false", parentId);
+    char url[2048];
+    char *qenc = curl_easy_escape(NULL, q, 0);
+    snprintf(url, sizeof(url), DRIVE_API "/files?pageSize=1000&q=%s&fields=nextPageToken,files(id,name,mimeType,parents)", qenc);
+    curl_free(qenc);
+
+    struct mem out = {0};
+    if (http_get_auth(url, bearer, &out) != 0) return -1;
+    json_error_t err;
+    json_t *resp = json_loads(out.data, 0, &err);
+    free(out.data);
+    if (!resp) return -1;
+    json_t *files = json_object_get(resp, "files");
+    if (!files) { json_decref(resp); return 0; }
+
+    size_t idx;
+    json_t *f;
+    json_array_foreach(files, idx, f) {
+        const char *id = json_string_value(json_object_get(f, "id"));
+        const char *name = json_string_value(json_object_get(f, "name"));
+        const char *mime = json_string_value(json_object_get(f, "mimeType"));
+        if (!id || !name || !mime) continue;
+        char relpath[4096];
+        if (path_prefix && strlen(path_prefix) > 0) snprintf(relpath, sizeof(relpath), "%s/%s", path_prefix, name);
+        else snprintf(relpath, sizeof(relpath), "%s", name);
+
+        if (strncmp(mime, "application/vnd.google-apps.folder", 34) == 0) {
+            char dirfull[4096];
+            snprintf(dirfull, sizeof(dirfull), "%s/%s", base_dir, relpath);
+            ensure_dir_recursive(dirfull);
+            traverse_and_download(id, base_dir, relpath, bearer);
+        } else {
+            struct mem filedata = {0};
+            if (download_file_content(id, mime, bearer, &filedata) == 0) {
+                const char *export_mime = export_mime_for(mime);
+                char save_rel[4096];
+                if (export_mime) {
+                    const char *ext = strstr(export_mime, "pdf") ? ".pdf" : (strstr(export_mime, "csv") ? ".csv" : ".bin");
+                    snprintf(save_rel, sizeof(save_rel), "%s%s", relpath, ext);
+                } else {
+                    snprintf(save_rel, sizeof(save_rel), "%s", relpath);
+                }
+                if (write_downloaded_file(base_dir, save_rel, filedata.data, filedata.size) != 0) {
+                    fprintf(stderr, "Failed to save %s\n", save_rel);
+                } else {
+                    printf("Saved: %s\n", save_rel);
+                }
+                free(filedata.data);
+            } else {
+                fprintf(stderr, "Failed to download file %s (%s)\n", name, id);
+            }
+        }
+    }
+
+    json_decref(resp);
+    return 0;
+}
+
+int main(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    const char *home = getenv(BASE_DIR_ENV);
+    if (!home) { fprintf(stderr, "HOME not set\n"); return 1; }
+    char base_dir[4096];
+    snprintf(base_dir, sizeof(base_dir), "%s/%s", home, TARGET_SUBDIR);
+    ensure_dir_recursive(base_dir);
+
+    char *access_token = NULL, *refresh_token = NULL;
+    int expires = 0;
+
+    if (oauth_device_flow(&access_token, &refresh_token, &expires) != 0) {
+        fprintf(stderr, "OAuth device flow failed. Ensure CLIENT_ID/CLIENT_SECRET are set in the source.\n");
+        return 1;
+    }
+
+    if (!access_token) { fprintf(stderr, "No access token obtained\n"); return 1; }
+
+    if (traverse_and_download("root", base_dir, "", access_token) != 0) {
+        fprintf(stderr, "Error during traversal\n");
+    }
+
+    free(access_token);
+    if (refresh_token) free(refresh_token);
+    curl_global_cleanup();
+    return 0;
+}

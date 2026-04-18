@@ -1,0 +1,16 @@
+# 3.5 rule: mod prefix, obj postfix
+mod_obj := exectrace1.o
+obj-m := $(mod_obj)
+
+# 3.5 rule: mak prefix, bin/dir postfix
+mak_bin := make
+mak_kdir := /lib/modules/$(shell uname -r)/build
+mak_cdir := $(shell pwd)
+
+.phony: all clean
+
+all:
+	$(mak_bin) -C $(mak_kdir) M=$(mak_cdir) modules
+
+clean:
+	$(mak_bin) -C $(mak_kdir) M=$(mak_cdir) clean

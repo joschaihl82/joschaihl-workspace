@@ -1,0 +1,53 @@
+cmake_minimum_required(VERSION 3.16)
+project(google_drive_sync_demo LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Optionally allow user to override Qt path via CMAKE_PREFIX_PATH
+# Example: cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/Qt6
+
+# Find Qt6 components
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network NetworkAuth)
+
+# Optional: try to find QtKeychain (name may vary by packaging)
+# If your system provides Qt6Keychain or Qt5Keychain, adjust the find_package call accordingly.
+find_package(Qt6Keychain QUIET)        # try Qt6Keychain
+if (NOT Qt6Keychain_FOUND)
+    find_package(Qt5Keychain QUIET)    # fallback to Qt5Keychain if available
+endif()
+
+# Create executable
+add_executable(google_drive_sync_demo
+    main.cpp
+)
+
+# Link Qt libraries
+target_link_libraries(google_drive_sync_demo
+    PRIVATE
+        Qt6::Widgets
+        Qt6::Network
+        Qt6::NetworkAuth
+)
+
+# If QtKeychain was found, link it and define compile symbol
+if (Qt6Keychain_FOUND)
+    target_link_libraries(google_drive_sync_demo PRIVATE Qt6::Keychain)
+    target_compile_definitions(google_drive_sync_demo PRIVATE QTKEYCHAIN_AVAILABLE=1)
+elseif (Qt5Keychain_FOUND)
+    target_link_libraries(google_drive_sync_demo PRIVATE Qt5::Keychain)
+    target_compile_definitions(google_drive_sync_demo PRIVATE QTKEYCHAIN_AVAILABLE=1)
+endif()
+
+# Install target (optional)
+install(TARGETS google_drive_sync_demo
+    RUNTIME DESTINATION bin
+)
+
+# Helpful compile flags for warnings (optional)
+if (MSVC)
+    target_compile_options(google_drive_sync_demo PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(google_drive_sync_demo PRIVATE -Wall -Wextra -Wpedantic)
+endif()

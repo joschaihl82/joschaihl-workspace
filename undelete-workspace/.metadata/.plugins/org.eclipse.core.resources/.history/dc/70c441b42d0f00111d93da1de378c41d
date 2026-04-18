@@ -1,0 +1,540 @@
+/*
+ * linear_inode_scan_ui.c
+ *
+ * Linear raw inode scan with top progress bar and bottom numbered list
+ * of found deleted files. Plain C, POSIX, no external libraries.
+ *
+ * Build: gcc -O2 -o linear_inode_scan_ui linear_inode_scan_ui.c
+ * Run:   sudo ./linear_inode_scan_ui /dev/sdXN
+ *
+ * Notes:
+ *  - Requires root to mount and read raw device.
+ *  - ext4 parsing: direct blocks only; heuristic scan.
+ *  - UI uses ANSI escape sequences and terminal size (ioctl TIOCGWINSZ).
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mount.h>
+#include <limits.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+
+#define EXT4_SUPER_OFFSET 1024
+#define EXT4_NAME_LEN 255
+
+/* Minimal ext4 on-disk structures (packed) */
+struct ext4_super {
+    uint32_t s_inodes_count;
+    uint32_t s_blocks_count_lo;
+    uint32_t s_r_blocks_count_lo;
+    uint32_t s_free_blocks_count_lo;
+    uint32_t s_free_inodes_count;
+    uint32_t s_first_data_block;
+    uint32_t s_log_block_size;
+    uint32_t s_log_cluster_size;
+    uint32_t s_blocks_per_group;
+    uint32_t s_clusters_per_group;
+    uint32_t s_inodes_per_group;
+    uint32_t s_mtime;
+    uint32_t s_wtime;
+    uint16_t s_mnt_count;
+    uint16_t s_max_mnt_count;
+    uint16_t s_magic;
+    uint16_t s_state;
+    uint16_t s_errors;
+    uint16_t s_minor_rev_level;
+    uint32_t s_lastcheck;
+    uint32_t s_checkinterval;
+    uint32_t s_creator_os;
+    uint32_t s_rev_level;
+    uint16_t s_def_resuid;
+    uint16_t s_def_resgid;
+    uint32_t s_first_ino;
+    uint16_t s_inode_size;
+    uint16_t s_block_group_nr;
+    uint32_t s_feature_compat;
+    uint32_t s_feature_incompat;
+    uint32_t s_feature_ro_compat;
+    uint8_t  s_uuid[16];
+    char     s_volume_name[16];
+    char     s_last_mounted[64];
+} __attribute__((packed));
+
+struct ext4_inode {
+    uint16_t i_mode;
+    uint16_t i_uid;
+    uint32_t i_size_lo;
+    uint32_t i_atime;
+    uint32_t i_ctime;
+    uint32_t i_mtime;
+    uint32_t i_dtime;
+    uint16_t i_gid;
+    uint16_t i_links_count;
+    uint32_t i_blocks_lo;
+    uint32_t i_flags;
+    uint32_t i_osd1;
+    uint32_t i_block[15];
+    uint32_t i_generation;
+    uint32_t i_file_acl_lo;
+    uint32_t i_size_high;
+    uint32_t i_obso_faddr;
+    uint8_t  i_osd2[12];
+} __attribute__((packed));
+
+struct ext2_dir_entry {
+    uint32_t inode;
+    uint16_t rec_len;
+    uint8_t  name_len;
+    uint8_t  file_type;
+    char     name[]; /* not NUL-terminated */
+} __attribute__((packed));
+
+/* helpers */
+static ssize_t pread_all(int fd, void *buf, size_t count, off_t offset) {
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pread(fd, (char*)buf + done, count - done, offset + done);
+        if (r < 0) return -1;
+        if (r == 0) break;
+        done += r;
+    }
+    return done;
+}
+static uint16_t le16(const void *p) {
+    const uint8_t *b = p;
+    return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+}
+static uint32_t le32(const void *p) {
+    const uint8_t *b = p;
+    return (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+}
+
+/* simple dynamic list of strings for deleted paths */
+struct str_list {
+    char **items;
+    size_t used;
+    size_t cap;
+};
+static void sl_init(struct str_list *s) { s->items = NULL; s->used = s->cap = 0; }
+static void sl_free(struct str_list *s) { for (size_t i=0;i<s->used;++i) free(s->items[i]); free(s->items); s->items=NULL; s->used=s->cap=0; }
+static int sl_add(struct str_list *s, const char *str) {
+    if (s->used == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 256;
+        char **n = realloc(s->items, ncap * sizeof(char*));
+        if (!n) return -1;
+        s->items = n; s->cap = ncap;
+    }
+    s->items[s->used] = strdup(str);
+    if (!s->items[s->used]) return -1;
+    s->used++;
+    return 0;
+}
+
+/* Terminal helpers */
+static int get_term_size(int *rows, int *cols) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) return -1;
+    *rows = ws.ws_row;
+    *cols = ws.ws_col;
+    return 0;
+}
+static void move_cursor(int row, int col) {
+    printf("\x1b[%d;%dH", row, col);
+}
+static void clear_line(void) {
+    printf("\x1b[2K");
+}
+static void hide_cursor(void) { printf("\x1b[?25l"); fflush(stdout); }
+static void show_cursor(void) { printf("\x1b[?25h"); fflush(stdout); }
+
+/* time helpers */
+static double time_diff_seconds(struct timeval *start, struct timeval *end) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_usec - start->tv_usec) / 1e6;
+}
+static void format_seconds(double s, char *out, size_t outlen) {
+    if (s < 0) s = 0;
+    int hours = (int)(s / 3600);
+    int minutes = (int)((s - hours * 3600) / 60);
+    int seconds = (int)(s - hours * 3600 - minutes * 60);
+    if (hours > 99) snprintf(out, outlen, "%02dh+%02dm", hours, minutes);
+    else snprintf(out, outlen, "%02d:%02d:%02d", hours, minutes, seconds);
+}
+
+/* UI: print progress bar at top row */
+static void ui_print_progress_top(off_t processed, off_t total, struct timeval *start) {
+    int rows, cols;
+    if (get_term_size(&rows, &cols) != 0) { return; }
+    struct timeval now; gettimeofday(&now, NULL);
+    double elapsed = time_diff_seconds(start, &now);
+    double percent = total ? (double)processed / (double)total : 0.0;
+    double eta = 0.0;
+    if (processed > 0 && percent > 0.0) {
+        double est_total = elapsed / percent;
+        eta = est_total - elapsed;
+    }
+    int bar_width = cols - 40;
+    if (bar_width < 10) bar_width = 10;
+    int filled = (int)(percent * bar_width + 0.5);
+    if (filled > bar_width) filled = bar_width;
+    char elapsed_s[32], eta_s[32];
+    format_seconds(elapsed, elapsed_s, sizeof(elapsed_s));
+    format_seconds(eta, eta_s, sizeof(eta_s));
+
+    move_cursor(1,1);
+    clear_line();
+    printf("[");
+    for (int i=0;i<filled;++i) putchar('=');
+    for (int i=filled;i<bar_width;++i) putchar(' ');
+    printf("] %6.2f%% %lld/%lld bytes el=%s ETA=%s", percent*100.0, (long long)processed, (long long)total, elapsed_s, eta_s);
+    fflush(stdout);
+}
+
+/* UI: print bottom numbered list of deleted files */
+static void ui_print_deleted_bottom(struct str_list *found) {
+    int rows, cols;
+    if (get_term_size(&rows, &cols) != 0) return;
+    int bottom_lines = rows - 2; /* reserve top line for progress and one blank */
+    if (bottom_lines < 1) bottom_lines = 1;
+
+    /* Determine start index to show so last entries are visible */
+    size_t start = 0;
+    if (found->used > (size_t)bottom_lines) start = found->used - bottom_lines;
+
+    /* Clear bottom area */
+    for (int r = rows - bottom_lines + 1; r <= rows; ++r) {
+        move_cursor(r,1);
+        clear_line();
+    }
+
+    /* Print entries */
+    int row = rows - bottom_lines + 1;
+    for (size_t i = start; i < found->used; ++i, ++row) {
+        move_cursor(row,1);
+        /* number starting from 1 */
+        printf("%4zu: %s", i + 1, found->items[i]);
+        fflush(stdout);
+    }
+}
+
+/* Check /proc/mounts for an existing mountpoint for 'device' */
+static int find_existing_mountpoint(const char *device, char *out_mount, size_t out_len) {
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) return -1;
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char dev[PATH_MAX], mnt[PATH_MAX], fstype[64], opts[256];
+        if (sscanf(line, "%4095s %4095s %63s %255s", dev, mnt, fstype, opts) >= 2) {
+            if (strcmp(dev, device) == 0) {
+                strncpy(out_mount, mnt, out_len - 1);
+                out_mount[out_len - 1] = '\0';
+                fclose(f);
+                return 0;
+            }
+        }
+    }
+    fclose(f);
+    return -1;
+}
+
+/* Create a temporary mountpoint under /tmp and mount the device read-only. */
+static int mount_device_ro(const char *device, char *out_mount, size_t out_len, int *mounted_by_us) {
+    if (find_existing_mountpoint(device, out_mount, out_len) == 0) {
+        if (mounted_by_us) *mounted_by_us = 0;
+        return 0;
+    }
+    char tmpl[] = "/tmp/scanmnt.XXXXXX";
+    char *tmp = mkdtemp(tmpl);
+    if (!tmp) {
+        fprintf(stderr, "mkdtemp failed: %s\n", strerror(errno));
+        return -1;
+    }
+    unsigned long flags = MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_DIRSYNC;
+    int rc = mount(device, tmp, "auto", flags, NULL);
+    if (rc != 0) {
+        rc = mount(device, tmp, "ext4", flags, NULL);
+        if (rc != 0) {
+            int saved = errno;
+            rmdir(tmp);
+            fprintf(stderr, "mount failed: %s\n", strerror(saved));
+            return -1;
+        }
+    }
+    strncpy(out_mount, tmp, out_len - 1);
+    out_mount[out_len - 1] = '\0';
+    if (mounted_by_us) *mounted_by_us = 1;
+    return 0;
+}
+static void unmount_and_cleanup(const char *mountpoint) {
+    if (!mountpoint || mountpoint[0] == '\0') return;
+    if (umount2(mountpoint, MNT_DETACH) != 0) {
+        umount2(mountpoint, 0);
+    }
+    rmdir(mountpoint);
+}
+
+/* Read superblock to get inode_size and block_size; return 0 on success */
+static int read_superblock(int fd, uint16_t *out_inode_size, uint32_t *out_block_size) {
+    struct ext4_super sb;
+    if (pread_all(fd, &sb, sizeof(sb), EXT4_SUPER_OFFSET) != sizeof(sb)) {
+        return -1;
+    }
+    if (le16(&sb.s_magic) != 0xEF53) return -1;
+    uint16_t inode_size = le16(&sb.s_inode_size);
+    if (inode_size == 0) inode_size = 128;
+    uint32_t log_block = le32(&sb.s_log_block_size);
+    uint32_t block_size = 1024U << log_block;
+    *out_inode_size = inode_size;
+    *out_block_size = block_size;
+    return 0;
+}
+
+/* Reconstruct path using simple parent '..' lookups from collected entries.
+ * This is a best-effort reconstruction similar to earlier code.
+ */
+struct dir_entry {
+    uint64_t parent;
+    uint64_t child;
+    char name[EXT4_NAME_LEN+1];
+};
+struct dir_entry_list {
+    struct dir_entry *items;
+    size_t used;
+    size_t cap;
+};
+static void del_init(struct dir_entry_list *d) { d->items=NULL; d->used=d->cap=0; }
+static void del_free(struct dir_entry_list *d) { free(d->items); d->items=NULL; d->used=d->cap=0; }
+static int del_add(struct dir_entry_list *d, uint64_t parent, uint64_t child, const char *name) {
+    if (d->used == d->cap) {
+        size_t ncap = d->cap ? d->cap * 2 : 4096;
+        struct dir_entry *n = realloc(d->items, ncap * sizeof(*n));
+        if (!n) return -1;
+        d->items = n; d->cap = ncap;
+    }
+    d->items[d->used].parent = parent;
+    d->items[d->used].child = child;
+    strncpy(d->items[d->used].name, name, EXT4_NAME_LEN);
+    d->items[d->used].name[EXT4_NAME_LEN] = '\0';
+    d->used++;
+    return 0;
+}
+static const char *del_find_name(struct dir_entry_list *d, uint64_t parent, uint64_t child) {
+    for (size_t i=0;i<d->used;++i) if (d->items[i].parent==parent && d->items[i].child==child) return d->items[i].name;
+    return NULL;
+}
+static uint64_t del_find_parent_of_dir(struct dir_entry_list *d, uint64_t dir) {
+    for (size_t i=0;i<d->used;++i) if (d->items[i].parent==dir && strcmp(d->items[i].name,"..")==0) return d->items[i].child;
+    return 0;
+}
+static char *del_reconstruct_path(struct dir_entry_list *d, uint64_t parent, uint64_t child, const char *name) {
+    size_t cap = 16, len = 0;
+    char **comps = malloc(cap * sizeof(char*));
+    if (!comps) return NULL;
+    comps[len++] = strdup(name);
+    uint64_t cur = parent;
+    const uint64_t ROOT = 2;
+    while (cur != 0 && cur != ROOT) {
+        uint64_t p = del_find_parent_of_dir(d, cur);
+        if (p == 0) break;
+        const char *nm = del_find_name(d, p, cur);
+        char *tmp = NULL;
+        if (!nm) {
+            char buf[64]; snprintf(buf,sizeof(buf),"[ino:%llu]", (unsigned long long)cur);
+            tmp = strdup(buf);
+            nm = tmp;
+        }
+        if (len == cap) {
+            cap *= 2;
+            char **n = realloc(comps, cap * sizeof(char*));
+            if (!n) { free(tmp); break; }
+            comps = n;
+        }
+        comps[len++] = strdup(nm);
+        if (tmp) free(tmp);
+        cur = p;
+    }
+    size_t total = 1;
+    for (size_t i=0;i<len;++i) total += strlen(comps[i]) + 1;
+    char *path = malloc(total+1);
+    if (!path) { for (size_t i=0;i<len;++i) free(comps[i]); free(comps); return NULL; }
+    char *p = path; *p++ = '/'; *p = '\0';
+    for (size_t i=0;i<len;++i) {
+        const char *c = comps[len-1-i];
+        size_t L = strlen(c);
+        memcpy(p, c, L); p += L;
+        if (i+1 < len) *p++ = '/';
+        *p = '\0';
+    }
+    for (size_t i=0;i<len;++i) free(comps[i]);
+    free(comps);
+    return path;
+}
+
+/* Linear scan: read device size, iterate offsets 0..end-inode_size step inode_size */
+static int linear_scan_and_collect(int fd, struct dir_entry_list *dlist, struct str_list *found, uint16_t inode_size, uint32_t block_size) {
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end == (off_t)-1) { fprintf(stderr,"lseek failed: %s\n", strerror(errno)); return -1; }
+    if (inode_size == 0) inode_size = 128;
+    if (block_size == 0) block_size = 4096;
+
+    off_t total_bytes = end;
+    off_t processed = 0;
+    struct timeval start; gettimeofday(&start, NULL);
+    ui_print_progress_top(processed, total_bytes, &start);
+    uint8_t *buf = malloc(inode_size);
+    if (!buf) return -1;
+
+    for (off_t off = 0; off + inode_size <= end; off += inode_size) {
+        ssize_t r = pread_all(fd, buf, inode_size, off);
+        if (r != (ssize_t)inode_size) {
+            processed = off + inode_size;
+            if ((off / inode_size) % 256 == 0) ui_print_progress_top(processed, total_bytes, &start);
+            continue;
+        }
+        struct ext4_inode inode;
+        memset(&inode,0,sizeof(inode));
+        memcpy(&inode, buf, sizeof(inode) < inode_size ? sizeof(inode) : inode_size);
+        uint16_t mode = le16(&inode.i_mode);
+        uint16_t type = mode & 0xF000;
+        if (type == 0x4000) { /* directory */
+            uint64_t pseudo_inode = (uint64_t)(off / inode_size) + 1;
+            for (int bi=0; bi<12; ++bi) {
+                uint32_t blk = le32(&inode.i_block[bi]);
+                if (blk == 0) continue;
+                off_t block_off = (off_t)blk * block_size;
+                if (block_off + block_size > end) continue;
+                uint8_t *block = malloc(block_size);
+                if (!block) continue;
+                if (pread_all(fd, block, block_size, block_off) != (ssize_t)block_size) { free(block); continue; }
+                uint32_t pos = 0;
+                while (pos + sizeof(struct ext2_dir_entry) < block_size) {
+                    struct ext2_dir_entry *de = (struct ext2_dir_entry *)(block + pos);
+                    uint32_t inode_no = le32(&de->inode);
+                    uint16_t rec_len = le16(&de->rec_len);
+                    uint8_t name_len = de->name_len;
+                    if (rec_len == 0) break;
+                    if (inode_no != 0 && name_len > 0 && name_len <= EXT4_NAME_LEN && pos + rec_len <= block_size) {
+                        char name[EXT4_NAME_LEN+1];
+                        if (name_len > EXT4_NAME_LEN) name_len = EXT4_NAME_LEN;
+                        memcpy(name, de->name, name_len);
+                        name[name_len] = '\0';
+                        del_add(dlist, pseudo_inode, (uint64_t)inode_no, name);
+                        /* attempt to reconstruct path for non '.'/'..' entries and check lstat */
+                        if (strcmp(name,".")!=0 && strcmp(name,"..")!=0) {
+                            char *rel = del_reconstruct_path(dlist, pseudo_inode, (uint64_t)inode_no, name);
+                            if (rel) {
+                                /* build full path using mountpoint (we will set mountpoint externally) */
+                                /* For UI simplicity, we store rel path and check later after scan or if mountpoint known */
+                                /* Here we check against mounted root by constructing path from global mountpoint */
+                                /* We'll use a global mountpoint variable set in main */
+                                extern char g_mountpoint[];
+                                if (g_mountpoint[0] != '\0') {
+                                    size_t mlen = strlen(g_mountpoint);
+                                    int need_slash = (mlen==0 || g_mountpoint[mlen-1] != '/');
+                                    size_t full_len = mlen + (need_slash?1:0) + strlen(rel) + 1;
+                                    char *full = malloc(full_len);
+                                    if (full) {
+                                        strcpy(full, g_mountpoint);
+                                        if (need_slash) strcat(full, "/");
+                                        if (rel[0] == '/') strcat(full, rel+1); else strcat(full, rel);
+                                        struct stat st;
+                                        if (lstat(full, &st) == -1 && errno == ENOENT) {
+                                            /* add to found list and refresh UI */
+                                            sl_add(found, rel);
+                                            ui_print_deleted_bottom(found);
+                                        }
+                                        free(full);
+                                    }
+                                }
+                                free(rel);
+                            }
+                        }
+                    }
+                    pos += rec_len;
+                }
+                free(block);
+            }
+        }
+        processed = off + inode_size;
+        if ((off / inode_size) % 256 == 0 || processed == total_bytes) ui_print_progress_top(processed, total_bytes, &start);
+    }
+
+    ui_print_progress_top(total_bytes, total_bytes, &start);
+    printf("\n");
+    free(buf);
+    return 0;
+}
+
+/* global mountpoint used inside scan for immediate lstat checks */
+char g_mountpoint[PATH_MAX] = {0};
+
+int main(int argc, char **argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <device-or-image>\n", argv[0]);
+        return 1;
+    }
+    const char *device = argv[1];
+    if (geteuid() != 0) {
+        fprintf(stderr, "This program requires root privileges.\n");
+        return 1;
+    }
+
+    /* mount or find mountpoint */
+    char mountpoint[PATH_MAX] = {0};
+    int mounted_by_us = 0;
+    if (mount_device_ro(device, mountpoint, sizeof(mountpoint), &mounted_by_us) != 0) {
+        fprintf(stderr, "Failed to mount or find mountpoint for %s\n", device);
+        return 2;
+    }
+    strncpy(g_mountpoint, mountpoint, sizeof(g_mountpoint)-1);
+
+    /* open raw device */
+    int fd = open(device, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "Failed to open %s: %s\n", device, strerror(errno)); if (mounted_by_us) unmount_and_cleanup(mountpoint); return 3; }
+
+    /* read superblock if possible */
+    uint16_t inode_size = 128;
+    uint32_t block_size = 4096;
+    if (read_superblock(fd, &inode_size, &block_size) == 0) {
+        fprintf(stderr, "Superblock: inode_size=%u block_size=%u\n", inode_size, block_size);
+    } else {
+        fprintf(stderr, "Superblock not found; using defaults inode_size=%u block_size=%u\n", inode_size, block_size);
+    }
+
+    /* prepare UI */
+    hide_cursor();
+    printf("\n"); /* ensure at least one line for progress */
+    fflush(stdout);
+
+    struct dir_entry_list dlist;
+    del_init(&dlist);
+    struct str_list found;
+    sl_init(&found);
+
+    /* perform linear scan and immediate checks */
+    linear_scan_and_collect(fd, &dlist, &found, inode_size, block_size);
+
+    /* final bottom refresh */
+    ui_print_deleted_bottom(&found);
+
+    /* cleanup */
+    sl_free(&found);
+    del_free(&dlist);
+    close(fd);
+
+    /* restore cursor and unmount if we mounted */
+    show_cursor();
+    if (mounted_by_us) unmount_and_cleanup(mountpoint);
+    return 0;
+}

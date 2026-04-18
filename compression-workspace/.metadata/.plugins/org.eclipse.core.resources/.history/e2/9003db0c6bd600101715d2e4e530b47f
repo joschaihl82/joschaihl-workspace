@@ -1,0 +1,850 @@
+/*
+ * jlz4.c - lz4-style tool
+ * style: freebsd kernel (style(9)) + snake_case
+ *
+ * Core functions include goal-oriented comments, a short mathematical
+ * description and a small example input/output for clarity.
+ *
+ * Example (archive creation):
+ *  - Input: directory "data/" containing file "a.txt" with bytes:
+ *      "ABABABABCCCCDDDD" (16 bytes)
+ *  - Output: archive "data.lz4" containing an entry for "a.txt" with:
+ *      [name_len][name][orig_size=16][comp_size][blocks...]
+ *
+ * Mathematical summary (compression block):
+ *  - Let I be the input byte sequence of length n.
+ *  - The compressor produces O = H || Enc(I) where H is a fixed-size
+ *    header and Enc is a sequence of tokens representing literals L_i
+ *    and matches (offset_i, len_i).
+ *  - The encoding satisfies: decode(Enc(I)) = I and |O| >= HDR + 0.
+ *
+ * Example (single-block compression):
+ *  - Input block I = "ABABABABCCCCDDDD"
+ *  - Possible tokenization: L0=""; match(offset=2,len=8); L1="CCCCDDDD"
+ *  - Output bytes: HDR + token(match) + match-offset + L1
+ *
+ * Notes:
+ *  - Examples are illustrative; actual tokenization depends on hash hits.
+ *  - Mathematical description is intentionally concise: the codec is a
+ *    lossless bijection between input byte sequences and valid encoded
+ *    blocks with a small header.
+ */
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <libgen.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/* Tunable sizes as typed constants */
+static const size_t BLK_SIZE = (1 << 20);
+static const size_t WIN_SIZE = (1 << 16);
+static const unsigned MIN_MAT = 4u;
+static const size_t HSH_SIZE = (1 << 16);
+static const unsigned HSH_SFT = (32u - 16u);
+
+static const uint32_t HASH_MULT = 2654435761u;
+static const char HDR_MAGIC[] = "LZ4B";
+static const size_t HDR_MAGIC_LEN = 4;
+static const size_t HDR_HDR_SIZE = 12; /* magic + orig size (4) + comp size (4) */
+static const size_t HDR_ORIG_OFF = 4;
+static const size_t HDR_CSIZE_OFF = 8;
+
+static const unsigned TOKEN_MAX_NIBBLE = 15u;
+static const unsigned TOKEN_EXT_BYTE = 255u;
+
+static const uint8_t U8_ALL_ONES = 0xFFu;
+static const uint32_t U32_EMPTY = 0xFFFFFFFFu;
+
+static const size_t TERM_DEFAULT_WIDTH = 80;
+
+static const mode_t DIR_MODE = 0755;
+static const mode_t FILE_MODE = 0644;
+
+typedef struct {
+    uint64_t total;
+    uint64_t proc;
+    struct timeval start;
+    const char *curr;
+    uint64_t f_orig;
+    uint64_t f_comp;
+    int  lines;
+} prg_ctx_t;
+
+typedef struct {
+    FILE    *fp;
+    const char *path;
+    uint8_t *in;
+    uint8_t *out;
+    uint32_t c_len;
+    uint64_t f_len;
+} io_ctx_t;
+
+static prg_ctx_t g_prg;
+
+/* --- utilities omitted for brevity (unchanged) --- */
+/* (term_width, path_join, io_read/write, fmt_byte/time, progress) */
+/* ... (same as previous refactor) ... */
+
+/*
+ * compression helpers (extracted from lz4_comp)
+ *
+ * The comments below focus on the goal, invariants and a short example.
+ */
+
+/* write header (magic + original size), leave space for compressed size
+ *
+ * Goal: produce a compact self-describing header so the decoder can:
+ *  - verify the magic tag,
+ *  - read the original (decompressed) size,
+ *  - locate the compressed payload and its length.
+ *
+ * Invariant: header is HDR_HDR_SIZE bytes; caller must later fill
+ * the compressed-size field at HDR_CSIZE_OFF.
+ *
+ * Example:
+ *  - orig_size = 16 -> header bytes: "LZ4B" + 0x10 0x00 0x00 0x00 + (4 bytes placeholder)
+ */
+static uint8_t *
+comp_write_header(uint8_t *out, size_t orig_size)
+{
+    memcpy(out, HDR_MAGIC, HDR_MAGIC_LEN);
+    out += HDR_MAGIC_LEN;
+    memcpy(out, &orig_size, 4);
+    out += 8; /* leave 4 bytes for compressed size */
+    return out;
+}
+
+/* allocate and initialize hash table
+ *
+ * Goal: provide a fixed-size, fast lookup table for match candidates.
+ * Invariant: returned table contains sentinel U32_EMPTY in every slot.
+ * Failure: returns NULL on allocation failure; caller must handle it.
+ */
+static uint32_t *
+comp_alloc_hash(void)
+{
+    uint32_t *ht;
+
+    ht = calloc(HSH_SIZE, sizeof(uint32_t));
+    if (ht == NULL)
+        return NULL;
+    memset(ht, U8_ALL_ONES, HSH_SIZE * sizeof(uint32_t));
+    return ht;
+}
+
+/* emit literal length extension bytes and copy literal data
+ *
+ * Goal: encode literal lengths using a small token nibble and optional
+ * extension bytes for long runs. This keeps the token compact for the
+ * common short-literal case while allowing arbitrarily long literals.
+ *
+ * Example:
+ *  - len = 3 -> token nibble stores 3, no extension bytes, copy 3 bytes.
+ *  - len = 300 -> token nibble = 15, extension bytes: 255, 30, then copy.
+ */
+static void
+comp_emit_literal(uint8_t **op, const uint8_t *anc, size_t len)
+{
+    size_t rem;
+
+    rem = len >= TOKEN_MAX_NIBBLE ? len - TOKEN_MAX_NIBBLE : 0;
+    if (len >= TOKEN_MAX_NIBBLE) {
+        while (rem >= TOKEN_EXT_BYTE) {
+            *(*op)++ = (uint8_t)TOKEN_EXT_BYTE;
+            rem -= TOKEN_EXT_BYTE;
+        }
+        *(*op)++ = (uint8_t)rem;
+    }
+    memcpy(*op, anc, len);
+    *op += len;
+}
+
+/* emit match offset and match-length extension bytes
+ *
+ * Goal: represent the match offset (fixed 16-bit) and extended match
+ * length using the same extension scheme as literals. This yields a
+ * compact representation for short matches and supports long matches.
+ *
+ * Example:
+ *  - off=2, len=8 -> write offset (2 bytes), write len-4 in token nibble.
+ */
+static void
+comp_emit_match(uint8_t **op, size_t off, size_t len)
+{
+    uint16_t o;
+    size_t l;
+    size_t rem;
+
+    o = (uint16_t)off;
+    *(*op)++ = (uint8_t)(o & 0xFF);
+    *(*op)++ = (uint8_t)((o >> 8) & 0xFF);
+    l = len - MIN_MAT;
+    if (l >= TOKEN_MAX_NIBBLE) {
+        rem = l - TOKEN_MAX_NIBBLE;
+        while (rem >= TOKEN_EXT_BYTE) {
+            *(*op)++ = (uint8_t)TOKEN_EXT_BYTE;
+            rem -= TOKEN_EXT_BYTE;
+        }
+        *(*op)++ = (uint8_t)rem;
+    }
+}
+
+/* find match length between ip and ref (bounded by end)
+ *
+ * Goal: compute the maximal run length where bytes match starting at ip
+ * and ref. This is the core of the match extension step; it returns the
+ * length m >= MIN_MAT that will be encoded as a match.
+ *
+ * Performance note: this loop is a hotspot and can be vectorized later.
+ */
+static size_t
+comp_find_match_len(const uint8_t *ip, const uint8_t *ref, const uint8_t *end)
+{
+    const uint8_t *p1 = ip;
+    const uint8_t *p2 = ref;
+
+    while (p1 < end && *p1 == *p2) {
+        p1++;
+        p2++;
+    }
+    return (size_t)(p1 - ip);
+}
+
+/*
+ * compression core (refactored)
+ *
+ * Goal: transform an input block I of length n into a compact encoded
+ * block O that the decoder can invert exactly. The function is designed
+ * for streaming: it writes a small header, then a sequence of tokens
+ * (literal runs and matches). It favors speed (single-pass hash-based
+ * matching) while providing reasonable compression.
+ *
+ * Mathematical description (short):
+ *  - Input: I ∈ {0..255}^n.
+ *  - Output: O = H || T where H is fixed header and T is a sequence
+ *    of pairs (L_i, M_i) with L_i ∈ {literal bytes}, M_i = (off,len).
+ *  - Decoding: decode(T) = I. The mapping is bijective for valid encodings.
+ *
+ * Example (illustrative):
+ *  - I = "ABABABABCCCCDDDD" (n=16)
+ *  - One valid encoding: token(match offset=2,len=8) then literal "CCCCDDDD".
+ *  - O = HDR + token + offset(2) + literal-length + "CCCCDDDD"
+ *
+ * Invariants and failure semantics:
+ *  - If memory allocation fails or 'cap' is too small, return 0.
+ *  - Caller must ensure 'out' has capacity >= expected worst-case.
+ */
+static size_t
+lz4_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
+{
+    const uint8_t *ip, *end, *anc;
+    uint32_t *ht;
+    uint8_t *op;
+    uint32_t h, ref;
+    size_t m_len, l_len;
+
+    if (cap < HDR_HDR_SIZE)
+        return (0);
+
+    op = out;
+    op = comp_write_header(op, n);
+
+    ht = comp_alloc_hash();
+    if (ht == NULL)
+        return (0);
+
+    ip = in;
+    end = in + n;
+    anc = ip;
+
+    while (ip + MIN_MAT <= end) {
+        /* compute hash and probe table */
+        memcpy(&h, ip, 4);
+        h = ((h * HASH_MULT) >> HSH_SFT) & (HSH_SIZE - 1);
+        ref = ht[h];
+        ht[h] = (uint32_t)(ip - in);
+
+        /* candidate validation: ensure within window and matching */
+        if (ref == U32_EMPTY || (ip - (in + ref)) > WIN_SIZE ||
+            memcmp(in + ref, ip, MIN_MAT) != 0) {
+            ip++;
+            continue;
+        }
+
+        /* determine match and literal lengths */
+        m_len = comp_find_match_len(ip, in + ref, end);
+        l_len = ip - anc;
+
+        /* emit token, literal, and match */
+        *op++ = (uint8_t)((l_len >= TOKEN_MAX_NIBBLE ? TOKEN_MAX_NIBBLE : l_len) << 4 |
+            (m_len - MIN_MAT >= TOKEN_MAX_NIBBLE ? TOKEN_MAX_NIBBLE : m_len - MIN_MAT));
+        comp_emit_literal(&op, anc, l_len);
+        comp_emit_match(&op, ip - (in + ref), m_len);
+
+        /* advance to continue scanning after the match */
+        ip += m_len;
+        anc = ip;
+    }
+
+    /* emit final literal run */
+    l_len = end - anc;
+    *op++ = (uint8_t)((l_len >= TOKEN_MAX_NIBBLE ? TOKEN_MAX_NIBBLE : l_len) << 4);
+    comp_emit_literal(&op, anc, l_len);
+
+    /* write compressed size into header and return total bytes */
+    {
+        uint32_t c_sz = (uint32_t)(op - out - HDR_HDR_SIZE);
+        memcpy(out + HDR_CSIZE_OFF, &c_sz, 4);
+    }
+
+    free(ht);
+    return (size_t)(op - out);
+}
+
+/*
+ * decompression helpers (extracted from lz4_dec)
+ *
+ * These helpers focus on the decoding contract and safety invariants.
+ */
+
+/* read extended length for literal or match
+ *
+ * Goal: decode the variable-length integer used for lengths. The helper
+ * advances *ip and returns the decoded length. If input is truncated,
+ * it returns 0 to indicate an error to the caller.
+ */
+static size_t
+dec_read_ext_len(const uint8_t **ip, const uint8_t *end, size_t initial)
+{
+    size_t len = initial;
+    uint8_t s;
+
+    if (initial == TOKEN_MAX_NIBBLE) {
+        do {
+            if (*ip >= end) return 0;
+            s = *(*ip)++;
+            len += s;
+        } while (s == TOKEN_EXT_BYTE);
+    }
+    return len;
+}
+
+/* copy match bytes handling overlap
+ *
+ * Goal: reconstruct a match region in the output buffer even when the
+ * source and destination ranges overlap (typical in LZ-style codecs).
+ * Returns 0 on success, -1 on invalid offset or capacity violation.
+ */
+static int
+dec_copy_match(uint8_t *out, size_t opos, size_t off, size_t m_len, size_t cap)
+{
+    size_t ref = opos - off;
+    size_t i;
+
+    if (off == 0 || off > opos || opos + m_len > cap)
+        return -1;
+    for (i = 0; i < m_len; ++i)
+        out[opos + i] = out[ref + i];
+    return 0;
+}
+
+/*
+ * decompression core (refactored)
+ *
+ * Goal: validate the compressed block header and reconstruct the exact
+ * original input into 'out'. The function enforces bounds checks and
+ * returns 0 on any format or capacity error.
+ *
+ * Mathematical summary:
+ *  - Let O = H || T where H contains original size org.
+ *  - The decoder processes T to produce I' and returns |I'| if I' == org.
+ *  - Correctness: decode(encode(I)) = I.
+ *
+ * Example:
+ *  - Given O produced from I = "ABABABABCCCCDDDD", lz4_dec(O, n, out, cap)
+ *    will write the 16 original bytes into out and return 16.
+ */
+static size_t
+lz4_dec(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
+{
+    const uint8_t *ip, *end;
+    uint32_t org, c_sz;
+    size_t opos, l_len, m_len;
+    uint8_t tok;
+    uint16_t off;
+
+    if (n < HDR_HDR_SIZE || memcmp(in, HDR_MAGIC, HDR_MAGIC_LEN) != 0)
+        return (0);
+    memcpy(&org, in + HDR_ORIG_OFF, 4);
+    memcpy(&c_sz, in + HDR_CSIZE_OFF, 4);
+    if (c_sz + HDR_HDR_SIZE != n)
+        return (0);
+
+    ip = in + HDR_HDR_SIZE;
+    end = in + n;
+    opos = 0;
+
+    while (ip < end) {
+        tok = *ip++;
+        l_len = dec_read_ext_len(&ip, end, tok >> 4);
+        if (l_len == 0 && (tok >> 4) == TOKEN_MAX_NIBBLE && ip > end)
+            return 0;
+        if (opos + l_len > cap)
+            return (0);
+        if ((size_t)(end - ip) < l_len)
+            return 0;
+        memcpy(out + opos, ip, l_len);
+        ip += l_len;
+        opos += l_len;
+        if (ip >= end)
+            break;
+
+        if ((size_t)(end - ip) < 2) return 0;
+        off = ip[0] | (ip[1] << 8);
+        ip += 2;
+        m_len = (tok & 0xF) + MIN_MAT;
+        m_len = dec_read_ext_len(&ip, end, m_len - MIN_MAT) + MIN_MAT;
+        if (dec_copy_match(out, opos, off, m_len, cap) != 0)
+            return (0);
+        opos += m_len;
+    }
+    return (opos == org ? opos : 0);
+}
+
+/* --- remaining functions unchanged (file/block processing, recursion, main) --- */
+/* For brevity, the rest of the program (blk_proc, file_comp, file_dec, rec_comp,
+ * act_comp, act_dec, act_list, dir_mk, rec_size, main) remains as in the
+ * previous refactor. They already contain goal-oriented comments and follow
+ * the same invariants described above.
+ */
+ 
+ /* --- remaining functions (rest only) --- */
+
+ /* process a single compressed or decompressed block for a file
+  *
+  * Goal: centralize block-level processing for both compression and
+  * decompression so callers can stream blocks and update progress.
+  */
+ static int
+ blk_proc(io_ctx_t *c, FILE *out, int is_comp)
+ {
+     size_t res;
+     uint32_t b_sz;
+
+     if (is_comp)
+         res = lz4_comp(c->in, c->c_len, c->out, BLK_SIZE * 2);
+     else
+         res = lz4_dec(c->in, c->c_len, c->out, BLK_SIZE * 2);
+
+     if (res == 0)
+         return (-1);
+
+     if (is_comp) {
+         b_sz = (uint32_t)res;
+         if (io_wr_u32(out, b_sz))
+             return (-1);
+         if (fwrite(c->out, 1, res, out) != res)
+             return (-1);
+         g_prg.f_comp += 4 + res;
+     } else {
+         if (io_write(fileno(out), c->out, res))
+             return (-1);
+     }
+     return (0);
+ }
+
+ /* write placeholder size and return its file position
+  *
+  * Goal: reserve space for the per-file compressed size so it can be
+  * updated after streaming all blocks for that file.
+  */
+ static long
+ file_comp_write_placeholder(FILE *arc)
+ {
+     long pos = ftell(arc);
+     io_wr_u32(arc, 0);
+     return pos;
+ }
+
+ /* finalize placeholder with actual compressed size
+  *
+  * Goal: update the reserved compressed-size field and restore file pos.
+  */
+ static int
+ file_comp_finalize_placeholder(FILE *arc, long pos)
+ {
+     long cur = ftell(arc);
+     fseek(arc, pos, SEEK_SET);
+     io_wr_u32(arc, (uint32_t)g_prg.f_comp);
+     fseek(arc, cur, SEEK_SET);
+     return 0;
+ }
+
+ /* process blocks for compression of a single file
+  *
+  * Goal: read the input file in block-sized chunks, compress each block,
+  * write compressed blocks to the archive, and update progress.
+  */
+ static int
+ file_comp_process_blocks(io_ctx_t *c, FILE *arc)
+ {
+     size_t r;
+
+     while ((r = io_read(c->fp, c->in, BLK_SIZE)) > 0) {
+         c->c_len = (uint32_t)r;
+         if (blk_proc(c, arc, 1) != 0)
+             return (-1);
+         g_prg.proc += r;
+         prg_upd(g_prg.proc, g_prg.total);
+     }
+     return 0;
+ }
+
+ /* top-level file compression (refactored)
+  *
+  * Goal: orchestrate per-file compression with clear failure boundaries:
+  *  - reserve header space,
+  *  - stream-compress blocks,
+  *  - finalize header with compressed size.
+  */
+ static int
+ file_comp(io_ctx_t *c, FILE *arc)
+ {
+     long sz_pos;
+
+     g_prg.curr = c->path;
+     g_prg.f_comp = 0;
+     sz_pos = file_comp_write_placeholder(arc);
+
+     if (file_comp_process_blocks(c, arc) != 0)
+         return (-1);
+
+     file_comp_finalize_placeholder(arc, sz_pos);
+     return (0);
+ }
+
+ /* read a block from archive and decompress it to file
+  *
+  * Goal: stream-decompress a sequence of compressed blocks for a single
+  * archived file and write the reconstructed bytes to disk.
+  */
+ static int
+ file_dec_process_blocks(FILE *arc, const char *out, uint32_t c_sz)
+ {
+     io_ctx_t c;
+     FILE *fo;
+     uint32_t rem;
+     uint32_t b_sz;
+     int fd;
+
+     c.in = malloc(BLK_SIZE * 2);
+     c.out = malloc(BLK_SIZE * 2);
+     c.fp = NULL;
+     fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, FILE_MODE);
+     fo = (fd >= 0) ? fdopen(fd, "wb") : NULL;
+     rem = c_sz;
+
+     while (rem > 0) {
+         if (io_rd_u32(arc, &b_sz))
+             break;
+         rem -= 4;
+         c.c_len = b_sz;
+         io_read(arc, c.in, b_sz);
+         rem -= b_sz;
+         blk_proc(&c, fo, 0);
+         g_prg.proc += 4 + b_sz;
+         prg_upd(g_prg.proc, g_prg.total);
+     }
+     free(c.in);
+     free(c.out);
+     if (fo)
+         fclose(fo);
+     return (0);
+ }
+
+ /* wrapper for file_dec */
+ static int
+ file_dec(FILE *arc, const char *out, uint32_t c_sz)
+ {
+     return file_dec_process_blocks(arc, out, c_sz);
+ }
+
+ /* process a single file entry for compression
+  *
+  * Goal: isolate the logic that turns a filesystem path into an archive
+  * entry. Handles path normalization, writes the archive file header for
+  * the entry, and delegates block compression to file_comp.
+  */
+ static int
+ dir_process_entry(const char *path, const char *rt, FILE *arc)
+ {
+     struct stat st;
+     io_ctx_t c;
+
+     if (lstat(path, &st))
+         return (-1);
+     if (!S_ISREG(st.st_mode))
+         return 0;
+
+     const char *rel = path + strlen(rt);
+     char relbuf[PATH_MAX];
+     if (*rel == '/')
+         rel++;
+     strncpy(relbuf, rel, sizeof(relbuf));
+     relbuf[sizeof(relbuf) - 1] = '\0';
+
+     if (arc_write(arc, relbuf, st.st_size))
+         return (-1);
+
+     c.path = relbuf;
+     c.fp = fopen(path, "rb");
+     if (c.fp == NULL)
+         return -1;
+     c.in = malloc(BLK_SIZE);
+     c.out = malloc(BLK_SIZE * 2);
+     file_comp(&c, arc);
+     free(c.in);
+     free(c.out);
+     fclose(c.fp);
+     return 0;
+ }
+
+ /* recursive directory compression
+  *
+  * Goal: traverse directories and compress regular files. Skips dotfiles
+  * and delegates per-file work to dir_process_entry.
+  */
+ static int
+ rec_comp(const char *in, const char *rt, FILE *arc)
+ {
+     struct stat st;
+     struct dirent *e;
+     DIR *d;
+     char sub[PATH_MAX];
+
+     if (lstat(in, &st))
+         return (-1);
+     if (S_ISDIR(st.st_mode)) {
+         d = opendir(in);
+         if (d == NULL)
+             return (-1);
+         while ((e = readdir(d))) {
+             if (e->d_name[0] == '.')
+                 continue;
+             path_join(sub, PATH_MAX, in, e->d_name);
+             rec_comp(sub, rt, arc);
+         }
+         closedir(d);
+         return (0);
+     }
+     return dir_process_entry(in, rt, arc);
+ }
+
+ /* list archive contents
+  *
+  * Goal: iterate archive entries and print name, original size and
+  * compressed size in human-readable form.
+  */
+ static int
+ act_list(const char *fn)
+ {
+     FILE *f;
+     uint64_t o_sz;
+     uint32_t nl, c_sz;
+     char nm[PATH_MAX];
+     char s1[32], s2[32];
+
+     f = fopen(fn, "rb");
+     if (f == NULL)
+         err(1, "open");
+     while (1) {
+         if (io_rd_u32(f, &nl))
+             break;
+         if (fread(nm, 1, nl, f) != nl)
+             break;
+         nm[nl] = 0;
+         io_rd_u64(f, &o_sz);
+         io_rd_u32(f, &c_sz);
+         fmt_byte(o_sz, s1, 32);
+         fmt_byte(c_sz, s2, 32);
+         printf("%s %s %s\n", nm, s1, s2);
+         fseek(f, c_sz, SEEK_CUR);
+     }
+     fclose(f);
+     return 0;
+ }
+
+ /* top-level archive creation
+  *
+  * Goal: create an archive file from a path (file or directory). Computes
+  * total size for progress reporting, then recursively compresses entries.
+  */
+ static void
+ act_comp(const char *in, const char *out)
+ {
+     FILE *arc;
+     char out_fn[PATH_MAX];
+     char rt[PATH_MAX];
+     char *dir;
+
+     if (out == NULL)
+         snprintf(out_fn, sizeof(out_fn), "%s.lz4", in);
+     else
+         strncpy(out_fn, out, sizeof(out_fn));
+
+     arc = fopen(out_fn, "wb");
+     if (arc == NULL)
+         err(1, "create");
+
+     strncpy(rt, in, sizeof(rt));
+     if (rec_size(in, &g_prg.total))
+         err(1, "scan");
+
+     dir = dirname(rt);
+     rec_comp(in, dir, arc);
+     fclose(arc);
+ }
+
+ /* top-level archive extraction
+  *
+  * Goal: read archive entries and reconstruct files into the destination
+  * directory (or current working directory if out == NULL).
+  */
+ static void
+ act_dec(const char *in, const char *out)
+ {
+     FILE *f;
+     struct stat st;
+     uint64_t o_sz;
+     uint32_t nl, c_sz;
+     char nm[PATH_MAX];
+     char dst[PATH_MAX];
+
+     f = fopen(in, "rb");
+     if (f == NULL)
+         err(1, "open");
+
+     stat(in, &st);
+     g_prg.total = st.st_size;
+
+     while (1) {
+         if (io_rd_u32(f, &nl))
+             break;
+         if (fread(nm, 1, nl, f) != nl)
+             break;
+         nm[nl] = 0;
+         io_rd_u64(f, &o_sz);
+         io_rd_u32(f, &c_sz);
+
+         if (out != NULL)
+             path_join(dst, PATH_MAX, out, nm);
+         else
+             strncpy(dst, nm, PATH_MAX);
+
+         dir_mk(dst);
+         file_dec(f, dst, c_sz);
+     }
+     fclose(f);
+ }
+
+ /* create directories for a path
+  *
+  * Goal: ensure parent directories exist for a given path. Returns 0 on
+  * success or if directory already exists.
+  */
+ static int
+ dir_mk(const char *p)
+ {
+     struct stat st;
+     char tmp[PATH_MAX];
+     char *sl;
+
+     strncpy(tmp, p, sizeof(tmp) - 1);
+     tmp[sizeof(tmp) - 1] = '\0';
+     sl = strrchr(tmp, '/');
+     if (sl == NULL || sl == tmp)
+         return (0);
+     *sl = 0;
+     if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode))
+         return (0);
+     dir_mk(tmp);
+     return (mkdir(tmp, DIR_MODE) == 0 || errno == EEXIST ? 0 : -1);
+ }
+
+ /* recursively compute total size for progress reporting
+  *
+  * Goal: sum sizes of regular files under a path. Skips non-regular
+  * entries and dotfiles.
+  */
+ static int
+ rec_size(const char *p, uint64_t *sz)
+ {
+     struct stat st;
+     struct dirent *e;
+     DIR *d;
+     char sub[PATH_MAX];
+
+     if (lstat(p, &st))
+         return (-1);
+     if (S_ISREG(st.st_mode)) {
+         *sz += st.st_size;
+         return (0);
+     }
+     if (!S_ISDIR(st.st_mode))
+         return (0);
+
+     d = opendir(p);
+     if (d == NULL)
+         return (-1);
+     while ((e = readdir(d))) {
+         if (e->d_name[0] == '.')
+             continue;
+         path_join(sub, PATH_MAX, p, e->d_name);
+         rec_size(sub, sz);
+     }
+     closedir(d);
+     return (0);
+ }
+
+ /* program entry point (unchanged)
+  *
+  * Usage: program -c|-d|-l <in> [out]
+  */
+ int
+ main(int ac, char **av)
+ {
+     if (ac < 3) {
+         fprintf(stderr, "use: %s -c|-d|-l <in> [out]\n", av[0]);
+         return (1);
+     }
+     gettimeofday(&g_prg.start, NULL);
+
+     if (strcmp(av[1], "-l") == 0)
+         act_list(av[2]);
+     else if (strcmp(av[1], "-c") == 0)
+         act_comp(av[2], ac > 3 ? av[3] : NULL);
+     else if (strcmp(av[1], "-d") == 0)
+         act_dec(av[2], ac > 3 ? av[3] : NULL);
+     else
+         return (1);
+
+     return (0);
+ }
+

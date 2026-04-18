@@ -1,0 +1,11 @@
+{
+    \"Name\" : \"Qtccreator3\",
+    \"Version\" : \"0.0.1\",
+    \"CompatVersion\" : \"0.0.1\",
+    \"Vendor\" : \"CIA\",
+    \"Copyright\" : \"(C) CIA\",
+    \"License\" : \"Fügen Sie hier kurze Lizenzinformationen ein\",
+    \"Description\" : \"Fügen Sie hier eine kurze Beschreibung Ihres Plugins ein\",
+    \"Url\" : \"https://www.cia.gov\",
+    $$dependencyList
+}

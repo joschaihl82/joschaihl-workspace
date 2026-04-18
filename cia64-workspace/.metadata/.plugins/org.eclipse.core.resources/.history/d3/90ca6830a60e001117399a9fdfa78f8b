@@ -1,0 +1,89 @@
+// kernel.c
+// Simple CIA64-compatible kernel demo that paints a moving rainbow
+// into a linear 32-bit framebuffer (ARGB8888).
+//
+// Adjust FB_BASE, FB_WIDTH and FB_HEIGHT to match your emulator/platform.
+
+#include <stdint.h>
+
+// --- Configuration: change these to match your environment ---
+#define FB_BASE    0x00200000u   // framebuffer physical/virtual base used by emulator
+#define FB_WIDTH   320           // framebuffer width in pixels
+#define FB_HEIGHT  200           // framebuffer height in pixels
+// -----------------------------------------------------------------
+
+// Convert HSV (h in [0,360), s in [0,1], v in [0,1]) to 32-bit ARGB (0xAARRGGBB).
+static uint32_t hsv_to_argb(float h, float s, float v)
+{
+    float r = 0, g = 0, b = 0;
+
+    if (s <= 0.0001f) {
+        r = g = b = v;
+    } else {
+        if (h >= 360.0f) h = 0.0f;
+        float hf = h / 60.0f;
+        int i = (int)hf;
+        float f = hf - i;
+        float p = v * (1.0f - s);
+        float q = v * (1.0f - s * f);
+        float t = v * (1.0f - s * (1.0f - f));
+        switch (i) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+        }
+    }
+
+    // clamp and convert to 8-bit
+    uint8_t R = (uint8_t)(r * 255.0f);
+    uint8_t G = (uint8_t)(g * 255.0f);
+    uint8_t B = (uint8_t)(b * 255.0f);
+    uint8_t A = 0xFF;
+
+    return (uint32_t)A << 24 | (uint32_t)R << 16 | (uint32_t)G << 8 | (uint32_t)B;
+}
+
+// Simple busy-wait delay (tunable)
+static void delay_loop(volatile int n) {
+    while (n-- > 0) {
+        // volatile to prevent optimization
+        __asm__ volatile("" ::: "memory");
+    }
+}
+
+int main(void) {
+    volatile uint32_t *fb = (volatile uint32_t *) (uintptr_t) FB_BASE;
+
+    // If the emulator expects a different pixel layout, change hsv_to_argb above.
+    // This loop continuously scrolls the hue horizontally to create a moving rainbow.
+    for (uint32_t frame = 0;; ++frame) {
+        // horizontal hue offset (wraps every 360)
+        float hue_offset = (frame % 360);
+
+        for (int y = 0; y < FB_HEIGHT; ++y) {
+            // use vertical position to vary brightness slightly
+            float v = 0.5f + 0.5f * ((float)y / (float)(FB_HEIGHT - 1));
+            for (int x = 0; x < FB_WIDTH; ++x) {
+                // hue varies across X and shifts with frame
+                float hue = ( (float)x / (float)FB_WIDTH ) * 360.0f;
+                hue += hue_offset;
+                if (hue >= 360.0f) hue -= 360.0f;
+
+                // full saturation for vivid colors
+                float s = 1.0f;
+
+                uint32_t color = hsv_to_argb(hue, s, v);
+                fb[y * FB_WIDTH + x] = color;
+            }
+        }
+
+        // small delay so animation is visible; tune as needed
+        delay_loop(200000);
+    }
+
+    // never reached
+    return 0;
+}

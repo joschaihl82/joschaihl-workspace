@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+1e9bb36861a248015192e6ff804c9d90 CMakeFiles/shader_ide_autogen
+2ae917e81390f7fe5ebfc638696b5fb2 shader_ide_autogen/timestamp

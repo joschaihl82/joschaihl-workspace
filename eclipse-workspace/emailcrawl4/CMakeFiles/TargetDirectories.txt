@@ -1,0 +1,4 @@
+/home/josh/eclipse-workspace/emailcrawl4/CMakeFiles/Qt5EmailCrawler.dir
+/home/josh/eclipse-workspace/emailcrawl4/CMakeFiles/edit_cache.dir
+/home/josh/eclipse-workspace/emailcrawl4/CMakeFiles/rebuild_cache.dir
+/home/josh/eclipse-workspace/emailcrawl4/CMakeFiles/Qt5EmailCrawler_autogen.dir

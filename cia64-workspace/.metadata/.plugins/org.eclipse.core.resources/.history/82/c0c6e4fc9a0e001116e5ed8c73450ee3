@@ -1,0 +1,288 @@
+/*
+ * ccompress.c
+ *
+ * Simple C source "compressor" with convention-over-configuration:
+ *  - Accepts exactly two arguments: input-file and output-file
+ *  - Removes C-style comments: // line comments and /* block comments *\/
+ *  - Preserves string and character literals (comments inside them are NOT removed)
+ *  - Converts only leading indentation spaces at the start of each line into tabs
+ *    (TAB_WIDTH spaces -> 1 tab). Remaining leading spaces (<TAB_WIDTH) are kept.
+ *  - **Removes newlines that were inside removed comments** (both line and block comments),
+ *    i.e., comment text and any newlines inside it are deleted so surrounding lines are joined.
+ *
+ * Usage:
+ *   ccompress input.c output.c
+ *
+ * Build:
+ *   gcc -O2 -Wall -o ccompress ccompress.c
+ *
+ * Notes:
+ *  - Tab width for indentation conversion is fixed to 4 spaces per tab.
+ *  - This is a single-pass state machine. It handles escaped quotes and
+ *    escaped backslashes inside strings/chars. It does not implement a full
+ *    C preprocessor (trigraphs, universal character names not specially handled).
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+
+typedef enum {
+	S_NORMAL,
+	S_IN_STRING,
+	S_IN_CHAR,
+	S_IN_LINE_COMMENT,
+	S_IN_BLOCK_COMMENT,
+	S_IN_BLOCK_COMMENT_ASTERISK
+} state_t;
+
+/* Tab width used to convert leading spaces into tabs */
+#define TAB_WIDTH 4
+
+/* Write 'count' tabs to out, return 0 on success, -1 on error */
+static int write_tabs(FILE *out, int count) {
+	for (int i = 0; i < count; ++i) {
+		if (fputc('\t', out) == EOF) return -1;
+	}
+	return 0;
+}
+
+/* Write 'count' spaces to out, return 0 on success, -1 on error */
+static int write_spaces(FILE *out, int count) {
+	for (int i = 0; i < count; ++i) {
+		if (fputc(' ', out) == EOF) return -1;
+	}
+	return 0;
+}
+
+/* Flush pending leading spaces: convert groups of TAB_WIDTH to tabs, leave remainder spaces.
+ * After flushing, mark that we've emitted content on the line (return 0) or error (-1).
+ */
+static int flush_leading_spaces(FILE *out, int *pending_leading_spaces, int *at_line_start) {
+	if (*pending_leading_spaces > 0) {
+		int tabs = *pending_leading_spaces / TAB_WIDTH;
+		int rem = *pending_leading_spaces % TAB_WIDTH;
+		if (write_tabs(out, tabs) != 0) return -1;
+		if (write_spaces(out, rem) != 0) return -1;
+		*pending_leading_spaces = 0;
+		*at_line_start = 0; /* we've emitted indentation */
+	}
+	return 0;
+}
+
+/*
+ * process_stream:
+ *  - removes comments
+ *  - converts only leading indentation spaces at the start of each line
+ *    into tabs (TAB_WIDTH spaces -> 1 tab). Remaining leading spaces (<TAB_WIDTH)
+ *    are kept as spaces.
+ *  - preserves all other spaces and characters
+ *  - removes newlines that were inside removed comments (both line and block)
+ */
+static int process_stream(FILE *in, FILE *out) {
+	state_t state = S_NORMAL;
+	int c;
+	int at_line_start = 1; /* true when we are at the start of a line and haven't emitted any non-newline char */
+	int pending_leading_spaces = 0; /* count of consecutive leading spaces seen while at_line_start */
+
+	while ((c = fgetc(in)) != EOF) {
+		if (state == S_NORMAL) {
+			if (at_line_start) {
+				/* Accumulate leading spaces without emitting until we see a non-space/tab/newline */
+				if (c == ' ') {
+					pending_leading_spaces++;
+					continue;
+				}
+				if (c == '\t') {
+					/* flush pending spaces first, then emit the existing tab */
+					if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+					if (fputc('\t', out) == EOF) return -1;
+					at_line_start = 0;
+					continue;
+				}
+				/* If we encounter a newline at line start, flush pending spaces (if any),
+				   emit newline, and remain at line start. */
+				if (c == '\n') {
+					if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+					if (fputc('\n', out) == EOF) return -1;
+					at_line_start = 1;
+					continue;
+				}
+				/* For any other character, flush pending leading spaces and fall through to handle c */
+				if (pending_leading_spaces > 0) {
+					if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+				}
+			}
+
+			/* Normal-state handling (not in string/char/comment) */
+			if (c == '/') {
+				int n = fgetc(in);
+				if (n == '/') {
+					/* start line comment: skip until newline, but DO NOT emit the newline (remove it) */
+					/* flush any pending leading spaces (they become indentation before merged content) */
+					if (at_line_start && pending_leading_spaces > 0) {
+						if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+					}
+					state = S_IN_LINE_COMMENT;
+					/* after removing comment and its newline, lines will be joined; at_line_start should reflect
+					   whether we emitted indentation before the comment (at_line_start==0) or not (still 1).
+					   flush_leading_spaces already set at_line_start appropriately. */
+				} else if (n == '*') {
+					/* start block comment: skip everything including newlines */
+					if (at_line_start && pending_leading_spaces > 0) {
+						if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+					}
+					state = S_IN_BLOCK_COMMENT;
+				} else {
+					/* not a comment: output '/' and push back n */
+					if (fputc('/', out) == EOF) return -1;
+					if (n != EOF) ungetc(n, in);
+					at_line_start = 0;
+				}
+			} else if (c == '"') {
+				if (fputc('"', out) == EOF) return -1;
+				state = S_IN_STRING;
+				at_line_start = 0;
+			} else if (c == '\'') {
+				if (fputc('\'', out) == EOF) return -1;
+				state = S_IN_CHAR;
+				at_line_start = 0;
+			} else if (c == '\n') {
+				/* newline: flush any pending leading spaces (convert them) then emit newline */
+				if (flush_leading_spaces(out, &pending_leading_spaces, &at_line_start) != 0) return -1;
+				if (fputc('\n', out) == EOF) return -1;
+				at_line_start = 1;
+			} else {
+				/* any other character: emit it */
+				if (fputc(c, out) == EOF) return -1;
+				at_line_start = 0;
+			}
+		} else if (state == S_IN_STRING) {
+			/* inside "..." - copy everything, but handle escapes */
+			if (c == '\\') {
+				/* escape: copy backslash and next char (if any) */
+				if (fputc('\\', out) == EOF) return -1;
+				int n = fgetc(in);
+				if (n == EOF) break;
+				if (fputc(n, out) == EOF) return -1;
+			} else if (c == '"') {
+				if (fputc('"', out) == EOF) return -1;
+				state = S_NORMAL;
+			} else {
+				if (fputc(c, out) == EOF) return -1;
+			}
+			at_line_start = 0;
+		} else if (state == S_IN_CHAR) {
+			/* inside '...' - copy, handle escapes */
+			if (c == '\\') {
+				if (fputc('\\', out) == EOF) return -1;
+				int n = fgetc(in);
+				if (n == EOF) break;
+				if (fputc(n, out) == EOF) return -1;
+			} else if (c == '\'') {
+				if (fputc('\'', out) == EOF) return -1;
+				state = S_NORMAL;
+			} else {
+				if (fputc(c, out) == EOF) return -1;
+			}
+			at_line_start = 0;
+		} else if (state == S_IN_LINE_COMMENT) {
+			/* skip until newline, but DO NOT emit the newline (remove it).
+			   When newline is encountered, consume it and return to normal without emitting it. */
+			if (c == '\n') {
+				/* consume newline and return to normal, but do NOT emit it */
+				state = S_NORMAL;
+				/* after removing the newline, we are still on the same logical line;
+				   at_line_start remains as set when we entered the comment (likely 0 if indentation flushed). */
+				/* Do not set at_line_start to 1. */
+			} else {
+				/* drop character (comment) */
+			}
+		} else if (state == S_IN_BLOCK_COMMENT) {
+			/* skip until '*/' and DO NOT emit any newlines inside the block comment */
+			if (c == '*') {
+				state = S_IN_BLOCK_COMMENT_ASTERISK;
+			} else {
+				/* drop everything including newlines */
+			}
+		} else if (state == S_IN_BLOCK_COMMENT_ASTERISK) {
+			if (c == '/') {
+				/* end of block comment */
+				state = S_NORMAL;
+				/* after closing comment, we continue reading next characters; since we removed all newlines
+				   inside the block comment, lines are joined. at_line_start remains as it was when comment started
+				   (flush_leading_spaces already handled indentation). */
+			} else if (c == '*') {
+				/* stay in asterisk-seen state */
+				state = S_IN_BLOCK_COMMENT_ASTERISK;
+			} else {
+				/* back to normal block comment scanning */
+				state = S_IN_BLOCK_COMMENT;
+			}
+		}
+	}
+
+	/* EOF reached: if there are pending leading spaces (file didn't end with newline),
+	   flush them (convert groups of TAB_WIDTH to tabs) */
+	if (pending_leading_spaces > 0) {
+		int tabs = pending_leading_spaces / TAB_WIDTH;
+		int rem = pending_leading_spaces % TAB_WIDTH;
+		if (write_tabs(out, tabs) != 0) return -1;
+		if (write_spaces(out, rem) != 0) return -1;
+	}
+
+	return 0;
+}
+
+int main(int argc, char **argv) {
+	if (argc != 3) {
+		fprintf(stderr, "Usage: %s input-file output-file\n", argv[0]);
+		return 2;
+	}
+
+	const char *inpath = argv[1];
+	const char *outpath = argv[2];
+
+	FILE *in = fopen(inpath, "rb");
+	if (!in) {
+		fprintf(stderr, "ccompress: cannot open input '%s': %s\n", inpath, strerror(errno));
+		return 3;
+	}
+
+	/* write to temporary file first to avoid truncating input on same-file mistakes */
+	char tmp[4096];
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", outpath) >= (int)sizeof(tmp)) {
+		fprintf(stderr, "ccompress: output path too long\n");
+		fclose(in);
+		return 4;
+	}
+
+	FILE *out = fopen(tmp, "wb");
+	if (!out) {
+		fprintf(stderr, "ccompress: cannot open output '%s': %s\n", tmp, strerror(errno));
+		fclose(in);
+		return 5;
+	}
+
+	int rc = process_stream(in, out);
+	fclose(in);
+	if (fflush(out) != 0) rc = -1;
+	if (fclose(out) != 0) rc = -1;
+
+	if (rc != 0) {
+		fprintf(stderr, "ccompress: processing failed\n");
+		remove(tmp);
+		return 6;
+	}
+
+	/* move temp to final output */
+	if (rename(tmp, outpath) != 0) {
+		fprintf(stderr, "ccompress: cannot rename '%s' -> '%s': %s\n", tmp, outpath, strerror(errno));
+		remove(tmp);
+		return 7;
+	}
+
+	return 0;
+}

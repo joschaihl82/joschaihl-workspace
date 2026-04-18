@@ -1,0 +1,424 @@
+// unused-optimizer1.cpp
+// Remove functions and types that are never used anywhere in the same C file.
+// Additionally: if any enum constant is used (e.g., return TEST_1;), print the full enum declaration
+// and treat the enum as used (do not remove it).
+// Writes modified files as filename.clean.c
+//
+// Build with a Clang/LLVM dev environment (libclang-cpp or Clang CMake package).
+// Example:
+//   cmake -S . -B build -DLLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+//   cmake --build build -- -j
+//
+// Usage (from project root with compile_commands.json):
+//   ./remove_unused_in_file    # analyzes files from compile_commands.json
+//   or pass explicit files: ./remove_unused_in_file file1.c file2.c
+
+#include <clang/Tooling/CommonOptionsParser.h>
+#include <clang/Tooling/Tooling.h>
+#include <clang/Frontend/FrontendActions.h>
+#include <clang/AST/RecursiveASTVisitor.h>
+#include <clang/AST/ASTContext.h>
+#include <clang/Basic/SourceManager.h>
+#include <clang/Lex/Lexer.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/Path.h>
+#include <llvm/Support/raw_ostream.h>
+
+#include <set>
+#include <map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+
+using namespace clang;
+using namespace clang::tooling;
+using namespace llvm;
+
+static cl::OptionCategory ToolCategory("remove-unused-in-file options");
+static cl::opt<std::string> OutputSuffix("suffix",
+    cl::desc("Suffix for cleaned files"),
+    cl::value_desc("suffix"),
+    cl::init(".clean.c"),
+    cl::cat(ToolCategory));
+
+// Range info for removal
+struct RangeInfo {
+  unsigned startOffset;
+  unsigned endOffset; // exclusive
+  std::string name;
+};
+
+// Per-file collector: collects defs and uses for functions and types
+class PerFileCollector : public RecursiveASTVisitor<PerFileCollector> {
+  ASTContext &Ctx;
+  SourceManager &SM;
+  LangOptions LO;
+
+public:
+  // Functions defined in this TU and written in this file
+  std::map<const FunctionDecl*, RangeInfo> funcDefs;
+  std::set<const FunctionDecl*> funcCalled;
+  std::set<const FunctionDecl*> funcAddrTaken;
+
+  // Type declarations defined in this file
+  std::map<const TagDecl*, RangeInfo> tagDefs;        // struct/union/class/enum
+  std::map<const TypedefNameDecl*, RangeInfo> typedefDefs; // typedef / using
+  // Uses of types (TagDecl or TypedefNameDecl) found in this file
+  std::set<const TagDecl*> tagUsed;
+  std::set<const TypedefNameDecl*> typedefUsed;
+
+  // Enum-constant usage: map enum decl -> list of enumerator names used
+  std::map<const EnumDecl*, std::vector<std::string>> enumConstantsUsed;
+
+  // File backing this TU
+  std::string fileName;
+
+  PerFileCollector(ASTContext &Context)
+    : Ctx(Context), SM(Context.getSourceManager()), LO(Context.getLangOpts()) {}
+
+  // Helpers to record a source range for a decl if it's in a real file
+  bool recordRangeForDecl(SourceLocation B, SourceLocation E, RangeInfo &out) {
+    if (!B.isValid() || !E.isValid()) return false;
+    if (!SM.isWrittenInSameFile(B, E)) return false;
+    FileID fid = SM.getFileID(B);
+    if (fid.isInvalid()) return false;
+    SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+    if (!realEnd.isValid()) return false;
+    unsigned start = SM.getFileOffset(B);
+    unsigned end = SM.getFileOffset(realEnd);
+    out.startOffset = start;
+    out.endOffset = end;
+    return true;
+  }
+
+  // Visit function definitions and also inspect return type (to mark type uses)
+  bool VisitFunctionDecl(FunctionDecl *FD) {
+    // --- record definition if present ---
+    if (FD->isThisDeclarationADefinition()) {
+      SourceLocation B = FD->getSourceRange().getBegin();
+      SourceLocation E = FD->getSourceRange().getEnd();
+      RangeInfo ri{0,0,FD->getNameAsString()};
+      if (recordRangeForDecl(B, E, ri)) {
+        funcDefs[FD] = ri;
+        fileName = SM.getFilename(B).str();
+      }
+    }
+
+    // --- inspect return type (and parameter types are handled by ParmVarDecl visitor) ---
+    if (TypeSourceInfo *TSI = FD->getTypeSourceInfo()) {
+      TypeLoc TL = TSI->getTypeLoc();
+      VisitTypeLoc(TL);
+    }
+
+    return true;
+  }
+
+  // Calls
+  bool VisitCallExpr(CallExpr *CE) {
+    if (FunctionDecl *Callee = CE->getDirectCallee()) {
+      funcCalled.insert(Callee);
+    }
+    return true;
+  }
+
+  // Address-of operator for functions
+  bool VisitUnaryOperator(UnaryOperator *UO) {
+    if (UO->getOpcode() == UO_AddrOf) {
+      Expr *sub = UO->getSubExpr()->IgnoreParenImpCasts();
+      if (DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(sub)) {
+        if (FunctionDecl *FD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
+          funcAddrTaken.insert(FD);
+        }
+      }
+    }
+    return true;
+  }
+
+  // DeclRefExpr used in pointer contexts may indicate address-of.
+  // Also detect enum-constant uses here.
+  bool VisitDeclRefExpr(DeclRefExpr *DRE) {
+    if (ValueDecl *VD = DRE->getDecl()) {
+      // Function pointer/address-of detection
+      if (FunctionDecl *FD = dyn_cast<FunctionDecl>(VD)) {
+        QualType QT = DRE->getType();
+        if (!QT.isNull() && (QT->isPointerType() || QT->isFunctionPointerType())) {
+          funcAddrTaken.insert(FD);
+        }
+      }
+
+      // Enum constant usage detection
+      if (EnumConstantDecl *ECD = dyn_cast<EnumConstantDecl>(VD)) {
+        // EnumConstantDecl's DeclContext is the EnumDecl; getDeclContext() and cast
+        if (DeclContext *DC = ECD->getDeclContext()) {
+          if (EnumDecl *ED = dyn_cast<EnumDecl>(DC)) {
+            const EnumDecl *def = ED->getDefinition() ? ED->getDefinition() : ED;
+            enumConstantsUsed[def].push_back(ECD->getNameAsString());
+            tagUsed.insert(def);
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  // Record tag (struct/union/class/enum) definitions
+  bool VisitTagDecl(TagDecl *TD) {
+    if (!TD->isThisDeclarationADefinition()) return true;
+    SourceLocation B = TD->getBeginLoc();
+    SourceLocation E = TD->getEndLoc();
+    RangeInfo ri{0,0,TD->getNameAsString()};
+    if (!recordRangeForDecl(B, E, ri)) return true;
+    tagDefs[TD] = ri;
+    fileName = SM.getFilename(B).str();
+    return true;
+  }
+
+  // Record typedef/using declarations
+  bool VisitTypedefNameDecl(TypedefNameDecl *TD) {
+    SourceLocation B = TD->getBeginLoc();
+    SourceLocation E = TD->getEndLoc();
+    RangeInfo ri{0,0,TD->getNameAsString()};
+    if (!recordRangeForDecl(B, E, ri)) return true;
+    typedefDefs[TD] = ri;
+    fileName = SM.getFilename(B).str();
+    return true;
+  }
+
+  // Visit TypeLocs to find uses of TagDecls and TypedefNameDecls
+  bool VisitTypeLoc(TypeLoc TL) {
+    if (TL.getType().isNull()) return true;
+
+    // TagType -> TagDecl
+    if (TagTypeLoc TTL = TL.getAs<TagTypeLoc>()) {
+      if (TagDecl *TD = TTL.getDecl()) {
+        const TagDecl *def = TD->getDefinition() ? TD->getDefinition() : TD;
+        tagUsed.insert(def);
+      }
+    }
+    // TypedefType -> TypedefNameDecl
+    if (TypedefTypeLoc TDL = TL.getAs<TypedefTypeLoc>()) {
+      if (TypedefNameDecl *TD = TDL.getTypedefNameDecl()) {
+        typedefUsed.insert(TD);
+      }
+    }
+    return true;
+  }
+
+  // Base classes reference types via TypeLoc
+  bool VisitCXXBaseSpecifier(CXXBaseSpecifier const &B) {
+    if (TypeSourceInfo *TSI = B.getTypeSourceInfo()) {
+      VisitTypeLoc(TSI->getTypeLoc());
+    }
+    return true;
+  }
+
+  // Also consider variable/field/param declarations to mark type uses
+  bool VisitVarDecl(VarDecl *VD) {
+    if (TypeSourceInfo *TSI = VD->getTypeSourceInfo()) {
+      VisitTypeLoc(TSI->getTypeLoc());
+    }
+    return true;
+  }
+  bool VisitFieldDecl(FieldDecl *FD) {
+    if (TypeSourceInfo *TSI = FD->getTypeSourceInfo()) {
+      VisitTypeLoc(TSI->getTypeLoc());
+    }
+    return true;
+  }
+  bool VisitParmVarDecl(ParmVarDecl *PD) {
+    if (TypeSourceInfo *TSI = PD->getTypeSourceInfo()) {
+      VisitTypeLoc(TSI->getTypeLoc());
+    }
+    return true;
+  }
+};
+
+// ASTConsumer that runs per-TU and writes cleaned file for that TU
+class PerFileConsumer : public ASTConsumer {
+  ASTContext *Ctx;
+public:
+  PerFileConsumer(ASTContext *C) : Ctx(C) {}
+
+  void HandleTranslationUnit(ASTContext &Context) override {
+    PerFileCollector V(Context);
+    V.TraverseDecl(Context.getTranslationUnitDecl());
+
+    if (V.fileName.empty()) {
+      llvm::outs() << "Skipping TU with no file backing\n";
+      return;
+    }
+
+    // --- Print enums that have enumerators used in this file ---
+    if (!V.enumConstantsUsed.empty()) {
+      SourceManager &SM = Context.getSourceManager();
+      LangOptions LO = Context.getLangOpts();
+      for (auto &entry : V.enumConstantsUsed) {
+        const EnumDecl *ED = entry.first;
+        const TagDecl *TD = ED;
+        SourceRange SR = TD->getSourceRange();
+        SourceLocation B = SR.getBegin();
+        SourceLocation E = TD->getEndLoc();
+        if (B.isValid() && E.isValid() && SM.isWrittenInSameFile(B, E)) {
+          SourceLocation realEnd = Lexer::getLocForEndOfToken(E, 0, SM, LO);
+          if (realEnd.isValid()) {
+            CharSourceRange CR = CharSourceRange::getCharRange(B, realEnd);
+            StringRef src = Lexer::getSourceText(CR, SM, LO);
+            llvm::outs() << "Enum used in file " << V.fileName << " :\n";
+            llvm::outs() << src << "\n";
+            llvm::outs() << "Used enumerators: ";
+            bool first = true;
+            for (auto &ename : entry.second) {
+              if (!first) llvm::outs() << ", ";
+              llvm::outs() << ename;
+              first = false;
+            }
+            llvm::outs() << "\n\n";
+          }
+        }
+      }
+    }
+
+    // --- Decide removable functions (conservative) ---
+    std::vector<RangeInfo> funcRemovals;
+    for (auto &p : V.funcDefs) {
+      const FunctionDecl *FD = p.first;
+      const RangeInfo &ri = p.second;
+      // Only remove file-scope static functions
+      if (FD->getStorageClass() != SC_Static) continue;
+      if (V.funcCalled.count(FD)) continue;
+      if (V.funcAddrTaken.count(FD)) continue;
+      if (FD->hasAttr<UsedAttr>() || FD->hasAttr<ConstructorAttr>() || FD->hasAttr<DestructorAttr>()) continue;
+      funcRemovals.push_back(ri);
+    }
+
+    // --- Decide removable types ---
+    std::vector<RangeInfo> typeRemovals;
+
+    // TagDecls (struct/union/class/enum)
+    for (auto &p : V.tagDefs) {
+      const TagDecl *TD = p.first;
+      const RangeInfo &ri = p.second;
+      const TagDecl *def = TD->getDefinition() ? TD->getDefinition() : TD;
+      // If the tag is used anywhere in the file (tagUsed contains the definition or decl), keep it
+      if (V.tagUsed.count(def)) continue;
+      // If this is an enum and any enumerator was used, keep it
+      if (const EnumDecl *ED = dyn_cast<EnumDecl>(def)) {
+        if (V.enumConstantsUsed.count(ED)) continue;
+      }
+      // Conservative: do not remove anonymous tags (no name) because they may be used via typedefs or other constructs
+      if (TD->getName().empty()) continue;
+      // Attributes that imply external use: keep
+      if (TD->hasAttr<UsedAttr>()) continue;
+      typeRemovals.push_back(ri);
+    }
+
+    // Typedefs / using
+    for (auto &p : V.typedefDefs) {
+      const TypedefNameDecl *TD = p.first;
+      const RangeInfo &ri = p.second;
+      if (V.typedefUsed.count(TD)) continue;
+      if (TD->hasAttr<UsedAttr>()) continue;
+      if (TD->getName().empty()) continue;
+      typeRemovals.push_back(ri);
+    }
+
+    if (funcRemovals.empty() && typeRemovals.empty()) {
+      llvm::outs() << "No removable functions or types in file: " << V.fileName << "\n";
+      return;
+    }
+
+    // Read file content
+    std::ifstream fin(V.fileName, std::ios::binary);
+    if (!fin) {
+      llvm::errs() << "Cannot open file: " << V.fileName << "\n";
+      return;
+    }
+    std::stringstream ss;
+    ss << fin.rdbuf();
+    std::string content = ss.str();
+    fin.close();
+
+    // Collect all ranges to remove and merge them
+    std::vector<std::pair<unsigned,unsigned>> ranges;
+    auto addRange = [&](const RangeInfo &r) {
+      unsigned s = r.startOffset;
+      unsigned e = r.endOffset;
+      if (s >= content.size()) return;
+      e = std::min(e, (unsigned)content.size());
+      ranges.emplace_back(s, e);
+    };
+    for (auto &r : funcRemovals) addRange(r);
+    for (auto &r : typeRemovals) addRange(r);
+
+    if (ranges.empty()) {
+      llvm::outs() << "No valid ranges to remove in file: " << V.fileName << "\n";
+      return;
+    }
+
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<unsigned,unsigned>> merged;
+    auto cur = ranges[0];
+    for (size_t i = 1; i < ranges.size(); ++i) {
+      if (ranges[i].first <= cur.second) {
+        cur.second = std::max(cur.second, ranges[i].second);
+      } else {
+        merged.push_back(cur);
+        cur = ranges[i];
+      }
+    }
+    merged.push_back(cur);
+
+    // Remove ranges from content (descending order)
+    std::sort(merged.begin(), merged.end(), [](auto &a, auto &b){ return a.first > b.first; });
+    std::string newContent = content;
+    for (auto &r : merged) {
+      unsigned s = r.first;
+      unsigned e = r.second;
+      if (s >= e || s >= newContent.size()) continue;
+      unsigned safeEnd = std::min(e, (unsigned)newContent.size());
+      newContent.erase(s, safeEnd - s);
+    }
+
+    // Write cleaned file
+    std::string outFile = V.fileName + OutputSuffix;
+    std::ofstream fout(outFile, std::ios::binary);
+    if (!fout) {
+      llvm::errs() << "Cannot write output file: " << outFile << "\n";
+      return;
+    }
+    fout << newContent;
+    fout.close();
+
+    llvm::outs() << "Wrote cleaned file: " << outFile << " (removed " << merged.size() << " ranges)\n";
+  }
+};
+
+class PerFileAction : public ASTFrontendAction {
+public:
+  PerFileAction() {}
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI, StringRef) override {
+    return std::make_unique<PerFileConsumer>(&CI.getASTContext());
+  }
+};
+
+int main(int argc, const char **argv) {
+  auto ExpectedParser = CommonOptionsParser::create(argc, argv, ToolCategory);
+  if (!ExpectedParser) {
+    llvm::errs() << "Error parsing command line: " << llvm::toString(ExpectedParser.takeError()) << "\n";
+    return 1;
+  }
+  CommonOptionsParser &OptionsParser = *ExpectedParser;
+  ClangTool Tool(OptionsParser.getCompilations(), OptionsParser.getSourcePathList());
+
+  int res = Tool.run(newFrontendActionFactory<PerFileAction>().get());
+  if (res != 0) {
+    llvm::errs() << "Error running tool over translation units\n";
+    return res;
+  }
+
+  llvm::outs() << "Done. Review the .clean.c files before replacing originals.\n";
+  return 0;
+}

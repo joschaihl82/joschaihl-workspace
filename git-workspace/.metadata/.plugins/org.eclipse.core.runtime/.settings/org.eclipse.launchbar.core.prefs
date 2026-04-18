@@ -1,0 +1,11 @@
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/arch=x86_64
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/name=Local
+LaunchTargetManager/org.eclipse.launchbar.core.launchTargetType.local,Local/os=linux
+configDescList=org.eclipse.launchbar.core.descriptorType.default\:gitpush,org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush7
+eclipse.preferences.version=1
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush1/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush1/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush6/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush6/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush7/activeLaunchMode=run
+org.eclipse.cdt.debug.core.coreBuildDescriptorType\:gitpush7/activeLaunchTarget=org.eclipse.launchbar.core.launchTargetType.local\:Local

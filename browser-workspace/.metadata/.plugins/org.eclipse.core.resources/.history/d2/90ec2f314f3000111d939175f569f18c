@@ -1,0 +1,97 @@
+cmake_minimum_required(VERSION 3.16)
+project(MiniGTK4Browser C)
+
+# C standard
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Default build type
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# Require pkg-config
+find_package(PkgConfig REQUIRED)
+
+# Find GTK4
+pkg_check_modules(GTK4 REQUIRED gtk4)
+
+# Try WebKitGTK 6, fallback to 4
+pkg_check_modules(WEBKIT6 QUIET webkit2gtk-6.0)
+pkg_check_modules(WEBKIT4 QUIET webkit2gtk-4.0)
+
+if(WEBKIT6_FOUND)
+  set(WEBKIT_PKG webkit2gtk-6.0)
+  pkg_check_modules(WEBKIT REQUIRED webkit2gtk-6.0)
+elseif(WEBKIT4_FOUND)
+  set(WEBKIT_PKG webkit2gtk-4.0)
+  pkg_check_modules(WEBKIT REQUIRED webkit2gtk-4.0)
+else()
+  message(FATAL_ERROR "Neither webkit2gtk-6.0 nor webkit2gtk-4.0 found. Install the development package (e.g. libwebkitgtk-6.0-dev) and ensure pkg-config can find it.")
+endif()
+
+# Optionally allow user override
+option(WEBKIT_PKG_OVERRIDE "Override webkit pkg-config name" OFF)
+if(WEBKIT_PKG_OVERRIDE)
+  message(STATUS "Using overridden WEBKIT pkg-config: ${WEBKIT_PKG}")
+endif()
+
+# Source files
+set(SRC
+  browser.c
+)
+
+add_executable(browser ${SRC})
+
+# Include directories
+target_include_directories(browser PRIVATE
+  ${GTK4_INCLUDE_DIRS}
+  ${WEBKIT_INCLUDE_DIRS}
+)
+
+# Compiler flags (pkg-config may provide -D, -I, -pthread etc.)
+if(GTK4_CFLAGS_OTHER)
+  target_compile_options(browser PRIVATE ${GTK4_CFLAGS_OTHER})
+endif()
+if(WEBKIT_CFLAGS_OTHER)
+  target_compile_options(browser PRIVATE ${WEBKIT_CFLAGS_OTHER})
+endif()
+
+# Link libraries
+target_link_libraries(browser PRIVATE
+  ${GTK4_LIBRARIES}
+  ${WEBKIT_LIBRARIES}
+)
+
+# Linker flags (pkg-config may provide -L, -Wl,...)
+if(GTK4_LDFLAGS)
+  if(POLICY CMP0077)
+    target_link_options(browser PRIVATE ${GTK4_LDFLAGS})
+  else()
+    # older CMake: append to LINK_FLAGS
+    set_target_properties(browser PROPERTIES LINK_FLAGS "${GTK4_LDFLAGS}")
+  endif()
+endif()
+if(WEBKIT_LDFLAGS)
+  if(POLICY CMP0077)
+    target_link_options(browser PRIVATE ${WEBKIT_LDFLAGS})
+  else()
+    set_target_properties(browser PROPERTIES LINK_FLAGS "${WEBKIT_LDFLAGS}")
+  endif()
+endif()
+
+# Helpful compile warnings and definitions
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(browser PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Install target
+install(TARGETS browser RUNTIME DESTINATION bin)
+
+# Print summary
+message(STATUS "Found GTK4: ${GTK4_VERSION}")
+message(STATUS "Using WebKit pkg-config: ${WEBKIT_PKG}")
+message(STATUS "WebKit pkg-config version: ${WEBKIT_VERSION}")
+
+# Export compile commands for IDEs
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

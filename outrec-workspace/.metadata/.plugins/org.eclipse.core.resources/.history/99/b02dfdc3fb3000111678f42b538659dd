@@ -1,0 +1,203 @@
+/*
+ record_auto_nopactl.c
+ Compile:
+   gcc $(pkg-config --cflags --libs gstreamer-1.0) record_auto_nopactl.c -o record_auto_nopactl
+
+ Usage:
+   ./record_auto_nopactl          # startet Aufnahme bis Ctrl+C
+   ./record_auto_nopactl 20       # nimmt 20 Sekunden auf und beendet
+   ./record_auto_nopactl device duration
+     device optional: GStreamer source element name or device string
+     duration optional: seconds (integer)
+*/
+
+#include <gst/gst.h>
+#include <gst/device-monitor/gstdevicemonitor.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+static GstElement *pipeline = NULL;
+static GMainLoop *loop = NULL;
+
+static void handle_int(int sig) {
+  if (pipeline) gst_element_send_event(pipeline, gst_event_new_eos());
+}
+
+static gchar *build_pipeline_desc(const char *source_element, const char *device_string) {
+  if (device_string && g_strcmp0(source_element, "pulsesrc") == 0) {
+    return g_strdup_printf("pulsesrc device=\"%s\" ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink location=out.wav", device_string);
+  } else if (g_strcmp0(source_element, "pipewiresrc") == 0) {
+    return g_strdup("pipewiresrc ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink location=out.wav");
+  } else if (g_strcmp0(source_element, "pulsesrc") == 0) {
+    return g_strdup("pulsesrc ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink location=out.wav");
+  } else if (g_strcmp0(source_element, "alsasrc") == 0) {
+    return g_strdup("alsasrc ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink location=out.wav");
+  } else {
+    // generic fallback: try the element name directly
+    return g_strdup_printf("%s ! audioconvert ! audioresample ! audio/x-raw,format=S16LE,channels=2,rate=44100 ! wavenc ! filesink location=out.wav", source_element);
+  }
+}
+
+static gboolean timeout_cb(gpointer user_data) {
+  if (pipeline) {
+    gst_element_send_event(pipeline, gst_event_new_eos());
+  }
+  return G_SOURCE_REMOVE;
+}
+
+int main(int argc, char *argv[]) {
+  gst_init(&argc, &argv);
+  signal(SIGINT, handle_int);
+
+  const char *forced_device = NULL;
+  int duration = 0;
+  if (argc >= 2) forced_device = argv[1];
+  if (argc >= 3) duration = atoi(argv[2]);
+
+  gchar *pipeline_desc = NULL;
+  gchar *chosen_device_string = NULL;
+  const char *chosen_source = NULL;
+
+  if (forced_device) {
+    // If user provided a device string or element name, try to use it directly.
+    // If it contains "src" assume it's an element name, else assume pulsesrc device string.
+    if (strstr(forced_device, "src") || strstr(forced_device, "src:")) {
+      chosen_source = forced_device;
+      pipeline_desc = build_pipeline_desc(chosen_source, NULL);
+    } else {
+      chosen_source = "pulsesrc";
+      chosen_device_string = g_strdup(forced_device);
+      pipeline_desc = build_pipeline_desc(chosen_source, chosen_device_string);
+    }
+  } else {
+    // No forced device: use GstDeviceMonitor to find monitor sources
+    GstDeviceMonitor *monitor = gst_device_monitor_new();
+    GstCaps *caps = gst_caps_new_empty_simple("audio/x-raw");
+    gst_device_monitor_add_filter(monitor, "Audio/Source", caps);
+    gst_caps_unref(caps);
+
+    gst_device_monitor_start(monitor);
+    GList *devices = gst_device_monitor_get_devices(monitor);
+    for (GList *l = devices; l; l = l->next) {
+      GstDevice *dev = GST_DEVICE(l->data);
+      const gchar *display = gst_device_get_display_name(dev);
+      if (!display) display = "(unknown)";
+      // Try to find PulseAudio monitor sources by name containing ".monitor" or "monitor"
+      if (g_strrstr(display, ".monitor") || g_strrstr(display, "monitor")) {
+        // try to get device properties for pulsesrc device string
+        GObject *props = gst_device_get_properties(dev);
+        if (props) {
+          GValue val = G_VALUE_INIT;
+          if (g_object_class_find_property(G_OBJECT_GET_CLASS(props), "device") != NULL) {
+            g_object_get(props, "device", &val, NULL);
+            if (G_VALUE_HOLDS_STRING(&val)) {
+              chosen_source = "pulsesrc";
+              chosen_device_string = g_strdup(g_value_get_string(&val));
+              g_value_unset(&val);
+              g_object_unref(props);
+              break;
+            }
+            g_value_unset(&val);
+          }
+          // fallback: try "device.string" property
+          if (g_object_class_find_property(G_OBJECT_GET_CLASS(props), "device.string") != NULL) {
+            g_object_get(props, "device.string", &val, NULL);
+            if (G_VALUE_HOLDS_STRING(&val)) {
+              chosen_source = "pulsesrc";
+              chosen_device_string = g_strdup(g_value_get_string(&val));
+              g_value_unset(&val);
+              g_object_unref(props);
+              break;
+            }
+            g_value_unset(&val);
+          }
+          g_object_unref(props);
+        }
+        // if we couldn't get a device string, still prefer pulsesrc by display name
+        if (!chosen_device_string) {
+          chosen_source = "pulsesrc";
+          chosen_device_string = g_strdup(display);
+          break;
+        }
+      }
+    }
+
+    // free device list
+    for (GList *l = devices; l; l = l->next) gst_object_unref(l->data);
+    g_list_free(devices);
+    gst_device_monitor_stop(monitor);
+    gst_object_unref(monitor);
+
+    // If no monitor found, try pipewiresrc factory
+    if (!chosen_source) {
+      if (gst_element_factory_find("pipewiresrc")) {
+        chosen_source = "pipewiresrc";
+      } else if (gst_element_factory_find("pulsesrc")) {
+        chosen_source = "pulsesrc";
+      } else if (gst_element_factory_find("alsasrc")) {
+        chosen_source = "alsasrc";
+      } else {
+        // last resort: try "autoaudiosrc" if available
+        if (gst_element_factory_find("autoaudiosrc")) chosen_source = "autoaudiosrc";
+      }
+    }
+
+    pipeline_desc = build_pipeline_desc(chosen_source ? chosen_source : "pulsesrc", chosen_device_string);
+  }
+
+  g_print("Pipeline: %s\n", pipeline_desc);
+  pipeline = gst_parse_launch(pipeline_desc, NULL);
+  g_free(pipeline_desc);
+
+  if (!pipeline) {
+    g_printerr("Failed to create pipeline\n");
+    if (chosen_device_string) g_free(chosen_device_string);
+    return 1;
+  }
+
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+  loop = g_main_loop_new(NULL, FALSE);
+  if (duration > 0) {
+    g_timeout_add_seconds(duration, timeout_cb, NULL);
+    g_print("Recording for %d seconds\n", duration);
+  } else {
+    g_print("Recording until interrupted\n");
+  }
+
+  // Bus watch: print errors and exit on EOS
+  GstBus *bus = gst_element_get_bus(pipeline);
+  gboolean terminate = FALSE;
+  while (!terminate) {
+    GstMessage *msg = gst_bus_timed_pop_filtered(bus, GST_CLOCK_TIME_NONE,
+      GST_MESSAGE_ERROR | GST_MESSAGE_EOS);
+    if (msg) {
+      switch (GST_MESSAGE_TYPE(msg)) {
+        case GST_MESSAGE_ERROR: {
+          GError *err = NULL;
+          gst_message_parse_error(msg, &err, NULL);
+          g_printerr("Error: %s\n", err ? err->message : "unknown");
+          g_clear_error(&err);
+          terminate = TRUE;
+          break;
+        }
+        case GST_MESSAGE_EOS:
+          g_print("Finished recording\n");
+          terminate = TRUE;
+          break;
+        default:
+          break;
+      }
+      gst_message_unref(msg);
+    }
+  }
+
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(bus);
+  gst_object_unref(pipeline);
+  if (chosen_device_string) g_free(chosen_device_string);
+  if (loop) g_main_loop_unref(loop);
+  return 0;
+}

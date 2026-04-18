@@ -1,0 +1,8 @@
+[
+{
+  "directory": "/home/joscha/cloud-workspace/google-drive/build/cmake.run.linux.x86_64.Local",
+  "command": "/usr/bin/g++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NETWORKAUTH_LIB -DQT_NETWORK_LIB -DQT_NO_DEBUG -DQT_WIDGETS_LIB -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetwork -isystem /usr/include/x86_64-linux-gnu/qt6/QtNetworkAuth -O3 -DNDEBUG -std=gnu++17 -fPIE -Wall -Wextra -Wpedantic -o CMakeFiles/google_drive_sync_demo.dir/main.cpp.o -c /home/joscha/cloud-workspace/google-drive/main.cpp",
+  "file": "/home/joscha/cloud-workspace/google-drive/main.cpp",
+  "output": "CMakeFiles/google_drive_sync_demo.dir/main.cpp.o"
+}
+]

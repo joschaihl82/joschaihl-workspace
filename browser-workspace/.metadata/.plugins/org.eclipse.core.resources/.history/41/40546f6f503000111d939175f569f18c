@@ -1,0 +1,245 @@
+cmake_minimum_required(VERSION 3.16)
+project(MiniGTK4Browser C)
+
+# C standard
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+# Default build type
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# -------------------------
+# User overrides (Cache)
+# -------------------------
+# Direktes Setzen des Include-Pfads für WebKit (z. B. /usr/include/webkit2gtk-6.0)
+set(WEBKIT_INCLUDE_DIR "" CACHE PATH "Pfad zu WebKitGTK include (z. B. /usr/include/webkit2gtk-6.0)")
+
+# Optional: Prefixes statt einzelner Include-Dir
+set(WEBKIT_ROOT "" CACHE PATH "Prefix, in dem WebKitGTK installiert ist (include/ und lib/)")
+set(GTK4_ROOT "" CACHE PATH "Prefix, in dem GTK4 installiert ist (include/ und lib/)")
+
+# Zusätzliche, vom Benutzer angegebene Include/Lib Pfade oder Libs
+set(EXTRA_INCLUDE_DIRS "" CACHE STRING "Extra include directories (semicolon-separated)")
+set(EXTRA_LINK_DIRS "" CACHE STRING "Extra library directories (semicolon-separated)")
+set(EXTRA_LIBS "" CACHE STRING "Extra libraries to link (semicolon-separated)")
+
+# -------------------------
+# Build search path strings (semicolon-separated)
+# -------------------------
+set(_search_inc_paths "")
+set(_search_lib_paths "")
+
+# Append GTK4_ROOT if provided
+if(GTK4_ROOT)
+  if(_search_inc_paths STREQUAL "")
+    set(_search_inc_paths "${GTK4_ROOT}/include;${GTK4_ROOT}/include/gtk-4.0")
+  else()
+    set(_search_inc_paths "${_search_inc_paths};${GTK4_ROOT}/include;${GTK4_ROOT}/include/gtk-4.0")
+  endif()
+  if(_search_lib_paths STREQUAL "")
+    set(_search_lib_paths "${GTK4_ROOT}/lib;${GTK4_ROOT}/lib64")
+  else()
+    set(_search_lib_paths "${_search_lib_paths};${GTK4_ROOT}/lib;${GTK4_ROOT}/lib64")
+  endif()
+endif()
+
+# Append WEBKIT_ROOT if provided
+if(WEBKIT_ROOT)
+  if(_search_inc_paths STREQUAL "")
+    set(_search_inc_paths "${WEBKIT_ROOT}/include;${WEBKIT_ROOT}/include/webkit2gtk-6.0")
+  else()
+    set(_search_inc_paths "${_search_inc_paths};${WEBKIT_ROOT}/include;${WEBKIT_ROOT}/include/webkit2gtk-6.0")
+  endif()
+  if(_search_lib_paths STREQUAL "")
+    set(_search_lib_paths "${WEBKIT_ROOT}/lib;${WEBKIT_ROOT}/lib64")
+  else()
+    set(_search_lib_paths "${_search_lib_paths};${WEBKIT_ROOT}/lib;${WEBKIT_ROOT}/lib64")
+  endif()
+endif()
+
+# Append common system locations
+if(_search_inc_paths STREQUAL "")
+  set(_search_inc_paths "/usr/include;/usr/local/include;/usr/include/gtk-4.0;/usr/local/include/gtk-4.0;/usr/include/webkit2gtk-6.0;/usr/local/include/webkit2gtk-6.0")
+else()
+  set(_search_inc_paths "${_search_inc_paths};/usr/include;/usr/local/include;/usr/include/gtk-4.0;/usr/local/include/gtk-4.0;/usr/include/webkit2gtk-6.0;/usr/local/include/webkit2gtk-6.0")
+endif()
+
+if(_search_lib_paths STREQUAL "")
+  set(_search_lib_paths "/usr/lib;/usr/lib64;/usr/local/lib;/usr/lib/x86_64-linux-gnu")
+else()
+  set(_search_lib_paths "${_search_lib_paths};/usr/lib;/usr/lib64;/usr/local/lib;/usr/lib/x86_64-linux-gnu")
+endif()
+
+# -------------------------
+# Find headers (WEBKIT_INCLUDE_DIR optional override)
+# -------------------------
+if(NOT WEBKIT_INCLUDE_DIR)
+  find_path(WEBKIT_INCLUDE_DIR
+    NAMES webkit2/webkit2.h
+    PATHS ${_search_inc_paths}
+  )
+endif()
+
+# Also allow explicit GTK4 include override
+set(GTK4_INCLUDE_DIR "" CACHE PATH "Pfad zu GTK4 include (z. B. /usr/include/gtk-4.0)")
+if(NOT GTK4_INCLUDE_DIR)
+  find_path(GTK4_INCLUDE_DIR
+    NAMES gtk/gtk.h
+    PATHS ${_search_inc_paths}
+  )
+endif()
+
+# -------------------------
+# Find libraries
+# -------------------------
+find_library(WEBKIT_LIBRARY
+  NAMES webkit2gtk-6.0 webkit2gtk-4.0 webkit2gtk-4
+  PATHS ${_search_lib_paths}
+)
+
+find_library(GTK4_LIBRARY
+  NAMES gtk-4 gtk-4.0
+  PATHS ${_search_lib_paths}
+)
+
+# Try to locate common transitive libs that pkg-config normally provides
+find_library(GLIB_LIBRARY NAMES glib-2.0 PATHS ${_search_lib_paths})
+find_library(GOBJECT_LIBRARY NAMES gobject-2.0 PATHS ${_search_lib_paths})
+find_library(GIO_LIBRARY NAMES gio-2.0 PATHS ${_search_lib_paths})
+find_library(GMODULE_LIBRARY NAMES gmodule-2.0 PATHS ${_search_lib_paths})
+find_library(GTHREAD_LIBRARY NAMES gthread-2.0 PATHS ${_search_lib_paths})
+
+# Fallback to default search if not found
+if(NOT WEBKIT_INCLUDE_DIR)
+  find_path(WEBKIT_INCLUDE_DIR NAMES webkit2/webkit2.h)
+endif()
+if(NOT GTK4_INCLUDE_DIR)
+  find_path(GTK4_INCLUDE_DIR NAMES gtk/gtk.h)
+endif()
+if(NOT WEBKIT_LIBRARY)
+  find_library(WEBKIT_LIBRARY NAMES webkit2gtk-6.0 webkit2gtk-4.0 webkit2gtk-4)
+endif()
+if(NOT GTK4_LIBRARY)
+  find_library(GTK4_LIBRARY NAMES gtk-4 gtk-4.0)
+endif()
+if(NOT GLIB_LIBRARY)
+  find_library(GLIB_LIBRARY NAMES glib-2.0)
+endif()
+if(NOT GOBJECT_LIBRARY)
+  find_library(GOBJECT_LIBRARY NAMES gobject-2.0)
+endif()
+if(NOT GIO_LIBRARY)
+  find_library(GIO_LIBRARY NAMES gio-2.0)
+endif()
+if(NOT GMODULE_LIBRARY)
+  find_library(GMODULE_LIBRARY NAMES gmodule-2.0)
+endif()
+if(NOT GTHREAD_LIBRARY)
+  find_library(GTHREAD_LIBRARY NAMES gthread-2.0)
+endif()
+
+# -------------------------
+# Validate results
+# -------------------------
+if(NOT WEBKIT_INCLUDE_DIR)
+  message(FATAL_ERROR "WebKitGTK headers not found. Set -DWEBKIT_INCLUDE_DIR=/path/to/webkit/include or install WebKitGTK development files.")
+endif()
+if(NOT WEBKIT_LIBRARY)
+  message(FATAL_ERROR "WebKitGTK library not found. Set -DWEBKIT_ROOT=/prefix or install WebKitGTK development files.")
+endif()
+if(NOT GTK4_INCLUDE_DIR)
+  message(FATAL_ERROR "GTK4 headers not found. Set -DGTK4_ROOT=/prefix or install GTK4 development files.")
+endif()
+if(NOT GTK4_LIBRARY)
+  message(FATAL_ERROR "GTK4 library not found. Set -DGTK4_ROOT=/prefix or install GTK4 development files.")
+endif()
+
+# -------------------------
+# Summary output
+# -------------------------
+string(REPLACE ";" " " _inc_paths_str "${_search_inc_paths}")
+string(REPLACE ";" " " _lib_paths_str "${_search_lib_paths}")
+message(STATUS "GTK4 include: ${GTK4_INCLUDE_DIR}")
+message(STATUS "GTK4 lib:     ${GTK4_LIBRARY}")
+message(STATUS "WebKit include:${WEBKIT_INCLUDE_DIR}")
+message(STATUS "WebKit lib:    ${WEBKIT_LIBRARY}")
+message(STATUS "Search include paths: ${_inc_paths_str}")
+message(STATUS "Search lib paths: ${_lib_paths_str}")
+
+# -------------------------
+# Target
+# -------------------------
+set(SRC browser.c)
+add_executable(browser ${SRC})
+
+# Include directories
+target_include_directories(browser PRIVATE ${GTK4_INCLUDE_DIR} ${WEBKIT_INCLUDE_DIR})
+
+# Extra include dirs (semicolon-separated)
+if(EXTRA_INCLUDE_DIRS)
+  foreach(_inc ${EXTRA_INCLUDE_DIRS})
+    if(NOT _inc STREQUAL "")
+      target_include_directories(browser PRIVATE ${_inc})
+    endif()
+  endforeach()
+endif()
+
+# Extra link dirs
+if(EXTRA_LINK_DIRS)
+  foreach(_ld ${EXTRA_LINK_DIRS})
+    if(NOT _ld STREQUAL "")
+      link_directories(${_ld})
+    endif()
+  endforeach()
+endif()
+
+# Build link list (semicolon-separated string expanded via foreach)
+set(_link_libs "${WEBKIT_LIBRARY};${GTK4_LIBRARY}")
+if(GLIB_LIBRARY)
+  set(_link_libs "${_link_libs};${GLIB_LIBRARY}")
+endif()
+if(GOBJECT_LIBRARY)
+  set(_link_libs "${_link_libs};${GOBJECT_LIBRARY}")
+endif()
+if(GIO_LIBRARY)
+  set(_link_libs "${_link_libs};${GIO_LIBRARY}")
+endif()
+if(GMODULE_LIBRARY)
+  set(_link_libs "${_link_libs};${GMODULE_LIBRARY}")
+endif()
+if(GTHREAD_LIBRARY)
+  set(_link_libs "${_link_libs};${GTHREAD_LIBRARY}")
+endif()
+
+if(EXTRA_LIBS)
+  foreach(_l ${EXTRA_LIBS})
+    if(NOT _l STREQUAL "")
+      set(_link_libs "${_link_libs};${_l}")
+    endif()
+  endforeach()
+endif()
+
+# Link each library
+foreach(_lib ${_link_libs})
+  if(NOT _lib STREQUAL "")
+    target_link_libraries(browser PRIVATE ${_lib})
+  endif()
+endforeach()
+
+# Compile options (common)
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(browser PRIVATE -Wall -Wextra -Wpedantic -pthread -D_REENTRANT)
+else()
+  target_compile_options(browser PRIVATE -D_REENTRANT)
+endif()
+
+# Helpful suggestion if transitive libs missing
+if(NOT GLIB_LIBRARY OR NOT GOBJECT_LIBRARY OR NOT GIO_LIBRARY)
+  message(STATUS "If you get undefined reference errors, re-run cmake with -DEXTRA_LIBS=\"gobject-2.0;gio-2.0;glib-2.0;gmodule-2.0;gthread-2.0\"")
+endif()
+
+# Install and export
+install(TARGETS browser RUNTIME DESTINATION bin)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

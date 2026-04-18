@@ -1,0 +1,21 @@
+# 3.5 rule: mod prefix, obj postfix
+mod_obj := exectrace1.o
+obj-m := $(mod_obj)
+
+# 3.5 rule: mak prefix, bin/knd/cur/flg postfix
+mak_bin := make
+mak_knd := /lib/modules/$(shell uname -r)/build
+mak_cur := $(shell pwd)
+mak_flg := v=1
+
+.phony: all clean cln_all
+
+all:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) modules $(mak_flg)
+
+clean:
+	$(mak_bin) -C $(mak_knd) M=$(mak_cur) clean
+
+# deep clean to remove hidden .cmd files
+cln_all: clean
+	rm -f .*.cmd *.o *.mod *.mod.c modules.order Module.symvers

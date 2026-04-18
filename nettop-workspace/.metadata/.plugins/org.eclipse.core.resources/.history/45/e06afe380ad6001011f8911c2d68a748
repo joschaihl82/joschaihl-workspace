@@ -1,0 +1,111 @@
+// nettop_qt.cpp  - minimal Qt5 nettop proof-of-concept
+#include <QApplication>
+#include <QTableView>
+#include <QAbstractTableModel>
+#include <QTimer>
+#include <QThread>
+#include <QMutex>
+#include <QMap>
+#include <QStringList>
+#include <pcap.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+struct ProcStat { pid_t pid; QString cmd; uint64_t inBytes=0, outBytes=0; uint64_t inPrev=0,outPrev=0; };
+
+class NetModel : public QAbstractTableModel {
+    Q_OBJECT
+public:
+    QList<ProcStat> rows;
+    int rowCount(const QModelIndex&) const override { return rows.size(); }
+    int columnCount(const QModelIndex&) const override { return 5; }
+    QVariant headerData(int c, Qt::Orientation, int) const override {
+        QStringList h = {"Path/Name","Input MB","Output MB","Input KB/s","Output KB/s"}; return h[c];
+    }
+    QVariant data(const QModelIndex &idx, int role) const override {
+        if(role!=Qt::DisplayRole) return {};
+        const ProcStat &p = rows[idx.row()];
+        switch(idx.column()){
+            case 0: return p.cmd;
+            case 1: return QString::number(p.inBytes/1024.0/1024.0,'f',2);
+            case 2: return QString::number(p.outBytes/1024.0/1024.0,'f',2);
+            case 3: return QString::number((p.inBytes - p.inPrev)/1024.0,'f',2);
+            case 4: return QString::number((p.outBytes - p.outPrev)/1024.0,'f',2);
+        }
+        return {};
+    }
+    void updateFromMap(const QMap<pid_t, ProcStat> &map){
+        beginResetModel();
+        rows.clear();
+        for(auto it=map.constBegin(); it!=map.constEnd(); ++it) rows.append(it.value());
+        std::sort(rows.begin(), rows.end(), [](const ProcStat&a,const ProcStat&b){ return (a.inBytes+b.outBytes) > (b.inBytes+a.outBytes); });
+        endResetModel();
+    }
+};
+
+class CaptureThread : public QThread {
+    Q_OBJECT
+public:
+    QMutex mutex;
+    QMap<pid_t, ProcStat> stats;
+    void run() override {
+        char err[PCAP_ERRBUF_SIZE];
+        pcap_t *p = pcap_open_live("any", 65536, 1, 500, err);
+        if(!p) return;
+        while(!isInterruptionRequested()){
+            pcap_dispatch(p, 50, [](u_char *user, const struct pcap_pkthdr *h, const u_char *bytes){
+                CaptureThread *self = (CaptureThread*)user;
+                // minimal IPv4/TCP/UDP parse (Ethernet assumed)
+                if(h->caplen < 14+20) return;
+                const u_char *ip = bytes+14;
+                if((ip[0]>>4)!=4) return;
+                uint8_t proto = ip[9];
+                uint32_t saddr = *(uint32_t*)(ip+12), daddr = *(uint32_t*)(ip+16);
+                uint16_t sport=0,dport=0;
+                int ihl = (ip[0]&0x0F)*4;
+                const u_char *l4 = ip+ihl;
+                if(proto==6 && h->caplen >= 14+ihl+20){ sport = ntohs(*(uint16_t*)(l4)); dport = ntohs(*(uint16_t*)(l4+2)); }
+                else if(proto==17 && h->caplen >= 14+ihl+8){ sport = ntohs(*(uint16_t*)(l4)); dport = ntohs(*(uint16_t*)(l4+2)); }
+                else return;
+                // Build a simple key string and attempt to map to pid by scanning /proc/net and /proc/*/fd
+                // For brevity: attribute all packets to pid 0 (kernel) unless mapping found.
+                pid_t pid = 0;
+                // TODO: implement mapping using /proc/net/tcp/udp inode -> /proc/*/fd socket:[inode]
+                self->mutex.lock();
+                auto &ps = self->stats[pid];
+                ps.pid = pid;
+                ps.cmd = (pid==0?QString("[kernel]"):QString("pid%1").arg(pid));
+                ps.inBytes += h->len;
+                self->mutex.unlock();
+            }, (u_char*)this);
+            msleep(200);
+        }
+        pcap_close(p);
+    }
+signals:
+    void updated();
+};
+
+int main(int argc, char **argv){
+    QApplication a(argc,argv);
+    NetModel model;
+    QTableView tv; tv.setModel(&model); tv.setWindowTitle("---- nettop ----"); tv.resize(700,400); tv.show();
+    CaptureThread cap; cap.start();
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, [&](){
+        cap.mutex.lock();
+        // copy and compute rates
+        QMap<pid_t, ProcStat> copy = cap.stats;
+        for(auto &ps : copy) { ps.inPrev = ps.inPrev; ps.outPrev = ps.outPrev; } // placeholder
+        cap.mutex.unlock();
+        model.updateFromMap(copy);
+    });
+    timer.start(1000);
+    int r = a.exec();
+    cap.requestInterruption(); cap.wait();
+    return r;
+}
+#include "nettop_qt.moc"

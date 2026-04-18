@@ -1,0 +1,935 @@
+// editor_mouse_select.c
+// gcc -O2 -o editor_mouse_select editor_mouse_select.c -lSDL2 -lSDL2_ttf
+// Editor mit vollständiger Mausunterstützung: Drag-Select, Double-Click Wort, Triple-Click Zeile,
+// Auto-Scroll beim Drag, Clipboard (Ctrl+C/X/V), Delete/Backspace, blinkender Caret.
+
+#include <SDL.h>
+#include <SDL_ttf.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define WINW 1200
+#define WINH 900
+#define FONT_SIZE 36
+#define MARGIN 16
+#define LINE_SPACING 8
+#define SCROLLBAR_THICK 32
+#define CURSOR_W 4
+#define BLINK_MS 500
+#define BOTTOM_PADDING 80
+
+typedef struct {
+	char *text;
+	int len, cap;
+	SDL_Texture *tex;
+	int tex_w, tex_h;
+	int dirty;
+} Line;
+typedef struct {
+	Line *a;
+	int n, cap;
+} Doc;
+typedef struct {
+	SDL_Window *win;
+	SDL_Renderer *ren;
+	TTF_Font *font;
+	SDL_Color bg, fg, sb_bg, sb_thumb;
+} UI;
+
+static int utf8_char_len(unsigned char lead) {
+	if ((lead & 0x80) == 0x00)
+		return 1;
+	if ((lead & 0xE0) == 0xC0)
+		return 2;
+	if ((lead & 0xF0) == 0xE0)
+		return 3;
+	if ((lead & 0xF8) == 0xF0)
+		return 4;
+	return 1;
+}
+static int measure_prefix_width(TTF_Font *font, const char *s, int prefix_len) {
+	if (prefix_len <= 0)
+		return 0;
+	char *tmp = malloc(prefix_len + 1);
+	memcpy(tmp, s, prefix_len);
+	tmp[prefix_len] = '\0';
+	int w = 0, h = 0;
+	TTF_SizeUTF8(font, tmp, &w, &h);
+	free(tmp);
+	return w;
+}
+static int find_offset_binary(TTF_Font *font, const char *s, int byte_len,
+		int target_x) {
+	if (byte_len <= 0)
+		return 0;
+	int cap = 64, cnt = 0;
+	int *offs = malloc(cap * sizeof(int));
+	int p = 0;
+	while (p < byte_len) {
+		if (cnt + 1 >= cap) {
+			cap *= 2;
+			offs = realloc(offs, cap * sizeof(int));
+		}
+		offs[cnt++] = p;
+		p += utf8_char_len((unsigned char) s[p]);
+	}
+	if (cnt + 1 >= cap) {
+		cap *= 2;
+		offs = realloc(offs, cap * sizeof(int));
+	}
+	offs[cnt++] = byte_len;
+	int lo = 0, hi = cnt - 1;
+	while (lo < hi) {
+		int mid = (lo + hi) / 2;
+		int w = measure_prefix_width(font, s, offs[mid]);
+		if (w < target_x)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	int result = offs[lo];
+	int w_lo = measure_prefix_width(font, s, result);
+	if (result > 0) {
+		int prev = offs[lo > 0 ? lo - 1 : 0];
+		int w_prev = measure_prefix_width(font, s, prev);
+		if (abs(w_prev - target_x) <= abs(w_lo - target_x))
+			result = prev;
+	}
+	free(offs);
+	return result;
+}
+
+/* ---------------- Doc ---------------- */
+static void doc_init(Doc *d) {
+	d->cap = 128;
+	d->n = 1;
+	d->a = calloc(d->cap, sizeof(Line));
+	d->a[0].cap = 256;
+	d->a[0].text = calloc(d->a[0].cap, 1);
+	d->a[0].len = 0;
+	d->a[0].tex = NULL;
+	d->a[0].dirty = 1;
+}
+static void doc_free(Doc *d) {
+	for (int i = 0; i < d->n; i++) {
+		free(d->a[i].text);
+		if (d->a[i].tex)
+			SDL_DestroyTexture(d->a[i].tex);
+	}
+	free(d->a);
+}
+static void ensure_cap(Line *ln, int need) {
+	if (ln->cap >= need)
+		return;
+	while (ln->cap < need)
+		ln->cap *= 2;
+	ln->text = realloc(ln->text, ln->cap);
+}
+static void mark_dirty(Line *ln) {
+	ln->dirty = 1;
+}
+static void insert_text(Line *ln, int pos, const char *s) {
+	int add = (int) strlen(s);
+	ensure_cap(ln, ln->len + add + 1);
+	memmove(ln->text + pos + add, ln->text + pos, ln->len - pos + 1);
+	memcpy(ln->text + pos, s, add);
+	ln->len += add;
+	mark_dirty(ln);
+}
+static void delete_back(Line *ln, int pos) {
+	if (pos <= 0)
+		return;
+	memmove(ln->text + pos - 1, ln->text + pos, ln->len - pos + 1);
+	ln->len -= 1;
+	mark_dirty(ln);
+}
+static void doc_insert_line(Doc *d, int idx) {
+	if (d->n + 1 > d->cap) {
+		d->cap *= 2;
+		d->a = realloc(d->a, d->cap * sizeof(Line));
+	}
+	for (int i = d->n; i > idx; i--)
+		d->a[i] = d->a[i - 1];
+	d->a[idx].cap = 128;
+	d->a[idx].text = calloc(d->a[idx].cap, 1);
+	d->a[idx].len = 0;
+	d->a[idx].tex = NULL;
+	d->a[idx].dirty = 1;
+	d->n++;
+}
+static void doc_split_line(Doc *d, int idx, int pos) {
+	if (d->n + 1 > d->cap) {
+		d->cap *= 2;
+		d->a = realloc(d->a, d->cap * sizeof(Line));
+	}
+	for (int i = d->n; i > idx + 1; i--)
+		d->a[i] = d->a[i - 1];
+	Line *cur = &d->a[idx];
+	Line *nxt = &d->a[idx + 1];
+	int rest = cur->len - pos;
+	nxt->cap = rest + 8;
+	nxt->text = malloc(nxt->cap);
+	memcpy(nxt->text, cur->text + pos, rest);
+	nxt->text[rest] = 0;
+	nxt->len = rest;
+	nxt->tex = NULL;
+	nxt->dirty = 1;
+	cur->text[pos] = 0;
+	cur->len = pos;
+	cur->dirty = 1;
+	d->n++;
+}
+static void doc_join_line(Doc *d, int idx) {
+	if (idx + 1 >= d->n)
+		return;
+	Line *a = &d->a[idx], *b = &d->a[idx + 1];
+	ensure_cap(a, a->len + b->len + 1);
+	memcpy(a->text + a->len, b->text, b->len + 1);
+	a->len += b->len;
+	a->dirty = 1;
+	if (b->tex) {
+		SDL_DestroyTexture(b->tex);
+		b->tex = NULL;
+	}
+	free(b->text);
+	for (int i = idx + 1; i < d->n - 1; i++)
+		d->a[i] = d->a[i + 1];
+	d->n--;
+}
+
+/* ---------------- Rendering ---------------- */
+static void render_line_if_needed(Line *ln, SDL_Renderer *ren, TTF_Font *font,
+		SDL_Color color) {
+	if (!ln->dirty)
+		return;
+	if (ln->tex) {
+		SDL_DestroyTexture(ln->tex);
+		ln->tex = NULL;
+	}
+	const char *txt = ln->len ? ln->text : " ";
+	SDL_Surface *surf = TTF_RenderUTF8_Blended(font, txt, color);
+	if (!surf)
+		return;
+	ln->tex = SDL_CreateTextureFromSurface(ren, surf);
+	ln->tex_w = surf->w;
+	ln->tex_h = surf->h;
+	SDL_FreeSurface(surf);
+	ln->dirty = 0;
+}
+
+/* ---------------- UI ---------------- */
+static int init_sdl_ttf(void) {
+	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+		fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+		return 0;
+	}
+	if (TTF_Init() != 0) {
+		fprintf(stderr, "TTF_Init: %s\n", TTF_GetError());
+		SDL_Quit();
+		return 0;
+	}
+	return 1;
+}
+static int create_ui(UI *ui, const char *font_path) {
+	ui->win = SDL_CreateWindow("Editor Mouse Select", SDL_WINDOWPOS_CENTERED,
+			SDL_WINDOWPOS_CENTERED, WINW, WINH, SDL_WINDOW_RESIZABLE);
+	if (!ui->win)
+		return 0;
+	ui->ren = SDL_CreateRenderer(ui->win, -1,
+			SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+	if (!ui->ren) {
+		SDL_DestroyWindow(ui->win);
+		return 0;
+	}
+	ui->font = TTF_OpenFont(font_path, FONT_SIZE);
+	if (!ui->font) {
+		SDL_DestroyRenderer(ui->ren);
+		SDL_DestroyWindow(ui->win);
+		return 0;
+	}
+	ui->bg = (SDL_Color ) { 255, 255, 255, 255 };
+	ui->fg = (SDL_Color ) { 0, 0, 0, 255 };
+	ui->sb_bg = (SDL_Color ) { 240, 240, 240, 255 };
+	ui->sb_thumb = (SDL_Color ) { 120, 120, 120, 255 };
+	return 1;
+}
+static void cleanup_ui(UI *ui) {
+	if (ui->font)
+		TTF_CloseFont(ui->font);
+	if (ui->ren)
+		SDL_DestroyRenderer(ui->ren);
+	if (ui->win)
+		SDL_DestroyWindow(ui->win);
+	TTF_Quit();
+	SDL_Quit();
+}
+
+/* ---------------- selection helpers ---------------- */
+typedef struct {
+	int line, off;
+} Pos;
+typedef struct {
+	Pos a, b;
+	int active;
+} Sel;
+static void sel_clear(Sel *s) {
+	s->active = 0;
+	s->a.line = s->a.off = s->b.line = s->b.off = 0;
+}
+static int sel_empty(Sel *s) {
+	return !s->active || (s->a.line == s->b.line && s->a.off == s->b.off);
+}
+static void sel_normalize(Sel *s, Pos *out_s, Pos *out_e) {
+	if (!s->active) {
+		out_s->line = out_s->off = out_e->line = out_e->off = 0;
+		return;
+	}
+	if (s->a.line < s->b.line
+			|| (s->a.line == s->b.line && s->a.off <= s->b.off)) {
+		*out_s = s->a;
+		*out_e = s->b;
+	} else {
+		*out_s = s->b;
+		*out_e = s->a;
+	}
+}
+static char* get_selected_text(Doc *doc, Sel *s) {
+	if (!s->active)
+		return NULL;
+	Pos st, ed;
+	sel_normalize(s, &st, &ed);
+	if (st.line == ed.line) {
+		int len = ed.off - st.off;
+		char *out = malloc(len + 1);
+		memcpy(out, doc->a[st.line].text + st.off, len);
+		out[len] = 0;
+		return out;
+	} else {
+		int total = 0;
+		total += doc->a[st.line].len - st.off;
+		for (int i = st.line + 1; i < ed.line; i++)
+			total += doc->a[i].len;
+		total += ed.off;
+		total += (ed.line - st.line);
+		char *out = malloc(total + 1);
+		char *p = out;
+		int first_len = doc->a[st.line].len - st.off;
+		memcpy(p, doc->a[st.line].text + st.off, first_len);
+		p += first_len;
+		*p++ = '\n';
+		for (int i = st.line + 1; i < ed.line; i++) {
+			memcpy(p, doc->a[i].text, doc->a[i].len);
+			p += doc->a[i].len;
+			*p++ = '\n';
+		}
+		if (ed.off > 0) {
+			memcpy(p, doc->a[ed.line].text, ed.off);
+			p += ed.off;
+		}
+		*p = 0;
+		return out;
+	}
+}
+static Pos delete_selection(Doc *doc, Sel *s) {
+	Pos st, ed;
+	sel_normalize(s, &st, &ed);
+	Pos res = st;
+	if (!s->active)
+		return res;
+	if (st.line == ed.line) {
+		Line *ln = &doc->a[st.line];
+		memmove(ln->text + st.off, ln->text + ed.off, ln->len - ed.off + 1);
+		ln->len -= (ed.off - st.off);
+		ln->dirty = 1;
+	} else {
+		Line *lns = &doc->a[st.line];
+		lns->text[st.off] = 0;
+		lns->len = st.off;
+		lns->dirty = 1;
+		Line *lne = &doc->a[ed.line];
+		ensure_cap(lns, lns->len + ed.off + 1);
+		memmove(lns->text + lns->len, lne->text, ed.off);
+		lns->len += ed.off;
+		lns->text[lns->len] = 0;
+		lns->dirty = 1;
+		for (int i = st.line + 1; i <= ed.line; i++) {
+			free(doc->a[i].text);
+			if (doc->a[i].tex) {
+				SDL_DestroyTexture(doc->a[i].tex);
+				doc->a[i].tex = NULL;
+			}
+		}
+		int shift = ed.line - st.line;
+		for (int i = st.line + 1; i + shift < doc->n; i++)
+			doc->a[i] = doc->a[i + shift];
+		doc->n -= shift;
+	}
+	sel_clear(s);
+	return res;
+}
+static Pos insert_text_at_caret(Doc *doc, Sel *sel, Pos caret, const char *text) {
+	if (sel->active && !sel_empty(sel))
+		caret = delete_selection(doc, sel);
+	const char *p = text;
+	const char *nl;
+	Pos cur = caret;
+	while ((nl = strchr(p, '\n')) != NULL) {
+		int chunk = (int) (nl - p);
+		ensure_cap(&doc->a[cur.line], doc->a[cur.line].len + chunk + 1);
+		memmove(doc->a[cur.line].text + cur.off + chunk,
+				doc->a[cur.line].text + cur.off,
+				doc->a[cur.line].len - cur.off + 1);
+		memcpy(doc->a[cur.line].text + cur.off, p, chunk);
+		doc->a[cur.line].len += chunk;
+		doc->a[cur.line].dirty = 1;
+		doc_split_line(doc, cur.line, cur.off + chunk);
+		cur.line += 1;
+		cur.off = 0;
+		p = nl + 1;
+	}
+	if (*p) {
+		insert_text(&doc->a[cur.line], cur.off, p);
+		cur.off += (int) strlen(p);
+	}
+	return cur;
+}
+
+/* ---------------- scroll & caret visibility ---------------- */
+static int compute_content_height(Doc *doc) {
+	return doc->n * (FONT_SIZE + LINE_SPACING);
+}
+static int compute_view_height(UI *ui) {
+	int ww, wh;
+	SDL_GetWindowSize(ui->win, &ww, &wh);
+	int vh = wh - SCROLLBAR_THICK - 2 * MARGIN;
+	return vh < 0 ? 0 : vh;
+}
+static void clamp_scroll(Doc *doc, UI *ui, int *scroll_y) {
+	int content_h = compute_content_height(doc);
+	int view_h = compute_view_height(ui);
+	int max_scroll = content_h - view_h + BOTTOM_PADDING;
+	if (max_scroll < 0)
+		max_scroll = 0;
+	if (*scroll_y < 0)
+		*scroll_y = 0;
+	if (*scroll_y > max_scroll)
+		*scroll_y = max_scroll;
+}
+static void ensure_caret_visible_with_padding(Doc *doc, UI *ui, Pos caret,
+		int *scroll_y) {
+	int view_h = compute_view_height(ui);
+	if (view_h <= 0)
+		return;
+	int caret_ypix = caret.line * (FONT_SIZE + LINE_SPACING);
+	int desired_bottom = view_h - (FONT_SIZE + LINE_SPACING) - BOTTOM_PADDING;
+	if (desired_bottom < 0)
+		desired_bottom = 0;
+	if (caret_ypix - *scroll_y < 0)
+		*scroll_y = caret_ypix - 20;
+	if (caret_ypix - *scroll_y > desired_bottom)
+		*scroll_y = caret_ypix - desired_bottom;
+	clamp_scroll(doc, ui, scroll_y);
+}
+
+/* ---------------- double/triple click helpers ---------------- */
+static int is_word_char(unsigned char c) {
+	if (c >= 'A' && c <= 'Z')
+		return 1;
+	if (c >= 'a' && c <= 'z')
+		return 1;
+	if (c >= '0' && c <= '9')
+		return 1;
+	if (c == '_' || c == '-')
+		return 1;
+	return 0;
+}
+static void select_word_at(Doc *doc, Sel *sel, Pos p) {
+	Line *ln = &doc->a[p.line];
+	if (ln->len == 0) {
+		sel->active = 1;
+		sel->a = sel->b = p;
+		return;
+	}
+	int start = p.off;
+	if (start > ln->len)
+		start = ln->len;
+	// if off is at end, move left one codepoint for selection base
+	if (start == ln->len && start > 0)
+		start--;
+	// move to codepoint boundary left until word char boundary
+	// convert to byte index; we assume p.off is byte offset already
+	int left = start;
+	while (left > 0) {
+		unsigned char lead = (unsigned char) ln->text[left - 1];
+		int clen = utf8_char_len(lead);
+		int idx = left - clen;
+		if (idx < 0)
+			break;
+		unsigned char ch = (unsigned char) ln->text[idx];
+		if (!is_word_char(ch))
+			break;
+		left = idx;
+	}
+	int right = start;
+	while (right < ln->len) {
+		unsigned char lead = (unsigned char) ln->text[right];
+		int clen = utf8_char_len(lead);
+		unsigned char ch = (unsigned char) ln->text[right];
+		if (!is_word_char(ch))
+			break;
+		right += clen;
+	}
+	sel->active = 1;
+	sel->a.line = p.line;
+	sel->a.off = left;
+	sel->b.line = p.line;
+	sel->b.off = right;
+}
+static void select_line_at(Doc *doc, Sel *sel, Pos p) {
+	sel->active = 1;
+	sel->a.line = sel->b.line = p.line;
+	sel->a.off = 0;
+	sel->b.off = doc->a[p.line].len;
+}
+
+/* ---------------- event handling & rendering ---------------- */
+static int handle_events(Doc *doc, UI *ui, Pos *caret, Sel *sel, int *scroll_y,
+		int *dragging_thumb, int *thumb_drag_offset, int *selecting_mouse,
+		Uint32 *last_click_time, int *click_count, int *last_click_x,
+		int *last_click_y) {
+	SDL_Event e;
+	int running = 1;
+	while (SDL_PollEvent(&e)) {
+		if (e.type == SDL_QUIT) {
+			running = 0;
+			break;
+		} else if (e.type == SDL_WINDOWEVENT
+				&& e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+			clamp_scroll(doc, ui, scroll_y);
+		} else if (e.type == SDL_KEYDOWN) {
+			SDL_Keycode k = e.key.keysym.sym;
+			int mod = SDL_GetModState();
+			int ctrl = (mod & KMOD_CTRL) != 0;
+			int shift = (mod & KMOD_SHIFT) != 0;
+			if (ctrl && k == SDLK_c) {
+				if (!sel_empty(sel)) {
+					char *txt = get_selected_text(doc, sel);
+					if (txt) {
+						SDL_SetClipboardText(txt);
+						free(txt);
+					}
+				}
+			} else if (ctrl && k == SDLK_x) {
+				if (!sel_empty(sel)) {
+					char *txt = get_selected_text(doc, sel);
+					if (txt) {
+						SDL_SetClipboardText(txt);
+						free(txt);
+					}
+					Pos nc = delete_selection(doc, sel);
+					caret->line = nc.line;
+					caret->off = nc.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				}
+			} else if (ctrl && k == SDLK_v) {
+				char *clip = SDL_GetClipboardText();
+				if (clip && *clip) {
+					*caret = insert_text_at_caret(doc, sel, *caret, clip);
+					SDL_free(clip);
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				} else if (clip)
+					SDL_free(clip);
+			} else if (k == SDLK_ESCAPE) {
+				running = 0;
+				break;
+			} else if (k == SDLK_BACKSPACE) {
+				if (!sel_empty(sel)) {
+					Pos nc = delete_selection(doc, sel);
+					caret->line = nc.line;
+					caret->off = nc.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				} else {
+					if (caret->off > 0) {
+						delete_back(&doc->a[caret->line], caret->off);
+						caret->off--;
+					} else if (caret->line > 0) {
+						int prevlen = doc->a[caret->line - 1].len;
+						doc_join_line(doc, caret->line - 1);
+						caret->line--;
+						caret->off = prevlen;
+					}
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				}
+			} else if (k == SDLK_DELETE) {
+				if (!sel_empty(sel)) {
+					Pos nc = delete_selection(doc, sel);
+					caret->line = nc.line;
+					caret->off = nc.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				} else {
+					Line *ln = &doc->a[caret->line];
+					if (caret->off < ln->len) {
+						memmove(ln->text + caret->off,
+								ln->text + caret->off + 1,
+								ln->len - caret->off);
+						ln->len--;
+						ln->dirty = 1;
+					} else if (caret->line < doc->n - 1)
+						doc_join_line(doc, caret->line);
+				}
+			} else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+				if (!sel_empty(sel)) {
+					Pos nc = delete_selection(doc, sel);
+					caret->line = nc.line;
+					caret->off = nc.off;
+				}
+				doc_split_line(doc, caret->line, caret->off);
+				caret->line++;
+				caret->off = 0;
+				sel_clear(sel);
+				ensure_caret_visible_with_padding(doc, ui, *caret, scroll_y);
+			} else if (k == SDLK_LEFT || k == SDLK_RIGHT || k == SDLK_UP
+					|| k == SDLK_DOWN) {
+				int shift = (SDL_GetModState() & KMOD_SHIFT) != 0;
+				if (!shift)
+					sel_clear(sel);
+				if (k == SDLK_LEFT) {
+					if (caret->off > 0)
+						caret->off--;
+					else if (caret->line > 0) {
+						caret->line--;
+						caret->off = doc->a[caret->line].len;
+					}
+				} else if (k == SDLK_RIGHT) {
+					if (caret->off < doc->a[caret->line].len)
+						caret->off++;
+					else if (caret->line < doc->n - 1) {
+						caret->line++;
+						caret->off = 0;
+					}
+				} else if (k == SDLK_UP) {
+					if (caret->line > 0) {
+						caret->line--;
+						if (caret->off > doc->a[caret->line].len)
+							caret->off = doc->a[caret->line].len;
+					}
+				} else if (k == SDLK_DOWN) {
+					if (caret->line < doc->n - 1) {
+						caret->line++;
+						if (caret->off > doc->a[caret->line].len)
+							caret->off = doc->a[caret->line].len;
+					}
+				}
+				if (shift) {
+					if (!sel->active) {
+						sel->active = 1;
+						sel->a = *caret;
+						sel->b = *caret;
+					}
+					sel->b = *caret;
+				} else
+					sel_clear(sel);
+				ensure_caret_visible_with_padding(doc, ui, *caret, scroll_y);
+			}
+		} else if (e.type == SDL_TEXTINPUT) {
+			*caret = insert_text_at_caret(doc, sel, *caret, e.text.text);
+			ensure_caret_visible_with_padding(doc, ui, *caret, scroll_y);
+		} else if (e.type == SDL_MOUSEWHEEL) {
+			*scroll_y -= e.wheel.y * (FONT_SIZE + LINE_SPACING);
+			clamp_scroll(doc, ui, scroll_y);
+		} else if (e.type == SDL_MOUSEBUTTONDOWN) {
+			if (e.button.button == SDL_BUTTON_LEFT) {
+				int mx = e.button.x, my = e.button.y;
+				Uint32 now = SDL_GetTicks();
+				int dx = mx - *last_click_x, dy = my - *last_click_y;
+				if (now - *last_click_time < 400 && abs(dx) < 6
+						&& abs(dy) < 6) {
+					(*click_count)++;
+				} else {
+					*click_count = 1;
+				}
+				*last_click_time = now;
+				*last_click_x = mx;
+				*last_click_y = my;
+				// compute click position in doc coords
+				int click_x = mx - MARGIN;
+				int click_y = my + *scroll_y - MARGIN;
+				int line_h = FONT_SIZE + LINE_SPACING;
+				int clicked_line = click_y / line_h;
+				if (clicked_line < 0)
+					clicked_line = 0;
+				if (clicked_line >= doc->n)
+					clicked_line = doc->n - 1;
+				Pos p;
+				p.line = clicked_line;
+				int byte_len = doc->a[p.line].len;
+				if (byte_len <= 0)
+					p.off = 0;
+				else {
+					if (click_x < 0)
+						click_x = 0;
+					p.off = find_offset_binary(ui->font, doc->a[p.line].text,
+							byte_len, click_x);
+					if (p.off < 0)
+						p.off = 0;
+					if (p.off > byte_len)
+						p.off = byte_len;
+				}
+				if (*click_count == 1) {
+					// start selection
+					sel->active = 1;
+					sel->a = p;
+					sel->b = p;
+					*selecting_mouse = 1;
+					*dragging_thumb = 0;
+					caret->line = p.line;
+					caret->off = p.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				} else if (*click_count == 2) {
+					// double click -> select word
+					select_word_at(doc, sel, p);
+					caret->line = sel->b.line;
+					caret->off = sel->b.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				} else {
+					// triple click -> select line
+					select_line_at(doc, sel, p);
+					caret->line = sel->b.line;
+					caret->off = sel->b.off;
+					ensure_caret_visible_with_padding(doc, ui, *caret,
+							scroll_y);
+				}
+			}
+		} else if (e.type == SDL_MOUSEBUTTONUP) {
+			if (e.button.button == SDL_BUTTON_LEFT) {
+				*selecting_mouse = 0;
+				*dragging_thumb = 0;
+			}
+		} else if (e.type == SDL_MOUSEMOTION) {
+			if (*selecting_mouse && (e.motion.state & SDL_BUTTON_LMASK)) {
+				int mx = e.motion.x, my = e.motion.y;
+				int click_x = mx - MARGIN;
+				int click_y = my + *scroll_y - MARGIN;
+				int line_h = FONT_SIZE + LINE_SPACING;
+				int clicked_line = click_y / line_h;
+				if (clicked_line < 0)
+					clicked_line = 0;
+				if (clicked_line >= doc->n)
+					clicked_line = doc->n - 1;
+				Pos newp;
+				newp.line = clicked_line;
+				int byte_len = doc->a[newp.line].len;
+				if (byte_len <= 0)
+					newp.off = 0;
+				else {
+					if (click_x < 0)
+						click_x = 0;
+					newp.off = find_offset_binary(ui->font,
+							doc->a[newp.line].text, byte_len, click_x);
+					if (newp.off < 0)
+						newp.off = 0;
+					if (newp.off > byte_len)
+						newp.off = byte_len;
+				}
+				caret->line = newp.line;
+				caret->off = newp.off;
+				sel->b = *caret;
+				// auto-scroll when dragging near top/bottom
+				int win_w, win_h;
+				SDL_GetWindowSize(ui->win, &win_w, &win_h);
+				int margin_scroll = 40;
+				if (my < MARGIN + margin_scroll) {
+					*scroll_y -= (margin_scroll - (my - MARGIN));
+					clamp_scroll(doc, ui, scroll_y);
+				} else if (my > win_h - SCROLLBAR_THICK - margin_scroll) {
+					*scroll_y +=
+							(my - (win_h - SCROLLBAR_THICK - margin_scroll));
+					clamp_scroll(doc, ui, scroll_y);
+				}
+				ensure_caret_visible_with_padding(doc, ui, *caret, scroll_y);
+			}
+			if (*dragging_thumb) {
+				int my = e.motion.y;
+				int win_w, win_h;
+				SDL_GetWindowSize(ui->win, &win_w, &win_h);
+				int vbg_y = MARGIN;
+				int vbg_h = win_h - SCROLLBAR_THICK - MARGIN;
+				int view_h = win_h - SCROLLBAR_THICK - 2 * MARGIN;
+				int content_h = compute_content_height(doc);
+				float vh = (float) vbg_h;
+				float thumb_h =
+						(view_h >= content_h) ?
+								vh :
+								(vh * ((float) view_h / (float) content_h));
+				if (thumb_h < 30)
+					thumb_h = 30;
+				float max_pos = vh - thumb_h - 4;
+				int thumb_y = my - *thumb_drag_offset;
+				if (thumb_y < vbg_y + 2)
+					thumb_y = vbg_y + 2;
+				if (thumb_y > vbg_y + 2 + (int) max_pos)
+					thumb_y = vbg_y + 2 + (int) max_pos;
+				float pos = (float) (thumb_y - (vbg_y + 2)) / max_pos;
+				if (pos < 0)
+					pos = 0;
+				if (pos > 1)
+					pos = 1;
+				if (content_h > view_h)
+					*scroll_y = (int) (pos
+							* (content_h - view_h + BOTTOM_PADDING));
+				else
+					*scroll_y = 0;
+				clamp_scroll(doc, ui, scroll_y);
+			}
+		}
+	}
+	return running;
+}
+
+static void render_frame(Doc *doc, UI *ui, Pos caret, Sel *sel, int scroll_y,
+		int show_caret) {
+	SDL_Renderer *ren = ui->ren;
+	TTF_Font *font = ui->font;
+	int win_w, win_h;
+	SDL_GetWindowSize(ui->win, &win_w, &win_h);
+	int view_w = win_w - SCROLLBAR_THICK - 2 * MARGIN;
+	int view_h = win_h - SCROLLBAR_THICK - 2 * MARGIN;
+	if (view_w < 10)
+		view_w = 10;
+	if (view_h < 10)
+		view_h = 10;
+	SDL_SetRenderDrawColor(ren, ui->bg.r, ui->bg.g, ui->bg.b, ui->bg.a);
+	SDL_RenderClear(ren);
+	SDL_Color sel_col = { 180, 200, 230, 255 };
+	int y = MARGIN - scroll_y;
+	SDL_Rect clip = { MARGIN, MARGIN, view_w, view_h };
+	SDL_RenderSetClipRect(ren, &clip);
+	Pos sstart, send;
+	int has_sel = sel->active && !sel_empty(sel);
+	if (has_sel)
+		sel_normalize(sel, &sstart, &send);
+	for (int i = 0; i < doc->n; i++) {
+		Line *ln = &doc->a[i];
+		render_line_if_needed(ln, ren, font, ui->fg);
+		if (has_sel && (i >= sstart.line && i <= send.line)) {
+			int sel_from = 0, sel_to = 0;
+			if (sstart.line == send.line) {
+				sel_from = sstart.off;
+				sel_to = send.off;
+			} else if (i == sstart.line) {
+				sel_from = sstart.off;
+				sel_to = ln->len;
+			} else if (i == send.line) {
+				sel_from = 0;
+				sel_to = send.off;
+			} else {
+				sel_from = 0;
+				sel_to = ln->len;
+			}
+			if (sel_from < sel_to) {
+				int x1 = MARGIN
+						+ measure_prefix_width(font, ln->text, sel_from);
+				int x2 = MARGIN + measure_prefix_width(font, ln->text, sel_to);
+				SDL_Rect r = { x1, y, x2 - x1, FONT_SIZE };
+				SDL_SetRenderDrawColor(ren, sel_col.r, sel_col.g, sel_col.b,
+						sel_col.a);
+				SDL_RenderFillRect(ren, &r);
+			}
+		}
+		if (ln->tex) {
+			SDL_Rect dst = { MARGIN, y, ln->tex_w, ln->tex_h };
+			SDL_RenderCopy(ren, ln->tex, NULL, &dst);
+		}
+		if (show_caret && i == caret.line) {
+			int cxpix =
+					caret.off > 0 ?
+							measure_prefix_width(font, doc->a[i].text,
+									caret.off) :
+							0;
+			SDL_Rect caret_r = { MARGIN + cxpix, y, CURSOR_W, FONT_SIZE };
+			SDL_SetRenderDrawColor(ren, ui->fg.r, ui->fg.g, ui->fg.b, ui->fg.a);
+			SDL_RenderFillRect(ren, &caret_r);
+		}
+		y += FONT_SIZE + LINE_SPACING;
+		if (y > win_h)
+			break;
+	}
+	SDL_RenderSetClipRect(ren, NULL);
+	SDL_Rect vbg = { win_w - SCROLLBAR_THICK, MARGIN, SCROLLBAR_THICK, win_h
+			- SCROLLBAR_THICK - MARGIN };
+	SDL_SetRenderDrawColor(ren, ui->sb_bg.r, ui->sb_bg.g, ui->sb_bg.b,
+			ui->sb_bg.a);
+	SDL_RenderFillRect(ren, &vbg);
+	int content_h = compute_content_height(doc);
+	if (content_h > 0 && view_h > 0) {
+		float vh = (float) vbg.h;
+		float thumb_h =
+				(view_h >= content_h) ?
+						vh : (vh * ((float) view_h / (float) content_h));
+		if (thumb_h < 30)
+			thumb_h = 30;
+		float pos =
+				(content_h <= view_h) ?
+						0.0f :
+						((float) scroll_y
+								/ (float) (content_h - view_h + BOTTOM_PADDING));
+		SDL_Rect vthumb =
+				{ vbg.x + 4, vbg.y + 4 + (int) (pos * (vh - thumb_h - 8)), vbg.w
+						- 8, (int) thumb_h - 8 };
+		SDL_SetRenderDrawColor(ren, ui->sb_thumb.r, ui->sb_thumb.g,
+				ui->sb_thumb.b, ui->sb_thumb.a);
+		SDL_RenderFillRect(ren, &vthumb);
+	}
+	SDL_RenderPresent(ren);
+}
+
+/* ---------------- main ---------------- */
+int main(int argc, char **argv) {
+	(void) argc;
+	(void) argv;
+	const char *font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
+	if (!init_sdl_ttf())
+		return 1;
+	UI ui = { 0 };
+	if (!create_ui(&ui, font_path)) {
+		fprintf(stderr, "UI creation failed (prüfe font_path).\n");
+		cleanup_ui(&ui);
+		return 1;
+	}
+	Doc doc;
+	doc_init(&doc);
+	Pos caret = { 0, 0 };
+	Sel sel = { { 0, 0 }, { 0, 0 }, 0 };
+	int scroll_y = 0, dragging_thumb = 0, thumb_drag_offset = 0,
+			selecting_mouse = 0;
+	Uint32 last_click_time = 0;
+	int click_count = 0, last_click_x = 0, last_click_y = 0;
+	SDL_StartTextInput();
+	int running = 1;
+	Uint32 last_blink = SDL_GetTicks();
+	int show_cursor = 1;
+	while (running) {
+		running = handle_events(&doc, &ui, &caret, &sel, &scroll_y,
+				&dragging_thumb, &thumb_drag_offset, &selecting_mouse,
+				&last_click_time, &click_count, &last_click_x, &last_click_y);
+		Uint32 now = SDL_GetTicks();
+		if (now - last_blink >= BLINK_MS) {
+			show_cursor = !show_cursor;
+			last_blink = now;
+		}
+		render_frame(&doc, &ui, caret, &sel, scroll_y, show_cursor);
+		SDL_Delay(10);
+	}
+	SDL_StopTextInput();
+	doc_free(&doc);
+	cleanup_ui(&ui);
+	return 0;
+}

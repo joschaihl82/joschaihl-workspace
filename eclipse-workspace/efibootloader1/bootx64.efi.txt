@@ -1,0 +1,121 @@
+
+bootx64.efi:     file format pei-x86-64
+
+
+Disassembly of section .text:
+
+0000000000401000 <efi_main>:
+  401000:	48 83 ec 28          	sub    $0x28,%rsp
+  401004:	48 85 d2             	test   %rdx,%rdx
+  401007:	74 1a                	je     401023 <efi_main+0x23>
+  401009:	48 8b 4a 30          	mov    0x30(%rdx),%rcx
+  40100d:	48 85 c9             	test   %rcx,%rcx
+  401010:	74 11                	je     401023 <efi_main+0x23>
+  401012:	48 8b 01             	mov    (%rcx),%rax
+  401015:	48 85 c0             	test   %rax,%rax
+  401018:	74 09                	je     401023 <efi_main+0x23>
+  40101a:	48 8d 15 df 0f 00 00 	lea    0xfdf(%rip),%rdx        # 402000 <__data_end__>
+  401021:	ff d0                	call   *%rax
+  401023:	31 c0                	xor    %eax,%eax
+  401025:	48 83 c4 28          	add    $0x28,%rsp
+  401029:	c3                   	ret
+  40102a:	90                   	nop
+  40102b:	90                   	nop
+  40102c:	90                   	nop
+  40102d:	90                   	nop
+  40102e:	90                   	nop
+  40102f:	90                   	nop
+
+0000000000401030 <__CTOR_LIST__>:
+  401030:	ff                   	(bad)
+  401031:	ff                   	(bad)
+  401032:	ff                   	(bad)
+  401033:	ff                   	(bad)
+  401034:	ff                   	(bad)
+  401035:	ff                   	(bad)
+  401036:	ff                   	(bad)
+  401037:	ff 00                	incl   (%rax)
+  401039:	00 00                	add    %al,(%rax)
+  40103b:	00 00                	add    %al,(%rax)
+  40103d:	00 00                	add    %al,(%rax)
+	...
+
+0000000000401040 <__DTOR_LIST__>:
+  401040:	ff                   	(bad)
+  401041:	ff                   	(bad)
+  401042:	ff                   	(bad)
+  401043:	ff                   	(bad)
+  401044:	ff                   	(bad)
+  401045:	ff                   	(bad)
+  401046:	ff                   	(bad)
+  401047:	ff 00                	incl   (%rax)
+  401049:	00 00                	add    %al,(%rax)
+  40104b:	00 00                	add    %al,(%rax)
+  40104d:	00 00                	add    %al,(%rax)
+	...
+
+Disassembly of section .rdata:
+
+0000000000402000 <__data_end__>:
+  402000:	48 00 65 00          	rex.W add %spl,0x0(%rbp)
+  402004:	6c                   	insb   (%dx),%es:(%rdi)
+  402005:	00 6c 00 6f          	add    %ch,0x6f(%rax,%rax,1)
+  402009:	00 20                	add    %ah,(%rax)
+  40200b:	00 66 00             	add    %ah,0x0(%rsi)
+  40200e:	72 00                	jb     402010 <__data_end__+0x10>
+  402010:	6f                   	outsl  %ds:(%rsi),(%dx)
+  402011:	00 6d 00             	add    %ch,0x0(%rbp)
+  402014:	20 00                	and    %al,(%rax)
+  402016:	6d                   	insl   (%dx),%es:(%rdi)
+  402017:	00 69 00             	add    %ch,0x0(%rcx)
+  40201a:	6e                   	outsb  %ds:(%rsi),(%dx)
+  40201b:	00 69 00             	add    %ch,0x0(%rcx)
+  40201e:	6d                   	insl   (%dx),%es:(%rdi)
+  40201f:	00 61 00             	add    %ah,0x0(%rcx)
+  402022:	6c                   	insb   (%dx),%es:(%rdi)
+  402023:	00 20                	add    %ah,(%rax)
+  402025:	00 45 00             	add    %al,0x0(%rbp)
+  402028:	46 00 49 00          	rex.RX add %r9b,0x0(%rcx)
+  40202c:	20 00                	and    %al,(%rax)
+  40202e:	61                   	(bad)
+  40202f:	00 70 00             	add    %dh,0x0(%rax)
+  402032:	70 00                	jo     402034 <__data_end__+0x34>
+  402034:	21 00                	and    %eax,(%rax)
+  402036:	0d 00 0a 00 00       	or     $0xa00,%eax
+  40203b:	00 00                	add    %al,(%rax)
+  40203d:	00 00                	add    %al,(%rax)
+	...
+
+0000000000402040 <.rdata$zzz>:
+  402040:	47                   	rex.RXB
+  402041:	43                   	rex.XB
+  402042:	43 3a 20             	rex.XB cmp (%r8),%spl
+  402045:	28 47 4e             	sub    %al,0x4e(%rdi)
+  402048:	55                   	push   %rbp
+  402049:	29 20                	sub    %esp,(%rax)
+  40204b:	31 32                	xor    %esi,(%rdx)
+  40204d:	2d 77 69 6e 33       	sub    $0x336e6977,%eax
+  402052:	32 00                	xor    (%rax),%al
+	...
+
+Disassembly of section .pdata:
+
+0000000000403000 <.pdata>:
+  403000:	00 10                	add    %dl,(%rax)
+  403002:	00 00                	add    %al,(%rax)
+  403004:	2a 10                	sub    (%rax),%dl
+  403006:	00 00                	add    %al,(%rax)
+  403008:	00 40 00             	add    %al,0x0(%rax)
+	...
+
+Disassembly of section .xdata:
+
+0000000000404000 <.xdata>:
+  404000:	01 04 01             	add    %eax,(%rcx,%rax,1)
+  404003:	00 04 42             	add    %al,(%rdx,%rax,2)
+	...
+
+Disassembly of section .idata:
+
+0000000000405000 <__bss_end__>:
+	...

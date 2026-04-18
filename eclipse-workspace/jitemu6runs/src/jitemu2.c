@@ -1,0 +1,311 @@
+// jitemu.c
+// Native x64 machine-code blink integrated into a runnable emulator scaffold.
+// - 1024x768 ARGB framebuffer
+// - Native machine-code routine fills the framebuffer each call (blinks based on rTimer bit)
+// - Worker thread runs the native routine continuously (no locks); main thread renders and shows FPS
+// Build: gcc -O2 jitemu.c -o jitemu -lpthread `sdl2-config --cflags --libs`
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <pthread.h>
+
+#ifndef __INTELLISENSE__
+#include <SDL2/SDL.h>
+#else
+// stubs for intellisense
+#define SDL_INIT_VIDEO 0
+#define SDL_WINDOWPOS_CENTERED 0
+typedef struct SDL_Window SDL_Window;
+typedef struct SDL_Renderer SDL_Renderer;
+typedef struct SDL_Texture SDL_Texture;
+typedef union SDL_Event SDL_Event;
+#endif
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+#define FB_WIDTH   1024
+#define FB_HEIGHT  768
+#define RAM_SIZE   8192
+
+typedef struct {
+    uint64_t rA,rB,rC,rD,rE,rF,rG,rH,rI,rJ,rK,rL,rM,rN,rO,rP;
+    uint64_t rSP, rFlags, rTimer;
+    uint32_t framebuffer[FB_WIDTH * FB_HEIGHT];
+    uint8_t  ram[RAM_SIZE];
+    int pc;
+} CPUState;
+
+// Offsets (must match struct layout)
+#define RA_OFF       0x00
+#define RB_OFF       0x08
+#define RC_OFF       0x10
+#define RD_OFF       0x18
+#define RE_OFF       0x20
+#define RF_OFF       0x28
+#define RG_OFF       0x30
+#define RH_OFF       0x38
+#define RI_OFF       0x40
+#define RJ_OFF       0x48
+#define RK_OFF       0x50
+#define RL_OFF       0x58
+#define RM_OFF       0x60
+#define RN_OFF       0x68
+#define RO_OFF       0x70
+#define RP_OFF       0x78
+#define RSP_OFF      0x80
+#define RFLAGS_OFF   0x88
+#define RTIMER_OFF   0x90
+#define FB_OFF       0x98
+#define RAM_OFF      (FB_OFF + (FB_WIDTH * FB_HEIGHT * sizeof(uint32_t)))
+
+// -----------------------------------------------------------------------------
+// Native blink routine builder (machine code bytes)
+// -----------------------------------------------------------------------------
+
+typedef void (*NativeBlink)(CPUState* state);
+
+static void* alloc_exec(size_t size) {
+    long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    size = (size + page - 1) & ~(page - 1);
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    return p;
+}
+static void free_exec(void* p, size_t size) {
+    if (!p || p == MAP_FAILED) return;
+    long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    size = (size + page - 1) & ~(page - 1);
+    munmap(p, size);
+}
+
+// Build a native machine-code routine that implements the AT&T assembly shown earlier.
+// The routine expects %rdi to point to CPUState and will:
+//  - read rTimer at offset RTIMER_OFF, mask with 0x20
+//  - if non-zero: load color from rA (low 32) into EAX; else EAX=0
+//  - increment rTimer (64-bit)
+//  - set R8 = &framebuffer (rdi + FB_OFF)
+//  - loop ECX from 0 to 786432-1 and store EAX into [R8 + ECX*4]
+// Returns a function pointer to the generated code.
+static NativeBlink build_native_blink(void) {
+    // allocate a small executable buffer
+    const size_t BUF_SZ = 4096;
+    uint8_t* buf = alloc_exec(BUF_SZ);
+    if (!buf) return NULL;
+    uint8_t* cp = buf;
+
+    // Helper to write bytes
+    #define EMIT1(b)  (*cp++ = (uint8_t)(b))
+    #define EMIT4(v)  do { uint32_t _v = (uint32_t)(v); memcpy(cp, &_v, 4); cp += 4; } while(0)
+    #define EMIT8(v)  do { uint64_t _v = (uint64_t)(v); memcpy(cp, &_v, 8); cp += 8; } while(0)
+
+    // mov 0x90(%rdi), %rax
+    EMIT1(0x48); EMIT1(0x8B); EMIT1(0x87); EMIT4(RTIMER_OFF);
+
+    // mov $0x20, %edx
+    EMIT1(0xBA); EMIT4(0x00000020u);
+
+    // and %rdx, %rax  -> 48 21 D0
+    EMIT1(0x48); EMIT1(0x21); EMIT1(0xD0);
+
+    // test %rax, %rax -> 48 85 C0
+    EMIT1(0x48); EMIT1(0x85); EMIT1(0xC0);
+
+    // je .zero_color (0F 84 rel32)
+    EMIT1(0x0F); EMIT1(0x84);
+    uint8_t* je_zero_disp = cp; EMIT4(0); // placeholder
+
+    // mov 0x00(%rdi), %eax  -> 8B 87 <disp32>
+    EMIT1(0x8B); EMIT1(0x87); EMIT4(RA_OFF);
+
+    // jmp .color_ready (E9 rel32)
+    EMIT1(0xE9);
+    uint8_t* jmp_ready_disp = cp; EMIT4(0);
+
+    // .zero_color:
+    size_t zero_pos = cp - buf;
+    // xor %eax, %eax -> 31 C0
+    EMIT1(0x31); EMIT1(0xC0);
+
+    // .color_ready:
+    size_t ready_pos = cp - buf;
+
+    // incq 0x90(%rdi) -> 48 FF 87 <disp32>
+    EMIT1(0x48); EMIT1(0xFF); EMIT1(0x87); EMIT4(RTIMER_OFF);
+
+    // leaq 0x98(%rdi), %r8 -> 4C 8D 87 <disp32>
+    EMIT1(0x4C); EMIT1(0x8D); EMIT1(0x87); EMIT4(FB_OFF);
+
+    // xorl %ecx, %ecx -> 31 C9
+    EMIT1(0x31); EMIT1(0xC9);
+
+    // mov $786432, %edx -> BA <imm32>
+    EMIT1(0xBA); EMIT4(786432u);
+
+    // loop start:
+    size_t loop_pos = cp - buf;
+
+    // mov %eax, (%r8,%rcx,4)
+    // Encoding: REX.B + 89 04 88
+    // 41 89 04 88  -> mov [r8 + rcx*4], eax
+    EMIT1(0x41); EMIT1(0x89); EMIT1(0x04); EMIT1(0x88);
+
+    // inc %ecx -> FF C1
+    EMIT1(0xFF); EMIT1(0xC1);
+
+    // cmp %edx, %ecx -> 39 CA
+    EMIT1(0x39); EMIT1(0xCA);
+
+    // jne loop -> 0F 85 rel32
+    EMIT1(0x0F); EMIT1(0x85);
+    uint8_t* jne_loop_disp = cp; EMIT4(0);
+
+    // ret
+    EMIT1(0xC3);
+
+    // Fixups:
+    // je_zero_disp -> target = zero_pos - (disp_ptr + 4)
+    int32_t rel_je = (int32_t)((int64_t)zero_pos - ((int64_t)(je_zero_disp - buf) + 4));
+    memcpy(je_zero_disp, &rel_je, 4);
+
+    // jmp_ready_disp -> target = ready_pos - (disp_ptr + 4)
+    int32_t rel_jmp = (int32_t)((int64_t)ready_pos - ((int64_t)(jmp_ready_disp - buf) + 4));
+    memcpy(jmp_ready_disp, &rel_jmp, 4);
+
+    // jne_loop_disp -> target = loop_pos - (disp_ptr + 4)
+    int32_t rel_jne = (int32_t)((int64_t)loop_pos - ((int64_t)(jne_loop_disp - buf) + 4));
+    memcpy(jne_loop_disp, &rel_jne, 4);
+
+    #undef EMIT1
+    #undef EMIT4
+    #undef EMIT8
+
+    return (NativeBlink)buf;
+}
+
+// -----------------------------------------------------------------------------
+// Worker thread: run native blink continuously (no locks)
+// -----------------------------------------------------------------------------
+
+typedef struct {
+    CPUState* state;
+    NativeBlink blink;
+    volatile int running;
+} Shared;
+
+static void* worker_thread(void* arg) {
+    Shared* s = (Shared*)arg;
+    while (s->running) {
+        s->blink(s->state);
+        // no delay, no synchronization (best-effort)
+    }
+    return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// Main: SDL render loop, FPS in title
+// -----------------------------------------------------------------------------
+
+int main(void) {
+    CPUState state;
+    memset(&state, 0, sizeof(state));
+    state.rSP = RAM_SIZE;
+    state.rA  = 0xFF0000FFu; // ARGB blue (low 32 used)
+    state.rTimer = 0;
+
+    NativeBlink blink = build_native_blink();
+    if (!blink) {
+        fprintf(stderr, "failed to build native blink routine\n");
+        return 1;
+    }
+
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        free_exec((void*)blink, 4096);
+        return 1;
+    }
+
+    SDL_Window* win = SDL_CreateWindow("jitemu native blink",
+                                       SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                       FB_WIDTH, FB_HEIGHT, SDL_WINDOW_SHOWN);
+    if (!win) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        free_exec((void*)blink, 4096);
+        return 1;
+    }
+
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
+    if (!ren) {
+        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win); SDL_Quit(); free_exec((void*)blink, 4096); return 1;
+    }
+
+    SDL_RenderSetLogicalSize(ren, FB_WIDTH, FB_HEIGHT);
+
+    SDL_Texture* tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_STREAMING, FB_WIDTH, FB_HEIGHT);
+    if (!tex) {
+        fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+        SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit(); free_exec((void*)blink, 4096); return 1;
+    }
+
+    Shared shared = { .state = &state, .blink = blink, .running = 1 };
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, worker_thread, &shared) != 0) {
+        perror("pthread_create");
+        shared.running = 0;
+        SDL_DestroyTexture(tex); SDL_DestroyRenderer(ren); SDL_DestroyWindow(win); SDL_Quit();
+        free_exec((void*)blink, 4096);
+        return 1;
+    }
+
+    uint64_t frames = 0;
+    uint32_t last = SDL_GetTicks();
+    int running = 1;
+    SDL_Event ev;
+
+    while (running) {
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+        }
+
+        // Update texture from framebuffer (no locks)
+        SDL_UpdateTexture(tex, NULL, state.framebuffer, FB_WIDTH * sizeof(uint32_t));
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+        SDL_RenderPresent(ren);
+
+        frames++;
+        uint32_t now = SDL_GetTicks();
+        if (now - last >= 1000) {
+            char title[128];
+            snprintf(title, sizeof(title), "jitemu native blink - %llu FPS", (unsigned long long)frames);
+            SDL_SetWindowTitle(win, title);
+            frames = 0;
+            last = now;
+        }
+        // no deliberate delay
+    }
+
+    shared.running = 0;
+    pthread_join(worker, NULL);
+
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    SDL_Quit();
+
+    free_exec((void*)blink, 4096);
+    return 0;
+}

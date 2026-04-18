@@ -1,0 +1,591 @@
+// main.cpp
+// Vollständige Qt5 Anwendung: SocketRefresher + PcapWorker + GUI
+// Zeigt alle Prozesse mit Internet-Sockets in einer sortierbaren Tabelle,
+// aktualisiert jede Sekunde.
+
+#include <QApplication>
+#include <QMainWindow>
+#include <QTableView>
+#include <QHeaderView>
+#include <QStandardItemModel>
+#include <QTimer>
+#include <QThread>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QDateTime>
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QDebug>
+#include <QObject>
+
+#include <pcap.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <net/ethernet.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#include <map>
+#include <QString>
+#include <QMap>
+#include <QList>
+#include <atomic>
+#include <cstring>
+#include <vector>
+
+// ---------- Konfiguration ----------
+static const char *DEFAULT_IFACE = "wlan0";
+static const char *DEFAULT_FILTER = "";
+static const int UPDATE_INTERVAL_MS = 1000; // UI-Update-Intervall
+static const int REFRESHER_INTERVAL_MS = 1000; // /proc-Refresh-Intervall
+
+// ---------- Hilfsfunktionen ----------
+static QString ipToString(uint32_t ip_net) {
+    struct in_addr a; a.s_addr = ip_net;
+    char buf[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &a, buf, sizeof(buf));
+    return QString::fromUtf8(buf);
+}
+
+// ---------- Datenstrukturen ----------
+struct ConnKey {
+    QString procName; // Prozessname / Path
+    QString local;    // "ip:port" (lokale Seite)
+    QString remote;   // "ip:port" (remote Seite) - kann "-" sein, wenn unbekannt
+    bool operator<(const ConnKey &o) const {
+        if (procName != o.procName) return procName < o.procName;
+        if (local != o.local) return local < o.local;
+        return remote < o.remote;
+    }
+};
+
+struct ConnStats {
+    qint64 bytes_in = 0;
+    qint64 bytes_out = 0;
+    qint64 last_bytes_in = 0;
+    qint64 last_bytes_out = 0;
+    double mb_in = 0.0;
+    double mb_out = 0.0;
+    double kbs_in = 0.0;
+    double kbs_out = 0.0;
+    qint64 last_seen = 0;
+};
+
+// ---------- SocketRefresher: Background /proc scanner ----------
+class SocketRefresher : public QThread {
+    Q_OBJECT
+public:
+    SocketRefresher(QObject *parent = nullptr) : QThread(parent), stopFlag(false) {}
+    ~SocketRefresher() { stop(); }
+
+    void stop() {
+        stopFlag.store(true);
+        wait();
+    }
+
+    // Thread-safe getter: proto = "tcp" or "udp", ip = "1.2.3.4", port = 80
+    QString getProcForSocket(const QString &proto, const QString &ip, int port) {
+        QMutexLocker lk(&mapMutex);
+        QString key = proto + "|" + ip + ":" + QString::number(port);
+        return socketToProc.value(key, QString("-"));
+    }
+
+    // Snapshot der gesamten Map (thread-safe)
+    QMap<QString, QString> snapshot() {
+        QMutexLocker lk(&mapMutex);
+        return socketToProc;
+    }
+
+signals:
+    void refreshed(); // nach jedem Refresh-Zyklus
+
+protected:
+    void run() override {
+        while (!stopFlag.load()) {
+            buildInodeToPidMap();
+            buildSocketMapFromProcNet();
+            emit refreshed();
+            // sleep in kleinen Schritten, damit stop() schnell reagiert
+            int slept = 0;
+            while (slept < REFRESHER_INTERVAL_MS && !stopFlag.load()) {
+                msleep(100);
+                slept += 100;
+            }
+        }
+    }
+
+private:
+    std::atomic<bool> stopFlag;
+    QMutex mapMutex;
+    QMap<QString, QString> socketToProc; // key -> procname
+    QMap<QString, QString> inodeToPid;   // inode -> pid
+    QMap<QString, QString> pidToName;    // pid -> comm
+
+    bool readFileLine(const QString &path, QString &out) {
+        FILE *f = fopen(path.toUtf8().constData(), "r");
+        if (!f) return false;
+        char buf[512];
+        if (!fgets(buf, sizeof(buf), f)) { fclose(f); return false; }
+        fclose(f);
+        size_t len = strlen(buf);
+        if (len && buf[len-1] == '\n') buf[len-1] = '\0';
+        out = QString::fromUtf8(buf);
+        return true;
+    }
+
+    void buildInodeToPidMap() {
+        inodeToPid.clear();
+        pidToName.clear();
+        DIR *pdir = opendir("/proc");
+        if (!pdir) return;
+        struct dirent *dent;
+        while ((dent = readdir(pdir)) != nullptr) {
+            char *endptr;
+            long pid = strtol(dent->d_name, &endptr, 10);
+            if (*endptr != '\0') continue;
+            QString pidStr = QString::number(pid);
+            // read comm
+            QString comm;
+            QString commPath = QString("/proc/%1/comm").arg(pidStr);
+            readFileLine(commPath, comm);
+            if (comm.isEmpty()) comm = QString("-");
+            pidToName[pidStr] = comm;
+
+            // scan fd directory
+            QString fdDir = QString("/proc/%1/fd").arg(pidStr);
+            DIR *fdd = opendir(fdDir.toUtf8().constData());
+            if (!fdd) continue;
+            struct dirent *fdent;
+            while ((fdent = readdir(fdd)) != nullptr) {
+                if (strcmp(fdent->d_name, ".")==0 || strcmp(fdent->d_name,"..")==0) continue;
+                QString linkPath = fdDir + "/" + fdent->d_name;
+                char target[PATH_MAX];
+                ssize_t r = readlink(linkPath.toUtf8().constData(), target, sizeof(target)-1);
+                if (r <= 0) continue;
+                target[r] = '\0';
+                const char *prefix = "socket:[";
+                char *p = strstr(target, prefix);
+                if (p) {
+                    p += strlen(prefix);
+                    char *q = strchr(p, ']');
+                    if (q) {
+                        *q = '\0';
+                        QString inode = QString::fromUtf8(p);
+                        inodeToPid[inode] = pidStr;
+                    }
+                }
+            }
+            closedir(fdd);
+        }
+        closedir(pdir);
+    }
+
+    static bool parseProcNetAddr(const QString &hexAddr, QString &ipOut, int &portOut) {
+        // hexAddr like "0100007F:1F90"
+        QStringList parts = hexAddr.split(':');
+        if (parts.size() != 2) return false;
+        bool ok;
+        quint32 ipHex = parts[0].toUInt(&ok, 16);
+        if (!ok) return false;
+        quint16 port = parts[1].toUShort(&ok, 16);
+        if (!ok) return false;
+        quint32 ipNet = htonl(ipHex); // convert to network order
+        struct in_addr a; a.s_addr = ipNet;
+        char buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &a, buf, sizeof(buf));
+        ipOut = QString::fromUtf8(buf);
+        portOut = (int)port;
+        return true;
+    }
+
+    void parseProcNetFile(const char *proto, QMap<QString, QString> &outMap) {
+        QString path = QString("/proc/net/%1").arg(proto);
+        FILE *f = fopen(path.toUtf8().constData(), "r");
+        if (!f) return;
+        char line[2048];
+        if (!fgets(line, sizeof(line), f)) { fclose(f); return; } // header
+        while (fgets(line, sizeof(line), f)) {
+            char local[128];
+            unsigned long inode = 0;
+            int items = sscanf(line, "%*d: %127s %*s %*s %*s %*s %*s %*s %*s %lu", local, &inode);
+            if (items >= 2) {
+                QString localStr = QString::fromUtf8(local);
+                QString ip; int port;
+                if (!parseProcNetAddr(localStr, ip, port)) continue;
+                QString inodeStr = QString::number(inode);
+                QString pid = inodeToPid.value(inodeStr, QString());
+                QString procname = pid.isEmpty() ? QString("-") : pidToName.value(pid, QString("-"));
+                QString key = QString("%1|%2:%3").arg(proto).arg(ip).arg(port);
+                outMap[key] = procname;
+            }
+        }
+        fclose(f);
+    }
+
+    void buildSocketMapFromProcNet() {
+        QMap<QString, QString> newMap;
+        parseProcNetFile("tcp", newMap);
+        parseProcNetFile("udp", newMap);
+        // optional: parse tcp6/udp6 for IPv6
+        {
+            QMutexLocker lk(&mapMutex);
+            socketToProc.swap(newMap);
+        }
+    }
+};
+
+// ---------- PcapWorker: Packet capture (nutzt SocketRefresher) ----------
+class PcapWorker : public QThread {
+    Q_OBJECT
+public:
+    PcapWorker(const QString &iface, const QString &filterExpr, SocketRefresher *refresher, QObject *parent = nullptr)
+        : QThread(parent), iface_(iface), filterExpr_(filterExpr), refresher_(refresher), handle_(nullptr) {}
+
+    void stop() {
+        if (handle_) pcap_breakloop(handle_);
+    }
+
+signals:
+    void packetParsed(const ConnKey &key, qint64 bytes_in, qint64 bytes_out, qint64 ts);
+    void error(const QString &msg);
+
+protected:
+    void run() override {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        handle_ = pcap_open_live(iface_.toUtf8().constData(), 65535, 1, 1000, errbuf);
+        if (!handle_) {
+            emit error(QString("pcap_open_live failed: %1").arg(errbuf));
+            return;
+        }
+        if (!filterExpr_.isEmpty()) {
+            struct bpf_program fp;
+            if (pcap_compile(handle_, &fp, filterExpr_.toUtf8().constData(), 1, PCAP_NETMASK_UNKNOWN) == -1 ||
+                pcap_setfilter(handle_, &fp) == -1) {
+                emit error(QString("filter error: %1").arg(pcap_geterr(handle_)));
+                pcap_freecode(&fp);
+                pcap_close(handle_);
+                handle_ = nullptr;
+                return;
+            }
+            pcap_freecode(&fp);
+        }
+        pcap_loop(handle_, -1, &PcapWorker::pcapCallback, reinterpret_cast<u_char*>(this));
+        if (handle_) { pcap_close(handle_); handle_ = nullptr; }
+    }
+
+private:
+    QString iface_;
+    QString filterExpr_;
+    SocketRefresher *refresher_;
+    pcap_t *handle_;
+
+    static void pcapCallback(u_char *user, const struct pcap_pkthdr *h, const u_char *bytes) {
+        PcapWorker *self = reinterpret_cast<PcapWorker*>(user);
+        if (!self) return;
+        self->processPacket(h, bytes);
+    }
+
+    static bool isHttpMethod(const char *p, size_t len) {
+        static const char *methods[] = {"GET","POST","PUT","DELETE","HEAD","OPTIONS","PATCH","CONNECT","TRACE"};
+        for (const char *m : methods) {
+            size_t ml = strlen(m);
+            if (len >= ml+1 && memcmp(p, m, ml) == 0 && p[ml] == ' ') return true;
+        }
+        return false;
+    }
+
+    void processPacket(const struct pcap_pkthdr *h, const u_char *bytes) {
+        if (!h || !bytes) return;
+        if (h->caplen < sizeof(struct ether_header)) return;
+        const struct ether_header *eth = (const struct ether_header*)bytes;
+        uint16_t eth_type = ntohs(eth->ether_type);
+        if (eth_type != ETHERTYPE_IP) return;
+        size_t ip_off = sizeof(struct ether_header);
+        if (h->caplen < ip_off + sizeof(struct ip)) return;
+        const struct ip *ip = (const struct ip*)(bytes + ip_off);
+        int ihl = ip->ip_hl * 4;
+        if (ihl < 20) return;
+        if (h->caplen < ip_off + ihl) return;
+        uint32_t src_ip = ip->ip_src.s_addr;
+        uint32_t dst_ip = ip->ip_dst.s_addr;
+        qint64 ts = (qint64)h->ts.tv_sec;
+
+        if (ip->ip_p == IPPROTO_TCP) {
+            size_t tcp_off = ip_off + ihl;
+            if (h->caplen < tcp_off + sizeof(struct tcphdr)) return;
+            const struct tcphdr *tcp = (const struct tcphdr*)(bytes + tcp_off);
+            int tcp_hdr_len = tcp->th_off * 4;
+            if (tcp_hdr_len < 20) return;
+            if (h->caplen < tcp_off + tcp_hdr_len) return;
+            size_t payload_off = tcp_off + tcp_hdr_len;
+            size_t payload_len = (h->caplen > payload_off) ? (h->caplen - payload_off) : 0;
+            unsigned short sport = ntohs(tcp->th_sport);
+            unsigned short dport = ntohs(tcp->th_dport);
+
+            // Best-effort: nutze SocketRefresher zur Zuordnung
+            QString proc = QString("-");
+            bool localIsDst = false;
+            if (refresher_) {
+                QString dstIp = ipToString(dst_ip);
+                QString srcIp = ipToString(src_ip);
+                proc = refresher_->getProcForSocket("tcp", dstIp, dport);
+                if (proc == "-" || proc.isEmpty()) {
+                    proc = refresher_->getProcForSocket("tcp", srcIp, sport);
+                    localIsDst = (proc != "-" && !proc.isEmpty());
+                } else {
+                    localIsDst = true;
+                }
+            }
+            if (proc.isEmpty()) proc = "-";
+
+            QString local = localIsDst ? (ipToString(dst_ip) + ":" + QString::number(dport)) : (ipToString(src_ip) + ":" + QString::number(sport));
+            QString remote = localIsDst ? (ipToString(src_ip) + ":" + QString::number(sport)) : (ipToString(dst_ip) + ":" + QString::number(dport));
+            ConnKey key{proc, local, remote};
+
+            qint64 bin = localIsDst ? (qint64)payload_len : 0;
+            qint64 bout = localIsDst ? 0 : (qint64)payload_len;
+            emit packetParsed(key, bin, bout, ts);
+        } else if (ip->ip_p == IPPROTO_UDP) {
+            size_t udp_off = ip_off + ihl;
+            if (h->caplen < udp_off + sizeof(struct udphdr)) return;
+            const struct udphdr *udp = (const struct udphdr*)(bytes + udp_off);
+            size_t payload_off = udp_off + sizeof(struct udphdr);
+            size_t payload_len = (h->caplen > payload_off) ? (h->caplen - payload_off) : 0;
+            unsigned short sport = ntohs(udp->uh_sport);
+            unsigned short dport = ntohs(udp->uh_dport);
+
+            QString proc = QString("-");
+            bool localIsDst = false;
+            if (refresher_) {
+                QString dstIp = ipToString(dst_ip);
+                QString srcIp = ipToString(src_ip);
+                proc = refresher_->getProcForSocket("udp", dstIp, dport);
+                if (proc == "-" || proc.isEmpty()) {
+                    proc = refresher_->getProcForSocket("udp", srcIp, sport);
+                    localIsDst = (proc != "-" && !proc.isEmpty());
+                } else {
+                    localIsDst = true;
+                }
+            }
+            if (proc.isEmpty()) proc = "-";
+
+            QString local = localIsDst ? (ipToString(dst_ip) + ":" + QString::number(dport)) : (ipToString(src_ip) + ":" + QString::number(sport));
+            QString remote = localIsDst ? (ipToString(src_ip) + ":" + QString::number(sport)) : (ipToString(dst_ip) + ":" + QString::number(dport));
+            ConnKey key{proc, local, remote};
+
+            qint64 bin = localIsDst ? (qint64)payload_len : 0;
+            qint64 bout = localIsDst ? 0 : (qint64)payload_len;
+            emit packetParsed(key, bin, bout, ts);
+        }
+    }
+};
+
+// ---------- MainWindow: GUI ----------
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr)
+        : QMainWindow(parent), refresher_(nullptr), worker_(nullptr) {
+        setWindowTitle("nettop_qt");
+        resize(1000, 600);
+
+        QWidget *central = new QWidget(this);
+        QVBoxLayout *vbox = new QVBoxLayout(central);
+
+        QHBoxLayout *hbox = new QHBoxLayout();
+        hbox->addWidget(new QLabel("Interface:"));
+        ifaceEdit_ = new QLineEdit(DEFAULT_IFACE);
+        hbox->addWidget(ifaceEdit_);
+        hbox->addWidget(new QLabel("Filter:"));
+        filterEdit_ = new QLineEdit(DEFAULT_FILTER);
+        hbox->addWidget(filterEdit_);
+        startBtn_ = new QPushButton("Start");
+        stopBtn_ = new QPushButton("Stop");
+        stopBtn_->setEnabled(false);
+        hbox->addWidget(startBtn_);
+        hbox->addWidget(stopBtn_);
+        vbox->addLayout(hbox);
+
+        tableView_ = new QTableView(this);
+        model_ = new QStandardItemModel(this);
+        QStringList headers = {"Path/Name", "Local (ip:port)", "Remote (ip:port)", "Input MB", "Output MB", "Input KB/s", "Output KB/s", "Last seen"};
+        model_->setHorizontalHeaderLabels(headers);
+        tableView_->setModel(model_);
+        tableView_->setSortingEnabled(true);
+        tableView_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+        vbox->addWidget(tableView_);
+
+        setCentralWidget(central);
+
+        uiTimer_ = new QTimer(this);
+        uiTimer_->setInterval(UPDATE_INTERVAL_MS);
+        connect(uiTimer_, &QTimer::timeout, this, &MainWindow::onUiTimer);
+
+        connect(startBtn_, &QPushButton::clicked, this, &MainWindow::onStart);
+        connect(stopBtn_, &QPushButton::clicked, this, &MainWindow::onStop);
+    }
+
+    ~MainWindow() {
+        stopAll();
+    }
+
+public slots:
+    void onStart() {
+        if (worker_) return;
+        // start refresher
+        refresher_ = new SocketRefresher(this);
+        connect(refresher_, &SocketRefresher::refreshed, this, &MainWindow::onRefreshed, Qt::QueuedConnection);
+        refresher_->start();
+
+        QString iface = ifaceEdit_->text().trimmed();
+        if (iface.isEmpty()) iface = DEFAULT_IFACE;
+        QString filter = filterEdit_->text();
+
+        worker_ = new PcapWorker(iface, filter, refresher_, this);
+        connect(worker_, &PcapWorker::packetParsed, this, &MainWindow::onPacketParsed, Qt::QueuedConnection);
+        connect(worker_, &PcapWorker::error, this, &MainWindow::onWorkerError, Qt::QueuedConnection);
+        worker_->start();
+
+        startBtn_->setEnabled(false);
+        stopBtn_->setEnabled(true);
+        uiTimer_->start();
+    }
+
+    void onStop() {
+        stopAll();
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        uiTimer_->stop();
+    }
+
+    void onWorkerError(const QString &msg) {
+        qWarning() << "Worker error:" << msg;
+    }
+
+    // Packet events
+    void onPacketParsed(const ConnKey &key, qint64 bin, qint64 bout, qint64 ts) {
+        QMutexLocker lk(&mapMutex_);
+        ConnStats &s = stats_[key];
+        s.bytes_in += bin;
+        s.bytes_out += bout;
+        s.last_seen = ts;
+    }
+
+    // Refresher signaled: ensure all known sockets exist in stats_ (even mit 0 bytes)
+    void onRefreshed() {
+        QMap<QString, QString> snap = refresher_->snapshot();
+        QMutexLocker lk(&mapMutex_);
+        for (auto it = snap.constBegin(); it != snap.constEnd(); ++it) {
+            QString key = it.key(); // "tcp|ip:port"
+            QString proc = it.value();
+            QStringList parts = key.split('|');
+            if (parts.size() != 2) continue;
+            QString proto = parts[0];
+            QString local = parts[1];
+            // remote unknown here; set to "-"
+            ConnKey ck{proc, local, QString("-")};
+            if (!stats_.contains(ck)) {
+                ConnStats s;
+                s.bytes_in = 0;
+                s.bytes_out = 0;
+                s.last_seen = QDateTime::currentSecsSinceEpoch();
+                stats_.insert(ck, s);
+            } else {
+                // update proc name if changed: need to find existing entries with same local and update key
+                // For simplicity, we keep keys as-is; refresher will produce same proc for same socket
+            }
+        }
+    }
+
+    void onUiTimer() {
+        qint64 now = QDateTime::currentSecsSinceEpoch();
+        QMutexLocker lk(&mapMutex_);
+        model_->removeRows(0, model_->rowCount());
+        if (stats_.isEmpty()) {
+            // placeholder row
+            QList<QStandardItem*> items;
+            items << new QStandardItem("[kernel]");
+            items << new QStandardItem("-");
+            items << new QStandardItem("-");
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QString::number(0.0, 'f', 2));
+            items << new QStandardItem(QDateTime::currentDateTime().toString("HH:mm:ss"));
+            model_->appendRow(items);
+            return;
+        }
+        int row = 0;
+        for (auto it = stats_.begin(); it != stats_.end(); ++it) {
+            const ConnKey &k = it.key();
+            ConnStats &s = it.value();
+            s.mb_in = s.bytes_in / (1024.0 * 1024.0);
+            s.mb_out = s.bytes_out / (1024.0 * 1024.0);
+            qint64 delta_in = s.bytes_in - s.last_bytes_in;
+            qint64 delta_out = s.bytes_out - s.last_bytes_out;
+            s.kbs_in = (delta_in / 1024.0) * (1000.0 / UPDATE_INTERVAL_MS);
+            s.kbs_out = (delta_out / 1024.0) * (1000.0 / UPDATE_INTERVAL_MS);
+            s.last_bytes_in = s.bytes_in;
+            s.last_bytes_out = s.bytes_out;
+
+            QList<QStandardItem*> items;
+            items << new QStandardItem(k.procName.isEmpty() ? "-" : k.procName);
+            items << new QStandardItem(k.local);
+            items << new QStandardItem(k.remote);
+            items << new QStandardItem(QString::number(s.mb_in, 'f', 2));
+            items << new QStandardItem(QString::number(s.mb_out, 'f', 2));
+            items << new QStandardItem(QString::number(s.kbs_in, 'f', 2));
+            items << new QStandardItem(QString::number(s.kbs_out, 'f', 2));
+            items << new QStandardItem(QDateTime::fromSecsSinceEpoch(s.last_seen).toString("HH:mm:ss"));
+            model_->appendRow(items);
+            ++row;
+        }
+    }
+
+private:
+    void stopAll() {
+        if (worker_) {
+            worker_->stop();
+            worker_->wait(2000);
+            delete worker_;
+            worker_ = nullptr;
+        }
+        if (refresher_) {
+            refresher_->stop();
+            delete refresher_;
+            refresher_ = nullptr;
+        }
+    }
+
+    QLineEdit *ifaceEdit_;
+    QLineEdit *filterEdit_;
+    QPushButton *startBtn_;
+    QPushButton *stopBtn_;
+    QTableView *tableView_;
+    QStandardItemModel *model_;
+    QTimer *uiTimer_;
+    SocketRefresher *refresher_;
+    PcapWorker *worker_;
+    QMutex mapMutex_;
+    QMap<ConnKey, ConnStats> stats_;
+};
+
+// ---------- main ----------
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include "nettop.moc"

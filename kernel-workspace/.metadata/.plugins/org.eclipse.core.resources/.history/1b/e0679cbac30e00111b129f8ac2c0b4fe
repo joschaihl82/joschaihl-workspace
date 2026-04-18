@@ -1,0 +1,108 @@
+cmake_minimum_required(VERSION 3.10)
+project(exectrace1_module NONE)
+
+# --- Module configuration (override with -D if you really want to)
+set(MODULE_NAME "exectrace1" CACHE STRING "Kernel module base name (without .ko)")
+set(MODULE_SRC "exectrace1.c" CACHE STRING "Module source file")
+set(MODULE_OUTPUT_DIR "${CMAKE_BINARY_DIR}/out" CACHE PATH "Directory to place built .ko")
+
+# --- Try to discover kernel build directory automatically
+# Order of checks:
+# 1) KERNEL_DIR cache / env (if user set it)
+# 2) /lib/modules/$(uname -r)/build
+# 3) /usr/src/linux-headers-$(uname -r)
+# 4) /usr/src/kernels/$(uname -r)
+# 5) /lib/modules/$(uname -r)/source
+if(NOT DEFINED KERNEL_DIR OR NOT EXISTS "${KERNEL_DIR}")
+  # get uname -r
+  execute_process(COMMAND uname -r
+                  OUTPUT_VARIABLE UNAME_R
+                  OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+  set(_candidates
+      "/lib/modules/${UNAME_R}/build"
+      "/usr/src/linux-headers-${UNAME_R}"
+      "/usr/src/kernels/${UNAME_R}"
+      "/lib/modules/${UNAME_R}/source"
+  )
+
+  set(_found_kernel_dir "")
+  foreach(_p IN LISTS _candidates)
+    if(EXISTS "${_p}")
+      set(_found_kernel_dir "${_p}")
+      break()
+    endif()
+  endforeach()
+
+  if(_found_kernel_dir STREQUAL "")
+    # Also allow common alternative locations (try /usr/src/linux if present)
+    if(EXISTS "/usr/src/linux")
+      set(_found_kernel_dir "/usr/src/linux")
+    endif()
+  endif()
+
+  if(_found_kernel_dir STREQUAL "")
+    message(FATAL_ERROR "Could not auto-detect kernel build directory.
+Set -DKERNEL_DIR=/path/to/kernel/build (e.g. /lib/modules/$(uname -r)/build) and re-run cmake.")
+  endif()
+
+  set(KERNEL_DIR "${_found_kernel_dir}" CACHE PATH "Path to kernel build directory" FORCE)
+endif()
+
+# Ensure we have a make program
+if(NOT CMAKE_MAKE_PROGRAM)
+  find_program(CMAKE_MAKE_PROGRAM make REQUIRED)
+endif()
+
+# --- Primary build target: runs the kernel build system
+# Marked ALL so plain "make" will build the module.
+add_custom_target(kbuild ALL
+  COMMENT "Building kernel module ${MODULE_NAME} using kernel build system at ${KERNEL_DIR}"
+)
+
+# Use POST_BUILD so commands run after target is considered built.
+# Each COMMAND is a separate argument; pass M=... as a single argument.
+add_custom_command(TARGET kbuild
+  POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULE_OUTPUT_DIR}"
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${KERNEL_DIR}" "M=${CMAKE_SOURCE_DIR}" modules
+  COMMAND /bin/sh -c "if [ -f '${CMAKE_SOURCE_DIR}/${MODULE_NAME}.ko' ]; then \
+      '${CMAKE_COMMAND}' -E copy_if_different '${CMAKE_SOURCE_DIR}/${MODULE_NAME}.ko' '${MODULE_OUTPUT_DIR}/${MODULE_NAME}.ko'; \
+    else \
+      echo 'Error: ${MODULE_NAME}.ko not found after kernel build' >&2; exit 1; \
+    fi"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Invoking kernel build and copying ${MODULE_NAME}.ko to ${MODULE_OUTPUT_DIR}"
+  VERBATIM
+)
+
+# --- Auxiliary targets (avoid reserved names)
+add_custom_target(kclean
+  COMMAND ${CMAKE_MAKE_PROGRAM} -C "${KERNEL_DIR}" "M=${CMAKE_SOURCE_DIR}" clean
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${MODULE_OUTPUT_DIR}"
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Cleaning kernel module build artifacts (kclean)"
+  VERBATIM
+)
+
+add_custom_target(kinstall
+  DEPENDS kbuild
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${MODULE_OUTPUT_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/${MODULE_NAME}.ko"
+          "${MODULE_OUTPUT_DIR}/${MODULE_NAME}.ko"
+  COMMENT "Copying ${MODULE_NAME}.ko to ${MODULE_OUTPUT_DIR} (kinstall)"
+  VERBATIM
+)
+
+add_custom_target(show
+  COMMAND ${CMAKE_COMMAND} -E echo "Kernel dir: ${KERNEL_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E echo "Module source: ${MODULE_SRC}"
+  COMMAND ${CMAKE_COMMAND} -E echo "Built module (after kinstall): ${MODULE_OUTPUT_DIR}/${MODULE_NAME}.ko"
+  VERBATIM
+)
+
+message(STATUS "CMake configured for kernel module build")
+message(STATUS "Detected KERNEL_DIR=${KERNEL_DIR}")
+message(STATUS "Run: cmake . && make")
+message(STATUS "Optional targets: make kclean; make kinstall; make show")

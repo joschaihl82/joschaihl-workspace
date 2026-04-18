@@ -1,0 +1,11 @@
+config/ext4recover/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/ext4recover/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/ext4recover/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/ext4recover/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/ext4recover/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/ext4recover2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/ext4recover2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/ext4recover2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/ext4recover2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/ext4recover2/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+eclipse.preferences.version=1

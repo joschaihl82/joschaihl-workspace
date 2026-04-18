@@ -1,0 +1,128 @@
+cmake_minimum_required(VERSION 3.16)
+project(MiniGTK4Browser C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# --- Suche Header (direkt, an üblichen Orten) ---
+find_path(GTK4_INCLUDE_DIR
+  NAMES gtk/gtk.h
+  PATHS
+    /usr/include/gtk-4.0
+    /usr/local/include/gtk-4.0
+    /usr/include
+    /usr/local/include
+)
+
+find_path(WEBKIT_INCLUDE_DIR
+  NAMES webkit2/webkit2.h
+  PATHS
+    /usr/include/webkit2gtk-6.0
+    /usr/local/include/webkit2gtk-6.0
+    /usr/include
+    /usr/local/include
+)
+
+# --- Suche Libraries (direkt, an üblichen Orten) ---
+find_library(GTK4_LIBRARY
+  NAMES gtk-4 gtk-4.0
+  PATHS
+    /usr/lib
+    /usr/lib64
+    /usr/lib/x86_64-linux-gnu
+    /usr/local/lib
+)
+
+find_library(WEBKIT_LIBRARY
+  NAMES webkit2gtk-6.0 webkit2gtk-4.0 webkit2gtk-4
+  PATHS
+    /usr/lib
+    /usr/lib64
+    /usr/lib/x86_64-linux-gnu
+    /usr/local/lib
+)
+
+# Transitive libs, die pkg-config normalerweise liefert
+find_library(GLIB_LIBRARY NAMES glib-2.0 PATHS /usr/lib /usr/local/lib)
+find_library(GOBJECT_LIBRARY NAMES gobject-2.0 PATHS /usr/lib /usr/local/lib)
+find_library(GIO_LIBRARY NAMES gio-2.0 PATHS /usr/lib /usr/local/lib)
+
+# --- Fallbacks: systemweite Suche, falls oben nichts gefunden wurde ---
+if(NOT GTK4_INCLUDE_DIR)
+  find_path(GTK4_INCLUDE_DIR NAMES gtk/gtk.h)
+endif()
+if(NOT WEBKIT_INCLUDE_DIR)
+  find_path(WEBKIT_INCLUDE_DIR NAMES webkit2/webkit2.h)
+endif()
+if(NOT GTK4_LIBRARY)
+  find_library(GTK4_LIBRARY NAMES gtk-4 gtk-4.0)
+endif()
+if(NOT WEBKIT_LIBRARY)
+  find_library(WEBKIT_LIBRARY NAMES webkit2gtk-6.0 webkit2gtk-4.0 webkit2gtk-4)
+endif()
+if(NOT GLIB_LIBRARY)
+  find_library(GLIB_LIBRARY NAMES glib-2.0)
+endif()
+if(NOT GOBJECT_LIBRARY)
+  find_library(GOBJECT_LIBRARY NAMES gobject-2.0)
+endif()
+if(NOT GIO_LIBRARY)
+  find_library(GIO_LIBRARY NAMES gio-2.0)
+endif()
+
+# --- Validierung mit klaren Hinweisen ---
+if(NOT WEBKIT_INCLUDE_DIR)
+  message(FATAL_ERROR "WebKitGTK headers not found. Install the WebKitGTK development package or run cmake with -DCMAKE_PREFIX_PATH=/path/to/prefix")
+endif()
+if(NOT WEBKIT_LIBRARY)
+  message(FATAL_ERROR "WebKitGTK library not found. Install the WebKitGTK development package or run cmake with -DCMAKE_PREFIX_PATH=/path/to/prefix")
+endif()
+if(NOT GTK4_INCLUDE_DIR)
+  message(FATAL_ERROR "GTK4 headers not found. Install libgtk-4-dev (or equivalent) or run cmake with -DCMAKE_PREFIX_PATH=/path/to/prefix")
+endif()
+if(NOT GTK4_LIBRARY)
+  message(FATAL_ERROR "GTK4 library not found. Install libgtk-4-dev (or equivalent) or run cmake with -DCMAKE_PREFIX_PATH=/path/to/prefix")
+endif()
+
+# --- Ausgabe zur Diagnose ---
+message(STATUS "GTK4 include: ${GTK4_INCLUDE_DIR}")
+message(STATUS "GTK4 lib:     ${GTK4_LIBRARY}")
+message(STATUS "WebKit include:${WEBKIT_INCLUDE_DIR}")
+message(STATUS "WebKit lib:    ${WEBKIT_LIBRARY}")
+
+# --- Ziel definieren ---
+add_executable(browser browser.c)
+
+# Include-Pfade direkt verwenden
+target_include_directories(browser PRIVATE ${GTK4_INCLUDE_DIR} ${WEBKIT_INCLUDE_DIR})
+
+# Linker: WebKit + GTK + typische GLib-Abhängigkeiten (falls gefunden)
+target_link_libraries(browser PRIVATE
+  ${WEBKIT_LIBRARY}
+  ${GTK4_LIBRARY}
+)
+
+# Füge transitive libs hinzu, wenn gefunden (vermeidet Link-Fehler)
+if(GLIB_LIBRARY)
+  target_link_libraries(browser PRIVATE ${GLIB_LIBRARY})
+endif()
+if(GOBJECT_LIBRARY)
+  target_link_libraries(browser PRIVATE ${GOBJECT_LIBRARY})
+endif()
+if(GIO_LIBRARY)
+  target_link_libraries(browser PRIVATE ${GIO_LIBRARY})
+endif()
+
+# Compiler-Optionen
+if (CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(browser PRIVATE -Wall -Wextra -Wpedantic -pthread -D_REENTRANT)
+else()
+  target_compile_options(browser PRIVATE -D_REENTRANT)
+endif()
+
+install(TARGETS browser RUNTIME DESTINATION bin)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

@@ -1,0 +1,2 @@
+#define cia-antivirus4_VERSION_MAJOR @cia-antivirus4_VERSION_MAJOR@
+#define cia-antivirus4_VERSION_MINOR @cia-antivirus4_VERSION_MINOR@

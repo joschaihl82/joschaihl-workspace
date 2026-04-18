@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;notepad1/notepad1.cpp&apos; to &apos;notepad1.c&apos;" description="Rename resource &apos;notepad1.cpp&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="notepad1.cpp" name="notepad1.c" stamp="1774769936226" updateReferences="true"/>
+</session>

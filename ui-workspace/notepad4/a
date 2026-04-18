@@ -1,0 +1,32 @@
+notepad1.c: In function ‘UpdateStatusBar’:
+notepad1.c:196:51: warning: passing argument 3 of ‘SendMessageW’ makes integer from pointer without a cast [-Wint-conversion]
+  196 |     int pos = (int)SendMessageW(hEdit, EM_GETSEL, NULL, NULL);
+      |                                                   ^~~~
+      |                                                   |
+      |                                                   void *
+In file included from /usr/share/mingw-w64/include/windows.h:72,
+                 from notepad1.c:4:
+/usr/share/mingw-w64/include/winuser.h:2050:68: note: expected ‘WPARAM’ {aka ‘long long unsigned int’} but argument is of type ‘void *’
+ 2050 |   WINUSERAPI LRESULT WINAPI SendMessageW(HWND hWnd,UINT Msg,WPARAM wParam,LPARAM lParam);
+      |                                                             ~~~~~~~^~~~~~
+notepad1.c:196:57: warning: passing argument 4 of ‘SendMessageW’ makes integer from pointer without a cast [-Wint-conversion]
+  196 |     int pos = (int)SendMessageW(hEdit, EM_GETSEL, NULL, NULL);
+      |                                                         ^~~~
+      |                                                         |
+      |                                                         void *
+/usr/share/mingw-w64/include/winuser.h:2050:82: note: expected ‘LPARAM’ {aka ‘long long int’} but argument is of type ‘void *’
+ 2050 |   WINUSERAPI LRESULT WINAPI SendMessageW(HWND hWnd,UINT Msg,WPARAM wParam,LPARAM lParam);
+      |                                                                           ~~~~~~~^~~~~~
+notepad1.c:213:27: error: ‘SB_SETTEXT’ undeclared (first use in this function); did you mean ‘WM_SETTEXT’?
+  213 |     SendMessageW(hStatus, SB_SETTEXT, 0, (LPARAM)status);
+      |                           ^~~~~~~~~~
+      |                           WM_SETTEXT
+notepad1.c:213:27: note: each undeclared identifier is reported only once for each function it appears in
+notepad1.c: In function ‘WndProc’:
+notepad1.c:405:38: error: ‘STATUSCLASSNAMEW’ undeclared (first use in this function)
+  405 |         hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, NULL, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+      |                                      ^~~~~~~~~~~~~~~~
+notepad1.c:405:86: error: ‘SBARS_SIZEGRIP’ undeclared (first use in this function); did you mean ‘SBS_SIZEGRIP’?
+  405 |         hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL, WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 0, 0, 0, 0, hwnd, NULL, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
+      |                                                                                      ^~~~~~~~~~~~~~
+      |                                                                                      SBS_SIZEGRIP

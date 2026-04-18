@@ -1,0 +1,547 @@
+// packer_lz4.cpp
+// Single-file Qt6 Widgets application: simple .lz4 packer/unpacker
+// - Uses LZ4 Frame API if available (include <lz4frame.h>)
+// - Otherwise falls back to calling 'lz4' CLI via QProcess
+//
+// Compile (example):
+// mkdir build && cd build
+// cmake -S .. -B .
+// cmake --build .
+// Or with qmake: g++ -std=c++17 `pkg-config --cflags Qt6Widgets` packer_lz4.cpp -o packer_lz4 `pkg-config --libs Qt6Widgets` -llz4
+//
+// Requirements:
+// - Qt6 (Widgets)
+// - Optional: liblz4 (development headers) to enable direct API
+//
+// This file implements:
+// - MainWindow with file list, options, toolbar, progress, log
+// - QRunnable worker for pack/unpack to avoid blocking UI
+// - Drag & drop support for adding files
+
+#include <QtWidgets>
+#include <QThreadPool>
+#include <QFileInfo>
+#include <QDateTime>
+#include <atomic>
+
+#ifdef __has_include
+#  if __has_include(<lz4frame.h>)
+#    include <lz4frame.h>
+#    define HAVE_LZ4_FRAME 1
+#  endif
+#endif
+
+#ifndef HAVE_LZ4_FRAME
+#  undef HAVE_LZ4_FRAME
+#endif
+
+// ---------- Utility helpers ----------
+static QString humanSize(qint64 bytes) {
+    const char* units[] = {"B","KB","MB","GB","TB"};
+    double b = double(bytes);
+    int i = 0;
+    while (b >= 1024.0 && i < 4) { b /= 1024.0; ++i; }
+    return QString::asprintf("%.2f %s", b, units[i]);
+}
+
+static void appendLog(QTextEdit* log, const QString& line) {
+    QString ts = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss");
+    log->append(QString("[%1] %2").arg(ts, line));
+}
+
+// ---------- Worker (QRunnable) ----------
+class PackWorker : public QObject, public QRunnable {
+    Q_OBJECT
+public:
+    enum Mode { Pack, Unpack };
+    PackWorker(const QStringList& inputs, const QString& outputPath, Mode mode,
+               int compressionLevel, bool checksum)
+        : m_inputs(inputs), m_outputPath(outputPath), m_mode(mode),
+          m_compressionLevel(compressionLevel), m_checksum(checksum)
+    {
+        setAutoDelete(true);
+    }
+
+signals:
+    void progress(int percent, const QString& message);
+    void finished(bool success, const QString& message);
+
+protected:
+    void run() override {
+        if (m_mode == Pack) {
+            pack();
+        } else {
+            unpack();
+        }
+    }
+
+private:
+    QStringList m_inputs;
+    QString m_outputPath;
+    Mode m_mode;
+    int m_compressionLevel;
+    bool m_checksum;
+
+    void emitProgress(int p, const QString& msg) {
+        emit progress(p, msg);
+    }
+
+    void pack() {
+        if (m_inputs.isEmpty()) {
+            emit finished(false, "No input files.");
+            return;
+        }
+
+        // If output path is a directory, create default name
+        QFileInfo outInfo(m_outputPath);
+        QString outFile = m_outputPath;
+        if (outInfo.isDir() || m_outputPath.isEmpty()) {
+            QString base = QCoreApplication::applicationName();
+            QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
+            outFile = QDir::current().filePath(QString("%1_%2.lz4").arg(base, stamp));
+        }
+
+#ifdef HAVE_LZ4_FRAME
+        // Use LZ4 Frame API to create a single archive that concatenates files with simple header
+        // Note: This is a minimal framing approach: we write file metadata as a small header before each file's compressed frame.
+        // Production code should use a proper archive format (e.g., tar + lz4) or implement robust metadata handling.
+        emitProgress(0, "Using LZ4 Frame API for packing");
+        FILE* out = fopen(outFile.toLocal8Bit().constData(), "wb");
+        if (!out) { emit finished(false, "Cannot open output file for writing."); return; }
+
+        LZ4F_preferences_t prefs;
+        memset(&prefs, 0, sizeof(prefs));
+        prefs.frameInfo.contentChecksumFlag = m_checksum ? LZ4F_contentChecksumEnabled : LZ4F_contentChecksumNotEnabled;
+        prefs.compressionLevel = m_compressionLevel;
+
+        LZ4F_errorCode_t err;
+        LZ4F_cctx* cctx = nullptr;
+        err = LZ4F_createCompressionContext(&cctx, LZ4F_VERSION);
+        if (LZ4F_isError(err)) { fclose(out); emit finished(false, "LZ4F_createCompressionContext failed"); return; }
+
+        // Write a single frame per file, preceded by a small metadata header: filename length + filename + file size (8 bytes)
+        qint64 totalBytes = 0;
+        for (const QString& f : m_inputs) {
+            QFileInfo fi(f);
+            totalBytes += fi.size();
+        }
+        qint64 processed = 0;
+        int idx = 0;
+        for (const QString& f : m_inputs) {
+            ++idx;
+            QFile in(f);
+            if (!in.open(QIODevice::ReadOnly)) {
+                LZ4F_freeCompressionContext(cctx);
+                fclose(out);
+                emit finished(false, QString("Cannot open input file: %1").arg(f));
+                return;
+            }
+            QByteArray filename = QFileInfo(f).fileName().toUtf8();
+            quint64 filesize = QFileInfo(f).size();
+
+            // metadata header: magic "PCK1", filename length (u16), filename bytes, filesize (u64)
+            fwrite("PCK1", 1, 4, out);
+            quint16 fnlen = quint16(filename.size());
+            fwrite(&fnlen, sizeof(fnlen), 1, out);
+            fwrite(filename.constData(), 1, fnlen, out);
+            fwrite(&filesize, sizeof(filesize), 1, out);
+
+            // Start frame
+            char outBuf[1<<16];
+            size_t headerSize = LZ4F_compressBegin(cctx, outBuf, sizeof(outBuf), &prefs);
+            if (LZ4F_isError(headerSize)) {
+                in.close();
+                LZ4F_freeCompressionContext(cctx);
+                fclose(out);
+                emit finished(false, "LZ4F_compressBegin failed");
+                return;
+            }
+            fwrite(outBuf, 1, headerSize, out);
+
+            // Stream compress
+            while (!in.atEnd()) {
+                QByteArray chunk = in.read(1<<16);
+                size_t cSize = LZ4F_compressUpdate(cctx, outBuf, sizeof(outBuf), chunk.constData(), chunk.size(), nullptr);
+                if (LZ4F_isError(cSize)) {
+                    in.close();
+                    LZ4F_freeCompressionContext(cctx);
+                    fclose(out);
+                    emit finished(false, "LZ4F_compressUpdate failed");
+                    return;
+                }
+                fwrite(outBuf, 1, cSize, out);
+                processed += chunk.size();
+                int percent = int((processed * 100) / qMax<qint64>(1, totalBytes));
+                emitProgress(percent, QString("Packing %1 (%2/%3)").arg(filename.constData()).arg(idx).arg(m_inputs.size()));
+            }
+
+            // End frame
+            size_t endSize = LZ4F_compressEnd(cctx, outBuf, sizeof(outBuf), nullptr);
+            if (LZ4F_isError(endSize)) {
+                in.close();
+                LZ4F_freeCompressionContext(cctx);
+                fclose(out);
+                emit finished(false, "LZ4F_compressEnd failed");
+                return;
+            }
+            fwrite(outBuf, 1, endSize, out);
+            in.close();
+        }
+
+        LZ4F_freeCompressionContext(cctx);
+        fclose(out);
+        emit finished(true, QString("Packed %1 files to %2").arg(m_inputs.size()).arg(outFile));
+#else
+        // Fallback: create a temporary tar-like concatenation and call 'lz4' CLI to compress
+        emitProgress(0, "Using lz4 CLI fallback for packing");
+        QString tmpTar = QDir::temp().filePath(QString("packer_tmp_%1.bin").arg(QDateTime::currentMSecsSinceEpoch()));
+        QFile out(tmpTar);
+        if (!out.open(QIODevice::WriteOnly)) { emit finished(false, "Cannot create temporary file."); return; }
+
+        // Simple custom container: for each file write header (magic, name length, name, size) then raw bytes
+        for (const QString& f : m_inputs) {
+            QFile in(f);
+            if (!in.open(QIODevice::ReadOnly)) { out.close(); QFile::remove(tmpTar); emit finished(false, QString("Cannot open input: %1").arg(f)); return; }
+            QByteArray filename = QFileInfo(f).fileName().toUtf8();
+            quint16 fnlen = quint16(filename.size());
+            quint64 filesize = QFileInfo(f).size();
+            out.write("PCK1", 4);
+            out.write(reinterpret_cast<const char*>(&fnlen), sizeof(fnlen));
+            out.write(filename);
+            out.write(reinterpret_cast<const char*>(&filesize), sizeof(filesize));
+            // copy data
+            while (!in.atEnd()) {
+                QByteArray chunk = in.read(1<<16);
+                out.write(chunk);
+            }
+            in.close();
+        }
+        out.close();
+
+        // Call lz4 CLI: lz4 -{level} tmpTar outFile
+        QStringList args;
+        if (m_compressionLevel >= 1 && m_compressionLevel <= 12) {
+            args << QString("-%1").arg(m_compressionLevel);
+        }
+        args << tmpTar << outFile;
+        QProcess proc;
+        proc.start("lz4", args);
+        if (!proc.waitForStarted()) { QFile::remove(tmpTar); emit finished(false, "Failed to start lz4 process."); return; }
+
+        // Monitor progress by polling file sizes (best-effort)
+        qint64 totalBytes = 0;
+        for (const QString& f : m_inputs) totalBytes += QFileInfo(f).size();
+        while (proc.state() == QProcess::Running) {
+            QThread::msleep(200);
+            QFileInfo fi(tmpTar);
+            qint64 processed = fi.exists() ? fi.size() : 0;
+            int percent = int((processed * 100) / qMax<qint64>(1, totalBytes));
+            emitProgress(qBound(0, percent, 99), "Compressing (external lz4)");
+            QCoreApplication::processEvents();
+        }
+        proc.waitForFinished();
+        int exitCode = proc.exitCode();
+        QFile::remove(tmpTar);
+        if (exitCode != 0) {
+            emit finished(false, QString("lz4 failed: %1").arg(proc.readAllStandardError()));
+            return;
+        }
+        emitProgress(100, "Compression finished");
+        emit finished(true, QString("Packed %1 files to %2").arg(m_inputs.size()).arg(outFile));
+#endif
+    }
+
+    void unpack() {
+        // Unpack: detect our simple container format and extract files
+#ifdef HAVE_LZ4_FRAME
+        emitProgress(0, "Using LZ4 Frame API for unpacking");
+        QFile in(m_outputPath);
+        if (!in.open(QIODevice::ReadOnly)) { emit finished(false, "Cannot open archive for reading."); return; }
+        // We'll read sequentially: metadata header then frame(s)
+        // This minimal implementation expects the archive created by pack() above.
+        QByteArray fileData = in.readAll();
+        const char* ptr = fileData.constData();
+        qint64 remaining = fileData.size();
+        int fileCount = 0;
+        while (remaining > 0) {
+            if (remaining < 4) { emit finished(false, "Corrupt archive (short magic)"); return; }
+            if (memcmp(ptr, "PCK1", 4) != 0) { emit finished(false, "Invalid archive magic"); return; }
+            ptr += 4; remaining -= 4;
+            if (remaining < (int)sizeof(quint16)) { emit finished(false, "Corrupt archive (short fnlen)"); return; }
+            quint16 fnlen;
+            memcpy(&fnlen, ptr, sizeof(fnlen));
+            ptr += sizeof(fnlen); remaining -= sizeof(fnlen);
+            if (remaining < fnlen) { emit finished(false, "Corrupt archive (short filename)"); return; }
+            QString filename = QString::fromUtf8(ptr, fnlen);
+            ptr += fnlen; remaining -= fnlen;
+            if (remaining < (int)sizeof(quint64)) { emit finished(false, "Corrupt archive (short filesize)"); return; }
+            quint64 filesize;
+            memcpy(&filesize, ptr, sizeof(filesize));
+            ptr += sizeof(filesize); remaining -= sizeof(filesize);
+
+            // Now ptr points to start of LZ4 frame for this file. We need to decompress frame by frame.
+            // For simplicity, write remaining bytes to a temp file and use LZ4F to decompress until we've produced 'filesize' bytes.
+            QByteArray frameData(ptr, remaining);
+            // Use LZ4F to decompress from memory
+            LZ4F_dctx* dctx = nullptr;
+            if (LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION) != 0) { emit finished(false, "LZ4F_createDecompressionContext failed"); return; }
+            const char* src = frameData.constData();
+            size_t srcSize = frameData.size();
+            size_t srcPos = 0;
+            QByteArray outBuf;
+            outBuf.resize(filesize);
+            size_t outPos = 0;
+            while (outPos < filesize && srcPos < srcSize) {
+                size_t dstCapacity = filesize - outPos;
+                size_t dstSize = dstCapacity;
+                size_t ret = LZ4F_decompress(dctx, outBuf.data()+outPos, &dstSize, src+srcPos, &srcSize, nullptr);
+                if (LZ4F_isError(ret)) { LZ4F_freeDecompressionContext(dctx); emit finished(false, "Decompression error"); return; }
+                outPos += dstSize;
+                srcPos = srcSize; // LZ4F_decompress updates srcSize to consumed bytes
+                if (ret == 0) break; // frame finished
+            }
+            LZ4F_freeDecompressionContext(dctx);
+
+            // Write file
+            QString outPath = QDir::current().filePath(filename);
+            QFile outFile(outPath);
+            if (!outFile.open(QIODevice::WriteOnly)) { emit finished(false, QString("Cannot write output file: %1").arg(outPath)); return; }
+            outFile.write(outBuf);
+            outFile.close();
+
+            // Advance ptr by the consumed frame bytes (we used srcPos)
+            ptr += srcPos;
+            remaining -= srcPos;
+            ++fileCount;
+            emitProgress(int((fileCount*100)/m_inputs.size()), QString("Unpacked %1").arg(filename));
+        }
+        emit finished(true, QString("Unpacked %1 files").arg(fileCount));
+#else
+        // Fallback: call lz4 -d archive tmpfile && parse our simple container
+        emitProgress(0, "Using lz4 CLI fallback for unpacking");
+        QString tmpOut = QDir::temp().filePath(QString("packer_unpacked_%1.bin").arg(QDateTime::currentMSecsSinceEpoch()));
+        QProcess proc;
+        proc.start("lz4", QStringList() << "-d" << m_outputPath << tmpOut);
+        if (!proc.waitForStarted()) { emit finished(false, "Failed to start lz4 process."); return; }
+        while (proc.state() == QProcess::Running) {
+            QThread::msleep(100);
+            emitProgress(10, "Decompressing (external lz4)");
+            QCoreApplication::processEvents();
+        }
+        proc.waitForFinished();
+        if (proc.exitCode() != 0) { emit finished(false, QString("lz4 failed: %1").arg(proc.readAllStandardError())); return; }
+
+        QFile in(tmpOut);
+        if (!in.open(QIODevice::ReadOnly)) { QFile::remove(tmpOut); emit finished(false, "Cannot open temporary decompressed file."); return; }
+        QDataStream ds(&in);
+        int extracted = 0;
+        while (!in.atEnd()) {
+            char magic[4];
+            if (in.read(magic, 4) != 4) break;
+            if (memcmp(magic, "PCK1", 4) != 0) { in.close(); QFile::remove(tmpOut); emit finished(false, "Invalid archive format"); return; }
+            quint16 fnlen;
+            if (in.read(reinterpret_cast<char*>(&fnlen), sizeof(fnlen)) != sizeof(fnlen)) break;
+            QByteArray fname = in.read(fnlen);
+            quint64 fsize;
+            if (in.read(reinterpret_cast<char*>(&fsize), sizeof(fsize)) != sizeof(fsize)) break;
+            QByteArray data = in.read((qint64)fsize);
+            QString outPath = QDir::current().filePath(QString::fromUtf8(fname));
+            QFile outFile(outPath);
+            if (!outFile.open(QIODevice::WriteOnly)) { in.close(); QFile::remove(tmpOut); emit finished(false, QString("Cannot write output file: %1").arg(outPath)); return; }
+            outFile.write(data);
+            outFile.close();
+            ++extracted;
+            emitProgress(qBound(0, extracted*10, 100), QString("Extracted %1").arg(QString::fromUtf8(fname)));
+        }
+        in.close();
+        QFile::remove(tmpOut);
+        emit finished(true, QString("Unpacked %1 files").arg(extracted));
+#endif
+    }
+};
+
+// ---------- MainWindow ----------
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow() {
+        setWindowTitle("LZ4 Packer");
+        resize(900, 600);
+        QWidget* central = new QWidget;
+        setCentralWidget(central);
+
+        // Toolbar
+        QToolBar* tb = addToolBar("main");
+        QAction* actAdd = tb->addAction(QIcon::fromTheme("list-add"), "Add");
+        QAction* actRemove = tb->addAction(QIcon::fromTheme("list-remove"), "Remove");
+        tb->addSeparator();
+        QAction* actPack = tb->addAction(QIcon::fromTheme("document-save"), "Pack");
+        QAction* actUnpack = tb->addAction(QIcon::fromTheme("document-open"), "Unpack");
+
+        // Left: file list
+        QGroupBox* gbFiles = new QGroupBox("Files to pack");
+        QVBoxLayout* vFiles = new QVBoxLayout;
+        m_listFiles = new QListWidget;
+        m_listFiles->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        m_listFiles->setAcceptDrops(true);
+        m_listFiles->setDragEnabled(true);
+        m_listFiles->setDropIndicatorShown(true);
+        m_listFiles->setDefaultDropAction(Qt::CopyAction);
+        vFiles->addWidget(m_listFiles);
+        QHBoxLayout* hBtns = new QHBoxLayout;
+        QPushButton* btnAdd = new QPushButton("Add");
+        QPushButton* btnRemove = new QPushButton("Remove");
+        hBtns->addWidget(btnAdd);
+        hBtns->addWidget(btnRemove);
+        vFiles->addLayout(hBtns);
+        gbFiles->setLayout(vFiles);
+
+        // Right: options
+        QGroupBox* gbOptions = new QGroupBox("Archive Options");
+        QFormLayout* fOpt = new QFormLayout;
+        m_cbLevel = new QComboBox;
+        for (int i=1;i<=12;++i) m_cbLevel->addItem(QString::number(i));
+        m_cbLevel->setCurrentIndex(3);
+        m_chkChecksum = new QCheckBox("Enable checksum");
+        m_leOutput = new QLineEdit;
+        QPushButton* btnBrowse = new QPushButton("Browse");
+        fOpt->addRow("Compression level", m_cbLevel);
+        fOpt->addRow("", m_chkChecksum);
+        fOpt->addRow("Output file / Archive", m_leOutput);
+        fOpt->addRow("", btnBrowse);
+        gbOptions->setLayout(fOpt);
+
+        // Bottom: progress + log
+        m_progress = new QProgressBar;
+        m_progress->setRange(0,100);
+        m_log = new QTextEdit;
+        m_log->setReadOnly(true);
+        QSplitter* bottomSplit = new QSplitter(Qt::Vertical);
+        bottomSplit->addWidget(m_progress);
+        bottomSplit->addWidget(m_log);
+        bottomSplit->setStretchFactor(1, 1);
+
+        // Layout
+        QHBoxLayout* topLayout = new QHBoxLayout;
+        topLayout->addWidget(gbFiles, 3);
+        topLayout->addWidget(gbOptions, 2);
+
+        QVBoxLayout* mainLayout = new QVBoxLayout;
+        mainLayout->addLayout(topLayout);
+        mainLayout->addWidget(bottomSplit, 1);
+        central->setLayout(mainLayout);
+
+        // Status bar
+        statusBar()->showMessage("Ready");
+
+        // Connections
+        connect(btnAdd, &QPushButton::clicked, this, &MainWindow::onAddFiles);
+        connect(actAdd, &QAction::triggered, this, &MainWindow::onAddFiles);
+        connect(btnRemove, &QPushButton::clicked, this, &MainWindow::onRemoveFiles);
+        connect(actRemove, &QAction::triggered, this, &MainWindow::onRemoveFiles);
+        connect(btnBrowse, &QPushButton::clicked, this, &MainWindow::onBrowseOutput);
+        connect(actPack, &QAction::triggered, this, &MainWindow::onPack);
+        connect(actUnpack, &QAction::triggered, this, &MainWindow::onUnpack);
+
+        // Drag & drop support for main window
+        setAcceptDrops(true);
+    }
+
+protected:
+    void dragEnterEvent(QDragEnterEvent* e) override {
+        if (e->mimeData()->hasUrls()) e->acceptProposedAction();
+    }
+    void dropEvent(QDropEvent* e) override {
+        const QList<QUrl> urls = e->mimeData()->urls();
+        for (const QUrl& u : urls) {
+            QString path = u.toLocalFile();
+            if (!path.isEmpty()) {
+                addFile(path);
+            }
+        }
+    }
+
+private slots:
+    void onAddFiles() {
+        QStringList files = QFileDialog::getOpenFileNames(this, "Add files to pack");
+        for (const QString& f : files) addFile(f);
+    }
+    void onRemoveFiles() {
+        qDeleteAll(m_listFiles->selectedItems());
+    }
+    void onBrowseOutput() {
+        QString file = QFileDialog::getSaveFileName(this, "Choose output archive", QDir::currentPath(), "LZ4 Archive (*.lz4)");
+        if (!file.isEmpty()) m_leOutput->setText(file);
+    }
+    void onPack() {
+        QStringList inputs;
+        for (int i=0;i<m_listFiles->count();++i) inputs << m_listFiles->item(i)->data(Qt::UserRole).toString();
+        if (inputs.isEmpty()) { appendLog(m_log, "No files selected."); return; }
+        QString out = m_leOutput->text();
+        if (out.isEmpty()) {
+            QString base = QFileInfo(inputs.first()).absolutePath();
+            out = QFileDialog::getSaveFileName(this, "Select output archive", base, "LZ4 Archive (*.lz4)");
+            if (out.isEmpty()) return;
+            m_leOutput->setText(out);
+        }
+        int level = m_cbLevel->currentText().toInt();
+        bool checksum = m_chkChecksum->isChecked();
+
+        appendLog(m_log, QString("Starting pack: %1 files -> %2").arg(inputs.size()).arg(out));
+        PackWorker* w = new PackWorker(inputs, out, PackWorker::Pack, level, checksum);
+        connect(w, &PackWorker::progress, this, &MainWindow::onWorkerProgress);
+        connect(w, &PackWorker::finished, this, &MainWindow::onWorkerFinished);
+        QThreadPool::globalInstance()->start(w);
+    }
+    void onUnpack() {
+        QString archive = QFileDialog::getOpenFileName(this, "Open archive to unpack", QDir::currentPath(), "LZ4 Archive (*.lz4)");
+        if (archive.isEmpty()) return;
+        // For simplicity, we pass the archive path in m_outputPath and empty inputs
+        appendLog(m_log, QString("Starting unpack: %1").arg(archive));
+        PackWorker* w = new PackWorker(QStringList(), archive, PackWorker::Unpack, m_cbLevel->currentText().toInt(), m_chkChecksum->isChecked());
+        connect(w, &PackWorker::progress, this, &MainWindow::onWorkerProgress);
+        connect(w, &PackWorker::finished, this, &MainWindow::onWorkerFinished);
+        QThreadPool::globalInstance()->start(w);
+    }
+
+    void onWorkerProgress(int percent, const QString& message) {
+        m_progress->setValue(percent);
+        statusBar()->showMessage(message);
+    }
+
+    void onWorkerFinished(bool success, const QString& message) {
+        appendLog(m_log, message);
+        m_progress->setValue(success ? 100 : 0);
+        statusBar()->showMessage(success ? "Done" : "Error");
+    }
+
+private:
+    QListWidget* m_listFiles = nullptr;
+    QComboBox* m_cbLevel = nullptr;
+    QCheckBox* m_chkChecksum = nullptr;
+    QLineEdit* m_leOutput = nullptr;
+    QProgressBar* m_progress = nullptr;
+    QTextEdit* m_log = nullptr;
+
+    void addFile(const QString& path) {
+        QFileInfo fi(path);
+        if (!fi.exists()) return;
+        QListWidgetItem* it = new QListWidgetItem(QString("%1 (%2)").arg(fi.fileName(), humanSize(fi.size())));
+        it->setData(Qt::UserRole, fi.absoluteFilePath());
+        it->setToolTip(fi.absoluteFilePath());
+        m_listFiles->addItem(it);
+        appendLog(m_log, QString("Added: %1").arg(fi.absoluteFilePath()));
+    }
+};
+
+// ---------- main ----------
+int main(int argc, char** argv) {
+    QApplication app(argc, argv);
+    QCoreApplication::setApplicationName("lz4_packer");
+    QCoreApplication::setOrganizationName("ExampleOrg");
+    MainWindow w;
+    w.show();
+    return app.exec();
+}
+
+#include "lz4packer1.moc"

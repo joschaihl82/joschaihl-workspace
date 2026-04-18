@@ -1,0 +1,1 @@
+i686-w64-mingw32-gcc -Wl,--subsystem,windows -municode -Wl,--dependency-file=CMakeFiles/winpaint.dir/link.d CMakeFiles/winpaint.dir/paint.c.o -o winpaint  -lcomctl32 -lgdi32 -luser32 -lkernel32 -luxtheme -lcomdlg32

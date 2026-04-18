@@ -1,0 +1,14 @@
+# ninja log v6
+2	481	1771690806804545604	ext4recover_autogen/timestamp	68a7f13bef71b1f
+2	481	1771690806804545604	ext4recover_autogen/mocs_compilation.cpp	68a7f13bef71b1f
+482	4668	1771690806817943867	CMakeFiles/ext4recover.dir/ext4recover.cpp.o	1a19d5b9d5ed8530
+2	481	1771690806804545604	/wrk/undelete-workspace/ext4recover/build/cmake.run.linux.x86_64.Local/ext4recover_autogen/timestamp	68a7f13bef71b1f
+2	481	1771690806804545604	/wrk/undelete-workspace/ext4recover/build/cmake.run.linux.x86_64.Local/ext4recover_autogen/mocs_compilation.cpp	68a7f13bef71b1f
+482	495	1771690806816664035	CMakeFiles/ext4recover.dir/ext4recover_autogen/mocs_compilation.cpp.o	a8c449614d14f18b
+4668	5587	1771690811002557146	ext4recover	dfb927b8b7439657
+11	629	1771691354469051428	ext4recover_autogen/timestamp	68a7f13bef71b1f
+11	629	1771691354469051428	ext4recover_autogen/mocs_compilation.cpp	68a7f13bef71b1f
+11	629	1771691354469051428	/wrk/undelete-workspace/ext4recover/build/cmake.run.linux.x86_64.Local/ext4recover_autogen/timestamp	68a7f13bef71b1f
+11	629	1771691354469051428	/wrk/undelete-workspace/ext4recover/build/cmake.run.linux.x86_64.Local/ext4recover_autogen/mocs_compilation.cpp	68a7f13bef71b1f
+630	9401	1771691355088053129	CMakeFiles/ext4recover.dir/ext4recover.cpp.o	1a19d5b9d5ed8530
+9401	10475	1771691363859077245	ext4recover	dfb927b8b7439657

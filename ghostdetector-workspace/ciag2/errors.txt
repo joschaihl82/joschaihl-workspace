@@ -1,0 +1,85 @@
+xghost.c: In function ‘sig_handler’:
+xghost.c:71:29: warning: unused parameter ‘signo’ [-Wunused-parameter]
+   71 | static void sig_handler(int signo) {
+      |                         ~~~~^~~~~
+xghost.c: In function ‘hsv_to_rgb’:
+xghost.c:104:9: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  104 |         if (vi < 0) vi = 0; if (vi > 255) vi = 255;
+      |         ^~
+xghost.c:104:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  104 |         if (vi < 0) vi = 0; if (vi > 255) vi = 255;
+      |                             ^~
+xghost.c:126:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  126 |     if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |     ^~
+xghost.c:126:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  126 |     if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |                         ^~
+xghost.c:127:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  127 |     if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |     ^~
+xghost.c:127:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  127 |     if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |                         ^~
+xghost.c:128:5: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  128 |     if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |     ^~
+xghost.c:128:25: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  128 |     if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |                         ^~
+xghost.c: In function ‘main’:
+xghost.c:329:47: error: ‘struct v4l2_fract’ has no member named ‘den’
+  329 |             den = sp.parm.capture.timeperframe.den;
+      |                                               ^
+xghost.c:330:47: error: ‘struct v4l2_fract’ has no member named ‘num’
+  330 |             num = sp.parm.capture.timeperframe.num;
+      |                                               ^
+xghost.c:574:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  574 |                 if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |                 ^~
+xghost.c:574:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  574 |                 if (ri < 0) ri = 0; if (ri > 255) ri = 255;
+      |                                     ^~
+xghost.c:575:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  575 |                 if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |                 ^~
+xghost.c:575:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  575 |                 if (gi < 0) gi = 0; if (gi > 255) gi = 255;
+      |                                     ^~
+xghost.c:576:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  576 |                 if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |                 ^~
+xghost.c:576:37: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  576 |                 if (bi < 0) bi = 0; if (bi > 255) bi = 255;
+      |                                     ^~
+xghost.c:589:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  589 |                 if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f;
+      |                 ^~
+xghost.c:589:41: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  589 |                 if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f;
+      |                                         ^~
+xghost.c:590:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  590 |                 if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+      |                 ^~
+xghost.c:590:41: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  590 |                 if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+      |                                         ^~
+xghost.c:598:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  598 |                 if (orr < 0) orr = 0; if (orr > 255) orr = 255;
+      |                 ^~
+xghost.c:598:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  598 |                 if (orr < 0) orr = 0; if (orr > 255) orr = 255;
+      |                                       ^~
+xghost.c:599:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  599 |                 if (org < 0) org = 0; if (org > 255) org = 255;
+      |                 ^~
+xghost.c:599:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  599 |                 if (org < 0) org = 0; if (org > 255) org = 255;
+      |                                       ^~
+xghost.c:600:17: warning: this ‘if’ clause does not guard... [-Wmisleading-indentation]
+  600 |                 if (orb < 0) orb = 0; if (orb > 255) orb = 255;
+      |                 ^~
+xghost.c:600:39: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the ‘if’
+  600 |                 if (orb < 0) orb = 0; if (orb > 255) orb = 255;
+      |                                       ^~
+make: *** [Makefile:23: ghost_filter] Error 1

@@ -1,0 +1,57 @@
+geiger.c: In function ‘v4l2_thread’:
+geiger.c:857:26: warning: variable ‘chosen_fourcc’ set but not used [-Wunused-but-set-variable]
+  857 |                 uint32_t chosen_fourcc = 0; // Warning: variable 'chosen_fourcc' set but not used
+      |                          ^~~~~~~~~~~~~
+geiger.c:950:16: warning: unused variable ‘t0’ [-Wunused-variable]
+  950 |         double t0 = now_seconds(); // Warning: unused variable 't0'
+      |                ^~
+geiger.c: In function ‘xcb_redraw’:
+geiger.c:1201:25: warning: unused variable ‘max_val’ [-Wunused-variable]
+ 1201 |             const float max_val = 1.00f; // Warning: unused variable 'max_val'
+      |                         ^~~~~~~
+geiger.c:1200:25: warning: unused variable ‘min_val’ [-Wunused-variable]
+ 1200 |             const float min_val = 0.85f; // Warning: unused variable 'min_val'
+      |                         ^~~~~~~
+geiger.c:1199:25: warning: unused variable ‘base_sat’ [-Wunused-variable]
+ 1199 |             const float base_sat = 0.95f; // Warning: unused variable 'base_sat'
+      |                         ^~~~~~~~
+geiger.c:1253:13: error: too few arguments to function ‘xcb_shm_put_image’
+ 1253 |             xcb_shm_put_image(
+      |             ^~~~~~~~~~~~~~~~~
+In file included from geiger.c:41:
+/usr/include/xcb/shm.h:504:1: note: declared here
+  504 | xcb_shm_put_image (xcb_connection_t *c,
+      | ^~~~~~~~~~~~~~~~~
+geiger.c:1269:13: error: implicit declaration of function ‘xcb_image_put’; did you mean ‘xcb_image_text_8’? [-Wimplicit-function-declaration]
+ 1269 |             xcb_image_put(xstate.conn, xstate.back_buffer, xstate.gc_blit,
+      |             ^~~~~~~~~~~~~
+      |             xcb_image_text_8
+geiger.c:1270:28: error: ‘xcb_image_t’ undeclared (first use in this function); did you mean ‘xcb_state_t’?
+ 1270 |                           (xcb_image_t*)0, video_x, video_y, vid_w, vid_h); // This image_put seems wrong, should be removed if shm_put_image is used
+      |                            ^~~~~~~~~~~
+      |                            xcb_state_t
+geiger.c:1270:28: note: each undeclared identifier is reported only once for each function it appears in
+geiger.c:1270:40: error: expected expression before ‘)’ token
+ 1270 |                           (xcb_image_t*)0, video_x, video_y, vid_w, vid_h); // This image_put seems wrong, should be removed if shm_put_image is used
+      |                                        ^
+geiger.c:1273:26: error: ‘img’ undeclared (first use in this function)
+ 1273 |             xcb_image_t *img = xcb_image_create_native(xstate.conn, vid_w, vid_h, XCB_IMAGE_FORMAT_Z_PIXMAP,
+      |                          ^~~
+geiger.c:1273:32: error: implicit declaration of function ‘xcb_image_create_native’ [-Wimplicit-function-declaration]
+ 1273 |             xcb_image_t *img = xcb_image_create_native(xstate.conn, vid_w, vid_h, XCB_IMAGE_FORMAT_Z_PIXMAP,
+      |                                ^~~~~~~~~~~~~~~~~~~~~~~
+geiger.c:1278:17: error: implicit declaration of function ‘xcb_image_destroy’; did you mean ‘xcb_image_text_16’? [-Wimplicit-function-declaration]
+ 1278 |                 xcb_image_destroy(img);
+      |                 ^~~~~~~~~~~~~~~~~
+      |                 xcb_image_text_16
+geiger.c:1003:22: warning: unused variable ‘last_alert_check_ms’ [-Wunused-variable]
+ 1003 |     static long long last_alert_check_ms = 0;
+      |                      ^~~~~~~~~~~~~~~~~~~
+geiger.c: In function ‘xcb_handle_events’:
+geiger.c:1387:43: error: implicit declaration of function ‘xcb_key_symbols_get_keysym’ [-Wimplicit-function-declaration]
+ 1387 |                     xcb_keysym_t keysym = xcb_key_symbols_get_keysym(xstate.keysyms, e->detail);
+      |                                           ^~~~~~~~~~~~~~~~~~~~~~~~~~
+geiger.c:1387:76: error: ‘xcb_state_t’ has no member named ‘keysyms’
+ 1387 |                     xcb_keysym_t keysym = xcb_key_symbols_get_keysym(xstate.keysyms, e->detail);
+      |                                                                            ^
+make: *** [Makefile:28: geiger] Error 1

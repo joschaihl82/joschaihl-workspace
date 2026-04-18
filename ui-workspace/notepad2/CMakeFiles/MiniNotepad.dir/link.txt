@@ -1,0 +1,1 @@
+x86_64-w64-mingw32-gcc -Wl,--dependency-file=CMakeFiles/MiniNotepad.dir/link.d CMakeFiles/MiniNotepad.dir/notepad1.c.o -o MiniNotepad  -lcomctl32 -luser32 -lgdi32 -lkernel32 -ladvapi32

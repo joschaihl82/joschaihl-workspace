@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">&#x0A;<refactoring comment="Copy Project &apos;torwebserver&apos;" description="Copy Project &apos;torwebserver&apos;" destination="/wrk/tor-workspace" element="/torwebserver" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="torwebserver2" stamp="1772310089410"/>&#x0A;<refactoring comment="Copy Project &apos;torssh&apos;" description="Copy Project &apos;torssh&apos;" destination="/wrk/tor-workspace" element="/torssh" flags="7" id="org.eclipse.ltk.core.refactoring.copyproject.resource" name="torssh2" stamp="1772316862963"/>
+</session>

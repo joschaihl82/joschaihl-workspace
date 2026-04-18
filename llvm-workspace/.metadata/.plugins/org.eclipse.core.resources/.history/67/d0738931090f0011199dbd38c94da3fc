@@ -1,0 +1,22 @@
+CMake Error at /usr/lib/llvm-20/lib/cmake/clang/ClangTargets.cmake:815 (message):
+  The imported target "clangBasic" references the file
+
+     "/usr/lib/llvm-20/lib/libclangBasic.a"
+
+  but this file does not exist.  Possible reasons include:
+
+  * The file was deleted, renamed, or moved to another location.
+
+  * An install or uninstall procedure did not complete successfully.
+
+  * The installation package was faulty and contained
+
+     "/usr/lib/llvm-20/lib/cmake/clang/ClangTargets.cmake"
+
+  but not all the files it references.
+
+Call Stack (most recent call first):
+  /usr/lib/cmake/clang-20/ClangConfig.cmake:20 (include)
+  CMakeLists.txt:5 (find_package)
+
+

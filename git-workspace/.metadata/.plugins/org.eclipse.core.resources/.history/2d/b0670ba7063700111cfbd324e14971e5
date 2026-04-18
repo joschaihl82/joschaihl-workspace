@@ -1,0 +1,67 @@
+cmake_minimum_required(VERSION 3.16)
+project(gitpush LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
+set(CMAKE_AUTOUIC ON)
+
+# Find Qt6 components
+find_package(Qt6 REQUIRED COMPONENTS Core Widgets Network)
+
+# Try to find libgit2 via pkg-config
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBGIT2 QUIET libgit2)
+
+if (LIBGIT2_FOUND)
+    message(STATUS "Found libgit2 via pkg-config: ${LIBGIT2_VERSION}")
+    set(LIBGIT2_INCLUDE_DIRS ${LIBGIT2_INCLUDE_DIRS})
+    set(LIBGIT2_LIBRARIES ${LIBGIT2_LIBRARIES})
+    set(LIBGIT2_CFLAGS_OTHER ${LIBGIT2_CFLAGS_OTHER})
+else()
+    # Fallback: try to find libgit2 with find_library / find_path
+    find_path(LIBGIT2_INCLUDE_DIR NAMES git2.h)
+    find_library(LIBGIT2_LIBRARY NAMES git2)
+    if (LIBGIT2_INCLUDE_DIR AND LIBGIT2_LIBRARY)
+        message(STATUS "Found libgit2 via find_path/find_library")
+        set(LIBGIT2_INCLUDE_DIRS ${LIBGIT2_INCLUDE_DIR})
+        set(LIBGIT2_LIBRARIES ${LIBGIT2_LIBRARY})
+        set(LIBGIT2_CFLAGS_OTHER "")
+    else()
+        message(FATAL_ERROR "libgit2 not found. Install libgit2-dev (pkg-config: libgit2) or set LIBGIT2_INCLUDE_DIR / LIBGIT2_LIBRARY.")
+    endif()
+endif()
+
+# Source
+set(SRC
+    gitpush.cpp
+)
+
+add_executable(gitpush ${SRC})
+
+# Include directories for libgit2 (pkg-config may provide multiple)
+target_include_directories(gitpush PRIVATE ${LIBGIT2_INCLUDE_DIRS})
+
+# Link libraries: Qt and libgit2
+target_link_libraries(gitpush PRIVATE
+    Qt6::Core
+    Qt6::Widgets
+    Qt6::Network
+    ${LIBGIT2_LIBRARIES}
+)
+
+# If pkg-config provided extra compile flags, add them
+if (LIBGIT2_CFLAGS_OTHER)
+    string(REPLACE " " ";" LIBGIT2_CFLAGS_LIST "${LIBGIT2_CFLAGS_OTHER}")
+    target_compile_options(gitpush PRIVATE ${LIBGIT2_CFLAGS_LIST})
+endif()
+
+# Install target (optional)
+install(TARGETS gitpush RUNTIME DESTINATION bin)
+
+# Helpful messages
+message(STATUS "Project: ${PROJECT_NAME}")
+message(STATUS "Qt6 components: Core Widgets Network")
+message(STATUS "libgit2 include dirs: ${LIBGIT2_INCLUDE_DIRS}")
+message(STATUS "libgit2 libraries: ${LIBGIT2_LIBRARIES}")

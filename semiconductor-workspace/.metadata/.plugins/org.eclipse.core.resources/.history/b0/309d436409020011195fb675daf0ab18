@@ -1,0 +1,435 @@
+/*
+ * ui.c
+ *
+ * UI module: toolbar, rulers, input handling, tooltips.
+ * Uses only the public render API declared in app.h.
+ *
+ * Compile together with main.c and render.c:
+ *   gcc main.c render.c ui.c -o cad -lGLEW -lGL -lGLU -lglut -lm
+ */
+
+#include "app.h"
+#include <GL/glut.h>
+#include <stdio.h>
+#include <string.h>
+
+/* Window size (kept local to UI) */
+static int win_w = 1200;
+static int win_h = 800;
+
+/* Mouse / interaction state */
+static int mouse_x = 0;
+static int mouse_y = 0;
+static int panning = 0;
+static int pan_last_x = 0;
+static int pan_last_y = 0;
+
+/* Button / tooltip state */
+static int hover_button = -1;
+static int pressed_button = -1;
+static int tooltip_visible = 0;
+static char tooltip_text[128] = "";
+
+/* Button identifiers */
+enum {
+    BTN_CENTER = 0,
+    BTN_PLUS   = 1,
+    BTN_MINUS  = 2,
+    BTN_RESET  = 3,
+    BTN_GRID   = 4,
+    BTN_SNAP   = 5,
+    BTN_COUNT  = 6
+};
+
+/* Compute button rectangles (x0,y0,x1,y1) in toolbar coordinates */
+static void compute_button_rects(int rects[BTN_COUNT][4]) {
+    int left = 8;
+    int top = 6;
+    int btn_h = TOOLBAR_HEIGHT - 12;
+    int spacing = 8;
+    int x = left;
+
+    rects[BTN_CENTER][0] = x; rects[BTN_CENTER][1] = top; rects[BTN_CENTER][2] = x + 80; rects[BTN_CENTER][3] = top + btn_h;
+    x += 80 + spacing;
+
+    rects[BTN_PLUS][0] = x; rects[BTN_PLUS][1] = top; rects[BTN_PLUS][2] = x + 36; rects[BTN_PLUS][3] = top + btn_h;
+    x += 36 + spacing;
+
+    rects[BTN_MINUS][0] = x; rects[BTN_MINUS][1] = top; rects[BTN_MINUS][2] = x + 36; rects[BTN_MINUS][3] = top + btn_h;
+    x += 36 + spacing;
+
+    rects[BTN_RESET][0] = x; rects[BTN_RESET][1] = top; rects[BTN_RESET][2] = x + 60; rects[BTN_RESET][3] = top + btn_h;
+    x += 60 + spacing;
+
+    rects[BTN_GRID][0] = x; rects[BTN_GRID][1] = top; rects[BTN_GRID][2] = x + 48; rects[BTN_GRID][3] = top + btn_h;
+    x += 48 + spacing;
+
+    rects[BTN_SNAP][0] = x; rects[BTN_SNAP][1] = top; rects[BTN_SNAP][2] = x + 48; rects[BTN_SNAP][3] = top + btn_h;
+}
+
+/* Simple bitmap text helper */
+static void draw_text_bitmap(int x, int y, const char *s) {
+    glRasterPos2i(x, y);
+    for (const char *p = s; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *p);
+}
+
+/* Return content rectangle in top-left coordinate system (GLUT mouse coords: y increases downward)
+   x,y = top-left of content area; w,h = width/height */
+static void get_content_rect_top(int *out_x, int *out_y, int *out_w, int *out_h) {
+    int cx = RULER_THICKNESS;
+    int cy = TOOLBAR_HEIGHT + RULER_THICKNESS;
+    int cw = win_w - RULER_THICKNESS;
+    int ch = win_h - STATUS_HEIGHT - cy;
+    if (out_x) *out_x = cx;
+    if (out_y) *out_y = cy;
+    if (out_w) *out_w = cw;
+    if (out_h) *out_h = ch;
+}
+
+/* Check if point (x,y) is inside rect [x0,y0,x1,y1] */
+static int point_in_rect(int x, int y, int rect[4]) {
+    return (x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]);
+}
+
+/* Draw toolbar (top) and icons */
+static void draw_toolbar(void) {
+    /* background */
+    glColor3ub(245, 245, 250);
+    glBegin(GL_QUADS);
+      glVertex2i(0, 0);
+      glVertex2i(win_w, 0);
+      glVertex2i(win_w, TOOLBAR_HEIGHT);
+      glVertex2i(0, TOOLBAR_HEIGHT);
+    glEnd();
+
+    /* separator line */
+    glColor3ub(180, 180, 180);
+    glBegin(GL_LINES);
+      glVertex2i(0, TOOLBAR_HEIGHT - 1);
+      glVertex2i(win_w, TOOLBAR_HEIGHT - 1);
+    glEnd();
+
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+
+    for (int i = 0; i < BTN_COUNT; ++i) {
+        int x0 = rects[i][0], y0 = rects[i][1], x1 = rects[i][2], y1 = rects[i][3];
+        int hovered = (hover_button == i);
+
+        unsigned char base_r = hovered ? 220 : 200;
+        unsigned char base_g = hovered ? 230 : 210;
+        unsigned char base_b = hovered ? 255 : 230;
+
+        glColor3ub(base_r, base_g, base_b);
+        glBegin(GL_QUADS);
+          glVertex2i(x0, y0);
+          glVertex2i(x1, y0);
+          glVertex2i(x1, y1);
+          glVertex2i(x0, y1);
+        glEnd();
+
+        /* simple icon drawing */
+        glColor3ub(0, 0, 0);
+        glLineWidth(2.0f);
+        int cx = x0 + (x1 - x0) / 2;
+        int cy = y0 + (y1 - y0) / 2;
+
+        if (i == BTN_CENTER) {
+            glBegin(GL_LINES);
+              glVertex2i(cx - 6, cy); glVertex2i(cx + 6, cy);
+              glVertex2i(cx, cy - 6); glVertex2i(cx, cy + 6);
+            glEnd();
+        } else if (i == BTN_PLUS) {
+            glBegin(GL_LINES);
+              glVertex2i(cx - 6, cy); glVertex2i(cx + 6, cy);
+              glVertex2i(cx, cy - 6); glVertex2i(cx, cy + 6);
+            glEnd();
+        } else if (i == BTN_MINUS) {
+            glBegin(GL_LINES);
+              glVertex2i(cx - 6, cy); glVertex2i(cx + 6, cy);
+            glEnd();
+        } else if (i == BTN_RESET) {
+            glBegin(GL_LINE_STRIP);
+              for (int a = 0; a <= 12; ++a) {
+                  double ang = (M_PI * 1.5) + (double)a / 12.0 * (M_PI * 1.2);
+                  double r = 8.0;
+                  glVertex2f((GLfloat)(cx + cos(ang) * r), (GLfloat)(cy + sin(ang) * r));
+              }
+            glEnd();
+        } else if (i == BTN_GRID) {
+            /* small grid icon */
+            int left = cx - 8, top = cy - 8;
+            for (int gx = 0; gx < 3; ++gx) {
+                for (int gy = 0; gy < 3; ++gy) {
+                    int px = left + gx * 8;
+                    int py = top + gy * 8;
+                    glBegin(GL_LINE_LOOP);
+                      glVertex2i(px, py);
+                      glVertex2i(px + 6, py);
+                      glVertex2i(px + 6, py + 6);
+                      glVertex2i(px, py + 6);
+                    glEnd();
+                }
+            }
+        } else { /* BTN_SNAP or fallback */
+            glBegin(GL_LINES);
+              glVertex2i(cx - 6, cy); glVertex2i(cx + 6, cy);
+            glEnd();
+        }
+    }
+
+    /* tooltip */
+    if (tooltip_visible && tooltip_text[0]) {
+        int tw = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)tooltip_text) + 12;
+        int th = 20;
+        int tx = mouse_x + 12;
+        int ty = mouse_y + 12;
+        if (tx + tw > win_w) tx = win_w - tw - 8;
+        if (ty + th > win_h) ty = win_h - th - 8;
+
+        glColor3ub(255, 255, 160);
+        glBegin(GL_QUADS);
+          glVertex2i(tx, ty);
+          glVertex2i(tx + tw, ty);
+          glVertex2i(tx + tw, ty + th);
+          glVertex2i(tx, ty + th);
+        glEnd();
+
+        glColor3ub(0, 0, 0);
+        draw_text_bitmap(tx + 6, ty + 14, tooltip_text);
+    }
+}
+
+/* Draw rulers and delegate content drawing to render module */
+static void draw_rulers_and_content(void) {
+    /* left ruler */
+    glColor3ub(240, 240, 240);
+    glBegin(GL_QUADS);
+      glVertex2i(0, TOOLBAR_HEIGHT);
+      glVertex2i(RULER_THICKNESS, TOOLBAR_HEIGHT);
+      glVertex2i(RULER_THICKNESS, win_h - STATUS_HEIGHT);
+      glVertex2i(0, win_h - STATUS_HEIGHT);
+    glEnd();
+
+    /* top ruler (below toolbar) */
+    glColor3ub(250, 250, 250);
+    glBegin(GL_QUADS);
+      glVertex2i(RULER_THICKNESS, TOOLBAR_HEIGHT);
+      glVertex2i(win_w, TOOLBAR_HEIGHT);
+      glVertex2i(win_w, TOOLBAR_HEIGHT + RULER_THICKNESS);
+      glVertex2i(RULER_THICKNESS, TOOLBAR_HEIGHT + RULER_THICKNESS);
+    glEnd();
+
+    /* delegate grid/content drawing */
+    render_draw();
+}
+
+/* Public UI API implementations */
+
+void ui_init(void) {
+    /* nothing heavy to init here; render_init already called by main */
+}
+
+/* Display callback */
+void ui_on_display(void) {
+    glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    /* Setup orthographic projection with origin top-left (gluOrtho2D(0, w, h, 0)) */
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluOrtho2D(0, win_w, win_h, 0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    draw_toolbar();
+    draw_rulers_and_content();
+
+    /* status bar at bottom */
+    int status_y = win_h - STATUS_HEIGHT;
+    glColor3ub(248, 248, 248);
+    glBegin(GL_QUADS);
+      glVertex2i(0, status_y);
+      glVertex2i(win_w, status_y);
+      glVertex2i(win_w, win_h);
+      glVertex2i(0, win_h);
+    glEnd();
+
+    glColor3ub(0, 0, 0);
+    draw_text_bitmap(8, status_y + STATUS_HEIGHT - 6, "CAD modular - mouse wheel: zoom, drag: pan, G: toggle grid");
+
+    glutSwapBuffers();
+}
+
+/* Reshape callback */
+void ui_on_reshape(int w, int h) {
+    win_w = w;
+    win_h = h;
+    render_resize(w, h);
+    glutPostRedisplay();
+}
+
+/* Mouse callback */
+void ui_on_mouse(int button, int state, int x, int y) {
+    mouse_x = x;
+    mouse_y = y;
+
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+
+    int cx, cy, cw, ch;
+    get_content_rect_top(&cx, &cy, &cw, &ch);
+
+    int in_toolbar = (y < TOOLBAR_HEIGHT);
+    int in_content = (x >= cx && x < cx + cw && y >= cy && y < cy + ch);
+
+    if (in_toolbar) {
+        glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+        if (button == GLUT_LEFT_BUTTON) {
+            if (state == GLUT_DOWN) {
+                hover_button = -1;
+                for (int i = 0; i < BTN_COUNT; ++i) {
+                    if (point_in_rect(x, y, rects[i])) {
+                        pressed_button = i;
+                        hover_button = i;
+                        tooltip_visible = 1;
+                        break;
+                    }
+                }
+            } else if (state == GLUT_UP) {
+                for (int i = 0; i < BTN_COUNT; ++i) {
+                    if (pressed_button == i && point_in_rect(x, y, rects[i])) {
+                        /* handle button action */
+                        if (i == BTN_CENTER) {
+                            render_zoom_to_centered(1.0, 0);
+                        } else if (i == BTN_PLUS) {
+                            render_zoom_in_centered();
+                        } else if (i == BTN_MINUS) {
+                            render_zoom_out_centered();
+                        } else if (i == BTN_RESET) {
+                            render_zoom_to_centered(1.0, 0);
+                        } else if (i == BTN_GRID) {
+                            render_toggle_grid();
+                        } else if (i == BTN_SNAP) {
+                            /* snap not implemented in this minimal API */
+                        }
+                    }
+                }
+                pressed_button = -1;
+                hover_button = -1;
+                tooltip_visible = 0;
+            }
+        }
+        glutPostRedisplay();
+        return;
+    }
+
+    /* Content area interactions */
+    if (in_content && button == GLUT_LEFT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            panning = 1;
+            pan_last_x = x;
+            pan_last_y = y;
+            glutSetCursor(GLUT_CURSOR_NONE);
+        } else if (state == GLUT_UP) {
+            panning = 0;
+            glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+        }
+    }
+
+    /* Mouse wheel (freeglut uses button 3/4) */
+    if (state == GLUT_DOWN) {
+        if (button == 3) {
+            render_zoom_in_centered();
+        } else if (button == 4) {
+            render_zoom_out_centered();
+        }
+    }
+
+    glutPostRedisplay();
+}
+
+/* Motion while a button is pressed (panning) */
+void ui_on_motion(int x, int y) {
+    mouse_x = x;
+    mouse_y = y;
+
+    if (panning) {
+        int dx = x - pan_last_x;
+        int dy = y - pan_last_y;
+        pan_last_x = x;
+        pan_last_y = y;
+        /* render_pan_by expects dx,dy in screen pixels; render inverts Y internally */
+        render_pan_by(dx, dy);
+    } else {
+        /* update cursor if outside content */
+        int cx, cy, cw, ch;
+        get_content_rect_top(&cx, &cy, &cw, &ch);
+        if (!(x >= cx && x < cx + cw && y >= cy && y < cy + ch)) {
+            glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+        }
+    }
+
+    glutPostRedisplay();
+}
+
+/* Passive motion (hover) */
+void ui_on_passive_motion(int x, int y) {
+    mouse_x = x;
+    mouse_y = y;
+
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+
+    int new_hover = -1;
+    if (y < TOOLBAR_HEIGHT) {
+        for (int i = 0; i < BTN_COUNT; ++i) {
+            if (point_in_rect(x, y, rects[i])) {
+                new_hover = i;
+                break;
+            }
+        }
+    }
+
+    if (new_hover != hover_button) {
+        hover_button = new_hover;
+        tooltip_visible = (hover_button != -1);
+        if (tooltip_visible) {
+            switch (hover_button) {
+                case BTN_CENTER: snprintf(tooltip_text, sizeof(tooltip_text), "Center view"); break;
+                case BTN_PLUS:   snprintf(tooltip_text, sizeof(tooltip_text), "Zoom in"); break;
+                case BTN_MINUS:  snprintf(tooltip_text, sizeof(tooltip_text), "Zoom out"); break;
+                case BTN_RESET:  snprintf(tooltip_text, sizeof(tooltip_text), "Reset view"); break;
+                case BTN_GRID:   snprintf(tooltip_text, sizeof(tooltip_text), "Toggle grid (G)"); break;
+                case BTN_SNAP:   snprintf(tooltip_text, sizeof(tooltip_text), "Snap (not implemented)"); break;
+                default: tooltip_text[0] = '\0'; break;
+            }
+        } else {
+            tooltip_text[0] = '\0';
+        }
+    }
+
+    /* cursor handling */
+    int cx, cy, cw, ch;
+    get_content_rect_top(&cx, &cy, &cw, &ch);
+    if (!(x >= cx && x < cx + cw && y >= cy && y < cy + ch)) {
+        if (!panning) glutSetCursor(GLUT_CURSOR_LEFT_ARROW);
+    }
+
+    glutPostRedisplay();
+}
+
+/* Keyboard */
+void ui_on_keyboard(unsigned char key, int x, int y) {
+    (void)x; (void)y;
+    if (key == 27) {
+        exit(0);
+    } else if (key == '+' || key == '=') {
+        render_zoom_in_centered();
+    } else if (key == '-') {
+        render_zoom_out_centered();
+    } else if (key == 'g' || key == 'G') {
+        render_toggle_grid();
+    }
+}

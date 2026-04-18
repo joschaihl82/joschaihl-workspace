@@ -1,0 +1,1522 @@
+/*
+ * main.c
+ *
+ * GLUT/OpenGL CAD demo — komplette Datei mit Toolbar-Vektor-Icons,
+ * Zeichenwerkzeugen: Line, Circle, Triangle (outline + filled), Rectangle (outline + filled) und Farbpalette.
+ *
+ * Compile:
+ *   gcc main.c -o cad -lGLEW -lGL -lGLU -lglut -lm
+ *
+ * Hinweise:
+ * - Linksklick in der Toolbar wählt Werkzeuge / Farben / Aktionen.
+ * - Line tool: Linksklick = Start, nächster Linksklick = Endpunkt (Endpunkt wird neuer Start).
+ *   Rechtsklick beendet die aktuelle Polyline (löscht Pending Start).
+ * - Circle tool: Linksklick = Center, nächster Linksklick = Perimeter (Radius) -> Kreis erzeugen.
+ *   Rechtsklick bricht aktuellen Vorgang ab.
+ * - Triangle tool: Drei Linksklicks erzeugen ein Dreieck (dann Reset der Pending-Vertices).
+ * - Rect tool: Zwei Linksklicks (diagonal) erzeugen Rechteck (dann Reset).
+ * - Es gibt Outline- und Filled-Varianten für Triangle und Rectangle.
+ * - Farbpalette oben rechts: Klick wählt aktuelle Zeichenfarbe.
+ */
+
+#include <GL/glew.h>
+#include <GL/gl.h>
+#include <GL/glu.h>
+#include <GL/glut.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+/* Layout */
+#define RULER_THICKNESS 28
+#define TOOLBAR_HEIGHT 40
+#define STATUS_HEIGHT 20
+#define MAX_POINTS 8192
+#define MAX_LINES 16384
+#define MAX_CIRCLES 4096
+#define MAX_TRIS 4096
+#define MAX_RECTS 4096
+
+/* Units */
+typedef struct { const char *name; double mm_per_unit; } UnitDef;
+static UnitDef units[] = {
+    {"nm", 1e-6}, {"µm", 1e-3}, {"mm", 1.0}, {"cm", 10.0}, {"dm", 100.0}, {"m", 1000.0}
+};
+static const int UNIT_COUNT = sizeof(units)/sizeof(units[0]);
+
+/* Numeric magnitude target range */
+static const double MAG_MIN = 0.1;
+static const double MAG_MAX = 100.0;
+
+/* Window / world state */
+static int win_w = 1200, win_h = 800;
+static double px_per_mm = 96.0 / 25.4;
+static double zoom_factor = 1.0;
+static double pan_x = 0.0, pan_y = 0.0;
+static int mouse_x = 0, mouse_y = 0;
+
+/* Points (legacy markers) */
+static double points_x[MAX_POINTS], points_y[MAX_POINTS];
+static int points_count = 0;
+
+/* Lines storage (pairs) */
+static double lines_x1[MAX_LINES], lines_y1[MAX_LINES];
+static double lines_x2[MAX_LINES], lines_y2[MAX_LINES];
+static unsigned int lines_color[MAX_LINES];
+static int lines_count = 0;
+
+/* Circles */
+static double circles_cx[MAX_CIRCLES], circles_cy[MAX_CIRCLES], circles_r[MAX_CIRCLES];
+static unsigned int circles_color[MAX_CIRCLES];
+static int circles_count = 0;
+
+/* Triangles (store vertices and color + filled flag) */
+static double tris_x1[MAX_TRIS], tris_y1[MAX_TRIS];
+static double tris_x2[MAX_TRIS], tris_y2[MAX_TRIS];
+static double tris_x3[MAX_TRIS], tris_y3[MAX_TRIS];
+static unsigned int tris_color[MAX_TRIS];
+static int tris_filled[MAX_TRIS];
+static int tris_count = 0;
+
+/* Rectangles (store as two opposite corners) */
+static double rects_x1[MAX_RECTS], rects_y1[MAX_RECTS];
+static double rects_x2[MAX_RECTS], rects_y2[MAX_RECTS];
+static unsigned int rects_color[MAX_RECTS];
+static int rects_filled[MAX_RECTS];
+static int rects_count = 0;
+
+/* Pending states for tools */
+static int line_active = 0; /* pending start exists */
+static double line_pending_x = 0.0, line_pending_y = 0.0;
+
+static int circle_pending = 0; /* 0 = no center, 1 = have center */
+static double circle_center_x = 0.0, circle_center_y = 0.0;
+
+static int tri_pending_count = 0; /* 0..2 pending vertices */
+static double tri_vx[3], tri_vy[3];
+
+static int rect_pending = 0; /* 0 = no first corner, 1 = have first corner */
+static double rect_xa = 0.0, rect_ya = 0.0;
+
+/* Unit selection */
+static int manual_unit_index = 2; /* mm */
+static int auto_unit_enabled = 1;
+static int current_unit_index = 2;
+
+/* Panning */
+static int panning = 0;
+static int pan_last_x = 0, pan_last_y = 0;
+
+/* Left-button drag handling for background panning */
+static int left_dragging = 0;
+static int left_drag_start_x = 0, left_drag_start_y = 0;
+static int left_drag_moved = 0;
+static const int LEFT_DRAG_THRESHOLD = 4; /* pixels */
+
+/* Animation for zoom */
+static int zoom_animating = 0;
+static double zoom_start = 1.0;
+static double zoom_target = 1.0;
+static double anim_duration = 0.20;
+static double anim_start_time = 0.0;
+static double anim_world_cx = 0.0, anim_world_cy = 0.0;
+
+/* Toolbar buttons
+   Added outline + filled variants for triangle and rectangle.
+*/
+enum {
+    BTN_LINE = 0,
+    BTN_CIRCLE = 1,
+    BTN_TRI_OUT = 2,
+    BTN_TRI_FILLED = 3,
+    BTN_RECT_OUT = 4,
+    BTN_RECT_FILLED = 5,
+    BTN_CENTER = 6,
+    BTN_PLUS = 7,
+    BTN_MINUS = 8,
+    BTN_RESET = 9,
+    BTN_GRID = 10,
+    BTN_SNAP = 11,
+    BTN_COUNT = 12
+};
+static int hover_button = -1;
+static int pressed_button = -1;
+
+/* Tools */
+typedef enum {
+    TOOL_NONE = 0,
+    TOOL_LINE = 1,
+    TOOL_CIRCLE = 2,
+    TOOL_TRI_OUT = 3,
+    TOOL_TRI_FILLED = 4,
+    TOOL_RECT_OUT = 5,
+    TOOL_RECT_FILLED = 6
+} Tool;
+static Tool selected_tool = TOOL_NONE;
+
+/* Grid / snap toggles */
+static int grid_visible = 1; /* standardmäßig an */
+static int snap_enabled = 0;
+
+/* Tooltip state (immediate) */
+static int tooltip_visible = 0;
+static char tooltip_text[128] = "";
+
+/* Color palette */
+#define PALETTE_COUNT 8
+static unsigned int palette_colors[PALETTE_COUNT] = {
+    0x000000, /* black */
+    0xFF0000, /* red */
+    0x00AA00, /* green */
+    0x0000FF, /* blue */
+    0xFF8800, /* orange */
+    0x800080, /* purple */
+    0x888888, /* gray */
+    0x000000  /* black duplicate for simplicity */
+};
+static int palette_rects[PALETTE_COUNT][4];
+static int palette_selected = 0; /* index into palette_colors */
+static unsigned int current_color = 0x000000;
+
+/* Timing helper */
+static double now_seconds() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+
+/* Forward declarations */
+static void timer_handler(int unused);
+static void redisplay_request() { glutPostRedisplay(); }
+
+/* Easing */
+static double ease_out_quad(double t) {
+    if (t <= 0.0) return 0.0;
+    if (t >= 1.0) return 1.0;
+    return 1.0 - (1.0 - t) * (1.0 - t);
+}
+
+/* Helpers */
+static double nice_multiplier_for_px(double px_per_unit, double target_px) {
+    double seq[] = {1.0,2.0,5.0,10.0,20.0,50.0,100.0,200.0,500.0,1000.0,2000.0,5000.0};
+    for (size_t i=0;i<sizeof(seq)/sizeof(seq[0]);++i) if (seq[i]*px_per_unit >= target_px) return seq[i];
+    double v = 10000.0; while (v * px_per_unit < target_px) v *= 2.0; return v;
+}
+static double nice_multiplier_for_px_generic(double px_per_unit, double target_px) { return nice_multiplier_for_px(px_per_unit,target_px); }
+
+static void get_content_rect(int *x0, int *y0, int *cw, int *ch) {
+    if (x0) *x0 = RULER_THICKNESS;
+    if (y0) *y0 = TOOLBAR_HEIGHT + RULER_THICKNESS;
+    if (cw) *cw = win_w - RULER_THICKNESS;
+    if (ch) *ch = win_h - (TOOLBAR_HEIGHT + RULER_THICKNESS) - STATUS_HEIGHT;
+}
+static void get_content_center_screen(int *cx, int *cy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    if (cx) *cx = x0 + cw/2;
+    if (cy) *cy = y0 + ch/2;
+}
+
+static void world_to_screen(double wx, double wy, int *sx, int *sy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    double ox = x0 + cw/2.0, oy = y0 + ch/2.0;
+    double zx = (wx - pan_x) * zoom_factor, zy = (wy - pan_y) * zoom_factor;
+    if (sx) *sx = (int)round(ox + zx);
+    if (sy) *sy = (int)round(oy + zy);
+}
+static void screen_to_world(int sx, int sy, double *wx, double *wy) {
+    int x0,y0,cw,ch; get_content_rect(&x0,&y0,&cw,&ch);
+    double ox = x0 + cw/2.0, oy = y0 + ch/2.0;
+    if (wx) *wx = (double)(sx - ox) / zoom_factor + pan_x;
+    if (wy) *wy = (double)(sy - oy) / zoom_factor + pan_y;
+}
+
+/* Ensure zoom safe */
+static void ensure_zoom_safe() {
+    if (zoom_factor < 1e-12) zoom_factor = 1e-12;
+}
+
+/* --- Zoom helpers: zoom_to_centered, zoom_in_centered, zoom_out_centered --- */
+
+static void zoom_to_centered(double new_zoom, int animate) {
+    if (!(new_zoom > 0.0)) return; /* guard */
+    if (new_zoom < 1e-9) new_zoom = 1e-9;
+    if (new_zoom > 1e12) new_zoom = 1e12;
+
+    int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+    double world_cx_before, world_cy_before;
+    screen_to_world(ccx, ccy, &world_cx_before, &world_cy_before);
+
+    if (animate) {
+        zoom_animating = 1;
+        zoom_start = zoom_factor;
+        zoom_target = new_zoom;
+        if (anim_duration <= 0.0) anim_duration = 0.20;
+        anim_start_time = now_seconds();
+        anim_world_cx = world_cx_before;
+        anim_world_cy = world_cy_before;
+        glutTimerFunc(16, timer_handler, 0);
+    } else {
+        zoom_factor = new_zoom;
+        ensure_zoom_safe();
+        pan_x = world_cx_before - (double)ccx / zoom_factor;
+        pan_y = world_cy_before - (double)ccy / zoom_factor;
+    }
+}
+
+static void zoom_in_centered() {
+    double factor = 1.15;
+    double new_zoom = zoom_factor * factor;
+    if (new_zoom > 1e12) new_zoom = 1e12;
+    zoom_to_centered(new_zoom, 1);
+}
+
+static void zoom_out_centered() {
+    double factor = 1.15;
+    double new_zoom = zoom_factor / factor;
+    if (new_zoom < 1e-12) new_zoom = 1e-12;
+    zoom_to_centered(new_zoom, 1);
+}
+
+static void timer_handler(int unused) {
+    (void)unused;
+    if (!zoom_animating) return;
+    double tnow = now_seconds();
+    double t = (tnow - anim_start_time) / anim_duration;
+    if (t >= 1.0) {
+        zoom_factor = zoom_target;
+        zoom_animating = 0;
+        ensure_zoom_safe();
+        int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+        pan_x = anim_world_cx - (double)ccx / zoom_factor;
+        pan_y = anim_world_cy - (double)ccy / zoom_factor;
+        glutPostRedisplay();
+        return;
+    }
+    double e = ease_out_quad(t);
+    zoom_factor = zoom_start + (zoom_target - zoom_start) * e;
+    ensure_zoom_safe();
+    int ccx, ccy; get_content_center_screen(&ccx, &ccy);
+    pan_x = anim_world_cx - (double)ccx / zoom_factor;
+    pan_y = anim_world_cy - (double)ccy / zoom_factor;
+    glutPostRedisplay();
+    glutTimerFunc(16, timer_handler, 0);
+}
+
+/* --- UI drawing: icons, toolbar, rulers, CPU-grid invocation --- */
+
+/* Draw text helper */
+static void draw_text_bitmap(int x, int y, const char *s) {
+    glRasterPos2i(x,y);
+    for (const char *p=s; *p; ++p) glutBitmapCharacter(GLUT_BITMAP_HELVETICA_12, *p);
+}
+
+/* --- Geometry helpers and vector icon implementations --- */
+#define PI 3.14159265359
+
+static void setColorHex(int hex) {
+    float r = ((hex >> 16) & 0xFF) / 255.0f;
+    float g = ((hex >> 8) & 0xFF) / 255.0f;
+    float b = ((hex) & 0xFF) / 255.0f;
+    glColor3f(r, g, b);
+}
+
+static void drawRectRotated(float x, float y, float w, float h, float angleDeg) {
+    glPushMatrix();
+    glTranslatef(x, y, 0);
+    glRotatef(angleDeg, 0, 0, 1);
+    glBegin(GL_QUADS);
+      glVertex2f(-w/2, -h/2);
+      glVertex2f( w/2, -h/2);
+      glVertex2f( w/2,  h/2);
+      glVertex2f(-w/2,  h/2);
+    glEnd();
+    glPopMatrix();
+}
+
+static void drawArc(float cx, float cy, float r, float thickness, float startAngle, float endAngle) {
+    int segments = 40;
+    glBegin(GL_TRIANGLE_STRIP);
+    for (int i = 0; i <= segments; ++i) {
+        float t = (float)i / (float)segments;
+        float angDeg = startAngle + t * (endAngle - startAngle);
+        float angRad = angDeg * PI / 180.0f;
+        float c = cosf(angRad);
+        float s = sinf(angRad);
+        glVertex2f(cx + (r - thickness/2.0f) * c, cy + (r - thickness/2.0f) * s);
+        glVertex2f(cx + (r + thickness/2.0f) * c, cy + (r + thickness/2.0f) * s);
+    }
+    glEnd();
+}
+
+/* Icon: Move */
+static void iconMove(float size) {
+    float thick = size * 0.08f;
+    float len = size * 0.7f;
+    drawRectRotated(0, 0, len, thick, 0);
+    drawRectRotated(0, 0, len, thick, 90);
+}
+
+/* Icon: Zoom (mode: 1 = plus, 0 = minus) */
+static void iconZoom(float size, int mode) {
+    float r = size * 0.32f;
+    float thick = size * 0.08f;
+    drawArc(0, 0, r, thick, 0, 360);
+    float handleL = size * 0.35f;
+    float handleW = thick;
+    float hX = r * cosf(-45.0f * PI/180.0f);
+    float hY = r * sinf(-45.0f * PI/180.0f);
+    glPushMatrix();
+    glTranslatef(hX, hY, 0);
+    glRotatef(-45.0f, 0, 0, 1);
+    drawRectRotated(handleL/2.0f, 0, handleL, handleW, 0);
+    glPopMatrix();
+    float symLen = r * 1.0f;
+    drawRectRotated(0, 0, symLen, thick*0.8f, 0); /* minus */
+    if (mode == 1) drawRectRotated(0, 0, symLen, thick*0.8f, 90); /* plus */
+}
+
+/* Icon: Refresh */
+static void iconRefresh(float size) {
+    float r = size * 0.35f;
+    float thick = size * 0.07f;
+    glPushMatrix();
+    glRotatef(-45.0f, 0, 0, 1);
+    drawArc(0, 0, r, thick, 0, 270);
+    float tipX = r * cosf(270.0f * PI/180.0f);
+    float tipY = r * sinf(270.0f * PI/180.0f);
+    float tipSize = size * 0.18f;
+    glPushMatrix();
+    glTranslatef(tipX, tipY, 0);
+    glRotatef(180.0f, 0, 0, 1);
+    glBegin(GL_TRIANGLES);
+      glVertex2f(0, 0);
+      glVertex2f(-tipSize, -tipSize/2.0f);
+      glVertex2f(-tipSize/3.0f, 0);
+    glEnd();
+    glBegin(GL_TRIANGLES);
+      glVertex2f(0, 0);
+      glVertex2f(-tipSize/3.0f, 0);
+      glVertex2f(-tipSize, tipSize/2.0f);
+    glEnd();
+    glPopMatrix();
+    glPopMatrix();
+}
+
+/* Icon: Grid */
+static void iconGrid(float size) {
+    float len = size * 0.7f;
+    float thick = size * 0.05f;
+    float gap = size * 0.25f;
+    drawRectRotated(-gap, 0, thick, len, 0);
+    drawRectRotated(0,    0, thick, len, 0);
+    drawRectRotated(gap,  0, thick, len, 0);
+    drawRectRotated(0, -gap, len, thick, 0);
+    drawRectRotated(0, 0,    len, thick, 0);
+    drawRectRotated(0, gap,  len, thick, 0);
+}
+
+/* Icon: Magnet (snap) */
+static void iconMagnet(float size) {
+    float w = size * 0.3f;
+    float h = size * 0.35f;
+    float thick = size * 0.14f;
+    drawRectRotated(-w + thick/2.0f, h/2.0f, thick, h, 0);
+    drawRectRotated( w - thick/2.0f, h/2.0f, thick, h, 0);
+    drawArc(0, 0, w - thick/2.0f, thick, 180, 360);
+}
+
+/* Icon: Line (simple straight line symbol) */
+static void iconLine(float size, int filled) {
+    (void)filled;
+    float len = size * 0.7f;
+    float half = len * 0.5f;
+    glLineWidth(2.0f);
+    glBegin(GL_LINES);
+      glVertex2f(-half, -half);
+      glVertex2f(half, half);
+    glEnd();
+}
+
+/* Icon: Circle */
+static void iconCircle(float size, int filled) {
+    float r = size * 0.35f;
+    int segments = 32;
+    if (filled) {
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(0,0);
+        for (int i=0;i<=segments;++i) {
+            float a = (float)i/segments * 2.0f * PI;
+            glVertex2f(cosf(a)*r, sinf(a)*r);
+        }
+        glEnd();
+    } else {
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+        for (int i=0;i<segments;++i) {
+            float a = (float)i/segments * 2.0f * PI;
+            glVertex2f(cosf(a)*r, sinf(a)*r);
+        }
+        glEnd();
+    }
+}
+
+/* Icon: Triangle (outline or filled) */
+static void iconTriangle(float size, int filled) {
+    float h = size * 0.6f;
+    float w = size * 0.6f;
+    if (filled) {
+        glBegin(GL_TRIANGLES);
+          glVertex2f(0, h/2.0f);
+          glVertex2f(-w/2.0f, -h/2.0f);
+          glVertex2f(w/2.0f, -h/2.0f);
+        glEnd();
+    } else {
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+          glVertex2f(0, h/2.0f);
+          glVertex2f(-w/2.0f, -h/2.0f);
+          glVertex2f(w/2.0f, -h/2.0f);
+        glEnd();
+    }
+}
+
+/* Icon: Rectangle (outline or filled) */
+static void iconRect(float size, int filled) {
+    float w = size * 0.7f;
+    float h = size * 0.45f;
+    if (filled) {
+        glBegin(GL_QUADS);
+          glVertex2f(-w/2.0f, -h/2.0f);
+          glVertex2f( w/2.0f, -h/2.0f);
+          glVertex2f( w/2.0f,  h/2.0f);
+          glVertex2f(-w/2.0f,  h/2.0f);
+        glEnd();
+    } else {
+        glLineWidth(2.0f);
+        glBegin(GL_LINE_LOOP);
+          glVertex2f(-w/2.0f, -h/2.0f);
+          glVertex2f( w/2.0f, -h/2.0f);
+          glVertex2f( w/2.0f,  h/2.0f);
+          glVertex2f(-w/2.0f,  h/2.0f);
+        glEnd();
+    }
+}
+
+/* Button geometry helper */
+static void compute_button_rects(int rects[BTN_COUNT][4]) {
+    int left = 8;
+    int top = 6;
+    int btn_h = TOOLBAR_HEIGHT - 12;
+    int spacing = 8;
+    int x = left;
+
+    /* BTN_LINE, BTN_CIRCLE, BTN_TRI_OUT, BTN_TRI_FILLED, BTN_RECT_OUT, BTN_RECT_FILLED */
+    rects[BTN_LINE][0] = x; rects[BTN_LINE][1] = top; rects[BTN_LINE][2] = x + 48; rects[BTN_LINE][3] = top + btn_h;
+    x += 48 + spacing;
+    rects[BTN_CIRCLE][0] = x; rects[BTN_CIRCLE][1] = top; rects[BTN_CIRCLE][2] = x + 48; rects[BTN_CIRCLE][3] = top + btn_h;
+    x += 48 + spacing;
+    rects[BTN_TRI_OUT][0] = x; rects[BTN_TRI_OUT][1] = top; rects[BTN_TRI_OUT][2] = x + 36; rects[BTN_TRI_OUT][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_TRI_FILLED][0] = x; rects[BTN_TRI_FILLED][1] = top; rects[BTN_TRI_FILLED][2] = x + 36; rects[BTN_TRI_FILLED][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_RECT_OUT][0] = x; rects[BTN_RECT_OUT][1] = top; rects[BTN_RECT_OUT][2] = x + 36; rects[BTN_RECT_OUT][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_RECT_FILLED][0] = x; rects[BTN_RECT_FILLED][1] = top; rects[BTN_RECT_FILLED][2] = x + 36; rects[BTN_RECT_FILLED][3] = top + btn_h;
+    x += 36 + spacing;
+
+    rects[BTN_CENTER][0] = x; rects[BTN_CENTER][1] = top; rects[BTN_CENTER][2] = x + 80; rects[BTN_CENTER][3] = top + btn_h;
+    x += 80 + spacing;
+    rects[BTN_PLUS][0] = x; rects[BTN_PLUS][1] = top; rects[BTN_PLUS][2] = x + 36; rects[BTN_PLUS][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_MINUS][0] = x; rects[BTN_MINUS][1] = top; rects[BTN_MINUS][2] = x + 36; rects[BTN_MINUS][3] = top + btn_h;
+    x += 36 + spacing;
+    rects[BTN_RESET][0] = x; rects[BTN_RESET][1] = top; rects[BTN_RESET][2] = x + 60; rects[BTN_RESET][3] = top + btn_h;
+    x += 60 + spacing;
+    rects[BTN_GRID][0] = x; rects[BTN_GRID][1] = top; rects[BTN_GRID][2] = x + 48; rects[BTN_GRID][3] = top + btn_h;
+    x += 48 + spacing;
+    rects[BTN_SNAP][0] = x; rects[BTN_SNAP][1] = top; rects[BTN_SNAP][2] = x + 48; rects[BTN_SNAP][3] = top + btn_h;
+
+    /* compute palette rects to the far right of toolbar */
+    int px = win_w - 8 - (PALETTE_COUNT * (btn_h) + (PALETTE_COUNT-1)*6);
+    if (px < x + 40) px = x + 40;
+    for (int i=0;i<PALETTE_COUNT;++i) {
+        int sx = px + i * (btn_h + 6);
+        palette_rects[i][0] = sx;
+        palette_rects[i][1] = top;
+        palette_rects[i][2] = sx + btn_h;
+        palette_rects[i][3] = top + btn_h;
+    }
+}
+
+/* Draw 3D-like button background */
+static void draw_button_rect_bg(int x0, int y0, int x1, int y1, int hovered, int pressed) {
+    unsigned char base_r = hovered ? 220 : 200;
+    unsigned char base_g = hovered ? 230 : 210;
+    unsigned char base_b = hovered ? 255 : 230;
+    if (pressed) { base_r = (unsigned char)fmax(0, base_r - 30); base_g = (unsigned char)fmax(0, base_g - 30); base_b = (unsigned char)fmax(0, base_b - 30); }
+
+    glColor3ub(base_r, base_g, base_b);
+    glBegin(GL_QUADS);
+      glVertex2i(x0, y0);
+      glVertex2i(x1, y0);
+      glVertex2i(x1, y1);
+      glVertex2i(x0, y1);
+    glEnd();
+
+    glLineWidth(1.0f);
+    glColor3ub(255,255,255);
+    glBegin(GL_LINES);
+      glVertex2i(x0, y1-1); glVertex2i(x0, y0);
+      glVertex2i(x0, y0); glVertex2i(x1-1, y0);
+    glEnd();
+    glColor3ub(120,120,120);
+    glBegin(GL_LINES);
+      glVertex2i(x1-1, y0); glVertex2i(x1-1, y1-1);
+      glVertex2i(x1-1, y1-1); glVertex2i(x0, y1-1);
+    glEnd();
+    glColor3ub(160,160,160);
+    glBegin(GL_LINE_LOOP);
+      glVertex2i(x0+1, y0+1);
+      glVertex2i(x1-1, y0+1);
+      glVertex2i(x1-1, y1-1);
+      glVertex2i(x0+1, y1-1);
+    glEnd();
+}
+
+/* Draw toolbar and icons; tooltip immediate (yellow bg, black border) */
+static void draw_toolbar() {
+    glColor3ub(245,245,250);
+    glBegin(GL_QUADS);
+      glVertex2i(0,0); glVertex2i(win_w,0); glVertex2i(win_w,TOOLBAR_HEIGHT); glVertex2i(0,TOOLBAR_HEIGHT);
+    glEnd();
+    glColor3ub(180,180,180);
+    glBegin(GL_LINES);
+      glVertex2i(0,TOOLBAR_HEIGHT-1); glVertex2i(win_w,TOOLBAR_HEIGHT-1);
+    glEnd();
+
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+    for (int i=0;i<BTN_COUNT;++i) {
+        int hovered = (hover_button == i);
+        int pressed = (pressed_button == i);
+        draw_button_rect_bg(rects[i][0], rects[i][1], rects[i][2], rects[i][3], hovered, pressed);
+        int bx = rects[i][0], by = rects[i][1], bw = rects[i][2]-rects[i][0], bh = rects[i][3]-rects[i][1];
+
+        /* Icon color: highlight active tool or toggles */
+        if (i == BTN_GRID) {
+            if (grid_visible) glColor3ub(10, 90, 200); else glColor3ub(0,0,0);
+        } else if (i == BTN_SNAP) {
+            if (snap_enabled) glColor3ub(10, 90, 200); else glColor3ub(0,0,0);
+        } else {
+            /* highlight selected tool buttons */
+            if ((i == BTN_LINE && selected_tool == TOOL_LINE) ||
+                (i == BTN_CIRCLE && selected_tool == TOOL_CIRCLE) ||
+                (i == BTN_TRI_OUT && selected_tool == TOOL_TRI_OUT) ||
+                (i == BTN_TRI_FILLED && selected_tool == TOOL_TRI_FILLED) ||
+                (i == BTN_RECT_OUT && selected_tool == TOOL_RECT_OUT) ||
+                (i == BTN_RECT_FILLED && selected_tool == TOOL_RECT_FILLED)) {
+                glColor3ub(10,90,200);
+            } else {
+                glColor3ub(0,0,0);
+            }
+        }
+
+        /* draw vector icon centered in button rect */
+        float cxp = bx + bw * 0.5f;
+        float cyp = by + bh * 0.5f;
+        float size = fmin((float)bw, (float)bh) * 0.8f;
+
+        glPushMatrix();
+        glTranslatef(cxp, cyp, 0.0f);
+
+        if (i == BTN_LINE) iconLine(size, 0);
+        else if (i == BTN_CIRCLE) iconCircle(size, 0);
+        else if (i == BTN_TRI_OUT) iconTriangle(size, 0);
+        else if (i == BTN_TRI_FILLED) iconTriangle(size, 1);
+        else if (i == BTN_RECT_OUT) iconRect(size, 0);
+        else if (i == BTN_RECT_FILLED) iconRect(size, 1);
+        else if (i == BTN_CENTER) iconMove(size);
+        else if (i == BTN_PLUS) iconZoom(size, 1);
+        else if (i == BTN_MINUS) iconZoom(size, 0);
+        else if (i == BTN_RESET) iconRefresh(size);
+        else if (i == BTN_GRID) iconGrid(size);
+        else if (i == BTN_SNAP) iconMagnet(size);
+
+        glPopMatrix();
+    }
+
+    /* draw palette swatches */
+    for (int i=0;i<PALETTE_COUNT;++i) {
+        int *r = palette_rects[i];
+        unsigned int hex = palette_colors[i];
+        unsigned char rr = (hex >> 16) & 0xFF;
+        unsigned char gg = (hex >> 8) & 0xFF;
+        unsigned char bb = hex & 0xFF;
+        glColor3ub(rr, gg, bb);
+        glBegin(GL_QUADS);
+          glVertex2i(r[0], r[1]);
+          glVertex2i(r[2], r[1]);
+          glVertex2i(r[2], r[3]);
+          glVertex2i(r[0], r[3]);
+        glEnd();
+        /* border */
+        glColor3ub(0,0,0);
+        glLineWidth(1.0f);
+        glBegin(GL_LINE_LOOP);
+          glVertex2i(r[0], r[1]);
+          glVertex2i(r[2], r[1]);
+          glVertex2i(r[2], r[3]);
+          glVertex2i(r[0], r[3]);
+        glEnd();
+        /* selection highlight */
+        if (i == palette_selected) {
+            glColor3ub(10,90,200);
+            glLineWidth(2.0f);
+            glBegin(GL_LINE_LOOP);
+              glVertex2i(r[0]-2, r[1]-2);
+              glVertex2i(r[2]+2, r[1]-2);
+              glVertex2i(r[2]+2, r[3]+2);
+              glVertex2i(r[0]-2, r[3]+2);
+            glEnd();
+        }
+    }
+
+    /* tooltip immediate: yellow background, black border outside text */
+    if (tooltip_visible && tooltip_text[0]) {
+        int tw = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)tooltip_text) + 12;
+        int th = 20;
+        int tx = mouse_x + 12;
+        int ty = mouse_y + 12;
+        if (tx + tw > win_w) tx = win_w - tw - 8;
+        if (ty + th > win_h) ty = win_h - th - 8;
+        glColor3ub(255, 255, 160);
+        glBegin(GL_QUADS);
+          glVertex2i(tx, ty);
+          glVertex2i(tx + tw, ty);
+          glVertex2i(tx + tw, ty + th);
+          glVertex2i(tx, ty + th);
+        glEnd();
+        glLineWidth(2.0f);
+        glColor3ub(0,0,0);
+        glBegin(GL_LINE_LOOP);
+          glVertex2i(tx-1, ty-1);
+          glVertex2i(tx + tw+1, ty-1);
+          glVertex2i(tx + tw+1, ty + th+1);
+          glVertex2i(tx-1, ty + th+1);
+        glEnd();
+        glColor3ub(0,0,0);
+        draw_text_bitmap(tx + 6, ty + 14, tooltip_text);
+    }
+}
+
+/* Auto unit selection (magnitude-targeted) */
+static int select_unit_index_auto(double min_px_per_unit) {
+    int best = 0;
+    double best_score = -1.0;
+    double geom_mean = sqrt(MAG_MIN * MAG_MAX);
+    for (int i = UNIT_COUNT-1; i >= 0; --i) {
+        double px_per_unit = px_per_mm * zoom_factor * units[i].mm_per_unit;
+        double mult = nice_multiplier_for_px_generic(px_per_unit, min_px_per_unit);
+        double eff_px = mult * px_per_unit;
+        double step_units = mult;
+        double target_px = min_px_per_unit * 1.8;
+        double pixel_score = 1.0 / (1.0 + fabs(eff_px - target_px));
+        double mag_score;
+        if (step_units >= MAG_MIN && step_units <= MAG_MAX) mag_score = 1.0;
+        else {
+            double log_dist = fabs(log10(fmax(step_units, 1e-30)) - log10(geom_mean));
+            mag_score = 1.0 / (1.0 + log_dist);
+        }
+        double score = pixel_score * 0.75 + mag_score * 0.25;
+        if (score > best_score) { best_score = score; best = i; }
+    }
+    return best;
+}
+
+/* Snap to grid */
+static void snap_to_grid(double *wx, double *wy) {
+    if (!snap_enabled) return;
+    UnitDef u;
+    if (auto_unit_enabled) u = units[current_unit_index]; else u = units[manual_unit_index];
+    double px_per_unit = px_per_mm * zoom_factor * u.mm_per_unit;
+    if (px_per_unit <= 0.0) px_per_unit = (96.0/25.4) * zoom_factor * u.mm_per_unit;
+    double MIN_PX_PER_UNIT = 40.0;
+    double step_units = nice_multiplier_for_px_generic(px_per_unit, MIN_PX_PER_UNIT);
+    double step_mm = step_units * u.mm_per_unit;
+    if (step_mm <= 0.0) return;
+    *wx = round((*wx) / step_mm) * step_mm;
+    *wy = round((*wy) / step_mm) * step_mm;
+}
+
+/* Draw rulers and CPU-grid (vertical + horizontal) */
+static void draw_rulers_and_cpu_grid() {
+    const double MIN_PX_PER_UNIT = 40.0;
+    if (auto_unit_enabled) current_unit_index = select_unit_index_auto(MIN_PX_PER_UNIT);
+    else current_unit_index = manual_unit_index;
+    UnitDef u = units[current_unit_index];
+
+    double px_per_unit = px_per_mm * zoom_factor * u.mm_per_unit;
+    if (px_per_unit <= 0.0) px_per_unit = (96.0/25.4) * zoom_factor * u.mm_per_unit;
+    double step_units = nice_multiplier_for_px_generic(px_per_unit, MIN_PX_PER_UNIT);
+    double step_mm = step_units * u.mm_per_unit;
+    double major_units = (step_units >= 10.0) ? step_units : 10.0;
+
+    int cx,cy,cw,ch; get_content_rect(&cx,&cy,&cw,&ch);
+
+    /* CPU grid (always used in dieser Version) */
+    if (grid_visible) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(cx, win_h - (cy + ch), cw, ch);
+
+        /* background */
+        glColor3ub(255,255,255);
+        glBegin(GL_QUADS);
+          glVertex2i(cx, cy);
+          glVertex2i(cx + cw, cy);
+          glVertex2i(cx + cw, cy + ch);
+          glVertex2i(cx, cy + ch);
+        glEnd();
+
+        /* minor lines */
+        glLineWidth(1.0f);
+        glColor3ub(224,224,224);
+
+        /* compute visible world bounds to limit line count */
+        double wx0, wy0, wx1, wy1;
+        screen_to_world(cx, cy, &wx0, &wy0);
+        screen_to_world(cx + cw, cy + ch, &wx1, &wy1);
+
+        int kx_min = (int)floor(fmin(wx0, wx1) / step_mm) - 2;
+        int kx_max = (int)ceil (fmax(wx0, wx1) / step_mm) + 2;
+        int ky_min = (int)floor(fmin(wy0, wy1) / step_mm) - 2;
+        int ky_max = (int)ceil (fmax(wy0, wy1) / step_mm) + 2;
+
+        /* Vertical lines */
+        for (int k = kx_min; k <= kx_max; ++k) {
+            double wx = k * step_mm;
+            int sx0, sy0, sx1, sy1;
+            world_to_screen(wx, wy0 - 1.0, &sx0, &sy0);
+            world_to_screen(wx, wy1 + 1.0, &sx1, &sy1);
+            glBegin(GL_LINES);
+                glVertex2i(sx0, sy0);
+                glVertex2i(sx1, sy1);
+            glEnd();
+        }
+
+        /* Horizontal lines */
+        for (int k = ky_min; k <= ky_max; ++k) {
+            double wy = k * step_mm;
+            int sx0, sy0, sx1, sy1;
+            world_to_screen(wx0 - 1.0, wy, &sx0, &sy0);
+            world_to_screen(wx1 + 1.0, wy, &sx1, &sy1);
+            glBegin(GL_LINES);
+                glVertex2i(sx0, sy0);
+                glVertex2i(sx1, sy1);
+            glEnd();
+        }
+
+        /* major lines (darker) */
+        glColor3ub(192,192,192);
+        for (int k = kx_min; k <= kx_max; ++k) {
+            double units_at_x = (k * step_mm) / u.mm_per_unit;
+            double rem = fmod(fabs(units_at_x), major_units);
+            if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+                double wx = k * step_mm;
+                int sx0, sy0, sx1, sy1;
+                world_to_screen(wx, wy0 - 1.0, &sx0, &sy0);
+                world_to_screen(wx, wy1 + 1.0, &sx1, &sy1);
+                glBegin(GL_LINES);
+                    glVertex2i(sx0, sy0);
+                    glVertex2i(sx1, sy1);
+                glEnd();
+            }
+        }
+        for (int k = ky_min; k <= ky_max; ++k) {
+            double units_at_y = (k * step_mm) / u.mm_per_unit;
+            double rem = fmod(fabs(units_at_y), major_units);
+            if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+                double wy = k * step_mm;
+                int sx0, sy0, sx1, sy1;
+                world_to_screen(wx0 - 1.0, wy, &sx0, &sy0);
+                world_to_screen(wx1 + 1.0, wy, &sx1, &sy1);
+                glBegin(GL_LINES);
+                    glVertex2i(sx0, sy0);
+                    glVertex2i(sx1, sy1);
+                glEnd();
+            }
+        }
+
+        glDisable(GL_SCISSOR_TEST);
+    } else {
+        /* wenn Grid ausgeschaltet ist, fülle Content-Hintergrund weiß */
+        glColor3ub(255,255,255);
+        glBegin(GL_QUADS);
+          glVertex2i(cx, cy);
+          glVertex2i(cx + cw, cy);
+          glVertex2i(cx + cw, cy + ch);
+          glVertex2i(cx, cy + ch);
+        glEnd();
+    }
+
+    /* Draw top ruler ticks and left ruler ticks (labels only) */
+    int cx0 = cx, cy0 = cy, cw0 = cw, ch0 = ch;
+    double wx0, wy0, wx1, wy1;
+    screen_to_world(cx0, cy0, &wx0, &wy0);
+    screen_to_world(cx0 + cw0, cy0 + ch0, &wx1, &wy1);
+    int kx_min = (int)floor(wx0 / step_mm) - 1;
+    int kx_max = (int)ceil(wx1 / step_mm) + 1;
+    int ky_min = (int)floor(wy0 / step_mm) - 1;
+    int ky_max = (int)ceil(wy1 / step_mm) + 1;
+
+    glColor3ub(0,0,0);
+    int last_label_right = -100000;
+    for (int k = kx_min; k <= kx_max; ++k) {
+        double world_x = k * step_mm;
+        int sx, sy;
+        world_to_screen(world_x, pan_y, &sx, &sy);
+        if (sx < cx0 - 2 || sx > cx0 + cw0 + 2) continue;
+        double units_at_x = world_x / u.mm_per_unit;
+        double rem = fmod(fabs(units_at_x), major_units);
+        if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1 - 12);
+            glEnd();
+            char buf[64];
+            double absval = fabs(units_at_x);
+            if (absval > 1e6 || (absval > 0 && absval < 1e-3)) snprintf(buf, sizeof(buf), "%.3e", units_at_x);
+            else {
+                if (strcmp(u.name,"nm")==0 || strcmp(u.name,"µm")==0) snprintf(buf, sizeof(buf), "%lld", (long long)llround(units_at_x));
+                else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.3f", units_at_x);
+                    char *p = tmp + strlen(tmp) - 1;
+                    while (p > tmp && *p == '0') { *p = '\0'; --p; }
+                    if (p > tmp && *p == '.') *p = '\0';
+                    snprintf(buf, sizeof(buf), "%s", tmp);
+                }
+            }
+            int label_w = glutBitmapLength(GLUT_BITMAP_HELVETICA_12, (const unsigned char*)buf);
+            int label_left = sx - label_w/2;
+            int label_right = label_left + label_w;
+            int margin = 4;
+            if (label_left >= cx0 + margin && label_right <= cx0 + cw0 - margin && label_left > last_label_right + margin) {
+                draw_text_bitmap(label_left, TOOLBAR_HEIGHT + RULER_THICKNESS - 14, buf);
+                last_label_right = label_right;
+            }
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1);
+              glVertex2i(sx, TOOLBAR_HEIGHT + RULER_THICKNESS - 1 - 6);
+            glEnd();
+        }
+    }
+
+    int last_label_bottom = -100000;
+    for (int k = ky_min; k <= ky_max; ++k) {
+        double world_y = k * step_mm;
+        int sx, sy;
+        world_to_screen(pan_x, world_y, &sx, &sy);
+        if (sy < cy0 - 2 || sy > cy0 + ch0 + 2) continue;
+        if (sy < TOOLBAR_HEIGHT + RULER_THICKNESS + 8) continue;
+        double units_at_y = world_y / u.mm_per_unit;
+        double rem = fmod(fabs(units_at_y), major_units);
+        if (rem < 1e-9 || fabs(rem - major_units) < 1e-9) {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS - 1, sy);
+              glVertex2i(RULER_THICKNESS - 1 - 12, sy);
+            glEnd();
+            char buf[64];
+            double absval = fabs(units_at_y);
+            if (absval > 1e6 || (absval > 0 && absval < 1e-3)) snprintf(buf, sizeof(buf), "%.3e", units_at_y);
+            else {
+                if (strcmp(u.name,"nm")==0 || strcmp(u.name,"µm")==0) snprintf(buf, sizeof(buf), "%lld", (long long)llround(units_at_y));
+                else {
+                    char tmp[64];
+                    snprintf(tmp, sizeof(tmp), "%.3f", units_at_y);
+                    char *p = tmp + strlen(tmp) - 1;
+                    while (p > tmp && *p == '0') { *p = '\0'; --p; }
+                    if (p > tmp && *p == '.') *p = '\0';
+                    snprintf(buf, sizeof(buf), "%s", tmp);
+                }
+            }
+            int label_h = 12;
+            int label_top = sy - label_h/2;
+            int label_bottom = label_top + label_h;
+            int margin = 4;
+            if (label_top >= cy0 + margin && label_bottom <= cy0 + ch0 - margin && label_top > last_label_bottom + margin) {
+                draw_text_bitmap(4, sy + 4, buf);
+                last_label_bottom = label_bottom;
+            }
+        } else {
+            glBegin(GL_LINES);
+              glVertex2i(RULER_THICKNESS - 1, sy);
+              glVertex2i(RULER_THICKNESS - 1 - 6, sy);
+            glEnd();
+        }
+    }
+
+    char corner[64];
+    if (auto_unit_enabled) snprintf(corner,sizeof(corner),"auto (%s)", units[current_unit_index].name);
+    else snprintf(corner,sizeof(corner),"%s (manual)", units[manual_unit_index].name);
+    draw_text_bitmap(6, TOOLBAR_HEIGHT + RULER_THICKNESS - 6, corner);
+}
+
+/* Display callback */
+static void display_cb(void) {
+    glClearColor(1,1,1,1); glClear(GL_COLOR_BUFFER_BIT);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluOrtho2D(0,win_w,win_h,0);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+
+    draw_toolbar();
+    draw_rulers_and_cpu_grid();
+
+    /* Draw stored lines */
+    glLineWidth(2.0f);
+    for (int i=0;i<lines_count;++i) {
+        unsigned int hex = lines_color[i];
+        float r = ((hex>>16)&0xFF)/255.0f;
+        float g = ((hex>>8)&0xFF)/255.0f;
+        float b = (hex&0xFF)/255.0f;
+        glColor3f(r,g,b);
+        int sx1, sy1, sx2, sy2;
+        world_to_screen(lines_x1[i], lines_y1[i], &sx1, &sy1);
+        world_to_screen(lines_x2[i], lines_y2[i], &sx2, &sy2);
+        glBegin(GL_LINES);
+          glVertex2i(sx1, sy1);
+          glVertex2i(sx2, sy2);
+        glEnd();
+    }
+
+    /* Draw circles */
+    for (int i=0;i<circles_count;++i) {
+        unsigned int hex = circles_color[i];
+        float rcol = ((hex>>16)&0xFF)/255.0f;
+        float gcol = ((hex>>8)&0xFF)/255.0f;
+        float bcol = (hex&0xFF)/255.0f;
+        glColor3f(rcol,gcol,bcol);
+        int sx, sy;
+        world_to_screen(circles_cx[i], circles_cy[i], &sx, &sy);
+        double rworld = circles_r[i];
+        int sxr, syr;
+        world_to_screen(circles_cx[i] + rworld, circles_cy[i], &sxr, &syr);
+        float rr = fabs((float)(sxr - sx));
+        int segments = 48;
+        glBegin(GL_LINE_LOOP);
+        for (int s=0;s<segments;++s) {
+            float a = (float)s / (float)segments * 2.0f * PI;
+            glVertex2f(sx + cosf(a)*rr, sy + sinf(a)*rr);
+        }
+        glEnd();
+    }
+
+    /* Draw triangles (filled or outline) */
+    for (int i=0;i<tris_count;++i) {
+        unsigned int hex = tris_color[i];
+        float rcol = ((hex>>16)&0xFF)/255.0f;
+        float gcol = ((hex>>8)&0xFF)/255.0f;
+        float bcol = (hex&0xFF)/255.0f;
+        glColor3f(rcol,gcol,bcol);
+        int sx1, sy1, sx2, sy2, sx3, sy3;
+        world_to_screen(tris_x1[i], tris_y1[i], &sx1, &sy1);
+        world_to_screen(tris_x2[i], tris_y2[i], &sx2, &sy2);
+        world_to_screen(tris_x3[i], tris_y3[i], &sx3, &sy3);
+        if (tris_filled[i]) {
+            glBegin(GL_TRIANGLES);
+              glVertex2i(sx1, sy1);
+              glVertex2i(sx2, sy2);
+              glVertex2i(sx3, sy3);
+            glEnd();
+        } else {
+            glLineWidth(2.0f);
+            glBegin(GL_LINE_LOOP);
+              glVertex2i(sx1, sy1);
+              glVertex2i(sx2, sy2);
+              glVertex2i(sx3, sy3);
+            glEnd();
+        }
+    }
+
+    /* Draw rects (filled or outline) */
+    for (int i=0;i<rects_count;++i) {
+        unsigned int hex = rects_color[i];
+        float rcol = ((hex>>16)&0xFF)/255.0f;
+        float gcol = ((hex>>8)&0xFF)/255.0f;
+        float bcol = (hex&0xFF)/255.0f;
+        glColor3f(rcol,gcol,bcol);
+        int sx1, sy1, sx2, sy2;
+        world_to_screen(rects_x1[i], rects_y1[i], &sx1, &sy1);
+        world_to_screen(rects_x2[i], rects_y2[i], &sx2, &sy2);
+        int left = sx1 < sx2 ? sx1 : sx2;
+        int right = sx1 < sx2 ? sx2 : sx1;
+        int top = sy1 < sy2 ? sy1 : sy2;
+        int bottom = sy1 < sy2 ? sy2 : sy1;
+        if (rects_filled[i]) {
+            glBegin(GL_QUADS);
+              glVertex2i(left, top);
+              glVertex2i(right, top);
+              glVertex2i(right, bottom);
+              glVertex2i(left, bottom);
+            glEnd();
+        } else {
+            glLineWidth(2.0f);
+            glBegin(GL_LINE_LOOP);
+              glVertex2i(left, top);
+              glVertex2i(right, top);
+              glVertex2i(right, bottom);
+              glVertex2i(left, bottom);
+            glEnd();
+        }
+    }
+
+    /* If there's a pending start for line, draw a small marker at it */
+    if (line_active) {
+        int sx, sy;
+        world_to_screen(line_pending_x, line_pending_y, &sx, &sy);
+        glColor3ub(200, 40, 40);
+        int r = 4;
+        glBegin(GL_TRIANGLE_FAN);
+          glVertex2i(sx, sy);
+          for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+        glEnd();
+    }
+
+    /* If circle center pending, draw marker */
+    if (circle_pending) {
+        int sx, sy;
+        world_to_screen(circle_center_x, circle_center_y, &sx, &sy);
+        glColor3ub(40, 120, 200);
+        int r = 4;
+        glBegin(GL_TRIANGLE_FAN);
+          glVertex2i(sx, sy);
+          for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+        glEnd();
+    }
+
+    /* If triangle pending vertices, draw small markers and connecting preview */
+    if (tri_pending_count > 0) {
+        glColor3ub(120, 20, 120);
+        for (int i=0;i<tri_pending_count;++i) {
+            int sx, sy;
+            world_to_screen(tri_vx[i], tri_vy[i], &sx, &sy);
+            int r = 4;
+            glBegin(GL_TRIANGLE_FAN);
+              glVertex2i(sx, sy);
+              for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+            glEnd();
+        }
+        if (tri_pending_count >= 2) {
+            int sx1, sy1, sx2, sy2;
+            world_to_screen(tri_vx[0], tri_vy[0], &sx1, &sy1);
+            world_to_screen(tri_vx[1], tri_vy[1], &sx2, &sy2);
+            glBegin(GL_LINES);
+              glVertex2i(sx1, sy1); glVertex2i(sx2, sy2);
+            glEnd();
+        }
+    }
+
+    /* If rect pending first corner, draw marker */
+    if (rect_pending) {
+        int sx, sy;
+        world_to_screen(rect_xa, rect_ya, &sx, &sy);
+        glColor3ub(20, 150, 20);
+        int r = 4;
+        glBegin(GL_TRIANGLE_FAN);
+          glVertex2i(sx, sy);
+          for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+        glEnd();
+    }
+
+    /* points (legacy markers) */
+    glColor3ub(0,0,0);
+    for (int i=0;i<points_count;++i) {
+        int sx,sy; world_to_screen(points_x[i], points_y[i], &sx, &sy);
+        int r = (int)fmax(2.0, 3.0 * zoom_factor);
+        glBegin(GL_TRIANGLE_FAN); glVertex2i(sx,sy);
+        for (int a=0;a<=20;++a) { double ang = a*(2.0*M_PI/20.0); glVertex2f(sx+cos(ang)*r, sy+sin(ang)*r); }
+        glEnd();
+    }
+
+    /* status bar */
+    int status_y = win_h - STATUS_HEIGHT;
+    glColor3ub(248,248,248); glBegin(GL_QUADS); glVertex2i(0,status_y); glVertex2i(win_w,status_y); glVertex2i(win_w,win_h); glVertex2i(0,win_h); glEnd();
+    glColor3ub(160,160,160); glBegin(GL_LINES); glVertex2i(0,status_y); glVertex2i(win_w,status_y); glEnd();
+
+    char status[256];
+    const char *toolname = "None";
+    if (selected_tool == TOOL_LINE) toolname = "Line";
+    else if (selected_tool == TOOL_CIRCLE) toolname = "Circle";
+    else if (selected_tool == TOOL_TRI_OUT) toolname = "Triangle (outline)";
+    else if (selected_tool == TOOL_TRI_FILLED) toolname = "Triangle (filled)";
+    else if (selected_tool == TOOL_RECT_OUT) toolname = "Rect (outline)";
+    else if (selected_tool == TOOL_RECT_FILLED) toolname = "Rect (filled)";
+    snprintf(status, sizeof(status), "Tool: %s  Color: #%06X  Zoom: %.3fx  Pan: (%.2f, %.2f)  Grid: %s  Snap: %s  Lines: %d  Circles: %d  Tris: %d  Rects: %d",
+             toolname, current_color, zoom_factor, pan_x, pan_y, grid_visible ? "on" : "off", snap_enabled ? "on" : "off",
+             lines_count, circles_count, tris_count, rects_count);
+    draw_text_bitmap(8, status_y + 14, status);
+
+    glutSwapBuffers();
+}
+
+/* Window reshape */
+static void reshape_cb(int w, int h) {
+    win_w = w; win_h = h;
+    glViewport(0,0,w,h);
+    glutPostRedisplay();
+}
+
+/* Utility: check if point inside rect */
+static int point_in_rect(int x, int y, int rect[4]) {
+    return (x >= rect[0] && x <= rect[2] && y >= rect[1] && y <= rect[3]);
+}
+
+/* Utility: convert hex color to unsigned int */
+static unsigned int color_from_palette(int idx) {
+    if (idx < 0 || idx >= PALETTE_COUNT) return 0x000000;
+    return palette_colors[idx];
+}
+
+/* Mouse button callback */
+static void mouse_cb(int button, int state, int x, int y) {
+    mouse_x = x; mouse_y = y;
+    if (button == GLUT_LEFT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            /* check toolbar clicks */
+            if (y >= 0 && y <= TOOLBAR_HEIGHT) {
+                int rects[BTN_COUNT][4];
+                compute_button_rects(rects);
+                int handled = 0;
+                for (int i=0;i<BTN_COUNT;++i) {
+                    if (point_in_rect(x,y,rects[i])) {
+                        pressed_button = i;
+                        hover_button = i;
+                        tooltip_visible = 0;
+                        handled = 1;
+                        glutPostRedisplay();
+                        break;
+                    }
+                }
+                /* palette clicks */
+                if (!handled) {
+                    for (int i=0;i<PALETTE_COUNT;++i) {
+                        if (point_in_rect(x,y,palette_rects[i])) {
+                            palette_selected = i;
+                            current_color = color_from_palette(i);
+                            glutPostRedisplay();
+                            handled = 1;
+                            break;
+                        }
+                    }
+                }
+                if (handled) return;
+            }
+
+            /* content area: start potential drag for panning */
+            left_dragging = 1;
+            left_drag_start_x = x;
+            left_drag_start_y = y;
+            left_drag_moved = 0;
+            /* do not add point yet; if user releases without moving, we'll treat as click */
+        } else { /* GLUT_UP */
+            /* release */
+            if (pressed_button >= 0) {
+                int clicked = pressed_button;
+                pressed_button = -1;
+                /* Toolbar button clicked: handle tool selection and actions */
+                if (clicked == BTN_LINE) {
+                    if (selected_tool == TOOL_LINE) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_LINE;
+                } else if (clicked == BTN_CIRCLE) {
+                    if (selected_tool == TOOL_CIRCLE) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_CIRCLE;
+                } else if (clicked == BTN_TRI_OUT) {
+                    if (selected_tool == TOOL_TRI_OUT) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_TRI_OUT;
+                } else if (clicked == BTN_TRI_FILLED) {
+                    if (selected_tool == TOOL_TRI_FILLED) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_TRI_FILLED;
+                } else if (clicked == BTN_RECT_OUT) {
+                    if (selected_tool == TOOL_RECT_OUT) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_RECT_OUT;
+                } else if (clicked == BTN_RECT_FILLED) {
+                    if (selected_tool == TOOL_RECT_FILLED) selected_tool = TOOL_NONE;
+                    else selected_tool = TOOL_RECT_FILLED;
+                } else if (clicked == BTN_CENTER) {
+                    selected_tool = TOOL_NONE;
+                    pan_x = 0.0; pan_y = 0.0;
+                    zoom_to_centered(1.0, 1);
+                } else if (clicked == BTN_PLUS) {
+                    zoom_in_centered();
+                } else if (clicked == BTN_MINUS) {
+                    zoom_out_centered();
+                } else if (clicked == BTN_RESET) {
+                    selected_tool = TOOL_NONE;
+                    pan_x = 0.0; pan_y = 0.0;
+                    zoom_factor = 1.0;
+                    ensure_zoom_safe();
+                    grid_visible = 1;
+                } else if (clicked == BTN_GRID) {
+                    grid_visible = !grid_visible;
+                } else if (clicked == BTN_SNAP) {
+                    snap_enabled = !snap_enabled;
+                }
+                glutPostRedisplay();
+            } else if (left_dragging) {
+                /* left button released after potential drag in content area */
+                if (!left_drag_moved) {
+                    /* treat as click: either add point or handle tool action */
+                    double wx, wy;
+                    screen_to_world(x, y, &wx, &wy);
+                    snap_to_grid(&wx, &wy);
+
+                    if (selected_tool == TOOL_LINE) {
+                        if (!line_active) {
+                            line_pending_x = wx; line_pending_y = wy; line_active = 1;
+                        } else {
+                            if (lines_count < MAX_LINES) {
+                                lines_x1[lines_count] = line_pending_x;
+                                lines_y1[lines_count] = line_pending_y;
+                                lines_x2[lines_count] = wx;
+                                lines_y2[lines_count] = wy;
+                                lines_color[lines_count] = current_color;
+                                lines_count++;
+                                /* new end becomes new pending start */
+                                line_pending_x = wx; line_pending_y = wy; line_active = 1;
+                            }
+                        }
+                    } else if (selected_tool == TOOL_CIRCLE) {
+                        if (!circle_pending) {
+                            circle_center_x = wx; circle_center_y = wy; circle_pending = 1;
+                        } else {
+                            double dx = wx - circle_center_x;
+                            double dy = wy - circle_center_y;
+                            double r = sqrt(dx*dx + dy*dy);
+                            if (circles_count < MAX_CIRCLES && r > 1e-6) {
+                                circles_cx[circles_count] = circle_center_x;
+                                circles_cy[circles_count] = circle_center_y;
+                                circles_r[circles_count] = r;
+                                circles_color[circles_count] = current_color;
+                                circles_count++;
+                            }
+                            /* reset pending center */
+                            circle_pending = 0;
+                        }
+                    } else if (selected_tool == TOOL_TRI_OUT || selected_tool == TOOL_TRI_FILLED) {
+                        if (tri_pending_count < 3) {
+                            tri_vx[tri_pending_count] = wx;
+                            tri_vy[tri_pending_count] = wy;
+                            tri_pending_count++;
+                            if (tri_pending_count == 3) {
+                                if (tris_count < MAX_TRIS) {
+                                    tris_x1[tris_count] = tri_vx[0];
+                                    tris_y1[tris_count] = tri_vy[0];
+                                    tris_x2[tris_count] = tri_vx[1];
+                                    tris_y2[tris_count] = tri_vy[1];
+                                    tris_x3[tris_count] = tri_vx[2];
+                                    tris_y3[tris_count] = tri_vy[2];
+                                    tris_color[tris_count] = current_color;
+                                    tris_filled[tris_count] = (selected_tool == TOOL_TRI_FILLED) ? 1 : 0;
+                                    tris_count++;
+                                }
+                                tri_pending_count = 0; /* reset for next triangle */
+                            }
+                        }
+                    } else if (selected_tool == TOOL_RECT_OUT || selected_tool == TOOL_RECT_FILLED) {
+                        if (!rect_pending) {
+                            rect_xa = wx; rect_ya = wy; rect_pending = 1;
+                        } else {
+                            if (rects_count < MAX_RECTS) {
+                                rects_x1[rects_count] = rect_xa;
+                                rects_y1[rects_count] = rect_ya;
+                                rects_x2[rects_count] = wx;
+                                rects_y2[rects_count] = wy;
+                                rects_color[rects_count] = current_color;
+                                rects_filled[rects_count] = (selected_tool == TOOL_RECT_FILLED) ? 1 : 0;
+                                rects_count++;
+                            }
+                            rect_pending = 0;
+                        }
+                    } else {
+                        /* default behavior: add a marker point */
+                        if (points_count < MAX_POINTS) {
+                            points_x[points_count] = wx;
+                            points_y[points_count] = wy;
+                            points_count++;
+                        }
+                    }
+                } else {
+                    /* if we were panning via left-drag, stop panning */
+                    if (panning) panning = 0;
+                }
+                left_dragging = 0;
+                left_drag_moved = 0;
+                glutPostRedisplay();
+            }
+        }
+    } else if (button == GLUT_RIGHT_BUTTON) {
+        if (state == GLUT_DOWN) {
+            /* Right-click: cancel pending for current tool or finish polyline */
+            if (selected_tool == TOOL_LINE && line_active) {
+                line_active = 0;
+            } else if (selected_tool == TOOL_CIRCLE && circle_pending) {
+                circle_pending = 0;
+            } else if ((selected_tool == TOOL_TRI_OUT || selected_tool == TOOL_TRI_FILLED) && tri_pending_count > 0) {
+                tri_pending_count = 0;
+            } else if ((selected_tool == TOOL_RECT_OUT || selected_tool == TOOL_RECT_FILLED) && rect_pending) {
+                rect_pending = 0;
+            }
+            glutPostRedisplay();
+        }
+    } else if (button == GLUT_MIDDLE_BUTTON) {
+        if (state == GLUT_DOWN) {
+            panning = 1;
+            pan_last_x = x; pan_last_y = y;
+        } else {
+            panning = 0;
+        }
+    } else if (button == 3) { /* wheel up */
+        zoom_in_centered();
+    } else if (button == 4) { /* wheel down */
+        zoom_out_centered();
+    }
+}
+
+/* Mouse motion while button pressed */
+static void motion_cb(int x, int y) {
+    /* Update mouse position for hover/tooltip logic later */
+    mouse_x = x; mouse_y = y;
+
+    if (left_dragging) {
+        if (!left_drag_moved) {
+            int total_dx = x - left_drag_start_x;
+            int total_dy = y - left_drag_start_y;
+            if (abs(total_dx) >= LEFT_DRAG_THRESHOLD || abs(total_dy) >= LEFT_DRAG_THRESHOLD) {
+                /* start panning */
+                left_drag_moved = 1;
+                panning = 1;
+                pan_last_x = x;
+                pan_last_y = y;
+            }
+        }
+        if (panning) {
+            int dx = x - pan_last_x;
+            int dy = y - pan_last_y;
+            pan_last_x = x;
+            pan_last_y = y;
+            pan_x -= (double)dx / zoom_factor;
+            pan_y -= (double)dy / zoom_factor;
+            glutPostRedisplay();
+            return;
+        }
+    }
+
+    if (panning) {
+        int dx = x - pan_last_x;
+        int dy = y - pan_last_y;
+        pan_last_x = x;
+        pan_last_y = y;
+        pan_x -= (double)dx / zoom_factor;
+        pan_y -= (double)dy / zoom_factor;
+        glutPostRedisplay();
+    } else {
+        int rects[BTN_COUNT][4];
+        compute_button_rects(rects);
+        hover_button = -1;
+        tooltip_visible = 0;
+        tooltip_text[0] = '\0';
+        for (int i=0;i<BTN_COUNT;++i) {
+            if (point_in_rect(x,y,rects[i])) {
+                hover_button = i;
+                tooltip_visible = 1;
+                if (i == BTN_LINE) snprintf(tooltip_text, sizeof(tooltip_text), "Line tool");
+                else if (i == BTN_CIRCLE) snprintf(tooltip_text, sizeof(tooltip_text), "Circle tool");
+                else if (i == BTN_TRI_OUT) snprintf(tooltip_text, sizeof(tooltip_text), "Triangle outline");
+                else if (i == BTN_TRI_FILLED) snprintf(tooltip_text, sizeof(tooltip_text), "Triangle filled");
+                else if (i == BTN_RECT_OUT) snprintf(tooltip_text, sizeof(tooltip_text), "Rectangle outline");
+                else if (i == BTN_RECT_FILLED) snprintf(tooltip_text, sizeof(tooltip_text), "Rectangle filled");
+                else if (i == BTN_CENTER) snprintf(tooltip_text, sizeof(tooltip_text), "Center view");
+                else if (i == BTN_PLUS) snprintf(tooltip_text, sizeof(tooltip_text), "Zoom in");
+                else if (i == BTN_MINUS) snprintf(tooltip_text, sizeof(tooltip_text), "Zoom out");
+                else if (i == BTN_RESET) snprintf(tooltip_text, sizeof(tooltip_text), "Reset view (grid on)");
+                else if (i == BTN_GRID) snprintf(tooltip_text, sizeof(tooltip_text), "%s grid", grid_visible ? "Hide" : "Show");
+                else if (i == BTN_SNAP) snprintf(tooltip_text, sizeof(tooltip_text), "%s snap", snap_enabled ? "Disable" : "Enable");
+                break;
+            }
+        }
+        /* palette hover */
+        for (int i=0;i<PALETTE_COUNT;++i) {
+            if (point_in_rect(x,y,palette_rects[i])) {
+                tooltip_visible = 1;
+                snprintf(tooltip_text, sizeof(tooltip_text), "Color #%06X", palette_colors[i]);
+                break;
+            }
+        }
+        glutPostRedisplay();
+    }
+}
+
+/* Passive motion (move without buttons) */
+static void passive_motion_cb(int x, int y) {
+    mouse_x = x; mouse_y = y;
+    int rects[BTN_COUNT][4];
+    compute_button_rects(rects);
+    hover_button = -1;
+    tooltip_visible = 0;
+    tooltip_text[0] = '\0';
+    for (int i=0;i<BTN_COUNT;++i) {
+        if (point_in_rect(x,y,rects[i])) {
+            hover_button = i;
+            tooltip_visible = 1;
+            if (i == BTN_LINE) snprintf(tooltip_text, sizeof(tooltip_text), "Line tool");
+            else if (i == BTN_CIRCLE) snprintf(tooltip_text, sizeof(tooltip_text), "Circle tool");
+            else if (i == BTN_TRI_OUT) snprintf(tooltip_text, sizeof(tooltip_text), "Triangle outline");
+            else if (i == BTN_TRI_FILLED) snprintf(tooltip_text, sizeof(tooltip_text), "Triangle filled");
+            else if (i == BTN_RECT_OUT) snprintf(tooltip_text, sizeof(tooltip_text), "Rectangle outline");
+            else if (i == BTN_RECT_FILLED) snprintf(tooltip_text, sizeof(tooltip_text), "Rectangle filled");
+            else if (i == BTN_CENTER) snprintf(tooltip_text, sizeof(tooltip_text), "Center view");
+            else if (i == BTN_PLUS) snprintf(tooltip_text, sizeof(tooltip_text), "Zoom in");
+            else if (i == BTN_MINUS) snprintf(tooltip_text, sizeof(tooltip_text), "Zoom out");
+            else if (i == BTN_RESET) snprintf(tooltip_text, sizeof(tooltip_text), "Reset view (grid on)");
+            else if (i == BTN_GRID) snprintf(tooltip_text, sizeof(tooltip_text), "%s grid", grid_visible ? "Hide" : "Show");
+            else if (i == BTN_SNAP) snprintf(tooltip_text, sizeof(tooltip_text), "%s snap", snap_enabled ? "Disable" : "Enable");
+            break;
+        }
+    }
+    for (int i=0;i<PALETTE_COUNT;++i) {
+        if (point_in_rect(x,y,palette_rects[i])) {
+            tooltip_visible = 1;
+            snprintf(tooltip_text, sizeof(tooltip_text), "Color #%06X", palette_colors[i]);
+            break;
+        }
+    }
+    glutPostRedisplay();
+}
+
+/* Keyboard */
+static void keyboard_cb(unsigned char key, int x, int y) {
+    (void)x; (void)y;
+    if (key == 27) exit(0); /* ESC */
+}
+
+/* Entry point */
+int main(int argc, char** argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB | GLUT_MULTISAMPLE);
+    glutInitWindowSize(win_w, win_h);
+    glutCreateWindow("CAD Demo with Tools: Line, Circle, Triangle (filled/outline), Rect (filled/outline) and Palette");
+
+    glewInit();
+
+    glutDisplayFunc(display_cb);
+    glutReshapeFunc(reshape_cb);
+    glutMouseFunc(mouse_cb);
+    glutMotionFunc(motion_cb);
+    glutPassiveMotionFunc(passive_motion_cb);
+    glutKeyboardFunc(keyboard_cb);
+
+    glutMainLoop();
+    return 0;
+}

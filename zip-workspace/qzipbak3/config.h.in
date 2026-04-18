@@ -1,0 +1,2 @@
+#define qzipbak2_VERSION_MAJOR @qzipbak2_VERSION_MAJOR@
+#define qzipbak2_VERSION_MINOR @qzipbak2_VERSION_MINOR@

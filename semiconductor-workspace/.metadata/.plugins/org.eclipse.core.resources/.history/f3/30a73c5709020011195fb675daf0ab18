@@ -1,0 +1,48 @@
+/* main.c
+ * Start, GLUT setup, minimal orchestration
+ */
+
+#include "app.h"
+#include <GL/glew.h>
+#include <GL/glut.h>
+#include <stdio.h>
+
+static int initial_w = 1200;
+static int initial_h = 800;
+
+int main(int argc, char **argv) {
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
+    glutInitWindowSize(initial_w, initial_h);
+    glutCreateWindow("CAD - modular");
+
+    /* Initialize render (includes GLEW + shader init) */
+    if (!render_init(initial_w, initial_h)) {
+        fprintf(stderr, "render_init failed, continuing with CPU fallback where possible.\n");
+    }
+
+    /* Initialize UI (toolbar, callbacks) */
+    ui_init();
+
+    /* Register GLUT callbacks that forward to UI module */
+    glutDisplayFunc(ui_on_display);
+    glutReshapeFunc(ui_on_reshape);
+    glutMouseFunc(ui_on_mouse);
+    glutMotionFunc(ui_on_motion);
+    glutPassiveMotionFunc(ui_on_passive_motion);
+    glutKeyboardFunc(ui_on_keyboard);
+
+    /* Maximize window to screen size (FreeGLUT) as requested earlier */
+    int screen_width = glutGet(GLUT_SCREEN_WIDTH);
+    int screen_height = glutGet(GLUT_SCREEN_HEIGHT);
+    if (screen_width > 0 && screen_height > 0) {
+        glutReshapeWindow(screen_width, screen_height);
+        glutPositionWindow(0, 0);
+    }
+
+    glutMainLoop();
+
+    /* never reached with GLUT, but keep API symmetry */
+    render_shutdown();
+    return 0;
+}

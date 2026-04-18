@@ -1,0 +1,760 @@
+/*
+ * jlz4.c - lz4-style tool
+ * style: freebsd kernel (style(9)) + snake_case
+ */
+
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/ioctl.h>
+
+#include <err.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <libgen.h>
+#include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define	BLK_SIZE	(1 << 20)
+#define	WIN_SIZE	(1 << 16)
+#define	MIN_MAT		4
+#define	HSH_SIZE	(1 << 16)
+#define	HSH_SFT		(32 - 16)
+
+#ifndef PATH_MAX
+#define	PATH_MAX	4096
+#endif
+
+typedef struct {
+	uint64_t total;
+	uint64_t proc;
+	struct timeval start;
+	const char *curr;
+	uint64_t f_orig;
+	uint64_t f_comp;
+	int	 lines;
+} prg_ctx_t;
+
+typedef struct {
+	FILE	*fp;
+	const char *path;
+	uint8_t *in;
+	uint8_t *out;
+	uint32_t c_len;
+	uint64_t f_len;
+} io_ctx_t;
+
+static prg_ctx_t g_prg;
+
+/*
+ * terminal & string utils
+ */
+
+static int
+term_width(void)
+{
+	struct winsize ws;
+
+	if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+		return ((int)ws.ws_col);
+	return (80);
+}
+
+static void
+path_join(char *dst, size_t max, const char *dir, const char *fn)
+{
+	if (dir == NULL || dir[0] == '\0') {
+		snprintf(dst, max, "%s", fn);
+	} else if (dir[strlen(dir) - 1] == '/') {
+		snprintf(dst, max, "%s%s", dir, fn);
+	} else {
+		snprintf(dst, max, "%s/%s", dir, fn);
+	}
+}
+
+/*
+ * io utils
+ */
+
+static int
+io_write(int fd, const void *buf, size_t n)
+{
+	const uint8_t *p;
+	ssize_t w;
+
+	p = buf;
+	while (n > 0) {
+		w = write(fd, p, n);
+		if (w < 0) {
+			if (errno == EINTR)
+				continue;
+			return (-1);
+		}
+		n -= w;
+		p += w;
+	}
+	return (0);
+}
+
+static size_t
+io_read(FILE *f, uint8_t *buf, size_t n)
+{
+	size_t got;
+	size_t r;
+
+	got = 0;
+	while (got < n) {
+		r = fread(buf + got, 1, n - got, f);
+		if (r == 0)
+			break;
+		got += r;
+	}
+	return (got);
+}
+
+static int
+io_wr_u32(FILE *f, uint32_t v)
+{
+	uint8_t b[4];
+
+	b[0] = v & 0xFF;
+	b[1] = (v >> 8) & 0xFF;
+	b[2] = (v >> 16) & 0xFF;
+	b[3] = (v >> 24) & 0xFF;
+	return (fwrite(b, 1, 4, f) == 4 ? 0 : -1);
+}
+
+static int
+io_wr_u64(FILE *f, uint64_t v)
+{
+	uint8_t b[8];
+	int i;
+
+	for (i = 0; i < 8; ++i)
+		b[i] = (v >> (8 * i)) & 0xFF;
+	return (fwrite(b, 1, 8, f) == 8 ? 0 : -1);
+}
+
+static int
+io_rd_u32(FILE *f, uint32_t *v)
+{
+	uint8_t b[4];
+
+	if (fread(b, 1, 4, f) != 4)
+		return (-1);
+	*v = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
+	return (0);
+}
+
+static int
+io_rd_u64(FILE *f, uint64_t *v)
+{
+	uint8_t b[8];
+	int i;
+
+	if (fread(b, 1, 8, f) != 8)
+		return (-1);
+	*v = 0;
+	for (i = 0; i < 8; ++i)
+		*v |= ((uint64_t)b[i]) << (8 * i);
+	return (0);
+}
+
+/*
+ * formatting
+ */
+
+static void
+fmt_byte(uint64_t v, char *b, size_t n)
+{
+	const char *u[] = {"B", "KB", "MB", "GB"};
+	double d;
+	int i;
+
+	d = (double)v;
+	i = 0;
+	while (d >= 1024.0 && i < 3) {
+		d /= 1024.0;
+		i++;
+	}
+	snprintf(b, n, "%.2f %s", d, u[i]);
+}
+
+static void
+fmt_time(double s, char *b, size_t n)
+{
+	int t;
+
+	if (s < 0)
+		s = 0;
+	t = (int)(s + 0.5);
+	snprintf(b, n, "%02d:%02d:%02d", t / 3600, (t % 3600) / 60, t % 60);
+}
+
+/*
+ * progress bar
+ */
+
+static void
+prg_line(int clr)
+{
+	if (clr && g_prg.lines > 0)
+		printf("\033[%dA", g_prg.lines);
+	g_prg.lines = 0;
+}
+
+static void
+prg_calc(double *pct, double *eta, double *spd)
+{
+	struct timeval now;
+	double el;
+
+	gettimeofday(&now, NULL);
+	el = (now.tv_sec - g_prg.start.tv_sec) +
+	    (now.tv_usec - g_prg.start.tv_usec) / 1e6;
+	*pct = g_prg.total ? (double)g_prg.proc * 100.0 / g_prg.total : 0;
+	*eta = (g_prg.proc > 0 && g_prg.total > g_prg.proc) ?
+	    el * (g_prg.total - g_prg.proc) / g_prg.proc : 0;
+	*spd = (g_prg.proc > 0 && el > 0) ? g_prg.proc / el : 0;
+}
+
+static void
+prg_draw(double pct, int w)
+{
+	int fil;
+	int i;
+
+	fil = (int)((pct / 100.0) * w + 0.5);
+	if (fil > w)
+		fil = w;
+	printf("\033[K%6.2f%% [", pct);
+	for (i = 0; i < fil; ++i)
+		putchar('=');
+	for (i = fil; i < w; ++i)
+		putchar(' ');
+	printf("]\n");
+	g_prg.lines++;
+}
+
+static void
+prg_upd(uint64_t p, uint64_t t)
+{
+	char s1[32], s3[32];
+	double pct, eta, spd;
+
+	g_prg.proc = p;
+	g_prg.total = t;
+	prg_line(1);
+	prg_calc(&pct, &eta, &spd);
+	fmt_byte((uint64_t)spd, s1, 32);
+	fmt_time(eta, s3, 32);
+
+	if (g_prg.curr)
+		printf("\033[KFile: %s\n", g_prg.curr);
+	else
+		printf("\033[K\n");
+	g_prg.lines++;
+	printf("\033[KETA: %s | Spd: %s/s\n", s3, s1);
+	g_prg.lines++;
+	prg_draw(pct, term_width() - 40);
+	fflush(stdout);
+}
+
+/*
+ * compression core
+ */
+
+static inline uint32_t
+lz4_hash(const uint8_t *p)
+{
+	uint32_t v;
+
+	memcpy(&v, p, 4);
+	return ((v * 2654435761u) >> HSH_SFT) & (HSH_SIZE - 1);
+}
+
+static void
+lz4_lit(uint8_t **op, const uint8_t *anc, size_t len)
+{
+	size_t rem;
+
+	rem = len >= 15 ? len - 15 : 0;
+	if (len >= 15) {
+		while (rem >= 255) {
+			*(*op)++ = 255;
+			rem -= 255;
+		}
+		*(*op)++ = (uint8_t)rem;
+	}
+	memcpy(*op, anc, len);
+	*op += len;
+}
+
+static void
+lz4_match(uint8_t **op, size_t off, size_t len)
+{
+	uint16_t o;
+	size_t l;
+	size_t rem;
+
+	o = (uint16_t)off;
+	*(*op)++ = (uint8_t)(o & 0xFF);
+	*(*op)++ = (uint8_t)((o >> 8) & 0xFF);
+	l = len - MIN_MAT;
+	if (l >= 15) {
+		rem = l - 15;
+		while (rem >= 255) {
+			*(*op)++ = 255;
+			rem -= 255;
+		}
+		*(*op)++ = (uint8_t)rem;
+	}
+}
+
+static size_t
+lz4_comp(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
+{
+	const uint8_t *ip, *end, *anc, *p1, *p2;
+	uint32_t *ht;
+	uint8_t *op;
+	uint32_t h, ref, c_sz;
+	size_t m_len, l_len;
+
+	if (cap < 12)
+		return (0);
+	op = out;
+	memcpy(op, "LZ4B", 4);
+	op += 4;
+	memcpy(op, &n, 4);
+	op += 8;
+
+	ht = calloc(HSH_SIZE, sizeof(uint32_t));
+	if (ht == NULL)
+		return (0);
+	memset(ht, 0xFF, HSH_SIZE * sizeof(uint32_t));
+
+	ip = in;
+	end = in + n;
+	anc = ip;
+
+	while (ip + MIN_MAT <= end) {
+		h = lz4_hash(ip);
+		ref = ht[h];
+		ht[h] = (uint32_t)(ip - in);
+		if (ref == 0xFFFFFFFFu || (ip - (in + ref)) > WIN_SIZE ||
+		    memcmp(in + ref, ip, 4) != 0) {
+			ip++;
+			continue;
+		}
+		p1 = ip;
+		p2 = in + ref;
+		while (p1 < end && *p1 == *p2) {
+			p1++;
+			p2++;
+		}
+		m_len = p1 - ip;
+		l_len = ip - anc;
+		*op++ = (l_len >= 15 ? 15 : l_len) << 4 |
+		    (m_len - 4 >= 15 ? 15 : m_len - 4);
+		lz4_lit(&op, anc, l_len);
+		lz4_match(&op, ip - (in + ref), m_len);
+		ip += m_len;
+		anc = ip;
+	}
+
+	l_len = end - anc;
+	*op++ = (l_len >= 15 ? 15 : l_len) << 4;
+	lz4_lit(&op, anc, l_len);
+
+	c_sz = (uint32_t)(op - out - 12);
+	memcpy(out + 8, &c_sz, 4);
+	free(ht);
+	return (op - out);
+}
+
+/*
+ * decompression core
+ */
+
+static size_t
+lz4_dec(const uint8_t *in, size_t n, uint8_t *out, size_t cap)
+{
+	const uint8_t *ip, *end;
+	uint32_t org, c_sz;
+	size_t opos, l_len, m_len, ref;
+	uint8_t s, tok;
+	uint16_t off;
+	int i;
+
+	if (n < 12 || memcmp(in, "LZ4B", 4) != 0)
+		return (0);
+	memcpy(&org, in + 4, 4);
+	memcpy(&c_sz, in + 8, 4);
+	if (c_sz + 12 != n)
+		return (0);
+
+	ip = in + 12;
+	end = in + n;
+	opos = 0;
+
+	while (ip < end) {
+		tok = *ip++;
+		l_len = tok >> 4;
+		if (l_len == 15) {
+			do {
+				s = *ip++;
+				l_len += s;
+			} while (s == 255);
+		}
+		if (opos + l_len > cap)
+			return (0);
+		memcpy(out + opos, ip, l_len);
+		ip += l_len;
+		opos += l_len;
+		if (ip >= end)
+			break;
+
+		off = ip[0] | (ip[1] << 8);
+		ip += 2;
+		m_len = (tok & 0xF) + 4;
+		if (m_len - 4 == 15) {
+			do {
+				s = *ip++;
+				m_len += s;
+			} while (s == 255);
+		}
+		ref = opos - off;
+		if (off == 0 || off > opos || opos + m_len > cap)
+			return (0);
+		for (i = 0; i < m_len; ++i)
+			out[opos + i] = out[ref + i];
+		opos += m_len;
+	}
+	return (opos == org ? opos : 0);
+}
+
+/*
+ * file processing helpers
+ */
+
+static int
+dir_mk(const char *p)
+{
+	struct stat st;
+	char tmp[PATH_MAX];
+	char *sl;
+
+	strncpy(tmp, p, sizeof(tmp) - 1);
+	sl = strrchr(tmp, '/');
+	if (sl == NULL || sl == tmp)
+		return (0);
+	*sl = 0;
+	if (stat(tmp, &st) == 0 && S_ISDIR(st.st_mode))
+		return (0);
+	dir_mk(tmp);
+	return (mkdir(tmp, 0755) == 0 || errno == EEXIST ? 0 : -1);
+}
+
+static int
+arc_write(FILE *arc, const char *nm, uint64_t sz)
+{
+	uint32_t nl;
+
+	nl = strlen(nm);
+	if (io_wr_u32(arc, nl))
+		return (-1);
+	if (fwrite(nm, 1, nl, arc) != nl)
+		return (-1);
+	if (io_wr_u64(arc, sz))
+		return (-1);
+	return (0);
+}
+
+static int
+blk_proc(io_ctx_t *c, FILE *out, int is_comp)
+{
+	size_t res;
+	uint32_t b_sz;
+
+	if (is_comp)
+		res = lz4_comp(c->in, c->c_len, c->out, BLK_SIZE * 2);
+	else
+		res = lz4_dec(c->in, c->c_len, c->out, BLK_SIZE * 2);
+
+	if (res == 0)
+		return (-1);
+
+	if (is_comp) {
+		b_sz = (uint32_t)res;
+		if (io_wr_u32(out, b_sz))
+			return (-1);
+		if (fwrite(c->out, 1, res, out) != res)
+			return (-1);
+		g_prg.f_comp += 4 + res;
+	} else {
+		if (io_write(fileno(out), c->out, res))
+			return (-1);
+	}
+	return (0);
+}
+
+static int
+file_comp(io_ctx_t *c, FILE *arc)
+{
+	size_t r;
+	long sz_pos, cur;
+
+	g_prg.curr = c->path;
+	g_prg.f_comp = 0;
+	sz_pos = ftell(arc);
+	if (io_wr_u32(arc, 0))
+		return (-1);
+
+	while ((r = io_read(c->fp, c->in, BLK_SIZE)) > 0) {
+		c->c_len = r;
+		if (blk_proc(c, arc, 1) != 0)
+			return (-1);
+		g_prg.proc += r;
+		prg_upd(g_prg.proc, g_prg.total);
+	}
+
+	cur = ftell(arc);
+	fseek(arc, sz_pos, SEEK_SET);
+	io_wr_u32(arc, (uint32_t)g_prg.f_comp);
+	fseek(arc, cur, SEEK_SET);
+	return (0);
+}
+
+static int
+file_dec(FILE *arc, const char *out, uint32_t c_sz)
+{
+	io_ctx_t c;
+	FILE *fo;
+	uint32_t rem;
+	uint32_t b_sz;
+	int fd;
+
+	c.in = malloc(BLK_SIZE * 2);
+	c.out = malloc(BLK_SIZE * 2);
+	c.fp = NULL;
+	fd = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	fo = (fd >= 0) ? fdopen(fd, "wb") : NULL;
+	rem = c_sz;
+
+	while (rem > 0) {
+		if (io_rd_u32(arc, &b_sz))
+			break;
+		rem -= 4;
+		c.c_len = b_sz;
+		io_read(arc, c.in, b_sz);
+		rem -= b_sz;
+		blk_proc(&c, fo, 0);
+		g_prg.proc += 4 + b_sz;
+		prg_upd(g_prg.proc, g_prg.total);
+	}
+	free(c.in);
+	free(c.out);
+	if (fo)
+		fclose(fo);
+	return (0);
+}
+
+/*
+ * directory traversal
+ */
+
+static int
+rec_size(const char *p, uint64_t *sz)
+{
+	struct stat st;
+	struct dirent *e;
+	DIR *d;
+	char sub[PATH_MAX];
+
+	if (lstat(p, &st))
+		return (-1);
+	if (S_ISREG(st.st_mode)) {
+		*sz += st.st_size;
+		return (0);
+	}
+	if (!S_ISDIR(st.st_mode))
+		return (0);
+
+	d = opendir(p);
+	if (d == NULL)
+		return (-1);
+	while ((e = readdir(d))) {
+		if (e->d_name[0] == '.')
+			continue;
+		path_join(sub, PATH_MAX, p, e->d_name);
+		rec_size(sub, sz);
+	}
+	closedir(d);
+	return (0);
+}
+
+static int
+rec_comp(const char *in, const char *rt, FILE *arc)
+{
+	struct stat st;
+	struct dirent *e;
+	io_ctx_t c;
+	DIR *d;
+	char sub[PATH_MAX];
+	const char *rel;
+
+	if (lstat(in, &st))
+		return (-1);
+	if (S_ISDIR(st.st_mode)) {
+		d = opendir(in);
+		if (d == NULL)
+			return (-1);
+		while ((e = readdir(d))) {
+			if (e->d_name[0] == '.')
+				continue;
+			path_join(sub, PATH_MAX, in, e->d_name);
+			rec_comp(sub, rt, arc);
+		}
+		closedir(d);
+		return (0);
+	}
+	if (!S_ISREG(st.st_mode))
+		return (0);
+
+	rel = in + strlen(rt);
+	if (*rel == '/')
+		rel++;
+	if (arc_write(arc, rel, st.st_size))
+		return (-1);
+
+	c.path = rel;
+	c.fp = fopen(in, "rb");
+	c.in = malloc(BLK_SIZE);
+	c.out = malloc(BLK_SIZE * 2);
+	file_comp(&c, arc);
+	free(c.in);
+	free(c.out);
+	fclose(c.fp);
+	return (0);
+}
+
+/*
+ * main actions
+ */
+
+static void
+act_list(const char *fn)
+{
+	FILE *f;
+	uint64_t o_sz;
+	uint32_t nl, c_sz;
+	char nm[PATH_MAX];
+	char s1[32], s2[32];
+
+	f = fopen(fn, "rb");
+	if (f == NULL)
+		err(1, "open");
+	while (1) {
+		if (io_rd_u32(f, &nl))
+			break;
+		if (fread(nm, 1, nl, f) != nl)
+			break;
+		nm[nl] = 0;
+		io_rd_u64(f, &o_sz);
+		io_rd_u32(f, &c_sz);
+		fmt_byte(o_sz, s1, 32);
+		fmt_byte(c_sz, s2, 32);
+		printf("%s %s %s\n", nm, s1, s2);
+		fseek(f, c_sz, SEEK_CUR);
+	}
+	fclose(f);
+}
+
+static void
+act_comp(const char *in, const char *out)
+{
+	FILE *arc;
+	char out_fn[PATH_MAX];
+	char rt[PATH_MAX];
+	char *dir;
+
+	if (out == NULL)
+		snprintf(out_fn, sizeof(out_fn), "%s.lz4", in);
+	else
+		strncpy(out_fn, out, sizeof(out_fn));
+
+	arc = fopen(out_fn, "wb");
+	if (arc == NULL)
+		err(1, "create");
+
+	strncpy(rt, in, sizeof(rt));
+	if (rec_size(in, &g_prg.total))
+		err(1, "scan");
+
+	dir = dirname(rt);
+	rec_comp(in, dir, arc);
+	fclose(arc);
+}
+
+static void
+act_dec(const char *in, const char *out)
+{
+	FILE *f;
+	struct stat st;
+	uint64_t o_sz;
+	uint32_t nl, c_sz;
+	char nm[PATH_MAX];
+	char dst[PATH_MAX];
+
+	f = fopen(in, "rb");
+	if (f == NULL)
+		err(1, "open");
+
+	stat(in, &st);
+	g_prg.total = st.st_size;
+
+	while (1) {
+		if (io_rd_u32(f, &nl))
+			break;
+		fread(nm, 1, nl, f);
+		nm[nl] = 0;
+		io_rd_u64(f, &o_sz);
+		io_rd_u32(f, &c_sz);
+
+		if (out != NULL)
+			path_join(dst, PATH_MAX, out, nm);
+		else
+			strncpy(dst, nm, PATH_MAX);
+
+		dir_mk(dst);
+		file_dec(f, dst, c_sz);
+	}
+	fclose(f);
+}
+
+int
+main(int ac, char **av)
+{
+	if (ac < 3) {
+		fprintf(stderr, "use: %s -c|-d|-l <in> [out]\n", av[0]);
+		return (1);
+	}
+	gettimeofday(&g_prg.start, NULL);
+
+	if (strcmp(av[1], "-l") == 0)
+		act_list(av[2]);
+	else if (strcmp(av[1], "-c") == 0)
+		act_comp(av[2], ac > 3 ? av[3] : NULL);
+	else if (strcmp(av[1], "-d") == 0)
+		act_dec(av[2], ac > 3 ? av[3] : NULL);
+	else
+		return (1);
+
+	return (0);
+}

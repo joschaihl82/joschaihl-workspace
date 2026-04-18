@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;cia64cc/src/cia64cc.c&apos; to &apos;asm.c&apos;" description="Rename resource &apos;cia64cc.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="src/cia64cc.c" name="asm.c" stamp="1771622992086" updateReferences="true"/>
+</session>
