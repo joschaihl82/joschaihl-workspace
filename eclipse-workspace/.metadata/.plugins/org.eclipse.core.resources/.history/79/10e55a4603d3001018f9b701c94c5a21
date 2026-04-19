@@ -1,0 +1,579 @@
+// main.c
+// Trainer with ncurses UI: two progress bars and a scrolling chat log.
+// Usage: ./trainer data.txt model_size_MBytes
+// Build: gcc -O2 -std=c11 main.c ggml.c -lncurses -lm -o trainer
+//
+// Requires ggml.c and ggml.h in the same folder.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <math.h>
+#include <sys/time.h>
+#include <ncurses.h>
+
+#include "ggml.h"
+
+#define MAGIC 0x4D4F444C
+#define ASCII_VOCAB 128
+
+/* Config */
+#define DEFAULT_EPOCHS 5
+#define DEFAULT_LR 0.01f
+#define MIN_HID 16
+#define MIN_POOL_BYTES (32 * 1024 * 1024)
+#define EVAL_SAMPLES 6
+#define PROMPT_MAX_CHARS 200
+#define REPLY_MAX_CHARS 160
+
+/* ---------- Utilities ---------- */
+
+static void die(const char *msg) {
+    endwin();
+    fprintf(stderr, "%s\n", msg);
+    exit(1);
+}
+
+static double now_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
+}
+
+static float randf_small(void) {
+    return ((float)rand() / (float)RAND_MAX - 0.5f) * 0.1f;
+}
+
+/* ---------- File I/O ---------- */
+
+static char *load_text_file(const char *path, long *out_size) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long fsize = ftell(f);
+    if (fsize < 0) { fclose(f); return NULL; }
+    rewind(f);
+    char *buf = malloc((size_t)fsize + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)fsize, f) != (size_t)fsize) { free(buf); fclose(f); return NULL; }
+    buf[fsize] = '\0';
+    fclose(f);
+    *out_size = fsize;
+    return buf;
+}
+
+/* ---------- Sentence splitting ---------- */
+
+static long *collect_sentence_starts(const char *text, long text_len, int *out_count) {
+    long *starts = malloc(sizeof(long) * (text_len / 10 + 16));
+    if (!starts) return NULL;
+    int count = 0;
+    long i = 0;
+    while (i < text_len && (text[i] == ' ' || text[i] == '\n' || text[i] == '\r' || text[i] == '\t')) ++i;
+    if (i < text_len) starts[count++] = i;
+    for (; i < text_len; ++i) {
+        char c = text[i];
+        if (c == '.' || c == '?' || c == '!') {
+            long j = i + 1;
+            while (j < text_len && (text[j] == '"' || text[j] == '\'' || text[j] == ')' || text[j] == ' ' || text[j] == '\n' || text[j] == '\r' || text[j] == '\t')) ++j;
+            if (j < text_len) starts[count++] = j;
+        }
+    }
+    *out_count = count;
+    return starts;
+}
+
+/* ---------- Model sizing ---------- */
+
+static void compute_dims_from_budget(size_t target_bytes, int *out_in, int *out_hid, int *out_out) {
+    const int in_dim = ASCII_VOCAB;
+    const int out_dim = ASCII_VOCAB;
+    const size_t bytes_per_param = sizeof(float);
+    long long target_params = (long long)(target_bytes / bytes_per_param);
+    long long denom = (long long)in_dim + (long long)out_dim + 1LL;
+    long long hid = 0;
+    if (target_params > out_dim) hid = (target_params - out_dim) / denom;
+    if (hid < MIN_HID) hid = MIN_HID;
+    if (hid > (1LL<<20)) hid = (1LL<<20);
+    *out_in = in_dim;
+    *out_hid = (int)hid;
+    *out_out = out_dim;
+}
+
+/* ---------- ggml context init ---------- */
+
+static struct ggml_context *init_ggml_context_for_model(long long params_bytes) {
+    size_t mem_size = (size_t)params_bytes + (size_t)(16 * 1024 * 1024);
+    if (mem_size < MIN_POOL_BYTES) mem_size = MIN_POOL_BYTES;
+    struct ggml_init_params ip = {
+        .mem_size = mem_size,
+        .mem_buffer = NULL
+    };
+    return ggml_init(ip);
+}
+
+/* ---------- Model struct and creation ---------- */
+
+struct model_t {
+    int in_dim;
+    int hid_dim;
+    int out_dim;
+    struct ggml_tensor *tW1;
+    struct ggml_tensor *tb1;
+    struct ggml_tensor *tW2;
+    struct ggml_tensor *tb2;
+    float *W1;
+    float *b1;
+    float *W2;
+    float *b2;
+};
+
+static int create_model_params(struct ggml_context *ctx, struct model_t *m) {
+    int ne2_W1[2] = { m->in_dim, m->hid_dim };
+    m->tW1 = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne2_W1);
+    m->tb1 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m->hid_dim);
+    int ne2_W2[2] = { m->hid_dim, m->out_dim };
+    m->tW2 = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne2_W2);
+    m->tb2 = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m->out_dim);
+
+    if (!m->tW1 || !m->tb1 || !m->tW2 || !m->tb2) return 0;
+
+    m->W1 = ggml_get_data_f32(m->tW1);
+    m->b1 = ggml_get_data_f32(m->tb1);
+    m->W2 = ggml_get_data_f32(m->tW2);
+    m->b2 = ggml_get_data_f32(m->tb2);
+
+    if (!m->W1 || !m->b1 || !m->W2 || !m->b2) return 0;
+
+    for (long i = 0; i < (long)m->in_dim * m->hid_dim; ++i) m->W1[i] = randf_small();
+    for (int i = 0; i < m->hid_dim; ++i) m->b1[i] = 0.0f;
+    for (long i = 0; i < (long)m->hid_dim * m->out_dim; ++i) m->W2[i] = randf_small();
+    for (int i = 0; i < m->out_dim; ++i) m->b2[i] = 0.0f;
+
+    return 1;
+}
+
+/* ---------- Save model ---------- */
+
+static void save_model_bin(const char *out,
+                           int in_dim, int hid, int out_dim,
+                           const float *W1, const float *b1,
+                           const float *W2, const float *b2) {
+    FILE *f = fopen(out, "wb");
+    if (!f) { return; }
+    uint32_t magic = MAGIC;
+    fwrite(&magic, sizeof(magic), 1, f);
+    fwrite(&in_dim, sizeof(int), 1, f);
+    fwrite(&hid, sizeof(int), 1, f);
+    fwrite(&out_dim, sizeof(int), 1, f);
+    fwrite(W1, sizeof(float), (size_t)in_dim * hid, f);
+    fwrite(b1, sizeof(float), (size_t)hid, f);
+    fwrite(W2, sizeof(float), (size_t)hid * out_dim, f);
+    fwrite(b2, sizeof(float), (size_t)out_dim, f);
+    fclose(f);
+}
+
+/* ---------- Sampling ---------- */
+
+static int sample_next_char_from_logits(const float *logits, int vocab, float temperature) {
+    float maxv = logits[0];
+    for (int i = 1; i < vocab; ++i) if (logits[i] > maxv) maxv = logits[i];
+    double sum = 0.0;
+    double probs[ASCII_VOCAB];
+    for (int i = 0; i < vocab; ++i) {
+        double v = exp((double)(logits[i] - maxv) / (double)temperature);
+        probs[i] = v;
+        sum += v;
+    }
+    double r = ((double)rand() / RAND_MAX) * sum;
+    double c = 0.0;
+    for (int i = 0; i < vocab; ++i) {
+        c += probs[i];
+        if (r <= c) return i;
+    }
+    return vocab - 1;
+}
+
+/* ---------- Generation ---------- */
+
+static void generate_reply(const struct model_t *m, int start_char, int gen_len, char *out_buf, float temperature) {
+    int last = start_char;
+    float *h = malloc((size_t)m->hid_dim * sizeof(float));
+    float *o = malloc((size_t)m->out_dim * sizeof(float));
+    if (!h || !o) { free(h); free(o); return; }
+    for (int t = 0; t < gen_len; ++t) {
+        for (int j = 0; j < m->hid_dim; ++j) h[j] = m->b1[j];
+        for (int i = 0; i < m->in_dim; ++i) {
+            if ((i % ASCII_VOCAB) == last) {
+                long base = (long)i * m->hid_dim;
+                for (int j = 0; j < m->hid_dim; ++j) h[j] += m->W1[base + j];
+            }
+        }
+        for (int j = 0; j < m->hid_dim; ++j) h[j] = tanhf(h[j]);
+        for (int k = 0; k < m->out_dim; ++k) o[k] = m->b2[k];
+        for (int j = 0; j < m->hid_dim; ++j) {
+            long base = (long)j * m->out_dim;
+            float hj = h[j];
+            for (int k = 0; k < m->out_dim; ++k) o[k] += m->W2[base + k] * hj;
+        }
+        int next = sample_next_char_from_logits(o, m->out_dim, temperature);
+        out_buf[t] = (char)next;
+        last = next;
+    }
+    free(h); free(o);
+}
+
+/* ---------- Chat evaluation (sentence prompts) ---------- */
+
+static void evaluate_chat_samples_ncurses(WINDOW *logwin, struct model_t *m, const char *text, long text_len, long *sent_starts, int sent_count, int n_samples) {
+    if (sent_count < 2) {
+        wprintw(logwin, "Not enough sentences for chat evaluation\n");
+        wrefresh(logwin);
+        return;
+    }
+    int used = 0;
+    double sum_acc = 0.0, sum_loss = 0.0;
+    for (int s = 0; s < n_samples; ++s) {
+        int idx = rand() % (sent_count - 1);
+        long prompt_pos = sent_starts[idx];
+        long next_pos = sent_starts[idx + 1];
+        int prompt_len = (int)(next_pos - prompt_pos);
+        if (prompt_len <= 0) continue;
+        int use_len = prompt_len;
+        if (use_len > PROMPT_MAX_CHARS) use_len = PROMPT_MAX_CHARS;
+        char *prompt = malloc(use_len + 1);
+        if (!prompt) break;
+        memcpy(prompt, text + prompt_pos, (size_t)use_len);
+        prompt[use_len] = '\0';
+        int gt_len = (int)((idx + 2 < sent_count) ? (sent_starts[idx + 2] - next_pos) : (text_len - next_pos));
+        if (gt_len <= 0) { free(prompt); continue; }
+        int use_gt_len = gt_len;
+        if (use_gt_len > REPLY_MAX_CHARS) use_gt_len = REPLY_MAX_CHARS;
+        char *gt = malloc(use_gt_len + 1);
+        if (!gt) { free(prompt); break; }
+        memcpy(gt, text + next_pos, (size_t)use_gt_len);
+        gt[use_gt_len] = '\0';
+        int start_char = 0;
+        if (use_len > 0) {
+            unsigned char c = (unsigned char)prompt[use_len - 1];
+            start_char = (c < ASCII_VOCAB) ? (int)c : 0;
+        }
+        char *gen = malloc(use_gt_len + 1);
+        if (!gen) { free(prompt); free(gt); break; }
+        generate_reply(m, start_char, use_gt_len, gen, 1.0f);
+        gen[use_gt_len] = '\0';
+        // compute accuracy and loss (teacher forcing)
+        float *h = malloc((size_t)m->hid_dim * sizeof(float));
+        float *o = malloc((size_t)m->out_dim * sizeof(float));
+        if (!h || !o) { free(prompt); free(gt); free(gen); free(h); free(o); break; }
+        int last = start_char;
+        int correct = 0;
+        double loss = 0.0;
+        for (int t = 0; t < use_gt_len; ++t) {
+            for (int j = 0; j < m->hid_dim; ++j) h[j] = m->b1[j];
+            for (int i = 0; i < m->in_dim; ++i) {
+                if ((i % ASCII_VOCAB) == last) {
+                    long base = (long)i * m->hid_dim;
+                    for (int j = 0; j < m->hid_dim; ++j) h[j] += m->W1[base + j];
+                }
+            }
+            for (int j = 0; j < m->hid_dim; ++j) h[j] = tanhf(h[j]);
+            for (int k = 0; k < m->out_dim; ++k) o[k] = m->b2[k];
+            for (int j = 0; j < m->hid_dim; ++j) {
+                long base = (long)j * m->out_dim;
+                float hj = h[j];
+                for (int k = 0; k < m->out_dim; ++k) o[k] += m->W2[base + k] * hj;
+            }
+            float maxv = o[0];
+            for (int k = 1; k < m->out_dim; ++k) if (o[k] > maxv) maxv = o[k];
+            double sum = 0.0;
+            for (int k = 0; k < m->out_dim; ++k) { o[k] = expf(o[k] - maxv); sum += o[k]; }
+            for (int k = 0; k < m->out_dim; ++k) o[k] /= (float)sum;
+            unsigned char gt_c = (unsigned char)gt[t];
+            int gt_i = (gt_c < ASCII_VOCAB) ? (int)gt_c : 0;
+            unsigned char gen_c = (unsigned char)gen[t];
+            int gen_i = (gen_c < ASCII_VOCAB) ? (int)gen_c : 0;
+            if (gen_i == gt_i) ++correct;
+            double p_true = o[gt_i] > 1e-12f ? o[gt_i] : 1e-12f;
+            loss += -log(p_true);
+            last = gt_i;
+        }
+        double acc = (double)correct / (double)use_gt_len;
+        double avg_loss = loss / (double)use_gt_len;
+        sum_acc += acc; sum_loss += avg_loss; ++used;
+        // print to log window
+        wprintw(logwin, "=== Chat sample %d ===\n", s + 1);
+        wprintw(logwin, "Prompt: \"");
+        for (int i = 0; i < use_len; ++i) {
+            unsigned char c = (unsigned char)prompt[i];
+            waddch(logwin, (c >= 32 && c < 127) ? (char)c : '.');
+        }
+        wprintw(logwin, "\"\n");
+        wprintw(logwin, "Generated: \"");
+        for (int i = 0; i < use_gt_len; ++i) {
+            unsigned char c = (unsigned char)gen[i];
+            waddch(logwin, (c >= 32 && c < 127) ? (char)c : '.');
+        }
+        wprintw(logwin, "\"\n");
+        wprintw(logwin, "Ground-truth: \"");
+        for (int i = 0; i < use_gt_len; ++i) {
+            unsigned char c = (unsigned char)gt[i];
+            waddch(logwin, (c >= 32 && c < 127) ? (char)c : '.');
+        }
+        wprintw(logwin, "\"\n");
+        wprintw(logwin, "  acc=%.3f loss=%.4f\n\n", acc, avg_loss);
+        wrefresh(logwin);
+        free(prompt); free(gt); free(gen); free(h); free(o);
+    }
+    if (used > 0) {
+        wprintw(logwin, "Eval summary: avg_acc=%.4f avg_loss=%.4f over %d samples\n\n", sum_acc / used, sum_loss / used, used);
+        wrefresh(logwin);
+    } else {
+        wprintw(logwin, "No evaluation samples used\n\n");
+        wrefresh(logwin);
+    }
+}
+
+/* ---------- Training with ncurses UI ---------- */
+
+static void train_with_ncurses(struct model_t *m, const int *data, long data_len, int epochs, float lr,
+                               const char *text, long text_len, long *sent_starts, int sent_count) {
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+
+    int bar_height = 4; // two bars + spacing
+    int log_height = rows - bar_height - 1;
+    if (log_height < 6) log_height = 6;
+
+    WINDOW *barwin = newwin(bar_height, cols, 0, 0);
+    WINDOW *logwin = newwin(log_height, cols, bar_height, 0);
+    scrollok(logwin, TRUE);
+
+    wclear(barwin);
+    box(barwin, 0, 0);
+    mvwprintw(barwin, 0, 2, " Training Progress ");
+    wrefresh(barwin);
+
+    // training buffers
+    float *h = malloc((size_t)m->hid_dim * sizeof(float));
+    float *o = malloc((size_t)m->out_dim * sizeof(float));
+    float *do_grad = malloc((size_t)m->out_dim * sizeof(float));
+    float *dh = malloc((size_t)m->hid_dim * sizeof(float));
+    if (!h || !o || !do_grad || !dh) die("Out of memory for training buffers");
+
+    const int update_every = 200;
+    double t_start_all = now_seconds();
+
+    for (int ep = 0; ep < epochs; ++ep) {
+        double t_epoch_start = now_seconds();
+        long steps = data_len > 1 ? data_len - 1 : 0;
+        double loss = 0.0;
+
+        for (long t = 0; t < steps; ++t) {
+            int x = data[t];
+            int y = data[t + 1];
+
+            // forward
+            for (int j = 0; j < m->hid_dim; ++j) h[j] = m->b1[j];
+            for (int i = 0; i < m->in_dim; ++i) {
+                if ((i % ASCII_VOCAB) == x) {
+                    long base = (long)i * m->hid_dim;
+                    for (int j = 0; j < m->hid_dim; ++j) h[j] += m->W1[base + j];
+                }
+            }
+            for (int j = 0; j < m->hid_dim; ++j) h[j] = tanhf(h[j]);
+
+            for (int k = 0; k < m->out_dim; ++k) o[k] = m->b2[k];
+            for (int j = 0; j < m->hid_dim; ++j) {
+                long base = (long)j * m->out_dim;
+                float hj = h[j];
+                for (int k = 0; k < m->out_dim; ++k) o[k] += m->W2[base + k] * hj;
+            }
+
+            // softmax
+            float maxv = o[0];
+            for (int k = 1; k < m->out_dim; ++k) if (o[k] > maxv) maxv = o[k];
+            double sum = 0.0;
+            for (int k = 0; k < m->out_dim; ++k) { o[k] = expf(o[k] - maxv); sum += o[k]; }
+            for (int k = 0; k < m->out_dim; ++k) o[k] /= (float)sum;
+
+            loss += -logf(o[y] + 1e-9f);
+
+            // backprop
+            for (int k = 0; k < m->out_dim; ++k) do_grad[k] = o[k];
+            do_grad[y] -= 1.0f;
+
+            for (int k = 0; k < m->out_dim; ++k) m->b2[k] -= lr * do_grad[k];
+            for (int j = 0; j < m->hid_dim; ++j) {
+                long base = (long)j * m->out_dim;
+                float hj = h[j];
+                for (int k = 0; k < m->out_dim; ++k) {
+                    float g = do_grad[k] * hj;
+                    m->W2[base + k] -= lr * g;
+                }
+            }
+
+            for (int j = 0; j < m->hid_dim; ++j) {
+                float s = 0.0f;
+                long base = (long)j * m->out_dim;
+                for (int k = 0; k < m->out_dim; ++k) s += m->W2[base + k] * do_grad[k];
+                dh[j] = (1.0f - h[j] * h[j]) * s;
+            }
+
+            for (int j = 0; j < m->hid_dim; ++j) m->b1[j] -= lr * dh[j];
+            for (int i = 0; i < m->in_dim; ++i) {
+                if ((i % ASCII_VOCAB) == x) {
+                    long base = (long)i * m->hid_dim;
+                    for (int j = 0; j < m->hid_dim; ++j) m->W1[base + j] -= lr * dh[j];
+                }
+            }
+
+            // update UI periodically
+            if ((t % update_every) == 0 || t == steps - 1) {
+                double now = now_seconds();
+                double epoch_elapsed = now - t_epoch_start;
+                double frac = steps > 0 ? (double)(t + 1) / (double)steps : 1.0;
+                double est_total_epoch = epoch_elapsed / frac;
+                double eta_epoch = est_total_epoch - epoch_elapsed;
+
+                double overall_elapsed = now - t_start_all;
+                double overall_frac = (double)(ep + frac) / (double)epochs;
+                double est_total_all = overall_elapsed / overall_frac;
+                double eta_all = est_total_all - overall_elapsed;
+
+                // draw epoch progress bar
+                werase(barwin);
+                box(barwin, 0, 0);
+                mvwprintw(barwin, 0, 2, " Training Progress ");
+                // epoch bar
+                int bar_w = cols - 4;
+                int filled = (int)round(frac * bar_w);
+                mvwprintw(barwin, 1, 2, "Epoch %d/%d:", ep + 1, epochs);
+                mvwprintw(barwin, 1, 14, "[");
+                for (int i = 0; i < filled; ++i) waddch(barwin, '=');
+                if (filled < bar_w) waddch(barwin, '>');
+                for (int i = filled + 1; i < bar_w; ++i) waddch(barwin, ' ');
+                waddch(barwin, ']');
+                mvwprintw(barwin, 2, 2, "ETA epoch: %5.1fs  ETA total: %5.1fs", eta_epoch, eta_all);
+                wrefresh(barwin);
+            }
+        } // steps
+
+        double t_epoch_end = now_seconds();
+        double epoch_time = t_epoch_end - t_epoch_start;
+        double avg_loss = loss / (steps > 0 ? steps : 1);
+
+        // save model after epoch
+        char fname[256];
+        snprintf(fname, sizeof(fname), "model_epoch_%d.bin", ep + 1);
+        save_model_bin(fname, m->in_dim, m->hid_dim, m->out_dim, m->W1, m->b1, m->W2, m->b2);
+
+        // append summary to log window
+        wprintw(logwin, "Epoch %d/%d finished: time=%.2fs avg_loss=%.6f\n", ep + 1, epochs, epoch_time, avg_loss);
+        wprintw(logwin, "Saved %s\n", fname);
+        wrefresh(logwin);
+
+        // evaluate chat-style samples and append to log
+        evaluate_chat_samples_ncurses(logwin, m, text, text_len, sent_starts, sent_count, EVAL_SAMPLES);
+
+        // scroll log window to bottom
+        int y, x;
+        getyx(logwin, y, x);
+        if (y > 0) {
+            wscrl(logwin, y - 1);
+        }
+        wrefresh(logwin);
+    } // epochs
+
+    // final save
+    save_model_bin("model.bin", m->in_dim, m->hid_dim, m->out_dim, m->W1, m->b1, m->W2, m->b2);
+    wprintw(logwin, "Saved model.bin (final)\n");
+    wrefresh(logwin);
+
+    free(h); free(o); free(do_grad); free(dh);
+    delwin(barwin);
+    delwin(logwin);
+}
+
+/* ---------- main (small) ---------- */
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s data.txt model_size_MBytes\n", argv[0]);
+        return 1;
+    }
+
+    const char *path = argv[1];
+    double model_mb = atof(argv[2]);
+    if (model_mb <= 0.0) { fprintf(stderr, "Invalid model size (MB)\n"); return 1; }
+
+    long text_len = 0;
+    char *text = load_text_file(path, &text_len);
+    if (!text) { fprintf(stderr, "Failed to read training file\n"); return 1; }
+
+    size_t target_bytes = (size_t)llround(model_mb * 1024.0 * 1024.0);
+
+    int in_dim = 0, hid_dim = 0, out_dim = 0;
+    compute_dims_from_budget(target_bytes, &in_dim, &hid_dim, &out_dim);
+
+    long long params = (long long)in_dim * hid_dim + (long long)hid_dim * out_dim + hid_dim + out_dim;
+    long long bytes = params * (long long)sizeof(float);
+
+    // prepare data indices
+    int *data = malloc((size_t)text_len * sizeof(int));
+    if (!data) { fprintf(stderr, "malloc failed\n"); free(text); return 1; }
+    for (long i = 0; i < text_len; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        data[i] = (c < ASCII_VOCAB) ? (int)c : 0;
+    }
+
+    // collect sentence starts
+    int sent_count = 0;
+    long *sent_starts = collect_sentence_starts(text, text_len, &sent_count);
+
+    // init ggml
+    struct ggml_context *ctx = init_ggml_context_for_model(bytes);
+    if (!ctx) { fprintf(stderr, "ggml_init failed\n"); free(text); free(data); free(sent_starts); return 1; }
+
+    // create model
+    struct model_t model;
+    model.in_dim = in_dim;
+    model.hid_dim = hid_dim;
+    model.out_dim = out_dim;
+    if (!create_model_params(ctx, &model)) { fprintf(stderr, "create_model_params failed\n"); ggml_free(ctx); free(text); free(data); free(sent_starts); return 1; }
+
+    // init ncurses
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, FALSE);
+    curs_set(0);
+
+    // header
+    int rows, cols;
+    getmaxyx(stdscr, rows, cols);
+    mvprintw(0, 0, "Trainer UI - two progress bars (top) and chat log below. Press Ctrl+C to quit.");
+    mvprintw(1, 0, "Model dims: in=%d hid=%d out=%d  Params=%lld  Bytes=%lld", in_dim, hid_dim, out_dim, params, bytes);
+    refresh();
+
+    // train with UI
+    srand((unsigned)time(NULL));
+    train_with_ncurses(&model, data, text_len, DEFAULT_EPOCHS, DEFAULT_LR, text, text_len, sent_starts, sent_count);
+
+    // finish
+    mvprintw(rows - 1, 0, "Training complete. Press any key to exit.");
+    nodelay(stdscr, FALSE);
+    getch();
+    endwin();
+
+    // cleanup
+    free(text);
+    free(data);
+    free(sent_starts);
+    ggml_free(ctx);
+
+    return 0;
+}

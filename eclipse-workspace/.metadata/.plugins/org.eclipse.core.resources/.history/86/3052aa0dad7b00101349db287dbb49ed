@@ -1,0 +1,161 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <elfutils/libdw.h>
+#include <dwarf.h>
+
+/**
+ * @brief Findet die Speicheradresse für eine gegebene Quelldatei und Zeilennummer.
+ * * @param prog_name Der Pfad zur ELF-Datei.
+ * @param file_name Der Name der Quelldatei.
+ * @param line_no Die Zeilennummer.
+ * @return Die virtuelle Speicheradresse oder 0 bei einem Fehler.
+ */
+Dwarf_Addr get_address_from_line(const char* prog_name, const char* file_name, int line_no) {
+    int fd = open(prog_name, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 0;
+    }
+
+    Dwarf* dbg = dwarf_begin(fd, DWARF_C_READ);
+    if (!dbg) {
+        fprintf(stderr, "dwarf_begin() fehlgeschlagen\n");
+        close(fd);
+        return 0;
+    }
+
+    Dwarf_Addr result_addr = 0;
+    Dwarf_Off cu_off = 0, next_cu_off;
+    Dwarf_Die* cu_die = NULL;
+
+    // Iteriere durch alle Compilation Units (CUs), was meistens einer C-Datei entspricht.
+    while (dwarf_nextcu(dbg, cu_off, &next_cu_off, NULL, NULL, NULL, NULL) == 0) {
+        cu_die = dwarf_offtodie(dbg, cu_off, NULL);
+        if (!cu_die) {
+            cu_off = next_cu_off;
+            continue;
+        }
+
+        // Finde den Namen der Quelldatei für diese CU.
+        const char *cu_file_name = dwarf_getsrcfiles(cu_die, NULL, NULL)[0];
+        if (strstr(cu_file_name, file_name)) {
+            Dwarf_Line* lines;
+            int nlines;
+
+            // Hole die Zeilennummerntabelle für diese CU.
+            if (dwarf_getsrclines(cu_die, &lines, &nlines) == 0) {
+                for (int i = 0; i < nlines; ++i) {
+                    int current_line;
+                    dwarf_lineno(lines[i], &current_line);
+
+                    // Wenn die Zeilennummer übereinstimmt, speichere die Adresse.
+                    if (current_line == line_no) {
+                        dwarf_lineaddr(lines[i], &result_addr);
+                        dwarf_srclines_dealloc(dbg, lines, nlines);
+                        goto found; // Springe aus der Schleife, wenn gefunden.
+                    }
+                }
+                dwarf_srclines_dealloc(dbg, lines, nlines);
+            }
+        }
+        cu_off = next_cu_off;
+    }
+
+found:
+    dwarf_end(dbg);
+    close(fd);
+    return result_addr;
+}
+
+/**
+ * @brief Die Hauptschleife des Debuggers, die den Breakpoint setzt und abfängt.
+ * * @param child_pid Die Prozess-ID des zu debuggenden Kindprozesses.
+ * @param addr Die Adresse, an der der Breakpoint gesetzt werden soll.
+ */
+void run_debugger(pid_t child_pid, Dwarf_Addr addr) {
+    int wait_status;
+    struct user_regs_struct regs;
+
+    printf("Debugger gestartet für PID: %d\n", child_pid);
+
+    // Warte, bis der Kindprozess nach dem exec() anhält.
+    wait(&wait_status);
+
+    // 1. Lese die ursprünglichen Daten an der Zieladresse.
+    long original_data = ptrace(PTRACE_PEEKDATA, child_pid, addr, NULL);
+    printf("Ursprüngliche Anweisung an Adresse 0x%llx: 0x%lx\n", addr, original_data);
+
+    // 2. Setze den Breakpoint (INT 3 = 0xcc).
+    long trap_instruction = (original_data & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKEDATA, child_pid, addr, trap_instruction);
+    printf("Breakpoint bei 0x%llx gesetzt.\n", addr);
+
+    // 3. Setze die Ausführung des Kindprozesses fort.
+    ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+    wait(&wait_status);
+
+    // 4. Prüfe, ob der Prozess wegen des Breakpoints angehalten wurde.
+    if (WIFSTOPPED(wait_status) && WSTOPSIG(wait_status) == SIGTRAP) {
+        printf("✅ Breakpoint erreicht!\n");
+
+        // Hole die aktuellen Registerwerte.
+        ptrace(PTRACE_GETREGS, child_pid, NULL, &regs);
+        printf("Instruction Pointer (RIP) steht bei 0x%llx\n", regs.rip);
+
+        // 5. Stelle die ursprüngliche Anweisung wieder her.
+        ptrace(PTRACE_POKEDATA, child_pid, addr, original_data);
+
+        // 6. Setze den Instruction Pointer um 1 zurück.
+        regs.rip -= 1;
+        ptrace(PTRACE_SETREGS, child_pid, NULL, &regs);
+        printf("Programm angehalten. Beende Debugger, um Prozess zu beenden.\n");
+        // Ein echter Debugger würde hier eine Befehlsschleife starten.
+    }
+
+    // Kindprozess beenden, um Zombies zu vermeiden.
+    kill(child_pid, SIGKILL);
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 4) {
+        fprintf(stderr, "Verwendung: %s <programm> <datei.c> <zeilennummer>\n", argv[0]);
+        return 1;
+    }
+
+    const char* prog_name = argv[1];
+    const char* file_name = argv[2];
+    int line_no = atoi(argv[3]);
+
+    // Adresse aus DWARF-Infos holen.
+    Dwarf_Addr addr = get_address_from_line(prog_name, file_name, line_no);
+    if (addr == 0) {
+        fprintf(stderr, "Fehler: Adresse für %s:%d konnte nicht gefunden werden.\n", file_name, line_no);
+        fprintf(stderr, "Stelle sicher, dass das Programm mit 'gcc -g' kompiliert wurde.\n");
+        return 1;
+    }
+
+    printf("Adresse für %s:%d ist 0x%llx\n", file_name, line_no, addr);
+
+    pid_t child_pid = fork();
+    if (child_pid == 0) {
+        // Dies ist der Kindprozess (das Ziel).
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        execl(prog_name, prog_name, NULL);
+        perror("execl"); // execl kehrt nur bei einem Fehler zurück.
+        exit(1);
+    } else if (child_pid > 0) {
+        // Dies ist der Elternprozess (der Debugger).
+        run_debugger(child_pid, addr);
+    } else {
+        perror("fork");
+        return 1;
+    }
+
+    return 0;
+}

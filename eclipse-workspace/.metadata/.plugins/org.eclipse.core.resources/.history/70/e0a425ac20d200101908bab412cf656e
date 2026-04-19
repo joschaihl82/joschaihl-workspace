@@ -1,0 +1,55 @@
+# Makefile (link via cross-gcc to avoid ld PHDRS syntax issues)
+CROSS ?= x86_64-w64-mingw32-
+CC	:= $(CROSS)gcc
+LD	:= $(CROSS)ld
+
+SRC := kernel.c
+OBJS := kernel.o
+OUT := kernel.efi
+EFI_NAME := BOOTX64.EFI
+
+LDSCRIPT := linker.ld
+
+# Image and QEMU settings
+FAT_IMG := fat.img
+FAT_SIZE := 64M
+OVMF ?= /usr/share/OVMF/OVMF_CODE.fd
+QEMU := qemu-system-x86_64
+QEMU_OPTS := -m 512 -serial mon:stdio -display none
+
+CFLAGS := -ffreestanding -fno-stack-protector -O2 -nostdlib -Wall -Wextra -c
+# Use gcc driver for linking; pass linker script and linker flags via -Wl,
+LINKER_FLAGS := -Wl,-T,$(LDSCRIPT) -Wl,-e,efi_main -Wl,--subsystem,EFI -Wl,--image-base,0
+
+.PHONY: all clean image qemu
+
+all: $(OUT)
+
+# compile C sources to object files
+%.o: %.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+# link final EFI binary using gcc driver (avoids direct ld PHDRS issues)
+$(OUT): $(OBJS) $(LDSCRIPT)
+	$(CC) $(OBJS) $(LINKER_FLAGS) -o $@
+
+# Create a small FAT image and copy EFI binary (requires mkfs.vfat and sudo)
+image: $(OUT)
+	@echo "Creating FAT image $(FAT_IMG)"
+	-rm -f $(FAT_IMG)
+	dd if=/dev/zero of=$(FAT_IMG) bs=1 count=0 seek=$(FAT_SIZE)
+	mkfs.vfat -n EFIIMG $(FAT_IMG)
+	tmpdir=$$(mktemp -d); sudo mount -o loop $(FAT_IMG) $$tmpdir; \
+	  sudo mkdir -p $$tmpdir/EFI/BOOT; sudo cp $(OUT) $$tmpdir/EFI/BOOT/$(EFI_NAME); sync; \
+	  sudo umount $$tmpdir; rmdir $$tmpdir
+	@echo "Image ready: $(FAT_IMG)"
+
+# build, create image, and run in QEMU with OVMF
+qemu: all image
+	@if [ ! -f "$(OVMF)" ]; then \
+	  echo "OVMF firmware not found at $(OVMF); set OVMF to your OVMF_CODE.fd path."; exit 1; \
+	fi
+	$(QEMU) $(QEMU_OPTS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) -drive file=$(FAT_IMG),format=raw,if=virtio
+
+clean:
+	-rm -f $(OBJS) $(OUT) $(FAT_IMG)

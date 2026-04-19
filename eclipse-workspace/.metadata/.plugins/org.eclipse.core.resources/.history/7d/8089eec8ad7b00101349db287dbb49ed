@@ -1,0 +1,121 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <libelf.h>
+#include <dwarf.h>
+#include <libdwarf.h>
+
+typedef unsigned long addr_t;
+
+/* Ruft die Datei- und Zeilenadresse aus DWARF ab */
+addr_t lookup_address(const char *binary, const char *srcfile, int srcline) {
+    int fd = open(binary, O_RDONLY);
+    if (fd < 0) { perror("open"); exit(1); }
+
+    if (elf_version(EV_CURRENT) == EV_NONE) {
+        fprintf(stderr, "ELF init failed\n"); exit(1);
+    }
+
+    Dwarf_Debug dbg;
+    Dwarf_Error err;
+    if (dwarf_init(fd, DW_DLC_READ, NULL, NULL, &dbg, &err) != DW_DLV_OK) {
+        fprintf(stderr, "DWARF init failed\n"); exit(1);
+    }
+
+    Dwarf_Unsigned cu_header_len, abbrev_off, type_off, next_cu;
+    Dwarf_Half version, addr_size;
+    while (dwarf_next_cu_header(dbg, &cu_header_len, &version,
+                                &abbrev_off, &type_off, &addr_size,
+                                &next_cu, &err) == DW_DLV_OK) {
+        Dwarf_Line *linebuf;
+        Dwarf_Signed linecount;
+        if (dwarf_srclines(dbg, &linebuf, &linecount, &err) != DW_DLV_OK)
+            continue;
+
+        for (int i = 0; i < linecount; ++i) {
+            char *file;
+            Dwarf_Unsigned line, address;
+            dwarf_linesrc(linebuf[i], &file, &err);
+            dwarf_lineno(linebuf[i], &line, &err);
+            if (strcmp(file, srcfile) == 0 && (int)line == srcline) {
+                dwarf_lineaddr(linebuf[i], &address, &err);
+                dwarf_dealloc(dbg, file, DW_DLA_STRING);
+                dwarf_finish(dbg);
+                close(fd);
+                return (addr_t)address;
+            }
+            dwarf_dealloc(dbg, file, DW_DLA_STRING);
+        }
+    }
+
+    fprintf(stderr, "Zeile %s:%d nicht gefunden\n", srcfile, srcline);
+    dwarf_finish(dbg);
+    close(fd);
+    exit(1);
+}
+
+/* Setzt einen Software-Breakpoint via INT3 (0xCC) */
+long set_breakpoint(pid_t pid, addr_t addr) {
+    long orig = ptrace(PTRACE_PEEKTEXT, pid, (void*)addr, NULL);
+    long trap = (orig & ~0xff) | 0xcc;
+    ptrace(PTRACE_POKETEXT, pid, (void*)addr, (void*)trap);
+    return orig;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <programm> <quelle.c>:<zeile>\n", argv[0]);
+        return 1;
+    }
+
+    /* Quelldatei und Zeile extrahieren */
+    char *sep = strrchr(argv[2], ':');
+    if (!sep) { fprintf(stderr, "Ungültiges Format\n"); return 1; }
+    *sep = 0;
+    const char *srcfile = argv[2];
+    int srcline = atoi(sep+1);
+
+    /* Adresse via DWARF auflösen */
+    addr_t bp_addr = lookup_address(argv[1], srcfile, srcline);
+    printf("Breakpoint bei 0x%lx\n", bp_addr);
+
+    pid_t child = fork();
+    if (child == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        execl(argv[1], argv[1], NULL);
+        perror("execl");
+        exit(1);
+    }
+
+    /* Parent wartet auf den ersten Stopp */
+    int status;
+    waitpid(child, &status, 0);
+
+    /* Breakpoint setzen */
+    long orig_data = set_breakpoint(child, bp_addr);
+
+    /* Programm fortsetzen */
+    ptrace(PTRACE_CONT, child, NULL, NULL);
+
+    /* Auf INT3 warten */
+    waitpid(child, &status, 0);
+    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+        printf("Breakpoint erreicht bei 0x%lx\n", bp_addr);
+
+        /* Originalinstruktion wiederherstellen */
+        ptrace(PTRACE_POKETEXT, child, (void*)bp_addr, (void*)orig_data);
+
+        /* Steuerung schrittweise weiter: ein Instruktions-Step */
+        ptrace(PTRACE_SINGLESTEP, child, NULL, NULL);
+        waitpid(child, &status, 0);
+    }
+
+    /* Debugging beendet */
+    ptrace(PTRACE_DETACH, child, NULL, NULL);
+    return 0;
+}

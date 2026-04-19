@@ -1,0 +1,49 @@
+# ============================================================================
+# makefile zur erstellung eines bare-metal-ähnlichen binärs mit dem HOST-GCC
+# HINWEIS: Dies ist ein Hack und funktioniert nur, wenn der Host-GCC
+# die Erstellung von reinen 64-Bit-Binärdateien ohne OS unterstützt.
+# ============================================================================
+
+# nutze den standard-host-gcc
+cc := gcc
+objcopy := objcopy
+
+# quelle und ziel
+source := test_bios.c
+object := test_bios.o
+binary_elf := test_bios.elf
+binary_raw := test_bios.bin
+load_addr := 0x0
+
+# c-flags (an den host-gcc angepasst):
+# -ffreestanding: keine std-c-bibliothek
+# -m64 -mcmodel=large -mno-red-zone: erzeugt 64-bit-code
+# -target x86_64-unknown-none: (optional, funktioniert nicht immer)
+cflags := -std=gnu99 -O2 -g -ffreestanding -m64 -mcmodel=large -mno-red-zone -I.
+
+# linker-flags:
+# -nostdlib: keine c-bibliothek
+# -Wl,--oformat=binary: (optional, kann objcopy ersetzen)
+# -Ttext $(load_addr) & -e start_bios: setzt startadresse und eintrittspunkt
+ldflags := -nostdlib -Ttext $(load_addr) -Wl,-e,start_bios -Wl,--build-id=none
+
+.PHONY: all clean
+
+all: $(binary_raw)
+
+# 1. c-quelldatei zu objektdatei kompilieren
+$(object): $(source)
+	$(cc) $(cflags) -c $< -o $@
+
+# 2. objektdatei zu elf-binärdatei linken (mit host-gcc)
+$(binary_elf): $(object)
+	# WARNUNG: Der Host-Linker (ld) versucht möglicherweise, OS-Header hinzuzufügen.
+	$(cc) $(cflags) $(ldflags) $< -o $@
+
+# 3. elf-datei in rohe binärdatei konvertieren
+# dies entfernt alle elf-header, um das rohe binär-image zu erhalten.
+$(binary_raw): $(binary_elf)
+	$(objcopy) -O binary $< $@
+
+clean:
+	rm -f $(object) $(binary_elf) $(binary_raw)

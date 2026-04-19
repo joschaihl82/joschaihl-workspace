@@ -1,0 +1,64 @@
+/* efi_app.c
+   Minimal UEFI application in C without using the C runtime or EFI libraries.
+   Entry point: efi_main(ImageHandle, SystemTable)
+*/
+
+#include <stdint.h>
+
+/* Basic UEFI types we need */
+typedef uint64_t EFI_STATUS;
+typedef void*    EFI_HANDLE;
+typedef uint16_t CHAR16;
+typedef uint64_t UINTN;
+typedef uint64_t EFI_PHYSICAL_ADDRESS;
+
+/* Minimal subset of the Simple Text Output Protocol we call */
+typedef struct {
+    /* Reset omitted */
+    EFI_STATUS (*OutputString)(void* This, const CHAR16* String);
+    /* Other members omitted */
+} SIMPLE_TEXT_OUTPUT_PROTOCOL;
+
+/* Minimal System Table layout (only fields we use) */
+typedef struct {
+    void* Hdr;
+    CHAR16* FirmwareVendor;
+    uint32_t FirmwareRevision;
+    void* ConsoleInHandle;
+    void* ConIn;
+    void* ConsoleOutHandle;
+    SIMPLE_TEXT_OUTPUT_PROTOCOL* ConOut;
+    void* StandardErrorHandle;
+    /* BootServices pointer and other fields omitted */
+} EFI_SYSTEM_TABLE;
+
+/* EFI return codes */
+#define EFI_SUCCESS 0
+
+/* Exported entry point for EFI applications.
+   Signature: EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable);
+   We keep the symbol name 'efi_main' and instruct the linker to use it as entry.
+*/
+EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE* SystemTable) {
+    (void)ImageHandle;
+
+    /* Compose a UTF-16 (CHAR16) string literal.
+       On Windows/mingw wchar_t is 16-bit; using L"" yields 16-bit characters.
+       We declare as CHAR16 to match UEFI's CHAR16 type.
+    */
+    static const CHAR16 msg[] = L"Hello from minimal EFI app!\r\n";
+
+    /* If ConOut is present, call OutputString */
+    if (SystemTable && SystemTable->ConOut && SystemTable->ConOut->OutputString) {
+        SystemTable->ConOut->OutputString(SystemTable->ConOut, msg);
+    }
+
+    /* Return success; UEFI will continue (or the firmware will handle exit) */
+    return EFI_SUCCESS;
+}
+
+/* Provide a weak alias for the symbol _start in case the toolchain expects it.
+   Not strictly necessary when we pass -Wl,-e,efi_main to the linker, but harmless.
+*/
+__attribute__((weak, alias("efi_main")))
+void _start(void);

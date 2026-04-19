@@ -1,0 +1,1913 @@
+// cc.c - amalgamated c-compiler file (parse.c + codegen.c)
+//
+// *************************************************************************
+// missing required components:
+// this code will not compile as it relies on:
+// 1. the header file: baricc.h (containing struct/enum/typedefs like node, lvar, type, nodekind, tokenkind, etc.)
+// 2. lexer/tokenizer functions (e.g., at_eof(), consume(), expect(), check(), etc.)
+// 3. error functions (e.g., error0(), error1(), error_at0(), error_at1())
+// 4. utility functions (e.g., get_type(), get_type_size(), align_to(), find_variable(), read_define_head(), read_define_suffix(), etc.)
+// *************************************************************************
+
+#include "baricc.h"
+#include <stdio.h>
+
+// =========================================================================
+// global variables
+// =========================================================================
+
+// from parse.c (parser state)
+lvar* locals[100];
+lvar* globals[100];
+int cur_scope_depth = 0;
+stringtoken* strings;
+tag* tags;
+enumvar* enum_vars;
+node* current_switch = 0;
+// how many function/global variables/global typedef this compiler supports.
+// todo replace node*[] -> node**
+node* code[1000];
+
+// from codegen.c (assembly generation state)
+// sets of alias based on byte size.
+// ex.
+// dil  = least 1byte of rdi
+// di   = least 2bytes of rdi
+// edi  = least 4bytes of rdi
+char* argreg1[] = {"dil", "sil", "dl", "cl", "r8b", "r9b"};
+char* argreg2[] = {"di", "si", "dx", "cx", "r8w", "r9w"};
+char* argreg4[] = {"edi", "esi", "edx", "ecx", "r8d", "r9d"};
+char* argreg8[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+
+// when we use jmp with label, we must increment this value.
+int if_sequence = 0;
+int break_sequence = 0;
+int continue_sequence = 0;
+
+// =========================================================================
+// required function prototypes (must be defined in baricc.h or other files)
+// =========================================================================
+
+// these are commented out as they are placeholders for missing code
+
+// void tokenize(char* p);
+// type* get_type(node* node);
+// int get_type_size(type* type);
+// void error0(char* fmt);
+// void error1(char* fmt, char* arg1);
+// void error_at0(char* loc, char* fmt);
+// void error_at1(char* loc, char* fmt, char* arg1);
+// node* primary();
+// node* unary();
+// node* mul();
+// node* add();
+// node* relational();
+// node* equality();
+// node* bitand();
+// node* bitxor();
+// node* bitor();
+// node* logand();
+// node* logor();
+// node* conditional();
+// node* assign();
+// node* expr();
+// node* stmt();
+// node* block();
+// node* define_arg();
+// node* func_def(define* def);
+// type* define_struct();
+// void define_enum_member(int* num);
+// type* define_enum();
+// bool define_typedef();
+// node* define_variable(define* def, lvar** varlist);
+// node* initializer(type* type);
+// void initializer_helper(type* type, node* init, int* i);
+// void gen_val(node* node); // from codegen.c
+// void program();
+// void gen(node* node);
+// node* local_variable_init(node* node);
+// node* variable(token* tok);
+// node* struct_ref(node* node);
+// node* ptr_conversion(node* l, node* r);
+// define* read_define();
+// define* read_define_head();
+// void read_define_suffix(define* def);
+// int align_to(int n, int align);
+// void push_tag(token* tok, type* type, bool is_complete);
+// tag* find_tag(token* tok);
+// tag* find_or_register_tag(token* tok);
+// node* find_enum_var(token* tok);
+// node* convert_predefined_keyword_to_num();
+// member* find_member(type* type, token* tok);
+// lvar* find_variable(token* tok);
+
+
+// =========================================================================
+// functions from parse.c (parser and ast builder)
+// =========================================================================
+
+/**************************
+ * node builder
+ * *************************/
+node* new_node(nodekind kind) {
+    node* node = calloc(1, sizeof(node));
+    node->kind = kind;
+    return node;
+}
+
+node* new_binary(nodekind kind, node* lhs, node* rhs) {
+    node* node = new_node(kind);
+    node->lhs = lhs;
+    node->rhs = rhs;
+    return node;
+}
+
+node* new_unary(nodekind kind, node* lhs) {
+    node* node = new_node(kind);
+    node->lhs = lhs;
+    return node;
+}
+
+// a util function to build num node
+node* new_num(int val) {
+    node* node = new_node(nd_num);
+    node->val = val;
+    return node;
+}
+
+// a util function to build string node
+node* new_string(stringtoken* str) {
+    node* node = new_node(nd_string);
+    node->string = str;
+    return node;
+}
+
+/**************************
+ * parse functions
+ * *************************/
+// program ::= ( func_def
+//             | define_variable ";"
+//             | "struct" define_struct ";"
+//             | "enum" define_enum ";"
+//             | "typedef" define_typedef
+//             )*
+void program() {
+    int i = 0;
+    while (!at_eof()) {
+        token* tk = token;
+        if (consume_kind(tk_typedef)) {
+            define_typedef();
+            expect(";");
+            continue;
+        }
+
+        if (check_kind(tk_enum)) {
+            define_enum();
+            expect(";");
+            continue;
+        }
+
+        // top level statements which start with type + ident, like "int* hoge"
+        define* def = read_define_head();
+
+        if (def == null) {
+            print_token(token);
+            error0("def is null");
+        }
+        if (consume("(")) {
+            node* func_node = func_def(def);
+            if (func_node) {
+                code[i] = func_node;
+            } else {
+                continue;
+            }
+        } else if (def->type->ty == struct) {
+            if (check("[")) {
+                // hoge hoge[] pattern.
+                node* gvar = define_variable(def, globals);
+
+                gvar->kind = nd_gvar_def;
+                code[i] = gvar;
+                expect(";");
+            } else {
+                // struct hoge {int a;};
+                define_struct();
+                expect(";");
+                continue;
+            }
+        } else {
+            node* gvar = define_variable(def, globals);
+
+            gvar->kind = nd_gvar_def;
+            code[i] = gvar;
+            expect(";");
+        }
+        i++;
+    }
+    code[i] = null;
+}
+
+// define_typedef ::= "typedef" type_decl alias
+bool define_typedef() {
+    define* def = read_define_head();
+    read_define_head(def);
+
+    push_tag(def->ident, def->type, false);
+    return true;
+}
+
+// define_enum ::= "enum" ident "{" (define_enum_member (","
+type* define_enum() {
+    if (!consume_kind(tk_enum)) {
+        return null;
+    }
+
+    token* name = consume_kind(tk_ident);
+
+    if (name && !check("{")) {
+        tag* tag = find_or_register_tag(name);
+        if (tag->type->incomplete) {
+            error0("type not found.");
+        }
+        return tag->type;
+    }
+
+    expect("{");
+    int num = 0;
+    while (true) {
+        if (consume("}")) break;
+
+        define_enum_member(&num);
+
+        if (consume("}")) break;
+        expect(",");
+    }
+
+    if (name) {
+        push_tag(name, int_type(), true);
+    }
+
+    return int_type();
+}
+
+/*
+define_enum_member ::= ident ("=" number)
+*/
+void define_enum_member(int* num) {
+    token* tok = expect_kind(tk_ident);
+
+    if (consume("=")) {
+        *num = expect_number();
+    } else {
+        *num += 1;
+    }
+
+    enumvar* e = calloc(1, sizeof(enumvar));
+    e->name = calloc(100, sizeof(char));
+    memcpy(e->name, tok->str, tok->len);
+    e->value = *num;
+    e->next = enum_vars;
+    enum_vars = e;
+    return;
+}
+
+type* int_type() {
+    type* t = calloc(1, sizeof(type));
+    t->ty = int;
+    t->size = 4;
+    return t;
+}
+type* char_type() {
+    type* t = calloc(1, sizeof(type));
+    t->ty = char;
+    t->size = 1;
+    return t;
+}
+type* ptr_type() {
+    type* t = calloc(1, sizeof(type));
+    t->ty = ptr;
+    t->size = 8;
+    return t;
+}
+
+/*
+define_struct ::= "struct" ident? define_struct_body
+                  | "struct" ident
+define_struct_body ::= "{" (define_variable ";")* "}"
+*/
+type* define_struct() {
+    if (!consume_kind(tk_struct)) {
+        return null;
+    }
+
+    token* name = consume_kind(tk_ident);
+
+    if (name && !check("{")) {
+        tag* tag = find_or_register_tag(name);
+        tag->type->ty = struct;
+        return tag->type;
+    }
+
+    expect("{");
+
+    type* struct_type = calloc(1, sizeof(type));
+    struct_type->ty = struct;
+
+    member head;
+    member* cur = &head;
+
+    int offset = 0;
+    int maxsize = 0;
+    while (!consume("}")) {
+        define* def = read_define();
+        expect(";");
+        member* m = calloc(1, sizeof(member));
+        m->name = calloc(100, sizeof(char));
+        memcpy(m->name, def->ident->str, def->ident->len);
+        m->ty = def->type;
+        int size = get_type_size(def->type);
+
+        offset = align_to(offset, size);
+        m->offset = offset;
+        offset += size;
+        cur->next = m;
+        cur = m;
+
+        if (maxsize <= 8 && maxsize <= size) {
+            maxsize = size;
+        }
+    }
+
+    struct_type->members = head.next;
+    struct_type->size = align_to(offset, maxsize);
+
+    if (name) {
+        push_tag(name, struct_type, true);
+    }
+
+    return struct_type;
+}
+
+/*
+func_def ::= read_define "(" (define_arg ("," define_ar)*)? ")" block
+*/
+node* func_def(define* def) {
+    cur_scope_depth++;
+
+    node* node = new_node(nd_func_def);
+
+    node->funcname = calloc(100, sizeof(char));
+    memcpy(node->funcname, def->ident->str, def->ident->len);
+    node->args = calloc(10, sizeof(node*));
+
+    for (int i = 0; !consume(")"); i++) {
+        if (i != 0) expect(",");
+        node->args[i] = define_arg();
+    }
+
+    if (consume(";")) {
+        locals[cur_scope_depth] = null;
+        cur_scope_depth--;
+        return null;
+    }
+
+    node->lhs = block();
+
+    return node;
+}
+
+// define_arg ::= type "*"* ident
+node* define_arg() {
+    define* arg_def = read_define_head();
+    if (arg_def == null) {
+        char* name[100] = {0};
+        memcpy(name, token->str, token->len);
+        error1("invalid token comes here. %d", name);
+    }
+
+    return define_variable(arg_def, locals);
+}
+
+// stmt = expr ";"
+//        | "return" expr ";"
+//        | "if" "(" expr ")" stmt ("else" stmt)?
+//        | "while" "(" expr ")" stmt
+//        | "for" "(" expr? ";" expr? ";" expr? ")" stmt
+//        | define_variable ";"
+//        | block
+//        | "break" ";"
+//        | "continue" ";"
+//        | ("--" | "++") ident
+//        | ident ("--" | "++")
+node* stmt() {
+    node* node;
+
+    if (consume_kind(tk_return)) {
+        node = new_node(nd_return);
+        if (!consume(";")) {
+            node->lhs = expr();
+            expect(";");
+        }
+        return node;
+    }
+
+    if (consume_kind(tk_if)) {
+        node = new_node(nd_if);
+        expect("(");
+        node->lhs = expr();
+        expect(")");
+        node->rhs = stmt();
+        if (consume_kind(tk_else)) {
+            node* els = new_node(nd_else);
+            els->lhs = node->rhs;
+            els->rhs = stmt();
+            node->rhs = els;
+        }
+        return node;
+    }
+
+    if (consume_kind(tk_while)) {
+        node* node = new_node(nd_while);
+        expect("(");
+        node->lhs = expr();
+        expect(")");
+        node->rhs = stmt();
+        return node;
+    }
+
+    if (consume_kind(tk_switch)) {
+        node* node = new_node(nd_switch);
+        expect("(");
+        node->lhs = expr();
+        expect(")");
+
+        node* sw = current_switch;
+        current_switch = node;
+
+        node->rhs = stmt();
+
+        current_switch = sw;
+        return node;
+    }
+
+    if (consume_kind(tk_case)) {
+        if (!current_switch) {
+            error0("stray case");
+        }
+        token* t = token;
+        token* ident = consume_kind(tk_ident);
+        node* num_node = null;
+        if (ident) {
+            num_node = find_enum_var(ident);
+        }
+        if (num_node == null) {
+            num_node = convert_predefined_keyword_to_num();
+        }
+
+        int val;
+
+        if (num_node) {
+            val = num_node->val;
+        } else {
+            val = expect_number();
+        }
+
+        expect(":");
+
+        node* node = new_node(nd_case);
+        node->val = val;
+        node->next_case = current_switch->next_case;
+        current_switch->next_case = node;
+        return node;
+    }
+
+    if (consume_kind(tk_default)) {
+        if (!current_switch) {
+            error0("stray case");
+        }
+        node* default_node = new_node(nd_case);
+        expect(":");
+        current_switch->default_case = default_node;
+        return default_node;
+    }
+
+    if (consume_kind(tk_for)) {
+        node* node = new_node(nd_for);
+        node* left = new_node(nd_for_left);
+        node* right = new_node(nd_for_right);
+        node->lhs = left;
+        node->rhs = right;
+
+        expect("(");
+        if (!consume(";")) {
+            left->lhs = stmt();
+        }
+
+        if (!consume(";")) {
+            left->rhs = expr();
+            expect(";");
+        }
+
+        if (!consume(")")) {
+            right->lhs = expr();
+            expect(")");
+        }
+
+        right->rhs = stmt();
+        return node;
+    }
+
+    if (consume_kind(tk_break)) {
+        node* node = new_node(nd_break);
+        expect(";");
+        return node;
+    }
+
+    if (consume_kind(tk_continue)) {
+        node* node = new_node(nd_continue);
+        expect(";");
+        return node;
+    }
+
+    if (check("{")) {
+        return block();
+    }
+
+    define* def = read_define_head();
+    if (def != null) {
+        node* node = define_variable(def, locals);
+        node = local_variable_init(node);
+        expect(";");
+        return node;
+    }
+
+    node = expr();
+    expect(";");
+    return node;
+}
+
+// block = "{" stmt* "}"
+node* block() {
+    node* node = null;
+    if (consume("{")) {
+        node = new_node(nd_block);
+        int max_block_size = 1000;
+        node->block = calloc(max_block_size, sizeof(node));
+        for (int i = 0; !consume("}"); i++) {
+            if (i >= max_block_size) {
+                error0(
+                    "size of statements in one block is over the limitation.");
+            }
+            node->block[i] = stmt();
+        }
+    }
+    return node;
+}
+
+// expr ::= assign
+node* expr() { return assign(); }
+
+// assign ::= equality ("=" equality)?
+node* assign() {
+    node* node = conditional();
+
+    if (consume("=")) {
+        node = new_binary(nd_assign, node, conditional());
+        return node;
+    }
+
+    if (consume("+=")) {
+        node* add =
+            new_binary(nd_add, node, ptr_conversion(node, conditional()));
+        node = new_binary(nd_assign, node, add);
+        return node;
+    }
+
+    if (consume("-=")) {
+        node* sub =
+            new_binary(nd_sub, node, ptr_conversion(node, conditional()));
+        node = new_binary(nd_assign, node, sub);
+        return node;
+    }
+    if (consume("*=")) {
+        node* mul = new_node(nd_mul);
+        node* right = conditional();
+        mul->lhs = node;
+        mul->rhs = right;
+        node = new_binary(nd_assign, node, mul);
+        return node;
+    }
+    if (consume("/=")) {
+        node* div = new_node(nd_div);
+        node* right = conditional();
+        div->lhs = node;
+        div->rhs = right;
+        node = new_binary(nd_assign, node, div);
+        return node;
+    }
+
+    return node;
+}
+
+// conditional ::= logor ("?" logor ":" logor)?
+node* conditional() {
+    node* node = logor();
+    if (consume("?")) {
+        node* cond = node;
+        node* then = logor();
+        expect(":");
+        node* alt = logor();
+
+        node* els = new_node(nd_else);
+        els->lhs = then;
+        els->rhs = alt;
+        node* ternary = new_node(nd_ternary);
+        ternary->lhs = cond;
+        ternary->rhs = els;
+
+        node = ternary;
+    }
+
+    return node;
+}
+
+node* logor() {
+    node* node = logand();
+    while (consume("||")) {
+        node = new_binary(nd_logor, node, logor());
+    }
+    return node;
+}
+node* logand() {
+    node* node = bitor ();
+    while (consume("&&")) {
+        node = new_binary(nd_logand, node, logand());
+    }
+    return node;
+}
+
+node* bitor () {
+    node* node = bitxor();
+    while (consume("|")) {
+        node = new_binary(nd_bitor, node, bitor ());
+    }
+    return node;
+}
+
+node* bitxor() {
+    node* node = bitand();
+    while (consume("^")) {
+        node = new_binary(nd_bitxor, node, bitxor());
+    }
+    return node;
+}
+
+node*bitand() {
+    node* node = equality();
+    while (consume("&")) {
+        node = new_binary(nd_bitand, node, bitand());
+    }
+    return node;
+}
+
+// equality ::= relational ("==" relational | "!=" relational)*
+node* equality() {
+    node* node = relational();
+
+    for (;;) {
+        if (consume("==")) {
+            node = new_binary(nd_eq, node, relational());
+        } else if (consume("!=")) {
+            node = new_binary(nd_ne, node, relational());
+        } else {
+            return node;
+        }
+    }
+}
+
+// relational = add ("<" add | ">" add | "<=" add | ">=" add)?
+node* relational() {
+    node* node = add();
+
+    for (;;) {
+        if (consume("<")) {
+            node = new_binary(nd_lt, node, add());
+        } else if (consume("<=")) {
+            node = new_binary(nd_le, node, add());
+        } else if (consume(">")) {
+            node = new_binary(nd_lt, add(), node);
+        } else if (consume(">=")) {
+            node = new_binary(nd_le, add(), node);
+        } else {
+            return node;
+        }
+    }
+}
+
+// add = mul("+" mul | "-" mul)*
+node* add() {
+    node* node = mul();
+
+    for (;;) {
+        if (consume("+")) {
+            node = new_binary(nd_add, node, ptr_conversion(node, mul()));
+        } else if (consume("-")) {
+            node = new_binary(nd_sub, node, ptr_conversion(node, mul()));
+        } else {
+            return node;
+        }
+    }
+}
+
+// mul = unary("*" unary| "/" unary)*
+node* mul() {
+    node* node = unary();
+    for (;;) {
+        if (consume("*")) {
+            node = new_binary(nd_mul, node, unary());
+        } else if (consume("/")) {
+            node = new_binary(nd_div, node, unary());
+        } else {
+            return node;
+        }
+    }
+}
+
+// unary = ("sizeof" | "+" | "-" | "*" | "&" | "++" | "--")? unary | primary
+node* unary() {
+    // ++a
+    if (consume("++")) {
+        return new_binary(nd_pre_inc, unary(), null);
+    }
+    // --a
+    if (consume("--")) {
+        return new_binary(nd_pre_dec, unary(), null);
+    }
+
+    if (consume("+")) {
+        return unary();
+    }
+
+    if (consume("-")) {
+        return new_binary(nd_sub, new_num(0), unary());
+    }
+
+    if (consume("*")) {
+        return new_binary(nd_deref, unary(), null);
+    }
+
+    if (consume("&")) {
+        return new_binary(nd_addr, unary(), null);
+    }
+
+    if (consume("!")) {
+        return new_binary(nd_not, unary(), null);
+    }
+
+    if (consume("~")) {
+        return new_binary(nd_bitnot, unary(), null);
+    }
+
+    if (consume_kind(tk_sizeof)) {
+        // when pure type is passed
+        if ((check("(") && token->next->kind == tk_type) || check_kind(tk_type)) {
+            bool has_brace = false;
+            if (consume("(")) {
+                has_brace = true;
+            }
+            char* name = calloc(100, sizeof(char));
+            memcpy(name, token->str, token->len);
+            consume_kind(tk_type);
+            node* size_of_type;
+            if (strcmp(name, "int") == 0) {
+                size_of_type = new_num(get_type_size(int_type()));
+            } else if (strcmp(name, "char") == 0) {
+                size_of_type = new_num(get_type_size(char_type()));
+            } else {
+                error1("invalid type name is passed here. %s", name);
+            }
+            if (has_brace) consume(")");
+            return size_of_type;
+        }
+        // when struct / enum definition is passed
+        if ((check("(") && (token->next->kind == tk_enum || token->next->kind == tk_struct)) || (check_kind(tk_enum) || check_kind(tk_struct))) {
+            bool has_brace = false;
+            if (consume("(")) {
+                has_brace = true;
+            }
+            define* def = read_define_head();
+            node* size_of_type = new_num(get_type_size(def->type));
+            if (has_brace) consume(")");
+            return size_of_type;
+        }
+        // when variable is passed
+        // sizeof(a)
+        node* expr_node = unary();
+        return new_num(get_type_size(get_type(expr_node)));
+    }
+
+    return primary();
+}
+
+// primary = "(" expr ")" | ident func_call | ident array_ref | num | string | enum
+node* primary() {
+    // next token must be `( expr )`
+    if (consume("(")) {
+        node* node = expr();
+        expect(")");
+        return node;
+    }
+
+    token* tok;
+    // when ident is consumed
+    if (tok = consume_kind(tk_ident)) {
+        // func call
+        if (consume("(")) {
+            // function call arguments
+            node* node = new_node(nd_func_call);
+            node->funcname = calloc(100, sizeof(char));
+            memcpy(node->funcname, tok->str, tok->len);
+
+            node->block = calloc(10, sizeof(node));
+            for (int i = 0; !consume(")"); i++) {
+                if (i != 0) {
+                    expect(",");
+                }
+                node->block[i] = expr();
+            }
+            return node;
+        }
+
+        // whne enum
+        node* num = find_enum_var(tok);
+        if (num) {
+            return num;
+        }
+
+        // calling variable
+        return variable(tok);
+    }
+
+    // predefined keywords
+    node* num_node = convert_predefined_keyword_to_num();
+    if (num_node) {
+        return num_node;
+    }
+
+    // string
+    if (tok = consume_kind(tk_string)) {
+        stringtoken* s = calloc(1, sizeof(stringtoken));
+        s->value = calloc(100, sizeof(char));
+        memcpy(s->value, tok->str, tok->len);
+        if (strings) {
+            s->index = strings->index + 1;
+        } else {
+            s->index = 0;
+        }
+        s->next = strings;
+        node* node = new_string(s);
+        strings = s;
+        return node;
+    }
+
+    // otherwise number
+    return new_num(expect_number());
+}
+
+// a[1] ==> *(a+1)
+// variable = ident ("[" num "]")?
+node* variable(token* tok) {
+    node* node = new_node(nd_lvar);
+    lvar* lvar = find_variable(tok);
+    if (lvar == null) {
+        char* name[100] = {0};
+        memcpy(name, tok->str, tok->len);
+        printf("; [debug] %s name\n", name);
+        error1("variable %s is not defined yet", name);
+    }
+    node->offset = lvar->offset;
+    node->type = lvar->type;
+    node->var = lvar;
+    node->varname = lvar->name;
+    node->varsize = lvar->size;
+
+    // array access a[b]
+    if (consume("[")) {
+        node* index = expr();
+        expect("]");
+
+        node* add = new_binary(nd_add, node, index);
+        node = new_binary(nd_deref, add, null);
+    }
+
+    // struct member access. we can use dot access multiple times.
+    char* varname = node->varname;
+    type* tp = node->type;
+    while (true) {
+        // access to member
+        if (consume(".")) {
+            node = struct_ref(node);
+            tp = node->type;
+            node->varname = varname;
+            continue;
+        }
+
+        // access to member (base is ptr)
+        if (consume("->")) {
+            type* t = node->type->ptr_to;
+            node* deref = new_node(nd_deref);
+            deref->lhs = node;
+            deref->type = t;
+            node = struct_ref(deref);
+            tp = node->type;
+            node->varname = varname;
+            continue;
+        }
+
+        // a++
+        if (consume("++")) {
+            node = new_binary(nd_suf_inc, node, null);
+            node->varname = varname;
+            continue;
+        }
+
+        // a--
+        if (consume("--")) {
+            node = new_binary(nd_suf_dec, node, null);
+            node->varname = varname;
+            continue;
+        }
+        break;
+    }
+
+    return node;
+}
+
+/* define_variable read variable decl and register it as ndlvar to varlist(globals or locals)
+define_variable ::= read_define ("=" initializer)
+*/
+node* define_variable(define* def, lvar** varlist) {
+    if (def == null) {
+        error0("invalid definition of function or variable");
+    }
+    int scope_depth = varlist == locals ? cur_scope_depth : 0;
+    lvar* varlist_to_use = varlist[scope_depth];
+    read_define_suffix(def);
+    type* type = def->type;
+    token* tok = def->ident;
+    node* init = null;
+    if (consume("=")) {
+        init = initializer(type);
+    }
+    int size = get_type_size(type);
+    node* node = new_node(nd_lvar);
+    // register local variable
+    lvar* lvar = calloc(1, sizeof(lvar));
+    lvar->next = varlist_to_use;
+    lvar->name = calloc(100, sizeof(char));
+    memcpy(lvar->name, tok->str, tok->len);
+    lvar->len = tok->len;
+    lvar->type = type;
+    lvar->size = size;
+    lvar->init = init;
+    lvar->kind = varlist == locals ? local : global;
+
+    if (varlist_to_use == null) {
+        lvar->offset = size;
+    } else {
+        lvar->offset = align_to(varlist_to_use->offset, size) + size;
+    }
+    varlist[scope_depth] = lvar;
+
+    // for returning
+    node->offset = lvar->offset;
+    node->type = type;
+    node->var = lvar;
+    node->varname = lvar->name;
+    node->varsize = lvar->size;
+    return node;
+}
+
+/*
+initializer ::= "{" initializer_list "}"
+                | expr
+initializer_list ::= initializer ("," initializer)*
+*/
+node* initializer(type* type) {
+    node* init = new_node(nd_initializer);
+    init->type = type;
+    int i = 0;
+    if (check("{")) {
+        int debug;
+        initializer_helper(type, init, &i);
+    } else {
+        init = expr();
+        if (init->kind == nd_string) {
+            int len = strlen(init->string->value) + 1;
+            if (type->array_size < len) {
+                type->array_size = len;
+            }
+        }
+    }
+    return init;
+}
+
+void initializer_helper(type* type, node* init, int* i) {
+    if (consume("{")) {
+        if (type->ty == array) {
+            for (; !consume("}");) {
+                if (check("{")) {
+                    initializer_helper(type->ptr_to, init, i);
+                } else {
+                    init->block[*i] = expr();
+                    init->block[*i]->type = type->ptr_to;
+                    *i += 1;
+                }
+                consume(",");
+            }
+            if (type->array_size < *i) {
+                type->array_size = *i;
+            }
+            for (; *i < type->array_size;) {
+                init->block[*i] = new_num(0);
+                *i += 1;
+            }
+        } else if (type->ty == struct) {
+            member* m = type->members;
+            int total = 0;
+            for (; !consume("}");) {
+                if (check("{")) {
+                    initializer_helper(m->ty, init, i);
+                } else {
+                    int aligned_total = align_to(total, get_type_size(m->ty));
+                    if (aligned_total != total) {
+                        init->block[*i] = new_node(nd_padding);
+                        init->block[*i]->size = (aligned_total - total);
+                        *i += 1;
+                    }
+
+                    init->block[*i] = expr();
+                    init->block[*i]->type = m->ty;
+                    *i += 1;
+                    total = aligned_total + get_type_size(m->ty);
+                    m = m->next;
+                }
+                consume(",");
+            }
+        } else {
+            init->block[*i] = expr();
+            init->block[*i]->type = type;
+            *i += 1;
+            consume("}");
+        }
+    }
+}
+
+// convert nd_lvar with initializer to nd_block of nd_assign
+node* local_variable_init(node* node) {
+    if (node->var->init == null) {
+        return node;
+    }
+    if (node->type->ty == array && node->var->init->block) {
+        node* block = new_node(nd_block);
+        block->block = calloc(node->var->type->array_size, sizeof(node));
+        for (int i = 0; node->var->init->block[i]; i++) {
+            node* add = new_node(nd_add);
+            add->lhs = node;
+            if (node->type && node->type->ptr_to) {
+                int size = get_type_size(node->type->ptr_to);
+                add->rhs = new_num(i * size);
+            }
+            node* deref = new_node(nd_deref);
+            deref->lhs = add;
+            node* assign = new_node(nd_assign);
+            assign->lhs = deref;
+            assign->rhs = node->var->init->block[i];
+            block->block[i] = assign;
+        }
+        return block;
+    }
+
+    if (node->type->ty == struct && node->var->init->block) {
+        node* block = new_node(nd_block);
+        block->block = calloc(node->var->type->array_size, sizeof(node));
+        member* m = node->var->type->members;
+        for (int i = 0; node->var->init->block[i]; i++) {
+            if (node->var->init->block[i]->kind == nd_padding) {
+                continue;
+            }
+
+            node* add = new_node(nd_add);
+            add->lhs = node;
+            add->rhs = new_num(m->offset);
+            node* deref = new_node(nd_deref);
+            deref->lhs = add;
+            node* assign = new_node(nd_assign);
+            assign->lhs = deref;
+            assign->rhs = node->var->init->block[i];
+            block->block[i] = assign;
+            m = m->next;
+        }
+        return block;
+    }
+
+    node* assign = new_node(nd_assign);
+    assign->lhs = new_unary(nd_addr, node);
+    assign->rhs = node->var->init;
+    return assign;
+}
+
+// find and return member struct
+member* find_member(type* type, token* tok) {
+    char* member_name[100] = {0};
+    memcpy(member_name, tok->str, tok->len);
+
+    for (member* m = type->members; m; m = m->next) {
+        if (strcmp(member_name, m->name) == 0) {
+            return m;
+        }
+    }
+    error0("member ident is not found");
+}
+
+// find and return lvar from locals and globals
+lvar* find_variable(token* tok) {
+    for (lvar* var = locals[cur_scope_depth]; var; var = var->next) {
+        if (var->len == tok->len && !memcmp(tok->str, var->name, var->len)) {
+            var->kind = local;
+            return var;
+        }
+    }
+    for (lvar* var = globals[0]; var; var = var->next) {
+        if (var->len == tok->len && !memcmp(tok->str, var->name, var->len)) {
+            var->kind = global;
+            return var;
+        }
+    }
+    return null;
+}
+
+// convert node(nd_lvar) to node(nd_member) with struct's member's offset
+node* struct_ref(node* node) {
+    token* member_name = expect_kind(tk_ident);
+
+    member* m = find_member(node->type, member_name);
+
+    node* add = new_binary(nd_add, node, new_num(m->offset));
+    node* member_node = new_unary(nd_deref, add);
+    member_node->type = m->ty;
+    return member_node;
+}
+
+// check if conversion is needed for pointer arithmetic.
+node* ptr_conversion(node* l, node* r) {
+    if (get_type(l) != null && (get_type(l)->ty == ptr || get_type(l)->ty == array)) {
+        if (get_type(r) == null || (get_type(r)->ty != ptr && get_type(r)->ty != array)) {
+            int size = get_type_size(get_type(l)->ptr_to);
+            r = new_binary(nd_mul, r, new_num(size));
+        }
+    }
+
+    return r;
+}
+
+// read_type_and_ident ::= type_info_prefix ident type_info_suffix
+define* read_define() {
+    define* def = read_define_head();
+    read_define_suffix(def);
+    return def;
+}
+
+/* read_define_head ::= type "*"* ident
+*/
+define* read_define_head() {
+    type* type = null;
+    token* t = token;
+    token* ident = consume_kind(tk_ident);
+    if (ident) {
+        tag* tag = find_tag(ident);
+        if (tag) {
+            type = tag->type;
+        } else {
+            token = t;
+        }
+    }
+    if (type == null) {
+        type = define_struct();
+    }
+    bool is_enum = false;
+    if (type == null) {
+        type = define_enum();
+        if (type) {
+            is_enum = true;
+        }
+    }
+    if (type == null) {
+        token* typetoken = consume_kind(tk_type);
+        if (typetoken == null) {
+            return null;
+        }
+
+        char* name = calloc(100, sizeof(char));
+        memcpy(name, typetoken->str, typetoken->len);
+
+        if (strcmp(name, "int") == 0) {
+            type = int_type();
+        } else if (strcmp(name, "char") == 0) {
+            type = char_type();
+        } else if (strcmp(name, "void") == 0) {
+            // todo: void type
+        } else if (strcmp(name, "bool") == 0) {
+            // todo: bool type
+        } else {
+            error0("unexpected token comes here.");
+        }
+    }
+
+    while (consume("*")) {
+        type* t;
+        t = calloc(1, sizeof(type));
+        t->ty = ptr;
+        t->size = 8;
+        t->ptr_to = type;
+        type = t;
+    }
+
+    token* tok = consume_kind(tk_ident);
+
+    define* def = calloc(1, sizeof(define));
+    def->ident = tok;
+    def->type = type;
+    def->is_enum = is_enum;
+    return def;
+}
+
+/* type_info_suffix ::= ("[" number? "]")*
+*/
+void read_define_suffix(define* def) {
+    type* type = def->type;
+    while (consume("[")) {
+        type* t;
+        t = calloc(1, sizeof(type));
+        t->ty = array;
+        t->ptr_to = type;
+        t->array_size = 0;
+        token* num = null;
+        if (num = consume_kind(tk_num)) {
+            t->array_size = num->val;
+        }
+        type = t;
+        expect("]");
+    }
+    def->type = type;
+}
+
+int align_to(int n, int align) {
+    return (n + align - 1) & ~(align - 1);
+}
+
+void push_tag(token* tok, type* type, bool is_complete) {
+    char* name = calloc(100, sizeof(char));
+    memcpy(name, tok->str, tok->len);
+    tag* tag = find_or_register_tag(tok);
+    tag->name = name;
+    tag->type->size = type->size;
+    tag->type->ty = type->ty;
+    tag->type->members = type->members;
+    tag->type->incomplete = !is_complete;
+}
+
+tag* find_tag(token* tok) {
+    char* name = calloc(100, sizeof(char));
+    memcpy(name, tok->str, tok->len);
+
+    for (tag* t = tags; t; t = t->next) {
+        if (strcmp(t->name, name) == 0) {
+            return t;
+        }
+    }
+
+    return null;
+}
+
+tag* find_or_register_tag(token* tok) {
+    tag* tag = find_tag(tok);
+    if (tag) {
+        return tag;
+    }
+
+    char* name = calloc(100, sizeof(char));
+    memcpy(name, tok->str, tok->len);
+
+    tag = calloc(1, sizeof(tag));
+    tag->name = name;
+    tag->type = int_type();
+    tag->type->incomplete = true;
+    tag->next = tags;
+    tags = tag;
+    return tag;
+}
+
+node* find_enum_var(token* tok) {
+    char* name = calloc(100, sizeof(char));
+    memcpy(name, tok->str, tok->len);
+
+    for (enumvar* e = enum_vars; e; e = e->next) {
+        if (strcmp(e->name, name) == 0) {
+            return new_num(e->value);
+        }
+    }
+
+    return null;
+}
+
+node* convert_predefined_keyword_to_num() {
+    if (consume_kind(tk_true)) {
+        return new_num(1);
+    }
+    if (consume_kind(tk_false)) {
+        return new_num(0);
+    }
+    if (consume_kind(tk_null)) {
+        return new_num(0);
+    }
+    if (consume_kind(tk_seekend)) {
+        return new_num(2);
+    }
+    if (consume_kind(tk_seekcur)) {
+        return new_num(1);
+    }
+    if (consume_kind(tk_seekset)) {
+        return new_num(0);
+    }
+    if (consume_kind(tk_eof)) {
+        return new_num(-1);
+    }
+    return null;
+}
+
+// =========================================================================
+// functions from codegen.c (code generator)
+// =========================================================================
+
+void gen(node* node) {
+    if (node == null) {
+        error0("node must not be null");
+    }
+    int id = if_sequence;
+    int original_brk = 0;
+    int original_cnt = 0;
+    int num_args = 0;
+    type* type;
+    node* n;
+
+    switch (node->kind) {
+        case nd_logand:
+            if_sequence++;
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lfalse%d\n", id);
+            gen(node->rhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lfalse%d\n", id);
+            printf("  push 1\n");
+            printf("  jmp .lend%d\n", id);
+            printf(".lfalse%d:\n", id);
+            printf("  push 0\n");
+            printf(".lend%d:\n", id);
+            return;
+        case nd_logor:
+            if_sequence++;
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  jne .ltrue%d\n", id);
+            gen(node->rhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  jne .ltrue%d\n", id);
+            printf("  push 0\n");
+            printf("  jmp .lend%d\n", id);
+            printf(".ltrue%d:\n", id);
+            printf("  push 1\n");
+            printf(".lend%d:\n", id);
+            return;
+        case nd_bitnot:
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  not rax\n");
+            printf("  push rax\n");
+            return;
+        case nd_not:
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  sete al\n");
+            printf("  movzb rax, al\n");
+            printf("  push rax\n");
+            return;
+        case nd_pre_inc:
+            n = new_node(nd_assign);
+            n->lhs = node->lhs;
+            n->rhs = new_binary(nd_add, node->lhs, new_num(1));
+            gen(n);
+            return;
+        case nd_suf_inc:
+            gen(new_binary(nd_pre_inc, node->lhs, null));
+            printf("  push 1\n");
+            printf("  pop rdi\n");
+            printf("  pop rax\n");
+            printf("  sub rax, rdi\n");
+            printf("  push rax\n");
+            return;
+        case nd_pre_dec:
+            n = new_node(nd_assign);
+            n->lhs = node->lhs;
+            n->rhs = new_binary(nd_sub, node->lhs, new_num(1));
+            gen(n);
+            return;
+        case nd_suf_dec:
+            gen(new_binary(nd_pre_dec, node->lhs, null));
+            printf("  push 1\n");
+            printf("  pop rdi\n");
+            printf("  pop rax\n");
+            printf("  add rax, rdi\n");
+            printf("  push rax\n");
+            return;
+        case nd_string:
+            printf("  push offset .lc%d\n", node->string->index);
+            return;
+        case nd_num:
+            printf("  push %d\n", node->val);
+            return;
+        case nd_gvar_def:
+            printf("%s:\n", node->varname);
+
+            if (node->var->init == null) {
+                printf("  .zero %d\n", node->varsize);
+                return;
+            }
+
+            if (node->type->ty == array && node->var->init->block) {
+                for (int i = 0; node->var->init->block[i]; i++) {
+                    if (node->var->init->block[i]->kind == nd_padding) {
+                        printf("  .zero 0x%x\n",
+                               node->var->init->block[i]->size);
+                        continue;
+                    }
+                    switch (node->var->init->block[i]->type->ty) {
+                        case int:
+                            printf("  .long 0x%x\n",
+                                   node->var->init->block[i]->val);
+                            break;
+                        case char:
+                            printf("  .byte 0x%x\n",
+                                   node->var->init->block[i]->val);
+                            break;
+                        case ptr:
+                            printf("  .quad .lc%d\n",
+                                   node->var->init->block[i]->string->index);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                return;
+            }
+
+            if (node->var->init->kind == nd_string) {
+                if (node->type->ty == array) {
+                    printf("  .string \"%s\"\n",
+                           node->var->init->string->value);
+                } else {
+                    printf("  .quad .lc%d\n", node->var->init->string->index);
+                }
+                return;
+            }
+
+            printf("  .long 0x%x\n", node->var->init->val);
+            return;
+        case nd_member:
+        case nd_gvar:
+        case nd_lvar:
+            gen_val(node);
+
+            type = get_type(node);
+            if (type && type->ty == array) {
+                return;
+            }
+
+            printf("  pop rax\n");
+
+            if (type) {
+                switch (type->ty) {
+                    case char:
+                        printf("  movsx rax, byte ptr [rax]\n");
+                        break;
+                    case int:
+                        printf("  movsxd rax, dword ptr [rax]\n");
+                        break;
+                    default:
+                        printf("  mov rax, [rax]\n");
+                        break;
+                }
+            } else {
+                printf("  mov rax, [rax]\n");
+            }
+
+            printf("  push rax\n");
+            return;
+        case nd_assign:
+            type = get_type(node->lhs);
+            gen_val(node->lhs);
+            gen(node->rhs);
+            printf("  pop rdi\n");
+            printf("  pop rax\n");
+
+            if (type && type->ty == char) {
+                printf("  mov [rax], dil\n");
+            } else if (type && type->ty == int) {
+                printf("  mov [rax], edi\n");
+            } else {
+                printf("  mov [rax], rdi\n");
+            }
+
+            printf("  push rdi\n");
+            return;
+        case nd_return:
+            if (node->lhs) {
+                gen(node->lhs);
+            } else {
+                gen(new_num(0));
+            }
+            printf("  pop rax\n");
+            printf("  mov rsp, rbp\n");
+            printf("  pop rbp\n");
+            printf("  ret\n");
+            return;
+        case nd_break:
+            if (break_sequence == 0) {
+                error0("currently not in for, while");
+            }
+            printf("  jmp .lend%d\n", break_sequence);
+            return;
+        case nd_continue:
+            if (continue_sequence == 0) {
+                error0("currently not in for, while");
+            }
+            printf("  jmp .lcontinue%d\n", continue_sequence);
+            return;
+        case nd_if:
+            if_sequence++;
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lelse%d\n", id);
+
+            if (node->rhs->kind == nd_else) {
+                node* els = node->rhs;
+                gen(els->lhs);
+                printf("  jmp .lend%d\n", id);
+                printf(".lelse%d:\n", id);
+                gen(els->rhs);
+                printf("  jmp .lend%d\n", id);
+            } else {
+                gen(node->rhs);
+                printf("  jmp .lend%d\n", id);
+                printf(".lelse%d:\n", id);
+            }
+
+            printf(".lend%d:\n", id);
+            return;
+        case nd_while:
+            if_sequence++;
+            original_brk = break_sequence;
+            original_cnt = continue_sequence;
+            break_sequence = id;
+            continue_sequence = id;
+
+            printf(".lbegin%d:\n", id);
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lend%d\n", id);
+            gen(node->rhs);
+            printf(".lcontinue%d:\n", id);
+            printf("  jmp .lbegin%d\n", id);
+            printf(".lend%d:\n", id);
+
+            break_sequence = original_brk;
+            continue_sequence = original_cnt;
+            return;
+        case nd_for:
+            if_sequence++;
+            original_brk = break_sequence;
+            original_cnt = continue_sequence;
+            break_sequence = id;
+            continue_sequence = id;
+
+            if (node->lhs->lhs != null) {
+                gen(node->lhs->lhs);
+            }
+
+            printf(".lbegin%d:\n", id);
+
+            if (node->lhs->rhs != null) {
+                gen(node->lhs->rhs);
+            } else {
+                printf("  push 1\n");
+            }
+
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lend%d\n", id);
+
+            gen(node->rhs->rhs);
+
+            printf(".lcontinue%d:\n", id);
+            if (node->rhs->lhs != null) {
+                gen(node->rhs->lhs);
+            }
+
+            printf("  jmp .lbegin%d\n", id);
+            printf(".lend%d:\n", id);
+
+            break_sequence = original_brk;
+            continue_sequence = original_cnt;
+            return;
+        case nd_block:
+            for (int i = 0; node->block[i] != null; i++) {
+                gen(node->block[i]);
+            }
+            return;
+        case nd_switch:
+            if_sequence++;
+            original_brk = break_sequence;
+            break_sequence = id;
+
+            gen(node->lhs);
+            printf("  pop rax\n");
+
+            for (node* n = node->next_case; n; n = n->next_case) {
+                printf("  cmp rax, %d\n", n->val);
+                printf("  je .lcase%d\n", n->val);
+            }
+
+            if (node->default_case) {
+                printf("  jmp .ldefault%d\n", id);
+            } else {
+                printf("  jmp .lend%d\n", id);
+            }
+
+            gen(node->rhs);
+
+            printf("  jmp .lend%d\n", id);
+            printf(".ldefault%d:\n", id);
+
+            break_sequence = original_brk;
+            return;
+        case nd_case:
+            printf(".lcase%d:\n", node->val);
+            return;
+        case nd_default:
+            printf(".ldefault%d:\n", id);
+            return;
+        case nd_ternary:
+            if_sequence++;
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  cmp rax, 0\n");
+            printf("  je .lelse%d\n", id);
+            gen(node->rhs->lhs);
+            printf("  jmp .lend%d\n", id);
+            printf(".lelse%d:\n", id);
+            gen(node->rhs->rhs);
+            printf(".lend%d:\n", id);
+            return;
+        case nd_func_call:
+            if_sequence++;
+            for (int i = 0; node->block[i] != null; i++) {
+                gen(node->block[i]);
+                num_args++;
+            }
+            if (num_args > 6) {
+                error_at0(token->str, "invalid number of args. lteq 6.");
+            }
+
+            for (int i = num_args - 1; i >= 0; i--) {
+                printf("  pop %s\n", argreg8[i]);
+            }
+
+            printf("  mov rax, rsp\n");
+            printf("  and rax, 15\n");
+            printf("  jnz .l.call.%03d\n", id);
+
+            printf("  mov rax, 0\n");
+            printf("  call %s\n", node->funcname);
+            printf("  jmp .l.end.%03d\n", id);
+
+            printf(".l.call.%03d:\n", id);
+            printf("  sub rsp, 8\n");
+            printf("  mov rax, 0\n");
+            printf("  call %s\n", node->funcname);
+            printf("  add rsp, 8\n");
+
+            printf(".l.end.%03d:\n", id);
+
+            printf("  push rax\n");
+            return;
+        case nd_func_def:
+            if (node->funcname == null) {
+                return;
+            }
+
+            printf(".globl %s\n", node->funcname);
+            printf("%s:\n", node->funcname);
+
+            printf("  push rbp\n");
+            printf("  mov rbp, rsp\n");
+
+            if (locals[cur_scope_depth]) {
+                int offset = locals[cur_scope_depth]->offset;
+                printf("  sub rsp, %d\n", offset);
+            }
+
+            for (int i = 0; node->args[i]; i++) {
+                if (node->args[i]->varsize == 1) {
+                    printf("  mov [rbp-%d], %s\n", node->args[i]->offset, argreg1[i]);
+                } else if (node->args[i]->varsize == 4) {
+                    printf("  mov [rbp-%d], %s\n", node->args[i]->offset, argreg4[i]);
+                } else {
+                    printf("  mov [rbp-%d], %s\n", node->args[i]->offset, argreg8[i]);
+                }
+            }
+
+            gen(node->lhs);
+
+            printf("  mov rsp, rbp\n");
+            printf("  pop rbp\n");
+            printf("  ret\n");
+            return;
+        case nd_addr:
+            gen_val(node->lhs);
+            return;
+        case nd_deref:
+            gen(node->lhs);
+            printf("  pop rax\n");
+            printf("  mov rax, [rax]\n");
+            printf("  push rax\n");
+            return;
+        case nd_for_left:
+        case nd_for_right:
+        case nd_else:
+        case nd_initializer:
+        case nd_padding:
+            return;
+        case nd_comma:
+            gen(node->lhs);
+            gen(node->rhs);
+            return;
+        default:
+            break;
+    }
+
+    gen(node->lhs);
+    gen(node->rhs);
+
+    printf("  pop rdi\n");
+    printf("  pop rax\n");
+
+    type* l_type = get_type(node->lhs);
+    type* r_type = get_type(node->rhs);
+    type* type_to_use = l_type;
+
+    if (l_type == null && r_type != null) {
+        type_to_use = r_type;
+    }
+
+    switch (node->kind) {
+        case nd_add:
+            printf("  add rax, rdi\n");
+            break;
+        case nd_sub:
+            printf("  sub rax, rdi\n");
+            break;
+        case nd_mul:
+            printf("  imul rax, rdi\n");
+            break;
+        case nd_div:
+            printf("  cqo\n");
+            printf("  idiv rdi\n");
+            break;
+        case nd_eq:
+            printf("  cmp rax, rdi\n");
+            printf("  sete al\n");
+            printf("  movzb rax, al\n");
+            break;
+        case nd_ne:
+            printf("  cmp rax, rdi\n");
+            printf("  setne al\n");
+            printf("  movzb rax, al\n");
+            break;
+        case nd_lt:
+            printf("  cmp rax, rdi\n");
+            printf("  setl al\n");
+            printf("  movzb rax, al\n");
+            break;
+        case nd_le:
+            printf("  cmp rax, rdi\n");
+            printf("  setle al\n");
+            printf("  movzb rax, al\n");
+            break;
+        case nd_bitxor:
+            printf("  xor rax, rdi\n");
+            break;
+        case nd_bitor:
+            printf("  or rax, rdi\n");
+            break;
+        case nd_bitand:
+            printf("  and rax, rdi\n");
+            break;
+    }
+
+    printf("  push rax\n");
+}
+
+void gen_val(node* node) {
+    if (node->kind == nd_deref) {
+        gen(node->lhs);
+        return;
+    }
+
+    if (node->kind == nd_lvar) {
+        if (node->var->kind == local) {
+            printf("  mov rax, rbp\n");
+            printf("  sub rax, %d\n", node->offset);
+            printf("  push rax\n");
+            return;
+        }
+
+        if (node->var->kind == global) {
+            printf("  push offset %s\n", node->varname);
+            return;
+        }
+    }
+
+    if (node->kind == nd_gvar) {
+        printf("  push offset %s\n", node->varname);
+        return;
+    }
+
+    if (node->kind == nd_member) {
+        gen_val(node->lhs);
+        printf("  pop rax\n");
+        printf("  add rax, %d\n", node->member->offset);
+        printf("  push rax\n");
+        return;
+    }
+
+    error0("invalid node to generate lvalue.");
+}
+
+
+// =========================================================================
+// main function (compiler entry point)
+// =========================================================================
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <c-source-file>\n", argv[0]);
+        return 1;
+    }
+
+    // 1. tokenize the input file content (this is a placeholder for the missing lexer)
+    // we assume argv[1] is the source code file path
+    tokenize(argv[1]);
+
+    // 2. parse the tokenized source code and build the ast
+    program();
+
+    // 3. initialize the output assembly with the data section
+    printf(".intel_syntax noprefix\n");
+    printf(".data\n");
+
+    // 4. generate assembly for string literals
+    for (stringtoken* s = strings; s; s = s->next) {
+        printf(".lc%d:\n", s->index);
+        printf("  .string \"%s\"\n", s->value);
+    }
+
+    // 5. initialize the text section (for code)
+    printf(".text\n");
+
+    // 6. generate assembly for each function definition in the ast
+    for (int i = 0; code[i] != null; i++) {
+        if (code[i]->kind == nd_func_def) {
+            gen(code[i]);
+        }
+    }
+
+    return 0;
+}

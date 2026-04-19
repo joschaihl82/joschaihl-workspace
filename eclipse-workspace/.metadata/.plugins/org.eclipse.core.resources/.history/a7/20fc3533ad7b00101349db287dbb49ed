@@ -1,0 +1,132 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <libelf.h>
+#include <fcntl.h>
+#include <gelf.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/user.h>
+#include <errno.h>
+#include <libdw.h>
+#include <libdwfl.h>
+
+#define MAX_CMD 256
+
+char *target_program = NULL;
+pid_t child_pid = -1;
+long saved_data = 0;
+unsigned long breakpoint_addr = 0;
+
+void run_target(const char *program) {
+    child_pid = fork();
+    if (child_pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+        execl(program, program, NULL);
+        perror("execl");
+        exit(1);
+    }
+}
+
+void continue_execution() {
+    ptrace(PTRACE_CONT, child_pid, NULL, NULL);
+    wait(NULL);
+}
+
+void set_breakpoint(unsigned long addr) {
+    saved_data = ptrace(PTRACE_PEEKTEXT, child_pid, (void *)addr, NULL);
+    long int3 = (saved_data & ~0xFF) | 0xCC;
+    ptrace(PTRACE_POKETEXT, child_pid, (void *)addr, (void *)int3);
+    breakpoint_addr = addr;
+    printf("[+] Breakpoint gesetzt bei 0x%lx\n", addr);
+}
+
+unsigned long resolve_line_address(const char *filename, int lineno, const char *binary_path) {
+    Dwfl *dwfl;
+    Dwfl_Callbacks callbacks = {
+        .find_elf = dwfl_build_id_find_elf,
+        .find_debuginfo = dwfl_standard_find_debuginfo,
+        .section_address = dwfl_offline_section_address
+    };
+
+    dwfl = dwfl_begin(&callbacks);
+    if (!dwfl) {
+        fprintf(stderr, "dwfl_begin fehlgeschlagen\n");
+        return 0;
+    }
+
+    if (dwfl_report_offline(dwfl, "", binary_path, -1) == NULL) {
+        fprintf(stderr, "dwfl_report_offline fehlgeschlagen\n");
+        dwfl_end(dwfl);
+        return 0;
+    }
+
+    dwfl_report_end(dwfl, NULL, NULL);
+
+    Dwfl_Module *mod = dwfl_nextdwflmod(dwfl, NULL);
+    Dwarf_Addr addr = 0;
+
+    Dwfl_Line *line = NULL;
+    while ((line = dwfl_getsrc_line(mod, addr)) != NULL) {
+        const char *srcfile;
+        int lineno_found;
+        Dwarf_Addr line_addr;
+        if (dwfl_lineinfo(line, &srcfile, &lineno_found, NULL, NULL, &line_addr) && srcfile) {
+            if (strcmp(srcfile, filename) == 0 && lineno_found == lineno) {
+                printf("[+] Zeile gefunden: %s:%d → 0x%lx\n", srcfile, lineno_found, (unsigned long)line_addr);
+                dwfl_end(dwfl);
+                return (unsigned long)line_addr;
+            }
+        }
+        addr++;
+    }
+
+    dwfl_end(dwfl);
+    fprintf(stderr, "[-] Konnte Adresse für %s:%d nicht finden\n", filename, lineno);
+    return 0;
+}
+
+void debugger_loop() {
+    char cmd[MAX_CMD];
+    while (1) {
+        printf("(dbg) ");
+        if (!fgets(cmd, sizeof(cmd), stdin)) break;
+
+        if (strncmp(cmd, "break ", 6) == 0) {
+            char file[128];
+            int line;
+            sscanf(cmd + 6, "%127[^:]:%d", file, &line);
+            unsigned long addr = resolve_line_address(file, line, target_program);
+            if (addr != 0) {
+                set_breakpoint(addr);
+            }
+        } else if (strncmp(cmd, "run", 3) == 0) {
+            run_target(target_program);
+            wait(NULL);
+            if (breakpoint_addr)
+                set_breakpoint(breakpoint_addr);
+            continue_execution();
+        } else if (strncmp(cmd, "quit", 4) == 0) {
+            if (child_pid > 0)
+                kill(child_pid, SIGKILL);
+            break;
+        } else {
+            printf("Unbekannter Befehl\n");
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Nutzung: %s <programm>\n", argv[0]);
+        return 1;
+    }
+
+    target_program = argv[1];
+
+    debugger_loop();
+
+    return 0;
+}

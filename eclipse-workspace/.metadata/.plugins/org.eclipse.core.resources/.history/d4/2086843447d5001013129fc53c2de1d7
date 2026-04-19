@@ -1,0 +1,756 @@
+/*
+ jitemu.c - enhanced
+ Robust EFI loader with verbose diagnostics and improved PE/PE32+ parsing and environment.
+ - Handles malformed OptionalHeader magic (e.g., 0x0200) by scanning for section table heuristically.
+ - Caps suspicious NumberOfSections and SizeOfOptionalHeader values.
+ - **full support for both IMAGE_OPTIONAL_HEADER32 (PE32) and IMAGE_OPTIONAL_HEADER64 (PE32+).**
+ - **improved error logging and cleanup logic.**
+ - **builds a more populated (though still fake) SystemTable/ConOut/BootServices.**
+ - builds minimal SystemTable/ConOut and calls entry via trampoline.
+ warning: executes loaded .efi in-process. run only trusted images.
+*/
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <inttypes.h>
+#include <errno.h>
+
+/* constants and types for pe headers */
+#define IMAGE_DOS_SIGNATURE 0x5a4d      /* 'mz' */
+#define IMAGE_NT_SIGNATURE 0x00004550   /* 'pe\0\0' */
+#define IMAGE_NT_OPTIONAL_HDR32_MAGIC 0x10b
+#define IMAGE_NT_OPTIONAL_HDR64_MAGIC 0x20b
+#define IMAGE_SCN_MEM_EXECUTE 0x20000000u
+#define IMAGE_FILE_MACHINE_AMD64 0x8664
+
+#pragma pack(push,1)
+
+/* dos header (unchanged) */
+typedef struct {
+    uint16_t e_magic;    /* "mz" */
+    uint16_t e_cblp;
+    uint16_t e_cp;
+    uint16_t e_crlc;
+    uint16_t e_cparhdr;
+    uint16_t e_minalloc;
+    uint16_t e_maxalloc;
+    uint16_t e_ss;
+    uint16_t e_sp;
+    uint16_t e_csum;
+    uint16_t e_ip;
+    uint16_t e_cs;
+    uint16_t e_lfarlc;
+    uint16_t e_ovno;
+    uint16_t e_res[4];
+    uint16_t e_oemid;
+    uint16_t e_oeminfo;
+    uint16_t e_res2[10];
+    uint32_t e_lfanew;   /* offset to pe header */
+} image_dos_header;
+
+/* file header (unchanged) */
+typedef struct {
+    uint32_t signature; /* "pe\0\0" */
+    uint16_t machine;
+    uint16_t numberofsections;
+    uint32_t timedatestamp;
+    uint32_t pointertosymboltable;
+    uint32_t numberofsymbols;
+    uint16_t sizeofoptionalheader;
+    uint16_t characteristics;
+} image_file_header;
+
+/* data directory structure (added) */
+typedef struct {
+    uint32_t virtualaddress;
+    uint32_t size;
+} image_data_directory;
+
+/* pe32 optional header (extended) */
+typedef struct {
+    uint16_t magic; /* 0x10b */
+    uint8_t  majorlinkerversion;
+    uint8_t  minorlinkerversion;
+    uint32_t sizeofcode;
+    uint32_t sizeofinitializeddata;
+    uint32_t sizeofuninitializeddata;
+    uint32_t addressofentrypoint;
+    uint32_t baseofcode;
+    uint32_t baseofdata;
+    uint32_t imagebase;
+    uint32_t sectionalignment;
+    uint32_t filealignment;
+    uint16_t majoroperatingsystemversion;
+    uint16_t minoroperatingsystemversion;
+    uint16_t majorimageversion;
+    uint16_t minorimageversion;
+    uint16_t majorsubsystemversion;
+    uint16_t minorsubsystemversion;
+    uint32_t win32versionvalue;
+    uint32_t sizeofimage;
+    uint32_t sizeofheaders;
+    uint32_t checksum;
+    uint16_t subsystem;
+    uint16_t dllcharacteristics;
+    uint32_t sizeofstackreserve;
+    uint32_t sizeofstackcommit;
+    uint32_t sizeofheapreserve;
+    uint32_t sizeofheapcommit;
+    uint32_t loaderflags;
+    uint32_t numberofrvadandsizes;
+    image_data_directory datadirectory[16];
+} image_optional_header32;
+
+/* pe32+ optional header (added, this is common for efi x64) */
+typedef struct {
+    uint16_t magic; /* 0x20b */
+    uint8_t  majorlinkerversion;
+    uint8_t  minorlinkerversion;
+    uint32_t sizeofcode;
+    uint32_t sizeofinitializeddata;
+    uint32_t sizeofuninitializeddata;
+    uint32_t addressofentrypoint;
+    uint32_t baseofcode;
+    uint64_t imagebase; /* 64-bit */
+    uint32_t sectionalignment;
+    uint32_t filealignment;
+    uint16_t majoroperatingsystemversion;
+    uint16_t minoroperatingsystemversion;
+    uint16_t majorimageversion;
+    uint16_t minorimageversion;
+    uint16_t majorsubsystemversion;
+    uint16_t minorsubsystemversion;
+    uint32_t win32versionvalue;
+    uint32_t sizeofimage;
+    uint32_t sizeofheaders;
+    uint32_t checksum;
+    uint16_t subsystem;
+    uint16_t dllcharacteristics;
+    uint64_t sizeofstackreserve; /* 64-bit */
+    uint64_t sizeofstackcommit;  /* 64-bit */
+    uint64_t sizeofheapreserve;  /* 64-bit */
+    uint64_t sizeofheapcommit;   /* 64-bit */
+    uint32_t loaderflags;
+    uint32_t numberofrvadandsizes;
+    image_data_directory datadirectory[16];
+} image_optional_header64;
+
+/* section header (unchanged) */
+typedef struct {
+    uint8_t  name[8];
+    union {
+        uint32_t physicaladdress;
+        uint32_t virtualsize;
+    } misc;
+    uint32_t virtualaddress;
+    uint32_t sizeofrawdata;
+    uint32_t pointertorawdata;
+    uint32_t pointertorelocations;
+    uint32_t pointertolinenumbers;
+    uint16_t numberofrelocations;
+    uint16_t numberoflinenumbers;
+    uint32_t characteristics;
+} image_section_header;
+#pragma pack(pop)
+
+/* unified optional header access structure */
+typedef struct {
+    uint64_t imagebase;
+    uint32_t sizeofimage;
+    uint32_t addressofentrypoint;
+    uint16_t magic;
+} optional_header_info;
+
+/* function to safely free all allocated fake structures */
+static void free_fake_efi_env(void* st, void* bs, void* conout) {
+    free(st);
+    free(bs);
+    free(conout);
+}
+
+/* ---------- helpers ---------- */
+
+static uint8_t* read_file(const char* path, size_t* out_size) {
+    if (!path || !out_size) return null;
+    file* f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[error] fopen('%s') failed: %s\n", path, strerror(errno));
+        return null;
+    }
+    if (fseek(f, 0, seek_end) != 0) {
+        fprintf(stderr, "[error] fseek end failed: %s\n", strerror(errno));
+        fclose(f); return null;
+    }
+    long sz = ftell(f);
+    if (sz < 0) {
+        fprintf(stderr, "[error] ftell failed: %s\n", strerror(errno));
+        fclose(f); return null;
+    }
+    rewind(f);
+    uint8_t* buf = malloc((size_t)sz);
+    if (!buf) { fprintf(stderr, "[error] malloc(%ld) failed\n", sz); fclose(f); return null; }
+    size_t got = fread(buf, 1, (size_t)sz, f);
+    if (got != (size_t)sz) {
+        fprintf(stderr, "[error] fread expected %ld bytes, got %zu\n", sz, got);
+        /* warning: partial read might be acceptable for some scenarios, but failing for a full read is safer here */
+        free(buf); fclose(f); return null;
+    }
+    fclose(f);
+    *out_size = (size_t)sz;
+    fprintf(stderr, "[info] read '%s' size=%zu bytes\n", path, *out_size);
+    return buf;
+}
+
+/* helper to map executable memory with proper alignment */
+static void* alloc_executable(size_t size) {
+    long ps = sysconf(_sc_page_size);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    /* align size up to page boundary */
+    size = (size + page - 1) & ~(page - 1);
+    void* p = mmap(null, size, prot_read | prot_write | prot_exec, map_private | map_anonymous, -1, 0);
+    if (p == map_failed) {
+        fprintf(stderr, "[error] mmap exec size=%zu failed: %s\n", size, strerror(errno));
+        return null;
+    }
+    return p;
+}
+/* helper to unmap memory (safer for mmap'ed areas) */
+static void free_executable(void* p, size_t size) {
+    if (!p || p == map_failed) return;
+    long ps = sysconf(_sc_page_size);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    size = (size + page - 1) & ~(page - 1);
+    munmap(p, size);
+}
+
+/* heuristic: validate and cap suspicious header values */
+static uint16_t cap_num_sections(uint16_t nsec, size_t file_size) {
+    if (nsec == 0) return 0;
+    if (nsec > 256) { /* stricter cap than 1024 */
+        fprintf(stderr, "[warn] numberofsections suspiciously large (%u), capping to 256\n", nsec);
+        return 256;
+    }
+    /* also ensure it is not larger than file_size/sizeof(section) */
+    size_t max_possible = file_size / sizeof(image_section_header);
+    if (nsec > max_possible) {
+        uint16_t cap = (uint16_t)(max_possible > 0 ? max_possible : 0);
+        fprintf(stderr, "[warn] numberofsections (%u) > file/section_size (%zu), capping to %u\n", nsec, max_possible, cap);
+        return cap;
+    }
+    return nsec;
+}
+
+/* function to parse and extract key info from either pe32 or pe32+ optional header */
+static int parse_optional_header(const uint8_t* opt_hdr, size_t opt_size, optional_header_info* info) {
+    if (opt_size < 2 || !info) return 0;
+
+    info->magic = *(uint16_t*)opt_hdr;
+    info->addressofentrypoint = 0;
+    info->imagebase = 0;
+    info->sizeofimage = 0;
+
+    if (info->magic == image_nt_optional_hdr32_magic) {
+        if (opt_size < sizeof(image_optional_header32)) return 0;
+        const image_optional_header32* hdr = (const image_optional_header32*)opt_hdr;
+        info->addressofentrypoint = hdr->addressofentrypoint;
+        info->imagebase = hdr->imagebase;
+        info->sizeofimage = hdr->sizeofimage;
+        return 1;
+    } else if (info->magic == image_nt_optional_hdr64_magic) {
+        if (opt_size < sizeof(image_optional_header64)) return 0;
+        const image_optional_header64* hdr = (const image_optional_header64*)opt_hdr;
+        info->addressofentrypoint = hdr->addressofentrypoint;
+        info->imagebase = hdr->imagebase;
+        info->sizeofimage = hdr->sizeofimage;
+        return 1;
+    }
+    return 0;
+}
+
+/* try to discover a plausible section table when optionalheader is unknown or corrupted. (improved)
+   we return a dynamically allocated array of image_section_header (caller must free) and set out_count.
+*/
+static image_section_header* discover_section_table(uint8_t* base, size_t pe_start_off, size_t opt_size, size_t file_size, int* out_count) {
+    /* scan after file header + capped optional header size */
+    size_t base_off = pe_start_off + 4 + sizeof(image_file_header) + opt_size;
+
+    const size_t scan_limit = 0x800; /* scan up to 2kb after where the section table *should* be */
+    size_t start = base_off;
+    size_t end = base_off + (scan_limit > file_size - base_off ? file_size - base_off : scan_limit);
+
+    int max_sections = 256;
+    image_section_header* found = calloc(max_sections, sizeof(image_section_header));
+    if (!found) { fprintf(stderr, "[fail] malloc for discovered sections failed\n"); return null; }
+    int found_count = 0;
+
+    for (size_t off = start; off + sizeof(image_section_header) <= end; off += 1) {
+        image_section_header* cand = (image_section_header*)(base + off);
+        /* quick sanity checks */
+        uint32_t ptr = cand->pointertorawdata;
+        uint32_t rawsz = cand->sizeofrawdata;
+        uint32_t vaddr = cand->virtualaddress;
+        uint32_t vsize = cand->misc.virtualsize;
+
+        /* pointer and size must be within file bounds */
+        if ((size_t)ptr + rawsz > file_size) continue;
+        if ((size_t)ptr >= file_size && rawsz > 0) continue;
+        /* virtual address should be reasonable (< 0x10000000) */
+        if (vaddr > 0x10000000u) continue;
+        /* virtual size should be reasonable (e.g., <= 0x1000000) */
+        if (vsize > 0x1000000u) continue;
+        /* characteristics should have at least read or execute bit */
+        if ((cand->characteristics & 0xf0000000u) == 0) continue;
+
+        /* name should be printable ascii or dot/underscore */
+        int printable = 1;
+        for (int i = 0; i < 8; ++i) {
+            unsigned char c = cand->name[i];
+            if (c == 0) break;
+            if ((c < 0x20 || c > 0x7e) && c != '.' && c != '_' && c != '$') { printable = 0; break; }
+        }
+        if (!printable) continue;
+
+        /* looks plausible; copy it */
+        if (found_count < max_sections) {
+            memcpy(&found[found_count], cand, sizeof(image_section_header));
+            found_count++;
+            off += sizeof(image_section_header) - 1; /* jump ahead to avoid immediate re-check */
+        } else break;
+    }
+
+    if (found_count == 0) {
+        free(found);
+        *out_count = 0;
+        return null;
+    }
+    *out_count = found_count;
+    fprintf(stderr, "[info] discovered %d plausible section headers by heuristic scan\n", found_count);
+    return found;
+}
+
+/* ---------- robust pe loader with fallback ---------- */
+
+static void* load_pe_to_executable_verbose(const char* path,
+                                          void (**entry_ptr)(void),
+                                          size_t* out_alloc_size,
+                                          uint64_t* out_entry_rva)
+{
+    size_t fsz = 0;
+    uint8_t* file = read_file(path, &fsz);
+    if (!file) {
+        fprintf(stderr, "[fail] cannot open or read file '%s'\n", path);
+        return null;
+    }
+
+    if (fsz < sizeof(image_dos_header)) {
+        fprintf(stderr, "[fail] file too small for image_dos_header: size=%zu, need=%zu\n", fsz, sizeof(image_dos_header));
+        free(file); return null;
+    }
+
+    image_dos_header* dos = (image_dos_header*)file;
+    fprintf(stderr, "[info] dos header e_magic=0x%04x e_lfanew=0x%08x\n", dos->e_magic, dos->e_lfanew);
+
+    if (dos->e_magic != image_dos_signature) {
+        fprintf(stderr, "[fail] invalid dos signature: 0x%04x (expected 0x%04x 'mz')\n", dos->e_magic, image_dos_signature);
+        free(file); return null;
+    }
+
+    if ((size_t)dos->e_lfanew + 4 + sizeof(image_file_header) > fsz) {
+        fprintf(stderr, "[fail] e_lfanew (0x%08x) points beyond file size %zu\n", dos->e_lfanew, fsz);
+        free(file); return null;
+    }
+
+    uint8_t* pe_ptr = file + dos->e_lfanew;
+    uint32_t pe_sig = *(uint32_t*)pe_ptr;
+    fprintf(stderr, "[info] pe signature at offset 0x%08x = 0x%08x\n", dos->e_lfanew, pe_sig);
+
+    if (pe_sig != image_nt_signature) {
+        fprintf(stderr, "[fail] invalid pe signature: 0x%08x (expected 0x%08x 'pe\\0\\0')\n", pe_sig, image_nt_signature);
+        free(file); return null;
+    }
+
+    image_file_header* fh = (image_file_header*)(pe_ptr + 4);
+    fprintf(stderr, "[info] image_file_header: machine=0x%04x numberofsections=%u sizeofoptionalheader=%u characteristics=0x%04x\n",
+            fh->machine, fh->numberofsections, fh->sizeofoptionalheader, fh->characteristics);
+
+    if (fh->machine != image_file_machine_amd64) {
+        fprintf(stderr, "[warn] pe machine is 0x%04x, expected 0x%04x (amd64 for efi x64). continuing anyway.\n", fh->machine, image_file_machine_amd64);
+    }
+
+    uint16_t nsec_raw = fh->numberofsections;
+    uint16_t nsec = cap_num_sections(nsec_raw, fsz);
+    uint16_t opt_size_raw = fh->sizeofoptionalheader;
+    size_t opt_size = (size_t)opt_size_raw;
+
+    uint8_t* opt_hdr = pe_ptr + 4 + sizeof(image_file_header);
+    if ((size_t)(opt_hdr - file) > fsz) {
+        fprintf(stderr, "[fail] optional header start beyond file bounds.\n");
+        free(file); return null;
+    }
+
+    size_t avail_bytes = fsz - (size_t)(opt_hdr - file);
+    if (opt_size > avail_bytes) {
+        fprintf(stderr, "[warn] optional header size (%u) exceeds file bounds (%zu bytes avail); capping to %zu\n", opt_size_raw, avail_bytes, avail_bytes);
+        opt_size = avail_bytes;
+    }
+
+    optional_header_info opt_info = {0};
+    int recognized_optional = parse_optional_header(opt_hdr, opt_size, &opt_info);
+
+    uint64_t entry_rva = 0;
+    uint64_t max_va = 0; /* use this to determine total allocation size */
+    uint32_t image_size = 0;
+
+    if (recognized_optional) {
+        entry_rva = opt_info.addressofentrypoint;
+        image_size = opt_info.sizeofimage;
+        fprintf(stderr, "[info] optionalheader magic=0x%04x (pe%s) recognized. entry_rva=0x%08" prix64 " sizeofimage=0x%08x\n",
+                opt_info.magic, (opt_info.magic == image_nt_optional_hdr64_magic ? "32+" : "32"), entry_rva, image_size);
+    } else {
+        fprintf(stderr, "[warn] unknown optionalheader magic: 0x%04x. will attempt section-table fallback.\n", opt_info.magic);
+    }
+
+    uint8_t* sec_table = opt_hdr + opt_size;
+
+    /* check if section table is fully in file using file header's nsec */
+    int used_discovered = 0;
+    image_section_header* sections = null;
+    int sections_count = 0;
+
+    if ((size_t)(sec_table - file) + (size_t)nsec * sizeof(image_section_header) <= fsz && nsec > 0) {
+        /* plausible: read sections directly */
+        sections_count = nsec;
+        sections = malloc(sizeof(image_section_header) * sections_count);
+        if (!sections) { fprintf(stderr, "[fail] malloc sections failed\n"); free(file); return null; }
+        memcpy(sections, sec_table, sizeof(image_section_header) * sections_count);
+        fprintf(stderr, "[info] read %d section headers from file (using sizeofoptionalheader=%zu and numberofsections=%u)\n", sections_count, opt_size, nsec);
+    } else {
+        /* fallback: try to discover plausible section headers by scanning */
+        int discovered = 0;
+        sections = discover_section_table(file, dos->e_lfanew, opt_size, fsz, &discovered);
+        if (sections && discovered > 0) {
+            sections_count = discovered;
+            used_discovered = 1;
+            fprintf(stderr, "[info] using %d discovered section headers\n", sections_count);
+        } else {
+            /* as last resort, treat whole file as single blob at exec+0 */
+            fprintf(stderr, "[warn] could not read or discover section headers; will map entire file and set entry rva=0\n");
+            sections_count = 0;
+        }
+    }
+
+    /* inspect sections to determine max_va and find candidate entry if optional header failed */
+    uint64_t candidate_entry = 0;
+    int found_text = 0;
+
+    if (sections_count > 0) {
+        for (int i = 0; i < sections_count; ++i) {
+            image_section_header* sh = &sections[i];
+            char name[9]; memcpy(name, sh->name, 8); name[8] = 0;
+            fprintf(stderr, "  [%02d] name='%.8s' virtualaddress=0x%08x virtualsize=0x%08x sizeifrawdata=0x%08x ptrtoraw=0x%08x chars=0x%08x\n",
+                    i, name, sh->virtualaddress, sh->misc.virtualsize, sh->sizeofrawdata, sh->pointertorawdata, sh->characteristics);
+            uint64_t va_end = (uint64_t)sh->virtualaddress + (uint64_t)sh->misc.virtualsize;
+            if (va_end > max_va) max_va = va_end;
+
+            /* heuristics for entry */
+            if (!recognized_optional) {
+                if (!found_text && (strcmp(name, ".text") == 0 || strcmp(name, "text") == 0)) {
+                    candidate_entry = sh->virtualaddress;
+                    found_text = 1;
+                    fprintf(stderr, "[info] found .text section, candidate entry rva = 0x%08" prix64 "\n", candidate_entry);
+                } else if (!found_text && (sh->characteristics & image_scn_mem_execute)) {
+                    candidate_entry = sh->virtualaddress;
+                    fprintf(stderr, "[info] found executable section '%.8s', candidate entry rva = 0x%08" prix64 "\n", name, candidate_entry);
+                }
+            }
+        }
+    }
+
+    if (!recognized_optional) {
+        if (candidate_entry != 0) {
+            entry_rva = candidate_entry;
+            fprintf(stderr, "[info] using candidate entry rva from section table: 0x%08" prix64 "\n", entry_rva);
+        } else {
+            entry_rva = 0;
+            fprintf(stderr, "[warn] no candidate entry found; using entry rva = 0 (exec+0)\n");
+        }
+    }
+
+    /* determine final allocation size */
+    size_t alloc_size = 0;
+    if (image_size > 0 && recognized_optional) {
+        /* use sizeofimage from optional header if available and trusted */
+        alloc_size = (size_t)image_size;
+    } else {
+        /* fallback to max_va (section table based) or file size */
+        if (max_va == 0) max_va = fsz;
+        alloc_size = (size_t)max_va;
+    }
+    /* always ensure it is page aligned and at least file size (for no-sections case) */
+    if (alloc_size < fsz) alloc_size = fsz;
+    alloc_size = (alloc_size + 0xfff) & ~0xfffull;
+    if (alloc_size < 0x1000) alloc_size = 0x1000;
+
+    fprintf(stderr, "[info] allocating exec buffer size=%zu (max_va=0x%zx file_size=%zu)\n", alloc_size, (size_t)max_va, fsz);
+
+    void* exec = alloc_executable(alloc_size);
+    if (!exec) {
+        fprintf(stderr, "[fail] alloc_executable(%zu) failed\n", alloc_size);
+        free(sections); free(file); return null;
+    }
+    memset(exec, 0, alloc_size);
+
+    /* copy sections or whole file */
+    if (sections_count > 0) {
+        for (int i = 0; i < sections_count; ++i) {
+            image_section_header* sh = &sections[i];
+            uint32_t vaddr = sh->virtualaddress;
+            uint32_t rawsz = sh->sizeofrawdata;
+            uint32_t rawptr = sh->pointertorawdata;
+            uint32_t vsize = sh->misc.virtualsize;
+            char name[9]; memcpy(name, sh->name, 8); name[8] = 0;
+
+            if ((size_t)rawptr + rawsz > fsz) {
+                fprintf(stderr, "[fail] section '%.8s' raw out of file bounds: rawptr=0x%08x rawsz=0x%08x file_size=%zu\n",
+                        name, rawptr, rawsz, fsz);
+                free_executable(exec, alloc_size); free(sections); free(file); return null;
+            }
+            if ((size_t)vaddr + (vsize > rawsz ? vsize : rawsz) > alloc_size) {
+                fprintf(stderr, "[fail] section '%.8s' would overflow exec buffer: vaddr=0x%08x vsize=0x%08x alloc_size=%zu\n",
+                        name, vaddr, vsize, alloc_size);
+                free_executable(exec, alloc_size); free(sections); free(file); return null;
+            }
+
+            if (rawsz > 0) {
+                memcpy((uint8_t*)exec + vaddr, file + rawptr, rawsz);
+            }
+            if (vsize > rawsz) {
+                memset((uint8_t*)exec + vaddr + rawsz, 0, vsize - rawsz);
+            }
+            fprintf(stderr, "[info] copied section '%.8s' -> exec+0x%08x (raw=0x%08x vsize=0x%08x)\n", name, vaddr, rawsz, vsize);
+        }
+    } else {
+        if (fsz > alloc_size) {
+            fprintf(stderr, "[fail] file size %zu larger than alloc_size %zu\n", fsz, alloc_size);
+            free_executable(exec, alloc_size); free(sections); free(file); return null;
+        }
+        memcpy(exec, file, fsz);
+        fprintf(stderr, "[info] no section table present; copied entire file into exec buffer (size=%zu)\n", fsz);
+    }
+
+    void* entry = (uint8_t*)exec + (size_t)entry_rva;
+    fprintf(stderr, "[info] final entry rva=0x%08" prix64 " -> exec@%p\n", entry_rva, entry);
+
+    /* final checks */
+    if ((size_t)entry_rva >= alloc_size) {
+        fprintf(stderr, "[fail] entry rva 0x%08" prix64 " is outside allocated memory size %zu\n", entry_rva, alloc_size);
+        free_executable(exec, alloc_size); free(sections); free(file); return null;
+    }
+
+    *entry_ptr = (void(*)(void))entry;
+    if (out_alloc_size) *out_alloc_size = alloc_size;
+    if (out_entry_rva) *out_entry_rva = entry_rva;
+
+    free(sections);
+    free(file);
+    return exec;
+}
+
+/* ---------- minimal conout outputstring and helpers ---------- */
+
+/* host implementation of uefi's outputstring (to stdout) */
+static uint64_t host_outputstring(void* this, const uint16_t* str) {
+    (void)this;
+    if (!str) return 1; /* efi_invalid_parameter (fake) */
+    char buf[2048];
+    size_t bi = 0;
+    for (const uint16_t* p = str; *p != 0; ++p) {
+        uint16_t ch = *p;
+        /* rudimentary utf-16 to ascii conversion for printing */
+        if (ch < 0x80) {
+            if (bi + 1 >= sizeof(buf)) break;
+            buf[bi++] = (char)ch;
+        } else {
+            if (bi + 1 >= sizeof(buf)) break;
+            buf[bi++] = '?';
+        }
+    }
+    if (bi > 0) {
+        fwrite(buf, 1, bi, stdout);
+        fflush(stdout);
+    }
+    return 0; /* efi_success (fake) */
+}
+
+/* stub for unimplemented services */
+static uint64_t host_service_stub(void) {
+    fprintf(stderr, "[host_stub] called by efi image\n");
+    fflush(stderr);
+    return 3; /* efi_unsupported (fake) */
+}
+
+/* build fake systemtable/bootservices/conout (more populated) */
+static int build_fake_system_table(void** out_st, void** out_bs, void** out_conout) {
+    if (!out_st || !out_bs || !out_conout) return -1;
+    /* use sizes corresponding to actual uefi structures (approx) */
+    size_t st_size = 0x200;
+    size_t bs_size = 0x400; /* boot services is large */
+    size_t conout_size = 0x100;
+
+    uint8_t* st = calloc(1, st_size);
+    uint8_t* bs = calloc(1, bs_size);
+    uint8_t* conout = calloc(1, conout_size);
+    if (!st || !bs || !conout) { free_fake_efi_env(st, bs, conout); return -1; }
+
+    /* fill in st fields */
+    uint64_t revision = 0x00020000; /* uefi spec 2.0 (fake) */
+    uint64_t tablesize = 0x80; /* minimal structure size */
+    uint64_t conout_ptr = (uint64_t)(uintptr_t)conout;
+    uint64_t bs_ptr = (uint64_t)(uintptr_t)bs;
+
+    memcpy(st + 0x08, &revision, sizeof(revision));       /* hdr.revision */
+    memcpy(st + 0x14, &tablesize, sizeof(tablesize));      /* hdr.tablesize */
+    memcpy(st + 0x18, &conout_ptr, sizeof(conout_ptr));    /* consoleout */
+    memcpy(st + 0x30, &bs_ptr, sizeof(bs_ptr));          /* bootservices */
+
+    /* fill in bs fields (minimal set for alloc/free and simple services) */
+    uint64_t stub_ptr = (uint64_t)(uintptr_t)host_service_stub;
+    memcpy(bs + 0x00, &stub_ptr, sizeof(stub_ptr)); /* bs.hdr.signature (not really a pointer) */
+
+    /* common boot service function offsets (simplified map to stub) */
+    memcpy(bs + 0x48, &stub_ptr, sizeof(stub_ptr)); /* allocpages */
+    memcpy(bs + 0x50, &stub_ptr, sizeof(stub_ptr)); /* freepages */
+    memcpy(bs + 0x58, &stub_ptr, sizeof(stub_ptr)); /* getmemorymap */
+    memcpy(bs + 0x60, &stub_ptr, sizeof(stub_ptr)); /* allocpool */
+    memcpy(bs + 0x68, &stub_ptr, sizeof(stub_ptr)); /* freepool */
+    memcpy(bs + 0xb0, &stub_ptr, sizeof(stub_ptr)); /* loaddriver */
+    memcpy(bs + 0xb8, &stub_ptr, sizeof(stub_ptr)); /* startimage */
+    memcpy(bs + 0xc0, &stub_ptr, sizeof(stub_ptr)); /* exit */
+
+    /* fill in conout fields */
+    uint64_t outstr_ptr = (uint64_t)(uintptr_t)host_outputstring;
+    memcpy(conout + 0x00, &outstr_ptr, sizeof(outstr_ptr)); /* conout.hdr.signature (not really a pointer) */
+    memcpy(conout + 0x30, &outstr_ptr, sizeof(outstr_ptr)); /* outputstring (observed offset) */
+
+    *out_st = st;
+    *out_bs = bs;
+    *out_conout = conout;
+    return 0;
+}
+
+/* build trampoline: set rdi=image_handle, rdx=system_table, rsi=system_table, then call entry */
+/* this is for sysv abi (linux/bsd x64), which uefi x64 often follows for the first call */
+static void* build_trampoline(void (*entry)(void), void* image_handle, void* system_table) {
+    /* need enough space for instructions */
+    uint8_t* tramp = alloc_executable(4096);
+    if (!tramp) return null;
+    uint8_t* cp = tramp;
+
+    /* mov rdi, imm64 (10 bytes) - image_handle */
+    *cp++ = 0x48; *cp++ = 0xbf;
+    uint64_t ih = (uint64_t)(uintptr_t)image_handle;
+    memcpy(cp, &ih, 8); cp += 8;
+
+    /* mov rdx, imm64 (10 bytes) - system_table (arg3) */
+    *cp++ = 0x48; *cp++ = 0xba;
+    uint64_t stp = (uint64_t)(uintptr_t)system_table;
+    memcpy(cp, &stp, 8); cp += 8;
+
+    /* mov rsi, imm64 (10 bytes) - system_table (arg2) */
+    *cp++ = 0x48; *cp++ = 0xbe;
+    memcpy(cp, &stp, 8); cp += 8;
+
+    /* call rel32 (5 bytes) - to entry_fn */
+    *cp++ = 0xe8;
+    int64_t rel = (int64_t)((uint8_t*)entry - (cp + 4));
+    if (rel < -2147483648ll || rel > 2147483647ll) {
+        /* entry too far for rel32 call, this is unlikely if entry is in exec_buf */
+        fprintf(stderr, "[fatal] entry address too far for rel32 call in trampoline. aborting.\n");
+        free_executable(tramp, 4096);
+        return null;
+    }
+    int32_t rel32 = (int32_t)rel;
+    memcpy(cp, &rel32, 4); cp += 4;
+
+    /* ret (1 byte) */
+    *cp++ = 0xc3;
+
+    return tramp;
+}
+
+/* ---------- main ---------- */
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <bootx64.efi>\n", argv[0]);
+        return 1;
+    }
+    const char* path = argv[1];
+
+    void (*entry_fn)(void) = null;
+    size_t exec_size = 0;
+    uint64_t entry_rva = 0;
+    void* exec_buf = null;
+
+    /* 1. load pe image */
+    exec_buf = load_pe_to_executable_verbose(path, &entry_fn, &exec_size, &entry_rva);
+    if (!exec_buf || !entry_fn) {
+        fprintf(stderr, "[fatal] failed to load efi image '%s'. see messages above for details.\n", path);
+        return 2;
+    }
+    fprintf(stderr, "[ok] loaded image exec@%p size=%zu entry_rva=0x%08" prix64 "\n", exec_buf, exec_size, entry_rva);
+
+    /* 2. build fake efi environment */
+    void* st_buf = null;
+    void* bs_buf = null;
+    void* conout_buf = null;
+    if (build_fake_system_table(&st_buf, &bs_buf, &conout_buf) != 0) {
+        fprintf(stderr, "[fatal] failed to build fake systemtable/bootservices/conout\n");
+        free_executable(exec_buf, exec_size);
+        return 3;
+    }
+    fprintf(stderr, "[info] systemtable=%p bootservices=%p conout=%p\n", st_buf, bs_buf, conout_buf);
+
+    /* 3. build trampoline */
+    void* image_handle = exec_buf;
+    void* tramp = build_trampoline(entry_fn, image_handle, st_buf);
+    if (!tramp) {
+        fprintf(stderr, "[fatal] failed to build trampoline\n");
+        free_fake_efi_env(st_buf, bs_buf, conout_buf);
+        free_executable(exec_buf, exec_size);
+        return 4;
+    }
+
+    /* 4. execute */
+    fprintf(stderr, "[info] invoking entry via trampoline %p\n", tramp);
+    typedef void (*trampfn)(void);
+    trampfn tf = (trampfn)tramp;
+
+    /* the efi image is called with:
+     * rdi = image_handle (exec_buf)
+     * rsi = system_table (st_buf)
+     * rdx = system_table (st_buf) - rdx is not standard for sysv but often used for uefi
+     * the actual signature is: efi_status efiapi entrypoint (efi_handle imagehandle, efi_system_table *systemtable)
+     * on x64, this corresponds to:
+     * rdi: imagehandle
+     * rsi: systemtable
+     * a proper call would pass rsi/rdx, then call. this trampoline is slightly simplified but common.
+     */
+    tf();
+
+    /* 5. cleanup */
+    fprintf(stderr, "[info] returned from efi image entry\n");
+
+    free_executable(tramp, 4096); /* cleanup trampoline */
+    free_fake_efi_env(st_buf, bs_buf, conout_buf); /* cleanup fake structures */
+    free_executable(exec_buf, exec_size); /* cleanup loaded image */
+
+    return 0;
+}

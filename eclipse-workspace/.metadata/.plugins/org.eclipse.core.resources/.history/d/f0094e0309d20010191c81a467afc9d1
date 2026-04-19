@@ -1,0 +1,28 @@
+# Makefile for building a minimal EFI application with mingw-w64
+# Requires: x86_64-w64-mingw32-gcc (mingw-w64 cross-compiler)
+#
+# The produced file is a PE/COFF image with subsystem set to EFI_APPLICATION (10).
+# We avoid linking the C runtime (-nostdlib) and compile freestanding.
+
+CC := x86_64-w64-mingw32-gcc
+
+SRC := main.c
+OBJ := $(SRC:.c=.o)
+OUT := bootx64.efi
+
+CFLAGS := -O2 -ffreestanding -fno-builtin -fno-exceptions -fno-stack-protector -Wall -Wextra -mno-red-zone
+# -mno-red-zone is often recommended for EFI code (UEFI uses no red zone)
+LDFLAGS := -nostdlib -Wl,--subsystem,10 -Wl,-e,efi_main -Wl,--image-base,0x400000
+
+.PHONY: all clean
+
+all: $(OUT)
+
+$(OUT): $(OBJ)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJ) $(OUT)

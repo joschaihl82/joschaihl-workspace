@@ -1,0 +1,793 @@
+// qterm1.cpp
+// Fast Qt6 ANSI Terminal (single-file), extended VT100 support for full-screen apps.
+// Fixed: removed invalid connect to protected resizeEvent, added setChildPid,
+// and silenced write() warnings. Build with Qt6 Widgets (C++17).
+
+#include <QApplication>
+#include <QWidget>
+#include <QPainter>
+#include <QPaintEvent>
+#include <QTimer>
+#include <QSocketNotifier>
+#include <QKeyEvent>
+#include <QVBoxLayout>
+#include <QScrollBar>
+#include <QFontMetrics>
+#include <QDebug>
+
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#if defined(__APPLE__)
+  #include <util.h>
+#else
+  #include <pty.h>
+#endif
+
+#include <vector>
+#include <algorithm>
+#include <cstring>
+
+// -----------------------------
+// Cell and ScreenBuffer
+// -----------------------------
+struct Cell {
+    QChar ch;
+    QColor fg;
+    QColor bg;
+    bool bold;
+    Cell() : ch(' '), fg(Qt::white), bg(Qt::black), bold(false) {}
+};
+
+class ScreenBuffer {
+public:
+    ScreenBuffer(int rows = 24, int cols = 80) { resize(rows, cols); }
+    void resize(int rows_, int cols_) {
+        rows = rows_; cols = cols_;
+        data.assign(rows, std::vector<Cell>(cols));
+        clearAll();
+    }
+    void clearAll() {
+        for (int r=0;r<rows;++r) clearLine(r);
+    }
+    void clearLine(int row) {
+        if (row<0 || row>=rows) return;
+        for (int c=0;c<cols;++c) data[row][c] = Cell();
+    }
+    void putChar(int row, int col, QChar ch, const Cell &fmt) {
+        if (row<0||row>=rows||col<0||col>=cols) return;
+        data[row][col] = fmt;
+        data[row][col].ch = ch;
+    }
+    const std::vector<Cell>& line(int row) const { return data[row]; }
+    std::vector<Cell>& line(int row) { return data[row]; }
+    int numRows() const { return rows; }
+    int numCols() const { return cols; }
+
+private:
+    int rows=24, cols=80;
+    std::vector<std::vector<Cell>> data;
+};
+
+// -----------------------------
+// FastTerminalWidget
+// -----------------------------
+class FastTerminalWidget : public QWidget {
+    Q_OBJECT
+public:
+    explicit FastTerminalWidget(QWidget *parent = nullptr)
+        : QWidget(parent),
+          font(QFont("Monospace", 11)),
+          fm(font)
+    {
+        font.setStyleHint(QFont::Monospace);
+        fm = QFontMetrics(font);
+
+        setFocusPolicy(Qt::StrongFocus);
+
+        lineHeight = fm.height();
+        charWidth = fm.horizontalAdvance(QLatin1Char('W'));
+
+        rows = 24;
+        cols = 80;
+        buffer = new ScreenBuffer(rows, cols);
+        altBuffer = new ScreenBuffer(rows, cols);
+        useAlt = false;
+
+        // coalescing timer
+        updateTimer = new QTimer(this);
+        updateTimer->setSingleShot(true);
+        connect(updateTimer, &QTimer::timeout, this, &FastTerminalWidget::flushPendingPaint);
+
+        dirtyTop = rows;
+        dirtyBottom = -1;
+
+        // initial preferred size
+        setMinimumSize(cols * charWidth + 4, rows * lineHeight + 4);
+
+        // default scroll region
+        scrollTop = 0;
+        scrollBottom = rows - 1;
+
+        // default saved cursor state
+        savedRow = savedCol = 0;
+        savedFmt = Cell();
+
+        masterFd = -1;
+        childPid = -1;
+    }
+
+    ~FastTerminalWidget() override {
+        delete buffer;
+        delete altBuffer;
+    }
+
+    void setPtyMasterFd(int fd) { masterFd = fd; }
+    void setChildPid(pid_t pid) { childPid = pid; }
+
+    // Feed raw bytes from PTY (called from socket notifier)
+    void feed(const QByteArray &data) {
+        incoming.append(data);
+        processIncoming();
+    }
+
+protected:
+    // handle widget resize -> update rows/cols and inform child via ioctl + SIGWINCH
+    void resizeEvent(QResizeEvent *ev) override {
+        QWidget::resizeEvent(ev);
+        int newCols = std::max(10, (width() - 4) / charWidth);
+        int newRows = std::max(2, (height() - 4) / lineHeight);
+        if (newCols != cols || newRows != rows) {
+            cols = newCols; rows = newRows;
+            buffer->resize(rows, cols);
+            altBuffer->resize(rows, cols);
+            scrollTop = 0; scrollBottom = rows - 1;
+            markRangeDirty(0, rows-1);
+            // set winsize on pty
+            if (masterFd >= 0) {
+                struct winsize ws;
+                ws.ws_row = rows;
+                ws.ws_col = cols;
+                ws.ws_xpixel = width();
+                ws.ws_ypixel = height();
+                ioctl(masterFd, TIOCSWINSZ, &ws);
+                if (childPid > 0) kill(childPid, SIGWINCH);
+            }
+        }
+    }
+
+    void paintEvent(QPaintEvent *event) override {
+        QPainter p(this);
+        p.fillRect(event->rect(), Qt::black);
+
+        int y0 = event->rect().top();
+        int y1 = event->rect().bottom();
+        int firstLine = std::max(0, y0 / lineHeight);
+        int lastLine = std::min(rows - 1, y1 / lineHeight);
+
+        ScreenBuffer *buf = activeBuffer();
+
+        for (int r = firstLine; r <= lastLine; ++r) {
+            const auto &line = buf->line(r);
+            int x = 2;
+            int col = 0;
+            while (col < cols) {
+                const Cell &c0 = line[col];
+                QColor fg = c0.fg;
+                QColor bg = c0.bg;
+                bool bold = c0.bold;
+                int runStart = col;
+                ++col;
+                while (col < cols) {
+                    const Cell &cn = line[col];
+                    if (cn.fg != fg || cn.bg != bg || cn.bold != bold) break;
+                    ++col;
+                }
+                int runLen = col - runStart;
+                if (bg != Qt::black) {
+                    p.fillRect(x + runStart * charWidth, r * lineHeight, runLen * charWidth, lineHeight, bg);
+                }
+                QPen pen(fg);
+                p.setPen(pen);
+                QFont drawFont = font;
+                if (bold) drawFont.setWeight(QFont::Bold);
+                p.setFont(drawFont);
+                QString s;
+                s.reserve(runLen);
+                for (int k = runStart; k < runStart + runLen; ++k) {
+                    QChar ch = line[k].ch;
+                    if (ch.isNull()) s.append(' ');
+                    else s.append(ch);
+                }
+                p.drawText(x + runStart * charWidth, (r+1) * lineHeight - fm.descent(), s);
+            }
+        }
+    }
+
+    void keyPressEvent(QKeyEvent *event) override {
+        if (masterFd < 0) { QWidget::keyPressEvent(event); return; }
+        QByteArray out;
+        QString txt = event->text();
+        if (!txt.isEmpty()) {
+            if (txt == "\r" || txt == "\n") out.append('\r');
+            else out.append(txt.toUtf8());
+        } else {
+            switch (event->key()) {
+                case Qt::Key_Backspace: out.append('\x7f'); break;
+                case Qt::Key_Left:  out.append("\033[D"); break;
+                case Qt::Key_Right: out.append("\033[C"); break;
+                case Qt::Key_Up:    out.append("\033[A"); break;
+                case Qt::Key_Down:  out.append("\033[B"); break;
+                case Qt::Key_Home:  out.append("\033[H"); break;
+                case Qt::Key_End:   out.append("\033[F"); break;
+                case Qt::Key_Tab:   out.append('\t'); break;
+                case Qt::Key_Return:
+                case Qt::Key_Enter: out.append('\r'); break;
+                default:
+                    if (event->modifiers() & Qt::ControlModifier) {
+                        int k = event->key();
+                        if (k >= Qt::Key_A && k <= Qt::Key_Z) {
+                            char ctrl = char(k - Qt::Key_A + 1);
+                            out.append(ctrl);
+                        }
+                    }
+                    break;
+            }
+        }
+        if (!out.isEmpty()) (void)write(masterFd, out.constData(), out.size());
+    }
+
+    QSize sizeHint() const override {
+        return QSize(cols * charWidth + 4, rows * lineHeight + 4);
+    }
+
+private slots:
+    void flushPendingPaint() {
+        if (dirtyBottom >= dirtyTop) {
+            int topY = dirtyTop * lineHeight;
+            int bottomY = (dirtyBottom + 1) * lineHeight - 1;
+            QRect r(0, topY, width(), bottomY - topY + 1);
+            update(r);
+            dirtyTop = rows;
+            dirtyBottom = -1;
+        }
+    }
+
+private:
+    // PTY
+    int masterFd = -1;
+    pid_t childPid = -1;
+
+    // font & metrics
+    QFont font;
+    QFontMetrics fm;
+    int lineHeight = 16;
+    int charWidth = 8;
+
+    // buffers
+    ScreenBuffer *buffer = nullptr;
+    ScreenBuffer *altBuffer = nullptr;
+    bool useAlt = false;
+    int rows = 24;
+    int cols = 80;
+
+    // scroll region
+    int scrollTop = 0;
+    int scrollBottom = 23;
+
+    // cursor
+    int curRow = 0;
+    int curCol = 0;
+
+    // current cell format
+    Cell curFmt;
+
+    // saved cursor/format (DECSC/DECRC)
+    int savedRow = 0, savedCol = 0;
+    Cell savedFmt;
+
+    // incoming raw bytes
+    QByteArray incoming;
+
+    // parser state
+    enum State { NORMAL, ESC, CSI, OSC, OSC_STR } state = NORMAL;
+    QByteArray csiBuf;
+    QByteArray oscBuf;
+
+    // dirty tracking
+    int dirtyTop;
+    int dirtyBottom;
+    QTimer *updateTimer;
+
+    ScreenBuffer* activeBuffer() { return useAlt ? altBuffer : buffer; }
+
+    void markLineDirty(int r) {
+        if (r < 0 || r >= rows) return;
+        dirtyTop = std::min(dirtyTop, r);
+        dirtyBottom = std::max(dirtyBottom, r);
+        if (!updateTimer->isActive()) updateTimer->start(16);
+    }
+
+    void markRangeDirty(int top, int bottom) {
+        top = std::max(0, top); bottom = std::min(rows-1, bottom);
+        if (top > bottom) return;
+        dirtyTop = std::min(dirtyTop, top);
+        dirtyBottom = std::max(dirtyBottom, bottom);
+        if (!updateTimer->isActive()) updateTimer->start(16);
+    }
+
+    // ---------- Buffer processing (UTF-8 safe) ----------
+    void processIncoming() {
+        while (!incoming.isEmpty()) {
+            unsigned char b = static_cast<unsigned char>(incoming.at(0));
+            int need = 0;
+            if (b < 0x80) need = 1;
+            else if ((b & 0xE0) == 0xC0) need = 2;
+            else if ((b & 0xF0) == 0xE0) need = 3;
+            else if ((b & 0xF8) == 0xF0) need = 4;
+            else {
+                char ch = incoming.at(0);
+                incoming.remove(0, 1);
+                processByte(ch);
+                continue;
+            }
+            if (incoming.size() < need) break;
+            QByteArray seq = incoming.left(need);
+            incoming.remove(0, need);
+            QString s = QString::fromUtf8(seq);
+            if (s.isEmpty()) {
+                for (char ch : seq) processByte(ch);
+            } else {
+                for (QChar qc : s) {
+                    if (qc.unicode() < 0x20 || qc.unicode() == 0x7f) {
+                        processByte(static_cast<char>(qc.unicode()));
+                    } else {
+                        putPrintable(qc);
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------- Byte-level parser with extended CSI/OSC handling ----------
+    void processByte(char ch) {
+        if (state == NORMAL) {
+            if (ch == '\033') { state = ESC; return; }
+            if (ch == '\r') { curCol = 0; return; }
+            if (ch == '\n') { newline(); return; }
+            if (ch == '\b') { if (curCol>0) --curCol; markLineDirty(curRow); return; }
+            return;
+        } else if (state == ESC) {
+            if (ch == '[') { state = CSI; csiBuf.clear(); return; }
+            if (ch == ']') { state = OSC; oscBuf.clear(); return; }
+            if (ch == '7') { // DECSC save cursor and attributes
+                saveCursor(); state = NORMAL; return;
+            }
+            if (ch == '8') { // DECRC restore
+                restoreCursor(); state = NORMAL; return;
+            }
+            // unsupported single-letter escapes -> ignore
+            state = NORMAL;
+            return;
+        } else if (state == CSI) {
+            if ((unsigned char)ch >= 0x40 && (unsigned char)ch <= 0x7E) {
+                handleCsi(csiBuf, ch);
+                state = NORMAL;
+            } else {
+                csiBuf.append(ch);
+            }
+            return;
+        } else if (state == OSC) {
+            if (ch == '\007') {
+                handleOsc(oscBuf);
+                state = NORMAL;
+            } else if (ch == '\033') {
+                state = OSC_STR;
+            } else {
+                oscBuf.append(ch);
+            }
+            return;
+        } else if (state == OSC_STR) {
+            if (ch == '\\') {
+                handleOsc(oscBuf);
+                state = NORMAL;
+            } else {
+                oscBuf.append('\033');
+                oscBuf.append(ch);
+                state = OSC;
+            }
+            return;
+        }
+    }
+
+    void handleOsc(const QByteArray &data) {
+        QList<QByteArray> parts = data.split(';');
+        if (parts.size() >= 2) {
+            bool ok;
+            int cmd = parts[0].toInt(&ok);
+            if (ok && (cmd == 0 || cmd == 2)) {
+                QByteArray title = data.mid(data.indexOf(';')+1);
+                QWidget *w = window();
+                if (w) w->setWindowTitle(QString::fromUtf8(title));
+            }
+        }
+    }
+
+    // parse CSI params into list of parts and final char
+    void handleCsi(const QByteArray &params, char final) {
+        QList<QByteArray> parts = params.split(';');
+        auto val = [&](int idx, int def)->int {
+            if (idx < parts.size() && !parts[idx].isEmpty()) return parts[idx].toInt();
+            return def;
+        };
+
+        switch (final) {
+            case 'A': cursorUp(val(0,1)); break;
+            case 'B': cursorDown(val(0,1)); break;
+            case 'C': cursorForward(val(0,1)); break;
+            case 'D': cursorBack(val(0,1)); break;
+            case 'H':
+            case 'f': setCursorPos(val(0,1)-1, val(1,1)-1); break;
+            case 'J': eraseDisplay(val(0,0)); break;
+            case 'K': eraseLine(val(0,0)); break;
+            case 'm': handleSgr(parts); markLineDirty(curRow); break;
+            case 's': saveCursor(); break;
+            case 'u': restoreCursor(); markLineDirty(curRow); break;
+            case 'r': {
+                int top = val(0,1)-1;
+                int bot = val(1,rows)-1;
+                if (top < 0) top = 0;
+                if (bot >= rows) bot = rows-1;
+                scrollTop = top; scrollBottom = bot;
+                break;
+            }
+            case 'n':
+                if (!parts.isEmpty() && parts[0] == "6") sendCursorReport();
+                break;
+            case 'h':
+            case 'l':
+                handleMode(final, params);
+                break;
+            case 'L': insertLines(val(0,1)); break;
+            case 'M': deleteLines(val(0,1)); break;
+            case '@': insertChars(val(0,1)); break;
+            case 'P': deleteChars(val(0,1)); break;
+            case 'S': scrollUp(val(0,1)); break;
+            case 'T': scrollDown(val(0,1)); break;
+            default:
+                break;
+        }
+    }
+
+    // SGR handling including 256 and 24-bit
+    void handleSgr(const QList<QByteArray> &parts) {
+        QList<int> params;
+        for (auto p : parts) {
+            if (p.isEmpty()) params.append(0);
+            else params.append(p.toInt());
+        }
+        int i = 0;
+        while (i < params.size()) {
+            int p = params[i];
+            if (p == 0) {
+                curFmt = Cell();
+                ++i;
+            } else if (p == 1) {
+                curFmt.bold = true; ++i;
+            } else if (p == 22) {
+                curFmt.bold = false; ++i;
+            } else if (p >= 30 && p <= 37) {
+                curFmt.fg = ansiColor(p - 30); ++i;
+            } else if (p == 39) {
+                curFmt.fg = Qt::white; ++i;
+            } else if (p >= 40 && p <= 47) {
+                curFmt.bg = ansiColor(p - 40); ++i;
+            } else if (p == 49) {
+                curFmt.bg = Qt::black; ++i;
+            } else if (p == 38 || p == 48) {
+                bool isFg = (p == 38);
+                if (i+1 < params.size()) {
+                    int mode = params[i+1];
+                    if (mode == 5 && i+2 < params.size()) {
+                        int idx = params[i+2];
+                        QColor col = color256(idx);
+                        if (isFg) curFmt.fg = col; else curFmt.bg = col;
+                        i += 3;
+                    } else if (mode == 2 && i+4 < params.size()) {
+                        int r = params[i+2], g = params[i+3], b = params[i+4];
+                        QColor col(r,g,b);
+                        if (isFg) curFmt.fg = col; else curFmt.bg = col;
+                        i += 5;
+                    } else {
+                        i += 2;
+                    }
+                } else ++i;
+            } else {
+                ++i;
+            }
+        }
+    }
+
+    QColor ansiColor(int idx) {
+        static QColor base[] = { Qt::black, Qt::red, Qt::green, Qt::yellow,
+                                 Qt::blue, Qt::magenta, Qt::cyan, Qt::white };
+        if (idx < 0 || idx > 7) return Qt::white;
+        return base[idx];
+    }
+
+    QColor color256(int idx) {
+        if (idx < 16) {
+            static QColor table16[] = {
+                QColor(0,0,0), QColor(128,0,0), QColor(0,128,0), QColor(128,128,0),
+                QColor(0,0,128), QColor(128,0,128), QColor(0,128,128), QColor(192,192,192),
+                QColor(128,128,128), QColor(255,0,0), QColor(0,255,0), QColor(255,255,0),
+                QColor(0,0,255), QColor(255,0,255), QColor(0,255,255), QColor(255,255,255)
+            };
+            return table16[idx];
+        } else if (idx >= 16 && idx <= 231) {
+            int v = idx - 16;
+            int r = v / 36;
+            int g = (v % 36) / 6;
+            int b = v % 6;
+            auto conv = [](int x){ return x==0 ? 0 : 55 + x*40; };
+            return QColor(conv(r), conv(g), conv(b));
+        } else if (idx >= 232 && idx <= 255) {
+            int gray = 8 + (idx - 232) * 10;
+            return QColor(gray, gray, gray);
+        }
+        return QColor();
+    }
+
+    // cursor and screen ops
+    void putPrintable(QChar qc) {
+        ScreenBuffer *buf = activeBuffer();
+        if (curRow < 0) curRow = 0;
+        if (curRow > scrollBottom) curRow = scrollBottom;
+        if (curRow >= buf->numRows()) {
+            scrollUp(1);
+            curRow = buf->numRows() - 1;
+        }
+        if (curCol >= buf->numCols()) {
+            curCol = 0;
+            ++curRow;
+            if (curRow > scrollBottom) {
+                scrollUp(1);
+                curRow = scrollBottom;
+            }
+        }
+        buf->putChar(curRow, curCol, qc, curFmt);
+        markLineDirty(curRow);
+        ++curCol;
+    }
+
+    void newline() {
+        curCol = 0;
+        ++curRow;
+        if (curRow > scrollBottom) {
+            scrollUp(1);
+            curRow = scrollBottom;
+        }
+    }
+
+    void scrollUp(int lines) {
+        ScreenBuffer *buf = activeBuffer();
+        if (lines <= 0) return;
+        for (int l=0;l<lines;++l) {
+            for (int r=scrollTop; r<scrollBottom; ++r) buf->line(r) = buf->line(r+1);
+            buf->clearLine(scrollBottom);
+        }
+        markRangeDirty(scrollTop, scrollBottom);
+    }
+
+    void scrollDown(int lines) {
+        ScreenBuffer *buf = activeBuffer();
+        if (lines <= 0) return;
+        for (int l=0;l<lines;++l) {
+            for (int r=scrollBottom; r>scrollTop; --r) buf->line(r) = buf->line(r-1);
+            buf->clearLine(scrollTop);
+        }
+        markRangeDirty(scrollTop, scrollBottom);
+    }
+
+    void cursorUp(int n) { curRow = std::max(scrollTop, curRow - std::max(1,n)); }
+    void cursorDown(int n) { curRow = std::min(scrollBottom, curRow + std::max(1,n)); }
+    void cursorForward(int n) { curCol = std::min(cols-1, curCol + std::max(1,n)); }
+    void cursorBack(int n) { curCol = std::max(0, curCol - std::max(1,n)); }
+    void setCursorPos(int r, int c) {
+        curRow = qBound(0, r, rows-1);
+        curCol = qBound(0, c, cols-1);
+    }
+    void eraseDisplay(int mode) {
+        ScreenBuffer *buf = activeBuffer();
+        if (mode == 0) {
+            for (int j=curCol;j<cols;++j) buf->line(curRow)[j] = Cell();
+            for (int i=curRow+1;i<rows;++i) buf->clearLine(i);
+            markRangeDirty(curRow, rows-1);
+        } else if (mode == 1) {
+            for (int j=0;j<=curCol;++j) buf->line(curRow)[j] = Cell();
+            for (int i=0;i<curRow;++i) buf->clearLine(i);
+            markRangeDirty(0, curRow);
+        } else {
+            buf->clearAll();
+            markRangeDirty(0, rows-1);
+        }
+    }
+    void eraseLine(int mode) {
+        ScreenBuffer *buf = activeBuffer();
+        if (mode == 0) {
+            for (int j=curCol;j<cols;++j) buf->line(curRow)[j] = Cell();
+        } else if (mode == 1) {
+            for (int j=0;j<=curCol;++j) buf->line(curRow)[j] = Cell();
+        } else {
+            buf->clearLine(curRow);
+        }
+        markLineDirty(curRow);
+    }
+    void saveCursor() {
+        savedRow = curRow; savedCol = curCol; savedFmt = curFmt;
+    }
+    void restoreCursor() {
+        curRow = savedRow; curCol = savedCol; curFmt = savedFmt;
+    }
+    void setScrollRegion(int top, int bottom) {
+        if (top < 0) top = 0;
+        if (bottom >= rows) bottom = rows-1;
+        scrollTop = top; scrollBottom = bottom;
+    }
+    void insertLines(int n) {
+        ScreenBuffer *buf = activeBuffer();
+        if (n <= 0) n = 1;
+        for (int i=0;i<n;++i) {
+            for (int r=scrollBottom; r>curRow; --r) buf->line(r) = buf->line(r-1);
+            buf->clearLine(curRow);
+        }
+        markRangeDirty(curRow, scrollBottom);
+    }
+    void deleteLines(int n) {
+        ScreenBuffer *buf = activeBuffer();
+        if (n <= 0) n = 1;
+        for (int i=0;i<n;++i) {
+            for (int r=curRow; r<scrollBottom; ++r) buf->line(r) = buf->line(r+1);
+            buf->clearLine(scrollBottom);
+        }
+        markRangeDirty(curRow, scrollBottom);
+    }
+    void insertChars(int n) {
+        ScreenBuffer *buf = activeBuffer();
+        if (n <= 0) n = 1;
+        for (int j=0;j<n;++j) {
+            for (int col=cols-1; col>curCol; --col) buf->line(curRow)[col] = buf->line(curRow)[col-1];
+            buf->line(curRow)[curCol] = Cell();
+        }
+        markLineDirty(curRow);
+    }
+    void deleteChars(int n) {
+        ScreenBuffer *buf = activeBuffer();
+        if (n <= 0) n = 1;
+        for (int j=0;j<n;++j) {
+            for (int col=curCol; col<cols-1; ++col) buf->line(curRow)[col] = buf->line(curRow)[col+1];
+            buf->line(curRow)[cols-1] = Cell();
+        }
+        markLineDirty(curRow);
+    }
+
+    void handleMode(char final, const QByteArray &params) {
+        bool set = (final == 'h');
+        if (params.startsWith('?')) {
+            QByteArray num = params.mid(1);
+            int n = num.toInt();
+            if (n == 25) {
+                cursorVisible = set;
+            } else if (n == 1049) {
+                if (set) {
+                    useAlt = true;
+                    altBuffer->clearAll();
+                    curRow = curCol = 0;
+                } else {
+                    useAlt = false;
+                    curRow = curCol = 0;
+                }
+                markRangeDirty(0, rows-1);
+            }
+        }
+    }
+
+    void sendCursorReport() {
+        if (masterFd >= 0) {
+            QByteArray rep = QByteArray::fromStdString("\033[" + std::to_string(curRow+1) + ";" + std::to_string(curCol+1) + "R");
+            (void)write(masterFd, rep.constData(), rep.size());
+        }
+    }
+
+    bool cursorVisible = true;
+
+    ScreenBuffer* activeBuffer() { return useAlt ? altBuffer : buffer; }
+
+    // saved cursor/format
+    int savedRow = 0, savedCol = 0;
+    Cell savedFmt;
+};
+
+// -----------------------------
+// main: spawn PTY and shell, wire to widget
+// -----------------------------
+int main(int argc, char **argv) {
+    QApplication app(argc, argv);
+
+    QWidget window;
+    window.setWindowTitle("Fast Qt6 ANSI Terminal");
+    QVBoxLayout *layout = new QVBoxLayout(&window);
+
+    FastTerminalWidget *term = new FastTerminalWidget;
+    layout->addWidget(term);
+    window.resize(1000, 600);
+    window.show();
+
+    int masterFd = -1;
+    pid_t pid = forkpty(&masterFd, nullptr, nullptr, nullptr);
+    if (pid < 0) {
+        qFatal("forkpty failed");
+        return 1;
+    }
+    if (pid == 0) {
+        // child: set TERM and exec shell
+        setenv("TERM", "xterm-256color", 1);
+        const char *shell = getenv("SHELL");
+        if (!shell) shell = "/bin/bash";
+        execlp(shell, shell, nullptr);
+        _exit(1);
+    }
+
+    // parent
+    term->setPtyMasterFd(masterFd);
+    term->setChildPid(pid);
+
+    // set non-blocking
+    int flags = fcntl(masterFd, F_GETFL, 0);
+    fcntl(masterFd, F_SETFL, flags | O_NONBLOCK);
+
+    QSocketNotifier *notifier = new QSocketNotifier(masterFd, QSocketNotifier::Read, &window);
+    QObject::connect(notifier, &QSocketNotifier::activated, [&](int fd){
+        char buf[8192];
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            term->feed(QByteArray(buf, (int)n));
+        } else if (n == 0) {
+            notifier->setEnabled(false);
+        }
+    });
+
+    // set initial winsize and notify child
+    {
+        struct winsize ws;
+        int cols = std::max(10, (term->width() - 4) / term->fontMetrics().horizontalAdvance(QLatin1Char('W')));
+        int rows = std::max(2, (term->height() - 4) / term->fontMetrics().height());
+        ws.ws_row = rows;
+        ws.ws_col = cols;
+        ws.ws_xpixel = term->width();
+        ws.ws_ypixel = term->height();
+        ioctl(masterFd, TIOCSWINSZ, &ws);
+        kill(pid, SIGWINCH);
+    }
+
+    // reap child
+    QTimer *reaper = new QTimer(&window);
+    reaper->setInterval(1000);
+    QObject::connect(reaper, &QTimer::timeout, [&](){
+        int status = 0;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            qDebug() << "Child exited, status" << status;
+            reaper->stop();
+            notifier->setEnabled(false);
+        }
+    });
+    reaper->start();
+
+    return app.exec();
+}
+
+#include "qterm1.moc"

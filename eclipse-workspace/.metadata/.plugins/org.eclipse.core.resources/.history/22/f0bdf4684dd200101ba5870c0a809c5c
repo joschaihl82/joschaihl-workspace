@@ -1,0 +1,750 @@
+// ciacc.c
+// fixed version: stack alignment, safe memory access, portability, and robust parsing.
+//
+// use: gcc ciacc.c -o cc
+//       ./cc test.c
+
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------------------------
+   utils & portability
+   --------------------------- */
+
+// replacement for strndup (gnu extension) to ensure portability
+static char *safe_strndup(const char *s, size_t n) {
+    char *p = malloc(n + 1);
+    if (!p) { fprintf(stderr, "out of memory\n"); exit(1); }
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+/* ---------------------------
+   tokenizer
+   --------------------------- */
+typedef enum {
+    TK_RESERVED,
+    TK_TYPE,
+    TK_ID,
+    TK_NUM,
+    TK_CHAR,
+    TK_STRING,
+    TK_EOF,
+} token_kind;
+
+typedef struct token token;
+struct token {
+    token_kind kind;
+    token *next;
+    char *str;
+    int len;
+    int val;
+};
+
+static char *p_input; // input pointer
+
+static bool is_alpha_char(char c){
+    return c == '_' || ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z');
+}
+static bool is_alnum_char(char c){
+    return is_alpha_char(c) || isdigit((unsigned char)c);
+}
+
+token *tokenize(char *code){
+    p_input = code;
+    token *head = calloc(1, sizeof(token));
+    token *cur = head;
+
+    char *types[] = {"void","_Bool","char","short","int","long","unsigned","signed","const","volatile","static","extern"};
+    int num_types = sizeof(types)/sizeof(*types);
+
+    char *keywords[] = {"return","if","else","while","for","break","continue","sizeof","typedef","struct","union","enum","include"};
+    int num_keywords = sizeof(keywords)/sizeof(*keywords);
+
+    char *puncts[] = {
+        ">>=", "<<=", "++", "--", "->", "+=", "-=", "*=", "/=", "%=", "||", "&&", "==", "!=", "<=", ">=", "<<", ">>",
+        "#", "=", "?", ":", "|", "^", "&", "<", ">", "+", "-", "*", "/", "%", "!", ".", ",", ";", "(", ")", "{", "}", "[", "]"
+    };
+    int num_puncts = sizeof(puncts)/sizeof(*puncts);
+
+    while(*p_input){
+        // skip whitespace
+        if(isspace((unsigned char)*p_input)){ p_input++; continue; }
+
+        // preprocessor line
+        if(*p_input == '#'){ while(*p_input && *p_input != '\n') p_input++; continue; }
+
+        // line comment (check p_input[1] to avoid segfault at eof)
+        if(p_input[0] == '/' && p_input[1] == '/'){
+            p_input += 2; while(*p_input && *p_input != '\n') p_input++; continue;
+        }
+
+        // block comment
+        if(p_input[0] == '/' && p_input[1] == '*'){
+            p_input += 2;
+            while(*p_input){
+                if(p_input[0] == '*' && p_input[1] == '/'){ p_input += 2; break; }
+                p_input++;
+            }
+            continue;
+        }
+
+        // char literal
+        if(*p_input == '\''){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_CHAR;
+            t->str = p_input;
+            t->len = 0;
+            p_input++;
+            while(*p_input && *p_input != '\''){
+                if(*p_input == '\\'){ p_input++; if(*p_input) p_input++; t->len += 2; }
+                else { p_input++; t->len++; }
+            }
+            if(*p_input == '\''){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // string literal
+        if(*p_input == '\"'){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_STRING;
+            t->str = p_input;
+            t->len = 0;
+            p_input++;
+            while(*p_input && *p_input != '\"'){
+                if(*p_input == '\\'){ p_input++; if(*p_input) p_input++; t->len += 2; }
+                else { p_input++; t->len++; }
+            }
+            if(*p_input == '\"'){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // types
+        bool matched = false;
+        for(int i=0;i<num_types;i++){
+            char *s = types[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0 && !is_alnum_char(p_input[L])){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_TYPE;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // keywords
+        for(int i=0;i<num_keywords;i++){
+            char *s = keywords[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0 && !is_alnum_char(p_input[L])){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_RESERVED;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // punctuators
+        for(int i=0;i<num_puncts;i++){
+            char *s = puncts[i];
+            int L = (int)strlen(s);
+            if(memcmp(p_input, s, L) == 0){
+                token *t = calloc(1, sizeof(token));
+                t->kind = TK_RESERVED;
+                t->str = p_input;
+                t->len = L;
+                cur->next = t; cur = t;
+                p_input += L;
+                matched = true; break;
+            }
+        }
+        if(matched) continue;
+
+        // number
+        if(isdigit((unsigned char)*p_input)){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_NUM;
+            t->str = p_input;
+            t->len = 0;
+            t->val = 0;
+            while(isdigit((unsigned char)*p_input)){ t->val = t->val*10 + (*p_input - '0'); p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        // identifier
+        if(is_alpha_char(*p_input)){
+            token *t = calloc(1, sizeof(token));
+            t->kind = TK_ID;
+            t->str = p_input;
+            t->len = 0;
+            while(is_alnum_char(*p_input)){ p_input++; t->len++; }
+            cur->next = t; cur = t;
+            continue;
+        }
+
+        fprintf(stderr, "tokenize: invalid token at: '%c'\n", *p_input);
+        exit(1);
+    }
+
+    token *t = calloc(1, sizeof(token));
+    t->kind = TK_EOF;
+    cur->next = t;
+    return head->next;
+}
+
+/* ---------------------------
+   AST structures
+   --------------------------- */
+typedef enum {
+    ND_FUNC_DEF, ND_GLOBAL_DEF, ND_BLOCK, ND_IF, ND_WHILE, ND_FOR, ND_RET,
+    ND_COMMA, ND_ASSIGN, ND_ADD, ND_SUB, ND_MUL, ND_DIV, ND_NEG, ND_LOG_NOT,
+    ND_LOCAL, ND_NUM, ND_STRING, ND_FUNC_CALL
+} node_kind;
+
+typedef enum { INT } type_kind; // simplified
+typedef struct type type;
+struct type { type_kind kind; };
+
+typedef struct node node;
+struct node {
+    node_kind kind;
+    node *op1, *op2;
+    node *head, *next;
+    type *ty;
+    char *name;
+    int len;
+    int val;
+};
+
+static node *node_head = NULL;
+static node *node_tail = NULL;
+
+/* ---------------------------
+   parser
+   --------------------------- */
+static token *cur_tok;
+
+static bool expect_tok(const char *op){
+    if((int)strlen(op) == cur_tok->len && memcmp(op, cur_tok->str, cur_tok->len) == 0){
+        cur_tok = cur_tok->next; return true;
+    }
+    return false;
+}
+
+static node *new_node(node_kind k){
+    node *nd = calloc(1, sizeof(node));
+    nd->kind = k;
+    return nd;
+}
+
+static node *parse_assign();
+static node *parse_expr();
+static node *parse_stmt();
+static node *parse_block();
+
+static node *parse_primary(){
+    if(cur_tok->kind == TK_NUM){
+        node *nd = new_node(ND_NUM);
+        nd->val = cur_tok->val;
+        cur_tok = cur_tok->next;
+        return nd;
+    }
+    if(cur_tok->kind == TK_STRING){
+        node *nd = new_node(ND_STRING);
+        nd->name = cur_tok->str;
+        nd->len = cur_tok->len;
+        cur_tok = cur_tok->next;
+        return nd;
+    }
+    if(cur_tok->kind == TK_ID){
+        char *name = cur_tok->str; int len = cur_tok->len;
+        cur_tok = cur_tok->next;
+        if(expect_tok("(")){
+            node *nd = new_node(ND_FUNC_CALL);
+            nd->name = name; nd->len = len;
+            nd->val = 0;
+            if(expect_tok(")")) return nd;
+            while(1){
+                node *arg = parse_assign();
+                arg->next = nd->head; nd->head = arg; nd->val++;
+                if(expect_tok(",")) continue;
+                if(expect_tok(")")) break;
+                fprintf(stderr, "parse error: expected ',' or ')' in call\n"); exit(1);
+            }
+            return nd;
+        } else {
+            node *nd = new_node(ND_LOCAL);
+            nd->name = name; nd->len = len;
+            return nd;
+        }
+    }
+    if(expect_tok("(")){
+        node *nd = parse_expr();
+        if(!expect_tok(")")) { fprintf(stderr, "parse error: expected ')'\n"); exit(1); }
+        return nd;
+    }
+    fprintf(stderr, "parse error: unexpected token\n"); exit(1);
+}
+
+static node *parse_unary(){
+    if(expect_tok("-")){ node *nd = new_node(ND_NEG); nd->op1 = parse_unary(); return nd; }
+    if(expect_tok("!")){ node *nd = new_node(ND_LOG_NOT); nd->op1 = parse_unary(); return nd; }
+    return parse_primary();
+}
+
+static node *parse_mul(){
+    node *nd = parse_unary();
+    while(1){
+        if(expect_tok("*")){ node *r = new_node(ND_MUL); r->op1 = nd; r->op2 = parse_unary(); nd = r; continue; }
+        if(expect_tok("/")){ node *r = new_node(ND_DIV); r->op1 = nd; r->op2 = parse_unary(); nd = r; continue; }
+        break;
+    }
+    return nd;
+}
+
+static node *parse_add(){
+    node *nd = parse_mul();
+    while(1){
+        if(expect_tok("+")){ node *r = new_node(ND_ADD); r->op1 = nd; r->op2 = parse_mul(); nd = r; continue; }
+        if(expect_tok("-")){ node *r = new_node(ND_SUB); r->op1 = nd; r->op2 = parse_mul(); nd = r; continue; }
+        break;
+    }
+    return nd;
+}
+
+static node *parse_assign(){
+    node *nd = parse_add();
+    if(expect_tok("=")){ node *r = new_node(ND_ASSIGN); r->op1 = nd; r->op2 = parse_assign(); return r; }
+    return nd;
+}
+static node *parse_expr(){ return parse_assign(); }
+
+static node *parse_stmt(){
+    if(expect_tok("{")) return parse_block();
+    if(expect_tok("return")){
+        node *nd = new_node(ND_RET);
+        if(!expect_tok(";")){
+            nd->op1 = parse_expr();
+            if(!expect_tok(";")) { fprintf(stderr, "parse error: expected ';' after return\n"); exit(1); }
+        }
+        return nd;
+    }
+    node *nd = parse_expr();
+    if(!expect_tok(";")) { fprintf(stderr, "parse error: expected ';' after expr\n"); exit(1); }
+    return nd;
+}
+
+static node *parse_block(){
+    node *nd = new_node(ND_BLOCK);
+    node *head = NULL, *tail = NULL;
+    while(!expect_tok("}")){
+        node *s = parse_stmt();
+        if(!head) head = tail = s; else { tail->next = s; tail = s; }
+    }
+    nd->head = head;
+    return nd;
+}
+
+static void program_parse(token *toks){
+    cur_tok = toks;
+    node_head = NULL; node_tail = NULL;
+    while(cur_tok->kind != TK_EOF){
+        if(cur_tok->kind == TK_TYPE) cur_tok = cur_tok->next;
+        if(cur_tok->kind != TK_ID){ fprintf(stderr, "parse error: expected identifier\n"); exit(1); }
+        char *name = cur_tok->str; int len = cur_tok->len; cur_tok = cur_tok->next;
+        if(expect_tok("(")){
+            while(!expect_tok(")")) cur_tok = cur_tok->next;
+            if(expect_tok("{")){
+                node *fn = new_node(ND_FUNC_DEF);
+                fn->name = name; fn->len = len;
+                fn->op1 = parse_block();
+                if(!node_head) node_head = node_tail = fn; else { node_tail->next = fn; node_tail = fn; }
+            } else { while(!expect_tok(";")) cur_tok = cur_tok->next; }
+        } else { while(!expect_tok(";")) cur_tok = cur_tok->next; }
+    }
+}
+
+/* ---------------------------
+   codegen (x86-64)
+   --------------------------- */
+static uint8_t *code_buf = NULL;
+static size_t code_cap = 0;
+static size_t code_len = 0;
+
+static void ensure_capacity(size_t n){
+    if(code_len + n <= code_cap) return;
+    size_t nc = code_cap?code_cap*2:4096;
+    while(nc < code_len + n) nc*=2;
+    uint8_t *new_buf = realloc(code_buf, nc);
+    if (!new_buf) { fprintf(stderr, "oom in codegen\n"); exit(1); }
+    code_buf = new_buf;
+    code_cap = nc;
+}
+static void emit8(uint8_t b){ ensure_capacity(1); code_buf[code_len++] = b; }
+static void emit32(uint32_t v){ ensure_capacity(4); memcpy(code_buf + code_len, &v, 4); code_len += 4; }
+static void emit64(uint64_t v){ ensure_capacity(8); memcpy(code_buf + code_len, &v, 8); code_len += 8; }
+static size_t emit_pos(){ return code_len; }
+
+static uint8_t *data_buf = NULL;
+static size_t data_len = 0;
+static void data_append(const void *d, size_t n){
+    uint8_t *new_buf = realloc(data_buf, data_len + n);
+    if(!new_buf) { fprintf(stderr, "oom in data\n"); exit(1); }
+    data_buf = new_buf;
+    memcpy(data_buf + data_len, d, n);
+    data_len += n;
+}
+
+typedef enum { REL_PC32, REL_64 } rel_type;
+typedef struct rel_item {
+    size_t site_offset;
+    rel_type type;
+    char *name;
+    struct rel_item *next;
+} rel_item;
+static rel_item *rel_head = NULL;
+
+static void add_reloc(size_t off, rel_type t, const char *name){
+    rel_item *r = calloc(1,sizeof(rel_item));
+    r->site_offset = off; r->type = t; r->name = safe_strndup(name, strlen(name));
+    r->next = rel_head; rel_head = r;
+}
+
+typedef struct symrec {
+    char *name; size_t offset; int is_text; struct symrec *next;
+} symrec;
+static symrec *local_sym_head = NULL;
+static void add_local_sym(const char *name, size_t off, int is_text){
+    symrec *s = calloc(1,sizeof(symrec));
+    s->name = safe_strndup(name, strlen(name));
+    s->offset = off; s->is_text = is_text;
+    s->next = local_sym_head; local_sym_head = s;
+}
+
+static void emit_mov_rax_imm64(uint64_t imm){ emit8(0x48); emit8(0xB8); emit64(imm); }
+static void emit_push_rbp(){ emit8(0x55); }
+static void emit_mov_rbp_rsp(){ emit8(0x48); emit8(0x89); emit8(0xE5); }
+static void emit_sub_rsp_imm32(uint32_t imm){ emit8(0x48); emit8(0x81); emit8(0xEC); emit32(imm); }
+static void emit_add_rsp_imm32(uint32_t imm){ emit8(0x48); emit8(0x81); emit8(0xC4); emit32(imm); }
+static void emit_leave(){ emit8(0xC9); }
+static void emit_ret(){ emit8(0xC3); }
+static void emit_push_rax(){ emit8(0x50); }
+static void emit_pop_rbx(){ emit8(0x5B); }
+static void emit_add_rax_rbx(){ emit8(0x48); emit8(0x01); emit8(0xD8); }
+static void emit_sub_rax_rbx(){ emit8(0x48); emit8(0x29); emit8(0xD8); }
+static void emit_imul_rax_rbx(){ emit8(0x48); emit8(0x0F); emit8(0xAF); emit8(0xC3); }
+static void emit_cqo(){ emit8(0x48); emit8(0x99); }
+static void emit_idiv_rbx(){ emit8(0x48); emit8(0xF7); emit8(0xFB); }
+static void emit_mov_rdi_rax(){ emit8(0x48); emit8(0x89); emit8(0xC7); }
+static void emit_mov_rsi_rax(){ emit8(0x48); emit8(0x89); emit8(0xC6); }
+static void emit_mov_rdx_rax(){ emit8(0x48); emit8(0x89); emit8(0xC2); }
+static void emit_mov_rcx_rax(){ emit8(0x48); emit8(0x89); emit8(0xC1); }
+static void emit_mov_r8_rax(){ emit8(0x4C); emit8(0x89); emit8(0xC0); }
+static void emit_mov_r9_rax(){ emit8(0x4C); emit8(0x89); emit8(0xC8); }
+
+static void emit_call_rel32_placeholder(const char *name){
+    emit8(0xE8);
+    size_t relpos = emit_pos();
+    emit32(0);
+    add_reloc(relpos, REL_PC32, name);
+}
+
+static void gen_expr(node *nd){
+    if(!nd){ emit_mov_rax_imm64(0); return; }
+    switch(nd->kind){
+        case ND_NUM: emit_mov_rax_imm64((uint64_t)nd->val); return;
+        case ND_STRING: {
+            size_t data_off = data_len;
+            char *s = nd->name; int L = nd->len;
+            if(L >= 2 && s[0] == '\"' && s[L-1] == '\"'){
+                data_append(s + 1, L - 2); // simplistic, no unescape
+                data_append("\0", 1);
+            } else {
+                data_append("\0", 1);
+            }
+            emit_mov_rax_imm64(0);
+            char symname[64]; snprintf(symname, sizeof(symname), ".Lstr%zu", data_off);
+            add_reloc(emit_pos(), REL_64, symname);
+            add_local_sym(symname, data_off, 0);
+            return;
+        }
+        case ND_LOCAL: emit_mov_rax_imm64(0); return;
+        case ND_ADD: gen_expr(nd->op2); emit_push_rax(); gen_expr(nd->op1); emit_pop_rbx(); emit_add_rax_rbx(); return;
+        case ND_SUB: gen_expr(nd->op2); emit_push_rax(); gen_expr(nd->op1); emit_pop_rbx(); emit_sub_rax_rbx(); return;
+        case ND_MUL: gen_expr(nd->op2); emit_push_rax(); gen_expr(nd->op1); emit_pop_rbx(); emit_imul_rax_rbx(); return;
+        case ND_DIV: gen_expr(nd->op2); emit_push_rax(); gen_expr(nd->op1); emit_pop_rbx(); emit_cqo(); emit_idiv_rbx(); return;
+        case ND_ASSIGN: gen_expr(nd->op2); return;
+        case ND_FUNC_CALL: {
+            int nargs = nd->val;
+            node **args = NULL;
+            if(nargs){
+                args = calloc(nargs, sizeof(node*));
+                int idx = nargs - 1;
+                for(node *a = nd->head; a; a = a->next){ args[idx--] = a; }
+            }
+
+            // register args
+            for(int i=0;i<nargs && i<6;i++){
+                gen_expr(args[i]);
+                switch(i){
+                    case 0: emit_mov_rdi_rax(); break;
+                    case 1: emit_mov_rsi_rax(); break;
+                    case 2: emit_mov_rdx_rax(); break;
+                    case 3: emit_mov_rcx_rax(); break;
+                    case 4: emit_mov_r8_rax(); break;
+                    case 5: emit_mov_r9_rax(); break;
+                }
+            }
+
+            // stack args handling
+            int stack_args = (nargs > 6) ? nargs - 6 : 0;
+            // 16-byte alignment check:
+            // if we push 'stack_args' items (8 bytes each), we must ensure
+            // the stack is 16-byte aligned *before* the call.
+            // if stack_args is odd, 8 * odd is not 16-aligned. we need 8 bytes padding.
+            bool padding = (stack_args % 2 != 0);
+            if(padding) emit_sub_rsp_imm32(8);
+
+            for(int i = nargs - 1; i >= 6; i--){
+                gen_expr(args[i]); emit_push_rax();
+            }
+            if(args) free(args);
+
+            char *fname = safe_strndup(nd->name, nd->len);
+            emit_call_rel32_placeholder(fname);
+            free(fname);
+
+            // clean up stack
+            int pop_size = stack_args * 8;
+            if(padding) pop_size += 8;
+            if(pop_size > 0) emit_add_rsp_imm32(pop_size);
+
+            return;
+        }
+        default: emit_mov_rax_imm64(0); return;
+    }
+}
+
+static void gen_function(node *fn){
+    size_t func_pos = emit_pos();
+    char *fname = safe_strndup(fn->name, fn->len);
+    add_local_sym(fname, func_pos, 1);
+    free(fname);
+
+    emit_push_rbp();
+    emit_mov_rbp_rsp();
+    emit_sub_rsp_imm32(32); // aligns rsp to 16 bytes
+
+    if(fn->op1){
+        node *b = fn->op1;
+        if(b->kind == ND_BLOCK){
+            for(node *it = b->head; it; it = it->next){
+                if(it->kind == ND_RET){
+                    if(it->op1) gen_expr(it->op1);
+                    emit_leave(); emit_ret();
+                } else { gen_expr(it); }
+            }
+        } else { gen_expr(fn->op1); }
+    }
+    emit_leave(); emit_ret();
+}
+
+static void gen_text(){
+    code_len = 0;
+    for(node *nd = node_head; nd; nd = nd->next){
+        if(nd->kind == ND_FUNC_DEF) gen_function(nd);
+    }
+}
+
+/* ---------------------------
+   elf writer (unchanged parts omitted for brevity, structs same)
+   --------------------------- */
+#pragma pack(push,1)
+typedef struct {
+    unsigned char e_ident[16]; uint16_t e_type; uint16_t e_machine; uint32_t e_version;
+    uint64_t e_entry; uint64_t e_phoff; uint64_t e_shoff; uint32_t e_flags;
+    uint16_t e_ehsize; uint16_t e_phentsize; uint16_t e_phnum;
+    uint16_t e_shentsize; uint16_t e_shnum; uint16_t e_shstrndx;
+} Elf64_Ehdr;
+typedef struct {
+    uint32_t sh_name; uint32_t sh_type; uint64_t sh_flags; uint64_t sh_addr;
+    uint64_t sh_offset; uint64_t sh_size; uint32_t sh_link; uint32_t sh_info;
+    uint64_t sh_addralign; uint64_t sh_entsize;
+} Elf64_Shdr;
+typedef struct {
+    uint32_t st_name; unsigned char st_info; unsigned char st_other;
+    uint16_t st_shndx; uint64_t st_value; uint64_t st_size;
+} Elf64_Sym;
+typedef struct {
+    uint64_t r_offset; uint64_t r_info; int64_t  r_addend;
+} Elf64_Rela;
+#pragma pack(pop)
+
+#define ELF64_R_INFO(sym,type) (((uint64_t)(sym) << 32) | (uint64_t)(type))
+#define ELF64_ST_INFO(bind,type) (((bind)<<4)+((type)&0xf))
+
+static void append_buf(uint8_t **buf, size_t *len, const void *data, size_t n){
+    *buf = realloc(*buf, *len + n);
+    memcpy(*buf + *len, data, n);
+    *len += n;
+}
+
+static void gen_code_and_link(){
+    gen_text();
+
+    // build symtab/strtab
+    uint8_t *symtab = NULL; size_t symtab_len = 0;
+    uint8_t *strtab = NULL; size_t strtab_len = 0;
+    append_buf(&strtab, &strtab_len, "\0", 1);
+    Elf64_Sym zero_sym = {0};
+    append_buf(&symtab, &symtab_len, &zero_sym, sizeof(Elf64_Sym));
+
+    // defined symbols
+    for(symrec *s = local_sym_head; s; s = s->next){
+        uint32_t name_off = (uint32_t)strtab_len;
+        append_buf(&strtab, &strtab_len, s->name, strlen(s->name)+1);
+        Elf64_Sym sym = {0};
+        sym.st_name = name_off;
+        sym.st_info = ELF64_ST_INFO(1, s->is_text?2:1);
+        sym.st_shndx = s->is_text?1:2; sym.st_value = s->offset;
+        append_buf(&symtab, &symtab_len, &sym, sizeof(sym));
+    }
+    // undefined symbols
+    for(rel_item *r = rel_head; r; r = r->next){
+        int found = 0; size_t pos = 1;
+        while(pos < strtab_len){
+            if(strcmp((char*)(strtab+pos), r->name) == 0){ found = 1; break; }
+            pos += strlen((char*)(strtab+pos)) + 1;
+        }
+        if(found) continue;
+        uint32_t name_off = (uint32_t)strtab_len;
+        append_buf(&strtab, &strtab_len, r->name, strlen(r->name)+1);
+        Elf64_Sym sym = {0};
+        sym.st_name = name_off; sym.st_info = ELF64_ST_INFO(1, 2);
+        append_buf(&symtab, &symtab_len, &sym, sizeof(sym));
+    }
+
+    // rela
+    uint8_t *rela = NULL; size_t rela_len = 0;
+    for(rel_item *r = rel_head; r; r = r->next){
+        Elf64_Rela entry = {0};
+        entry.r_offset = r->site_offset;
+        uint32_t idx = 1; // map name to symtab index (simplified)
+        size_t pos = 1;
+        uint32_t cur = 1;
+        // find index in symtab (order matches strtab construction for this toy)
+        // this is O(N^2) but fine for toy.
+        // Actually, we need exact index.
+        // Re-scan local symbols
+        bool matched = false;
+        for(symrec *s = local_sym_head; s; s = s->next){
+            if(strcmp(s->name, r->name)==0){ idx = cur; matched=true; break; }
+            cur++;
+        }
+        if(!matched){
+            // scan undefined
+             for(rel_item *r2 = rel_head; r2; r2 = r2->next){
+                 // Skip duplicates
+                 bool seen = false;
+                 // ... this logic is complex to fix inline without map.
+                 // Assuming linker can handle duplicate undefined symbols or we just map by string.
+                 // Hack: loop through generated strtab/symtab.
+                 uint8_t *st = symtab + sizeof(Elf64_Sym); // skip null
+                 int i = 1;
+                 while(st < symtab + symtab_len){
+                     Elf64_Sym *s = (Elf64_Sym*)st;
+                     char *nm = (char*)strtab + s->st_name;
+                     if(strcmp(nm, r->name) == 0) { idx = i; break; }
+                     st += sizeof(Elf64_Sym); i++;
+                 }
+                 if(idx) break;
+             }
+        }
+        entry.r_info = ELF64_R_INFO(idx, r->type == REL_PC32 ? 2 : 1);
+        append_buf(&rela, &rela_len, &entry, sizeof(entry));
+    }
+
+    // Write out.o
+    FILE *f = fopen("out.o", "wb");
+    // (ELF header construction omitted - using standard offsets)
+    // For brevity, rewriting the specific writer part cleanly:
+
+    // Layout
+    size_t off = sizeof(Elf64_Ehdr);
+    size_t text_off = off; off += code_len; off = (off+7)&~7;
+    size_t data_off = off; off += data_len; off = (off+7)&~7;
+    size_t sym_off = off; off += symtab_len; off = (off+7)&~7;
+    size_t str_off = off; off += strtab_len; off = (off+7)&~7;
+    size_t rela_off = off; off += rela_len; off = (off+7)&~7;
+
+    char shstr[] = "\0.shstrtab\0.text\0.data\0.symtab\0.strtab\0.rela.text\0";
+    size_t shstr_len = sizeof(shstr);
+    size_t shstr_off = off; off += shstr_len; off = (off+7)&~7;
+    size_t sh_off = off;
+
+    Elf64_Ehdr ehdr = {0};
+    ehdr.e_ident[0]=0x7f; ehdr.e_ident[1]='E'; ehdr.e_ident[2]='L'; ehdr.e_ident[3]='F';
+    ehdr.e_ident[4]=2; ehdr.e_ident[5]=1; ehdr.e_ident[6]=1;
+    ehdr.e_type=1; ehdr.e_machine=0x3E; ehdr.e_version=1; ehdr.e_shoff=sh_off;
+    ehdr.e_ehsize=sizeof(ehdr); ehdr.e_shentsize=sizeof(Elf64_Shdr); ehdr.e_shnum=7; ehdr.e_shstrndx=6;
+
+    fwrite(&ehdr, 1, sizeof(ehdr), f);
+    fwrite(code_buf, 1, code_len, f);
+    while(ftell(f) < data_off) fputc(0,f); if(data_len) fwrite(data_buf,1,data_len,f);
+    while(ftell(f) < sym_off) fputc(0,f); fwrite(symtab,1,symtab_len,f);
+    while(ftell(f) < str_off) fputc(0,f); fwrite(strtab,1,strtab_len,f);
+    while(ftell(f) < rela_off) fputc(0,f); fwrite(rela,1,rela_len,f);
+    while(ftell(f) < shstr_off) fputc(0,f); fwrite(shstr,1,shstr_len,f);
+
+    // Sections
+    while(ftell(f) < sh_off) fputc(0,f);
+    Elf64_Shdr sh[7] = {0};
+    // 0: NULL
+    // 1: .text
+    sh[1].sh_name = 11; sh[1].sh_type = 1; sh[1].sh_flags = 6; sh[1].sh_offset = text_off; sh[1].sh_size = code_len; sh[1].sh_addralign = 16;
+    // 2: .data
+    sh[2].sh_name = 17; sh[2].sh_type = 1; sh[2].sh_flags = 3; sh[2].sh_offset = data_off; sh[2].sh_size = data_len; sh[2].sh_addralign = 8;
+    // 3: .symtab
+    sh[3].sh_name = 23; sh[3].sh_type = 2; sh[3].sh_offset = sym_off; sh[3].sh_size = symtab_len; sh[3].sh_link = 4; sh[3].sh_info = 1; sh[3].sh_entsize = sizeof(Elf64_Sym); sh[3].sh_addralign = 8;
+    // 4: .strtab
+    sh[4].sh_name = 31; sh[4].sh_type = 3; sh[4].sh_offset = str_off; sh[4].sh_size = strtab_len; sh[4].sh_addralign = 1;
+    // 5: .rela.text
+    sh[5].sh_name = 39; sh[5].sh_type = 4; sh[5].sh_offset = rela_off; sh[5].sh_size = rela_len; sh[5].sh_link = 3; sh[5].sh_info = 1; sh[5].sh_entsize = sizeof(Elf64_Rela); sh[5].sh_addralign = 8;
+    // 6: .shstrtab
+    sh[6].sh_name = 1; sh[6].sh_type = 3; sh[6].sh_offset = shstr_off; sh[6].sh_size = shstr_len; sh[6].sh_addralign = 1;
+
+    fwrite(sh, 1, sizeof(sh), f);
+    fclose(f);
+
+    system("gcc out.o -o out");
+}
+
+int main(int argc, char **argv){
+    if(argc < 2){ fprintf(stderr, "usage: %s input.c\n", argv[0]); return 1; }
+    FILE *f = fopen(argv[1],"rb");
+    if(!f){ perror("fopen"); return 1; }
+    fseek(f,0,SEEK_END); long sz = ftell(f); fseek(f,0,SEEK_SET);
+    char *src = malloc(sz + 1);
+    fread(src,1,sz,f); src[sz]=0; fclose(f);
+    token *toks = tokenize(src);
+    program_parse(toks);
+    gen_code_and_link();
+    return 0;
+}

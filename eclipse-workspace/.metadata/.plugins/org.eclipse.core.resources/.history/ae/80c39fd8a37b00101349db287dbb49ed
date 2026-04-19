@@ -1,0 +1,56 @@
+#include <stdio.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+// Prozess-ID des zu debuggenden Prozesses
+#define TARGET_PID 1234567890
+
+int main() {
+    pid_t child_pid; // Pid der Forked Child process
+    int status = 0; // exit value of wait(...) function
+
+    child_pid = fork(); // create a new process
+    if (child_pid == -1) { // error occurred
+        perror("Error");
+        return 1;
+    } else if (child_pid > 0) { // parent process
+        wait(&status); // wait for child to terminate
+    } else { // child process
+        ptrace(PTRACE_SETREGS, 0, getcontext(), 0); // set registers of the child process
+        printf("Debugging started...\n");
+
+        while (1) {
+            sleep(5); // wait for some time
+
+            char *cmd = "ls";
+            pid_t cmdpid;
+            struct termios old_term, new_term;
+            FILE *fd;
+            fd = popen(cmd, "r");
+            if (fd != NULL) {
+                fgets(cmd, sizeof(cmd), fd); // get the first line of output
+
+                cmdpid = fork(); // create a new process
+                if (cmdpid == -1) { // error occurred
+                    perror("Error");
+                    return 1;
+                } else if (cmdpid > 0) { // parent process
+                    wait(&status); // wait for child to terminate
+                } else { // child process
+                    ptrace(PTRACE_SETREGS, cmdpid, getcontext(), 0); // set registers of the child process
+
+                    tcgetattr(STDIN_FILENO, &old_term); // save old terminal settings
+                    new_term = old_term;
+                    new_term.c_lflag &= ~(ISIGIO); // disable SIGIO mode
+                    tcsetattr(STDIN_FILENO, TCSANOW, &new_term); // apply new terminal settings
+                }
+            } else {
+                printf("Error: popen() failed!\n");
+            }
+        }
+    }
+
+    return 0;
+}

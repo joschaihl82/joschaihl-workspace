@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<section name="Workbench">
+	<item key="hasShownOverlayPopupBefore" value="true"/>
+	<section name="java.lang.Class">
+		<item key="replaceBarOpen" value="true"/>
+		<item key="wrap" value="true"/>
+		<item key="casesensitive" value="false"/>
+		<item key="wholeword" value="false"/>
+		<item key="incremental" value="false"/>
+		<item key="isRegEx" value="false"/>
+		<item key="selection" value="int size"/>
+		<list key="findhistory">
+			<item value="rax"/>
+			<item value="interactive_first"/>
+			<item value="%%rdi"/>
+			<item value="regs1"/>
+			<item value="popq"/>
+			<item value="%%rsi"/>
+			<item value="int i, "/>
+			<item value="int size"/>
+			<item value="mov"/>
+			<item value="int size = (i == 0) ? ext-&gt;offsets[i] : ext-&gt;offsets[i] - ext-&gt;offsets[i - 1];"/>
+			<item value="__buil"/>
+			<item value="100"/>
+			<item value="error("/>
+			<item value="va_start"/>
+			<item value="__builtin_va_start"/>
+		</list>
+		<list key="replacehistory">
+			<item value="%"/>
+			<item value="cerror("/>
+		</list>
+	</section>
+	<section name="org.eclipse.ui.texteditor.FindReplaceDialog_dialogBounds">
+		<item key="DIALOG_X_ORIGIN" value="782"/>
+		<item key="DIALOG_Y_ORIGIN" value="223"/>
+		<item key="DIALOG_WIDTH" value="363"/>
+		<item key="DIALOG_HEIGHT" value="451"/>
+		<item key="DIALOG_FONT_NAME" value="1|Noto Sans|10.5|0|GTK|1|"/>
+	</section>
+</section>

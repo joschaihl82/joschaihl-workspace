@@ -1,0 +1,789 @@
+// ============================================================================
+// x64emu.c - PART 2 (continuation)
+// - Implements arithmetic, flags, control flow, push/pop, cmp, lea
+// - Adds many SSE/MMX routines and opcases
+// - Framebuffer mapping + SDL renderer (simple blit from FB_BASE)
+// - Minimal ALSA beep generator (nonblocking thread style implemented simply)
+// ============================================================================
+
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Forward declarations from Part 1 (if needed) */
+extern uint8_t *ram_mem;
+extern uint8_t *fb_mem;
+extern X64CPU cpu;
+extern uint8_t mem_read8(uint64_t);
+extern uint16_t mem_read16(uint64_t);
+extern uint32_t mem_read32(uint64_t);
+extern uint64_t mem_read64(uint64_t);
+extern void mem_write8(uint64_t, uint8_t);
+extern void mem_write16(uint64_t, uint16_t);
+extern void mem_write32(uint64_t, uint32_t);
+extern void mem_write64(uint64_t, uint64_t);
+extern uint8_t *get_memory_ptr(uint64_t);
+extern uint64_t compute_ea();
+extern void decode_modrm();
+extern uint8_t fetch8();
+extern uint32_t fetch32();
+extern uint64_t fetch64();
+extern void cpu_init();
+extern void cpu_decode_reset();
+extern void cpu_decode_reset();
+extern void execute_one();
+
+/* --- Helper: Flag updates (SF ZF OF CF PF) --- */
+
+/* compute parity of low byte */
+static inline int parity8(uint8_t x) {
+    x ^= x >> 4;
+    x &= 0xF;
+    return (0x6996 >> x) & 1;
+}
+
+static inline void set_flag_zf_sf_pf8(uint64_t res, int width) {
+    /* width in bits: 8/16/32/64 */
+    uint64_t mask = (width==64) ? ~0ULL : ((1ULL << width) - 1);
+    uint64_t v = res & mask;
+    /* ZF */
+    if (v == 0) cpu.rflags |= (1ULL << 6); else cpu.rflags &= ~(1ULL << 6);
+    /* SF: sign bit */
+    if (v & (1ULL << (width-1))) cpu.rflags |= (1ULL << 7); else cpu.rflags &= ~(1ULL << 7);
+    /* PF: parity of low byte */
+    if (parity8((uint8_t)(v & 0xFF))) cpu.rflags |= (1ULL << 2); else cpu.rflags &= ~(1ULL << 2);
+}
+
+/* Update CF/OF for addition/subtraction on unsigned/signed */
+static inline void update_add_flags_u64(uint64_t a, uint64_t b, uint64_t res, int width) {
+    (void)width;
+    /* CF: carry out of MSB */
+    if (res < a) cpu.rflags |= 1ULL; else cpu.rflags &= ~1ULL;
+    /* OF: signed overflow: signs of a and b same and result sign differs */
+    int sa = (a >> 63) & 1; int sb = (b >> 63) & 1; int sr = (res >> 63) & 1;
+    if ((sa == sb) && (sr != sa)) cpu.rflags |= (1ULL << 11); else cpu.rflags &= ~(1ULL << 11);
+}
+
+static inline void update_sub_flags_u64(uint64_t a, uint64_t b, uint64_t res, int width) {
+    (void)width;
+    /* CF: set if borrow -> a < b */
+    if (a < b) cpu.rflags |= 1ULL; else cpu.rflags &= ~1ULL;
+    /* OF: signed overflow: signs of a and b differ and result sign differs from a */
+    int sa = (a >> 63) & 1; int sb = (b >> 63) & 1; int sr = (res >> 63) & 1;
+    if ((sa != sb) && (sr != sa)) cpu.rflags |= (1ULL << 11); else cpu.rflags &= ~(1ULL << 11);
+}
+
+/* Clear arithmetic flags we will set: CF, OF, SF, ZF, PF */
+static inline void clear_alu_flags() {
+    cpu.rflags &= ~((1ULL<<0) | (1ULL<<2) | (1ULL<<6) | (1ULL<<7) | (1ULL<<11));
+}
+
+/* --- Extended execute implementation including many opcodes --- */
+void execute_one_extended()
+{
+    cpu_decode_reset();
+
+    /* fetch prefixes & rex same approach as earlier execute_one */
+    int decoding = 1;
+    uint8_t op = 0;
+    while (decoding) {
+        uint8_t b = fetch8();
+        switch (b) {
+            case 0x66: cpu.op_size = 16; continue;
+            case 0x67: cpu.addr_size = 32; continue;
+            default:
+                if ((b & 0xF0) == 0x40) {
+                    cpu.has_rex = 1;
+                    cpu.rex_w = (b >> 3) & 1; cpu.rex_r = (b >> 2) & 1; cpu.rex_x = (b >> 1) & 1; cpu.rex_b = b & 1;
+                    continue;
+                }
+                op = b; decoding = 0;
+                break;
+        }
+    }
+
+    /* Handle op */
+    switch (op) {
+        /* ADD r/m64, r64  (01 /r) */
+        case 0x01: {
+            decode_modrm();
+            uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))];
+            if (cpu.modrm_mod == 3) {
+                uint64_t *dstp = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                uint64_t res = *dstp + src;
+                clear_alu_flags();
+                update_add_flags_u64(*dstp, src, res, 64);
+                *dstp = res;
+                set_flag_zf_sf_pf8(res, 64);
+                trace_printf("ADD %s, %s -> 0x%016" PRIx64 "\n", gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)), gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), *dstp);
+            } else {
+                uint64_t addr = compute_ea();
+                uint64_t val = mem_read64(addr);
+                uint64_t res = val + src;
+                mem_write64(addr, res);
+                clear_alu_flags();
+                update_add_flags_u64(val, src, res, 64);
+                set_flag_zf_sf_pf8(res, 64);
+                trace_printf("ADD [0x%016" PRIx64 "], %s -> 0x%016" PRIx64 "\n", addr, gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), res);
+            }
+            break;
+        }
+
+        /* SUB r/m64, r64 (29 /r) */
+        case 0x29: {
+            decode_modrm();
+            uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))];
+            if (cpu.modrm_mod == 3) {
+                uint64_t *dstp = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                uint64_t res = *dstp - src;
+                clear_alu_flags();
+                update_sub_flags_u64(*dstp, src, res, 64);
+                *dstp = res;
+                set_flag_zf_sf_pf8(res, 64);
+                trace_printf("SUB %s, %s -> 0x%016" PRIx64 "\n", gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)), gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), *dstp);
+            } else {
+                uint64_t addr = compute_ea();
+                uint64_t val = mem_read64(addr);
+                uint64_t res = val - src;
+                mem_write64(addr, res);
+                clear_alu_flags();
+                update_sub_flags_u64(val, src, res, 64);
+                set_flag_zf_sf_pf8(res, 64);
+                trace_printf("SUB [0x%016" PRIx64 "], %s -> 0x%016" PRIx64 "\n", addr, gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), res);
+            }
+            break;
+        }
+
+        /* INC r/m64 (FF /0) */
+        case 0xFF: {
+            decode_modrm();
+            int subop = cpu.modrm_reg;
+            if (subop == 0) { /* INC r/m64 */
+                if (cpu.modrm_mod == 3) {
+                    uint64_t *r = &cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                    uint64_t old = *r; uint64_t res = old + 1;
+                    clear_alu_flags();
+                    update_add_flags_u64(old, 1, res, 64);
+                    *r = res;
+                    set_flag_zf_sf_pf8(res, 64);
+                    trace_printf("INC %s -> 0x%016" PRIx64 "\n", gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)), res);
+                } else {
+                    uint64_t addr = compute_ea();
+                    uint64_t old = mem_read64(addr);
+                    uint64_t res = old + 1;
+                    mem_write64(addr, res);
+                    clear_alu_flags();
+                    update_add_flags_u64(old, 1, res, 64);
+                    set_flag_zf_sf_pf8(res, 64);
+                    trace_printf("INC [0x%016" PRIx64 "] -> 0x%016" PRIx64 "\n", addr, res);
+                }
+            } else if (subop == 2) { /* CALL r/m64 */
+                if (cpu.modrm_mod == 3) {
+                    uint64_t dest = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                    uint64_t ret = cpu.rip;
+                    cpu.gpr[4] -= 8; mem_write64(cpu.gpr[4], ret);
+                    cpu.rip = dest;
+                    trace_printf("CALL reg 0x%016" PRIx64 " -> rip\n", dest);
+                } else {
+                    uint64_t addr = compute_ea();
+                    uint64_t dest = mem_read64(addr);
+                    uint64_t ret = cpu.rip;
+                    cpu.gpr[4] -= 8; mem_write64(cpu.gpr[4], ret);
+                    cpu.rip = dest;
+                    trace_printf("CALL mem [0x%016" PRIx64 "] -> 0x%016" PRIx64 "\n", addr, dest);
+                }
+            } else if (subop == 4) { /* JMP r/m64 (FF /4) */
+                if (cpu.modrm_mod == 3) {
+                    cpu.rip = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                    trace_printf("JMP reg 0x%016" PRIx64 "\n", cpu.rip);
+                } else {
+                    uint64_t addr = compute_ea();
+                    uint64_t dest = mem_read64(addr);
+                    cpu.rip = dest;
+                    trace_printf("JMP [0x%016" PRIx64 "] -> 0x%016" PRIx64 "\n", addr, dest);
+                }
+            } else {
+                trace_printf("FF subop %d unimplemented\n", subop);
+                exit(1);
+            }
+            break;
+        }
+
+        /* PUSH r64 (50+rd) , POP r64 (58+rd) handled earlier, but add PUSH r/m64 (FF /6) and POP r/m64 (8F /0) */
+        case 0x8F: { /* POP r/m64 */
+            decode_modrm();
+            if (cpu.modrm_reg != 0) { trace_printf("8F with reg!=0 unimplemented\n"); exit(1); }
+            uint64_t val = mem_read64(cpu.gpr[4]); cpu.gpr[4] += 8;
+            if (cpu.modrm_mod == 3) {
+                cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))] = val;
+                trace_printf("POP %s -> 0x%016" PRIx64 "\n", gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)), val);
+            } else {
+                uint64_t addr = compute_ea();
+                mem_write64(addr, val);
+                trace_printf("POP [0x%016" PRIx64 "] <- 0x%016" PRIx64 "\n", addr, val);
+            }
+            break;
+        }
+
+        case 0x6A: { /* push imm8 */
+            int8_t imm = (int8_t)fetch8();
+            cpu.gpr[4] -= 8;
+            mem_write64(cpu.gpr[4], (uint64_t)(int64_t)imm);
+            trace_printf("PUSH imm8 %d\n", imm);
+            break;
+        }
+        case 0x68: { /* push imm32 */
+            uint32_t imm = fetch32();
+            cpu.gpr[4] -= 8;
+            mem_write64(cpu.gpr[4], (uint64_t)(int64_t)(int32_t)imm);
+            trace_printf("PUSH imm32 0x%08X\n", imm);
+            break;
+        }
+
+        /* CMP r/m64, r64 (39 /r) */
+        case 0x39: {
+            decode_modrm();
+            uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))];
+            uint64_t lhs;
+            if (cpu.modrm_mod == 3) lhs = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+            else { uint64_t addr = compute_ea(); lhs = mem_read64(addr); }
+            uint64_t res = lhs - src;
+            clear_alu_flags();
+            update_sub_flags_u64(lhs, src, res, 64);
+            set_flag_zf_sf_pf8(res, 64);
+            trace_printf("CMP %s, %s => res=0x%016" PRIx64 "\n", gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)), gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), res);
+            break;
+        }
+
+        /* TEST r/m64, r64 (85 /r) */
+        case 0x85: {
+            decode_modrm();
+            uint64_t src = cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))];
+            uint64_t lhs;
+            if (cpu.modrm_mod == 3) lhs = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+            else { uint64_t addr = compute_ea(); lhs = mem_read64(addr); }
+            uint64_t res = lhs & src;
+            /* set ZF/SF/PF accordingly, clear OF/CF */
+            cpu.rflags &= ~(1ULL | (1ULL<<11)); /* clear CF & OF */
+            set_flag_zf_sf_pf8(res, 64);
+            trace_printf("TEST [r/m], r => res=0x%016" PRIx64 "\n", res);
+            break;
+        }
+
+        /* LEA r64, m (8D /r) */
+        case 0x8D: {
+            decode_modrm();
+            if (cpu.modrm_mod == 3) {
+                /* LEA reg, reg is allowed but often used with scaled index; treat reg=rm */
+                uint64_t val = cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))] = val;
+                trace_printf("LEA %s, %s\n", gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), gpr_name(cpu.modrm_rm | (cpu.rex_b<<3)));
+            } else {
+                uint64_t addr = compute_ea();
+                cpu.gpr[(cpu.modrm_reg | (cpu.rex_r<<3))] = addr;
+                trace_printf("LEA %s, [ea] -> 0x%016" PRIx64 "\n", gpr_name(cpu.modrm_reg | (cpu.rex_r<<3)), addr);
+            }
+            break;
+        }
+
+        /* 0x0F two-byte group - extend with more SSE/MMX and MOV variants */
+        case 0x0F: {
+            uint8_t op2 = fetch8();
+            switch (op2) {
+                case 0x6E: { /* MOVD xmm, r/m32 (or MOVQ xmm, r/m64 depending) - simplified */
+                    decode_modrm();
+                    if (cpu.modrm_mod == 3) {
+                        /* move low 32 from reg to xmm */
+                        uint32_t v = (uint32_t)cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))];
+                        memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo, &v, 4);
+                        cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].hi = 0;
+                        trace_printf("MOVD xmm%d, reg%d(low32)\n", cpu.modrm_reg | (cpu.rex_r<<3), cpu.modrm_rm | (cpu.rex_b<<3));
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint32_t v = mem_read32(addr);
+                        memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo, &v, 4);
+                        cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].hi = 0;
+                        trace_printf("MOVD xmm%d, [0x%016" PRIx64 "]\n", cpu.modrm_reg | (cpu.rex_r<<3), addr);
+                    }
+                    break;
+                }
+                case 0x7E: { /* MOVD r/m32, xmm/m32 (simplified) */
+                    decode_modrm();
+                    if (cpu.modrm_mod == 3) {
+                        uint32_t v = (uint32_t)cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo;
+                        cpu.gpr[(cpu.modrm_rm | (cpu.rex_b<<3))] = (uint64_t)v;
+                        trace_printf("MOVD reg%d, xmm%d(low32)\n", cpu.modrm_rm | (cpu.rex_b<<3), cpu.modrm_reg | (cpu.rex_r<<3));
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint32_t v = (uint32_t)cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo;
+                        mem_write32(addr, v);
+                        trace_printf("MOVD [0x%016" PRIx64 "], xmm%d(low32)\n", addr, cpu.modrm_reg | (cpu.rex_r<<3));
+                    }
+                    break;
+                }
+                case 0x28: { /* MOVAPS xmm, xmm/m128 */
+                    decode_modrm();
+                    if (cpu.modrm_mod == 3) {
+                        cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo = cpu.xmm[(cpu.modrm_rm | (cpu.rex_b<<3))].lo;
+                        cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].hi = cpu.xmm[(cpu.modrm_rm | (cpu.rex_b<<3))].hi;
+                        trace_printf("MOVAPS XMM%d, XMM%d\n", cpu.modrm_reg | (cpu.rex_r<<3), cpu.modrm_rm | (cpu.rex_b<<3));
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16];
+                        memcpy(tmp, get_memory_ptr(addr), 16);
+                        memcpy(&cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))], tmp, 16);
+                        trace_printf("MOVAPS XMM%d, [0x%016" PRIx64 "]\n", cpu.modrm_reg | (cpu.rex_r<<3), addr);
+                    }
+                    break;
+                }
+                case 0x29: { /* MOVAPS xmm/m128, xmm */
+                    decode_modrm();
+                    if (cpu.modrm_mod == 3) {
+                        cpu.xmm[(cpu.modrm_rm | (cpu.rex_b<<3))].lo = cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].lo;
+                        cpu.xmm[(cpu.modrm_rm | (cpu.rex_b<<3))].hi = cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))].hi;
+                        trace_printf("MOVAPS XMM%d, XMM%d (reg->reg)\n", cpu.modrm_rm | (cpu.rex_b<<3), cpu.modrm_reg | (cpu.rex_r<<3));
+                    } else {
+                        uint64_t addr = compute_ea();
+                        memcpy(get_memory_ptr(addr), &cpu.xmm[(cpu.modrm_reg | (cpu.rex_r<<3))], 16);
+                        trace_printf("MOVAPS [0x%016" PRIx64 "], XMM%d\n", addr, cpu.modrm_reg | (cpu.rex_r<<3));
+                    }
+                    break;
+                }
+                case 0x58: { /* ADDPS/ADDPD */
+                    decode_modrm();
+                    int dst = (cpu.modrm_reg | (cpu.rex_r<<3));
+                    if (cpu.modrm_mod == 3) {
+                        int src = (cpu.modrm_rm | (cpu.rex_b<<3));
+                        if (cpu.op == 0x0F /* placeholder - actually we know op2=0x58 */) { }
+                        /* decide between PS/PD by current op_size/seen66 heuristics - we used cpu.op_size earlier */
+                        if (cpu.op_size == 16) { /* treat as ADDPD */
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo = *(double*)&cpu.xmm[src].lo;
+                            double b_hi = *(double*)&cpu.xmm[src].hi;
+                            double r_lo = a_lo + b_lo; double r_hi = a_hi + b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("ADDPD XMM%d, XMM%d\n", dst, src);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, &cpu.xmm[src].lo, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] + bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("ADDPS XMM%d, XMM%d\n", dst, src);
+                        }
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        if (cpu.op_size == 16) {
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo; double b_hi;
+                            memcpy(&b_lo, tmp+0, 8); memcpy(&b_hi, tmp+8, 8);
+                            double r_lo = a_lo + b_lo; double r_hi = a_hi + b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("ADDPD XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, tmp, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] + bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("ADDPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        }
+                    }
+                    break;
+                }
+                case 0x5C: { /* SUBPS/SUBPD */
+                    decode_modrm();
+                    int dst = (cpu.modrm_reg | (cpu.rex_r<<3));
+                    if (cpu.modrm_mod == 3) {
+                        int src = (cpu.modrm_rm | (cpu.rex_b<<3));
+                        if (cpu.op_size == 16) {
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo = *(double*)&cpu.xmm[src].lo;
+                            double b_hi = *(double*)&cpu.xmm[src].hi;
+                            double r_lo = a_lo - b_lo; double r_hi = a_hi - b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("SUBPD XMM%d, XMM%d\n", dst, src);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, &cpu.xmm[src].lo, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] - bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("SUBPS XMM%d, XMM%d\n", dst, src);
+                        }
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        if (cpu.op_size == 16) {
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo; double b_hi;
+                            memcpy(&b_lo, tmp+0, 8); memcpy(&b_hi, tmp+8, 8);
+                            double r_lo = a_lo - b_lo; double r_hi = a_hi - b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("SUBPD XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, tmp, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] - bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("SUBPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        }
+                    }
+                    break;
+                }
+                case 0x5E: { /* DIVPS/DIVPD */
+                    decode_modrm();
+                    int dst = (cpu.modrm_reg | (cpu.rex_r<<3));
+                    if (cpu.modrm_mod == 3) {
+                        int src = (cpu.modrm_rm | (cpu.rex_b<<3));
+                        if (cpu.op_size == 16) {
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo = *(double*)&cpu.xmm[src].lo;
+                            double b_hi = *(double*)&cpu.xmm[src].hi;
+                            double r_lo = a_lo / b_lo; double r_hi = a_hi / b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("DIVPD XMM%d, XMM%d\n", dst, src);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, &cpu.xmm[src].lo, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] / bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("DIVPS XMM%d, XMM%d\n", dst, src);
+                        }
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        if (cpu.op_size == 16) {
+                            double a_lo = *(double*)&cpu.xmm[dst].lo;
+                            double a_hi = *(double*)&cpu.xmm[dst].hi;
+                            double b_lo; double b_hi;
+                            memcpy(&b_lo, tmp+0, 8); memcpy(&b_hi, tmp+8, 8);
+                            double r_lo = a_lo / b_lo; double r_hi = a_hi / b_hi;
+                            memcpy(&cpu.xmm[dst].lo, &r_lo, 8); memcpy(&cpu.xmm[dst].hi, &r_hi, 8);
+                            trace_printf("DIVPD XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        } else {
+                            float af[4], bf[4], rf[4];
+                            memcpy(af, &cpu.xmm[dst].lo, 16);
+                            memcpy(bf, tmp, 16);
+                            for (int i=0;i<4;i++) rf[i] = af[i] / bf[i];
+                            memcpy(&cpu.xmm[dst].lo, rf, 16);
+                            trace_printf("DIVPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                        }
+                    }
+                    break;
+                }
+                case 0x54: { /* ANDPS/ANDPD (bitwise AND) */
+                    decode_modrm();
+                    int dst = cpu.modrm_reg | (cpu.rex_r<<3);
+                    if (cpu.modrm_mod == 3) {
+                        int src = cpu.modrm_rm | (cpu.rex_b<<3);
+                        cpu.xmm[dst].lo &= cpu.xmm[src].lo;
+                        cpu.xmm[dst].hi &= cpu.xmm[src].hi;
+                        trace_printf("ANDPS XMM%d, XMM%d\n", dst, src);
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        uint64_t *t64 = (uint64_t*)tmp;
+                        cpu.xmm[dst].lo &= t64[0];
+                        cpu.xmm[dst].hi &= t64[1];
+                        trace_printf("ANDPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                    }
+                    break;
+                }
+                case 0x56: { /* ORPS/ORPD */
+                    decode_modrm();
+                    int dst = cpu.modrm_reg | (cpu.rex_r<<3);
+                    if (cpu.modrm_mod == 3) {
+                        int src = cpu.modrm_rm | (cpu.rex_b<<3);
+                        cpu.xmm[dst].lo |= cpu.xmm[src].lo;
+                        cpu.xmm[dst].hi |= cpu.xmm[src].hi;
+                        trace_printf("ORPS XMM%d, XMM%d\n", dst, src);
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        uint64_t *t64 = (uint64_t*)tmp;
+                        cpu.xmm[dst].lo |= t64[0];
+                        cpu.xmm[dst].hi |= t64[1];
+                        trace_printf("ORPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                    }
+                    break;
+                }
+                case 0x57: { /* XORPS/XORPD */
+                    decode_modrm();
+                    int dst = cpu.modrm_reg | (cpu.rex_r<<3);
+                    if (cpu.modrm_mod == 3) {
+                        int src = cpu.modrm_rm | (cpu.rex_b<<3);
+                        cpu.xmm[dst].lo ^= cpu.xmm[src].lo;
+                        cpu.xmm[dst].hi ^= cpu.xmm[src].hi;
+                        trace_printf("XORPS XMM%d, XMM%d\n", dst, src);
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint8_t tmp[16]; memcpy(tmp, get_memory_ptr(addr), 16);
+                        uint64_t *t64 = (uint64_t*)tmp;
+                        cpu.xmm[dst].lo ^= t64[0];
+                        cpu.xmm[dst].hi ^= t64[1];
+                        trace_printf("XORPS XMM%d, [0x%016" PRIx64 "]\n", dst, addr);
+                    }
+                    break;
+                }
+
+                /* MMX integer additions on 64-bit lanes: 0F FE /r etc - simplified mapping */
+                case 0xFE: {
+                    decode_modrm();
+                    /* For demo: interpret as PADDQ xmm/m64, xmm (packed add quadwords) */
+                    int dst = cpu.modrm_reg | (cpu.rex_r<<3);
+                    if (cpu.modrm_mod == 3) {
+                        int src = cpu.modrm_rm | (cpu.rex_b<<3);
+                        uint64_t a0 = cpu.xmm[dst].lo; uint64_t b0 = cpu.xmm[src].lo;
+                        uint64_t r0 = a0 + b0;
+                        cpu.xmm[dst].lo = r0;
+                        trace_printf("PADDQ (sim) XMM%d.lo += XMM%d.lo\n", dst, src);
+                    } else {
+                        uint64_t addr = compute_ea();
+                        uint64_t memv = mem_read64(addr);
+                        uint64_t a0 = cpu.xmm[dst].lo;
+                        cpu.xmm[dst].lo = a0 + memv;
+                        trace_printf("PADDQ (sim) XMM%d.lo += [0x%016" PRIx64 "]\n", dst, addr);
+                    }
+                    break;
+                }
+
+                default:
+                    trace_printf("Unimplemented 0F %02X\n", op2);
+                    exit(1);
+            }
+            break;
+        }
+
+        /* JMP short (EB +8-bit disp) */
+        case 0xEB: {
+            int8_t d8 = (int8_t)fetch8();
+            cpu.rip = cpu.rip + d8;
+            trace_printf("JMP short to 0x%016" PRIx64 "\n", cpu.rip);
+            break;
+        }
+
+        /* JMP near (E9 rel32) */
+        case 0xE9: {
+            uint32_t d32 = fetch32();
+            int32_t s = (int32_t)d32;
+            cpu.rip = cpu.rip + s;
+            trace_printf("JMP rel to 0x%016" PRIx64 "\n", cpu.rip);
+            break;
+        }
+
+        /* CALL rel32 */
+        case 0xE8: {
+            uint32_t d32 = fetch32();
+            int32_t s = (int32_t)d32;
+            uint64_t ret = cpu.rip;
+            cpu.gpr[4] -= 8; mem_write64(cpu.gpr[4], ret);
+            cpu.rip = cpu.rip + s;
+            trace_printf("CALL rel -> 0x%016" PRIx64 "\n", cpu.rip);
+            break;
+        }
+
+        /* RET (C3) handled earlier in Part1 loop; implement here too */
+        case 0xC3: {
+            uint64_t ret = mem_read64(cpu.gpr[4]); cpu.gpr[4] += 8;
+            cpu.rip = ret;
+            trace_printf("RET -> 0x%016" PRIx64 "\n", cpu.rip);
+            break;
+        }
+
+        default:
+            trace_printf("Unimplemented opcode extended: 0x%02X at rip=0x%016" PRIx64 "\n", op, cpu.rip-1);
+            exit(1);
+    }
+}
+
+/* ===== Framebuffer / SDL Renderer ===== */
+
+typedef struct {
+    SDL_Window *window;
+    SDL_Renderer *renderer;
+    SDL_Texture *texture;
+    int width, height;
+    int pitch;
+} FBDisplay;
+
+static FBDisplay fbdisp;
+
+int fb_init_display(int width, int height) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
+        return -1;
+    }
+    fbdisp.width = width; fbdisp.height = height;
+    fbdisp.window = SDL_CreateWindow("x64emu Framebuffer", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                    width, height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    if (!fbdisp.window) { fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return -1; }
+    fbdisp.renderer = SDL_CreateRenderer(fbdisp.window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!fbdisp.renderer) { fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError()); return -1; }
+    fbdisp.texture = SDL_CreateTexture(fbdisp.renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+    if (!fbdisp.texture) { fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError()); return -1; }
+    fbdisp.pitch = width * 4;
+    return 0;
+}
+
+/* Blit the emulator framebuffer region (fb_mem) onto the SDL texture.
+   The framebuffer memory layout is assumed 32-bit ARGB little-endian (BGRA).
+*/
+void fb_update_and_render()
+{
+    if (!fbdisp.texture) return;
+    void *pixels; int pitch;
+    if (SDL_LockTexture(fbdisp.texture, NULL, &pixels, &pitch) != 0) {
+        fprintf(stderr, "SDL_LockTexture: %s\n", SDL_GetError());
+        return;
+    }
+    /* copy min(height*pitch, FB_SIZE) */
+    size_t copy_lines = fbdisp.height;
+    size_t copy_bytes = fbdisp.pitch * copy_lines;
+    if (copy_bytes > FB_SIZE) copy_bytes = FB_SIZE;
+    memcpy(pixels, fb_mem, copy_bytes);
+    SDL_UnlockTexture(fbdisp.texture);
+    SDL_RenderClear(fbdisp.renderer);
+    SDL_RenderCopy(fbdisp.renderer, fbdisp.texture, NULL, NULL);
+    SDL_RenderPresent(fbdisp.renderer);
+}
+
+/* Minimal ALSA tone generation thread - plays a sine beep repeatedly based on a flag.
+   This is a simplistic demo and not robust for production use.
+*/
+static pthread_t alsa_thread;
+static int alsa_thread_running = 0;
+static int alsa_frequency = 440; // A4
+
+void *alsa_thread_func(void *arg) {
+    (void)arg;
+    snd_pcm_t *handle;
+    snd_pcm_hw_params_t *params;
+    unsigned int sample_rate = 44100;
+    int rc = snd_pcm_open(&handle, "default", SND_PCM_STREAM_PLAYBACK, 0);
+    if (rc < 0) { fprintf(stderr, "ALSA open error: %s\n", snd_strerror(rc)); return NULL; }
+    snd_pcm_hw_params_alloca(&params);
+    snd_pcm_hw_params_any(handle, params);
+    snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(handle, params, 1);
+    snd_pcm_hw_params_set_rate_near(handle, params, &sample_rate, 0);
+    snd_pcm_uframes_t frames = 1024;
+    snd_pcm_hw_params_set_period_size_near(handle, params, &frames, 0);
+    rc = snd_pcm_hw_params(handle, params);
+    if (rc < 0) { fprintf(stderr, "ALSA params error: %s\n", snd_strerror(rc)); snd_pcm_close(handle); return NULL; }
+
+    int16_t *buffer = malloc(frames * sizeof(int16_t));
+    double phase = 0.0;
+    while (alsa_thread_running) {
+        for (int i=0;i<(int)frames;i++) {
+            buffer[i] = (int16_t)(sin(phase) * 16000);
+            phase += 2.0 * M_PI * alsa_frequency / sample_rate;
+            if (phase > 2.0*M_PI) phase -= 2.0*M_PI;
+        }
+        rc = snd_pcm_writei(handle, buffer, frames);
+        if (rc == -EPIPE) { snd_pcm_prepare(handle); }
+        else if (rc < 0) { fprintf(stderr, "ALSA write error: %s\n", snd_strerror(rc)); }
+    }
+    free(buffer);
+    snd_pcm_drain(handle);
+    snd_pcm_close(handle);
+    return NULL;
+}
+
+void start_alsa_beep() {
+    if (alsa_thread_running) return;
+    alsa_thread_running = 1;
+    pthread_create(&alsa_thread, NULL, alsa_thread_func, NULL);
+}
+void stop_alsa_beep() {
+    if (!alsa_thread_running) return;
+    alsa_thread_running = 0;
+    pthread_join(alsa_thread, NULL);
+}
+
+/* --- Integration main: run CPU and render FB --- */
+
+int main(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (init_memory() != 0) return 1;
+    cpu_init();
+
+    /* Simple sample: draw gradient to fb_mem so we see something */
+    for (int y=0;y<FB_HEIGHT;y++) {
+        for (int x=0;x<FB_WIDTH;x++) {
+            uint32_t px = ((y & 0xFF) << 16) | ((x & 0xFF) << 8) | ((x+y) & 0xFF);
+            uint64_t addr = FB_BASE + (y*FB_WIDTH + x)*4;
+            if (get_memory_ptr(addr)) {
+                mem_write32(addr, px | 0xFF000000); /* ARGB */
+            }
+        }
+    }
+
+    if (fb_init_display(FB_WIDTH, FB_HEIGHT) != 0) {
+        fprintf(stderr, "Failed to init framebuffer display, continuing without SDL\n");
+    }
+
+    /* Start ALSA beep thread (optional) */
+    start_alsa_beep();
+
+    /* Run a small synthetic code sequence in RAM: we'll place a test blob at RAM_BASE and set RIP there.
+       For now we can just run the loop which calls execute_one_extended repeatedly - in a real emulator we'd fetch instructions from RAM.
+    */
+    cpu.gpr[4] = RAM_SIZE - 4096; /* RSP */
+
+    /* For demonstration: place a tiny program in RAM that writes into the framebuffer:
+       - We'll craft simple pseudo machine code by directly writing to memory (this is illustrative).
+       In a complete system you'd load binaries and execute properly.
+    */
+
+    /* Event/render loop */
+    int running = 1;
+    uint64_t cycles = 0;
+    uint64_t start_time = (uint64_t)time(NULL);
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_ESCAPE) running = 0;
+            }
+        }
+
+        /* Execute a number of CPU instructions per frame (coarse) */
+        for (int i=0;i<2000;i++) {
+            execute_one_extended();
+            cycles++;
+        }
+
+        /* Update display */
+        fb_update_and_render();
+
+        /* Simple periodic status print */
+        if ((cycles & 0xFFF) == 0) {
+            uint64_t t = (uint64_t)time(NULL);
+            printf("[emu] cycles=%" PRIu64 " uptime=%" PRIu64 "s\n", cycles, t - start_time);
+        }
+
+        SDL_Delay(16); /* ~60fps */
+    }
+
+    stop_alsa_beep();
+    if (fbdisp.texture) SDL_DestroyTexture(fbdisp.texture);
+    if (fbdisp.renderer) SDL_DestroyRenderer(fbdisp.renderer);
+    if (fbdisp.window) SDL_DestroyWindow(fbdisp.window);
+    SDL_Quit();
+
+    free(ram_mem); free(fb_mem);
+    return 0;
+}
+

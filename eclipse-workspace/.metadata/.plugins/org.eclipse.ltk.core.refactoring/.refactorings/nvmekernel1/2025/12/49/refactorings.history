@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;nvmekernel1/kernel.c&apos; to &apos;bootx64.c&apos;" description="Rename resource &apos;kernel.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="kernel.c" name="bootx64.c" stamp="1764977299303" updateReferences="true"/>
+</session>

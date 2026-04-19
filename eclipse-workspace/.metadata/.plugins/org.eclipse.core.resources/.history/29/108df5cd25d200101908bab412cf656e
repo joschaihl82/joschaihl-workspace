@@ -1,0 +1,328 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+
+// --- on-disk vfat structure definitions ---
+// the following structs define the layout of the fat filesystem's boot sector
+// and directory entries, using #pragma pack(1) to ensure correct byte alignment.
+#pragma pack(push, 1)
+
+// --- common bios parameter block (bpb) for fat12/16/32 ---
+
+typedef struct {
+    uint8_t  jmpboot[3];             // 0x00 - jump instruction to the boot code
+    char     oemname[8];             // 0x03 - oem name/version (e.g., "msdos5.0")
+    uint16_t bytespersector;         // 0x0B - sector size in bytes (e.g., 512)
+    uint8_t  sectorspercluster;      // 0x0D - number of sectors per allocation unit (cluster)
+    uint16_t reservedsectorcount;    // 0x0E - number of reserved sectors (usually 1)
+    uint8_t  numfats;                // 0x10 - number of file allocation tables (usually 2)
+    uint16_t rootentrycount;         // 0x11 - for fat12/16, max number of directory entries in the root dir
+    uint16_t totalsectors16;         // 0x13 - total sectors (if 0, look at totalsectors32)
+    uint8_t  mediatype;              // 0x15 - media descriptor type
+    uint16_t fatsize16;              // 0x16 - sectors per fat (if 0, look at fatsize32)
+    uint16_t sectorspertrack;        // 0x18
+    uint16_t numheads;               // 0x1A
+    uint32_t hiddensectors;          // 0x1C - number of hidden sectors
+    uint32_t totalsectors32;         // 0x20 - total number of sectors on logical volume
+} fat_bpb_t;
+
+// --- fat12/16 extended bios parameter block (ebpb) ---
+
+typedef struct {
+    // 0x24 (after bpb)
+    uint8_t  drivenum;               // 0x24 - physical drive number (0x80 for hard disks)
+    uint8_t  reserved1;              // 0x25 - reserved (always 0x00)
+    uint8_t  bootsig;                // 0x26 - extended boot signature (0x29)
+    uint32_t volumeid;               // 0x27 - volume serial number
+    char     volumelabel[11];        // 0x2B - volume label
+    char     filesystemtype[8];      // 0x36 - filesystem type string ("fat12   ", "fat16   ")
+    uint8_t  bootcode[448];          // 0x3E - boot code
+    uint16_t bootsignature;          // 0x1FE - boot sector signature (0xAA55)
+} fat16_ebpb_t;
+
+// --- fat32 extended bios parameter block (ebpb) ---
+
+typedef struct {
+    // 0x24 (after bpb)
+    uint32_t fatsize32;              // 0x24 - sectors per fat (takes precedence over fatsize16)
+    uint16_t extflags;               // 0x28 - mirrors and active fat
+    uint16_t fsversion;              // 0x2A - major/minor fs version
+    uint32_t rootcluster;            // 0x2C - cluster number of the root directory start
+    uint16_t fsinfo;                 // 0x30 - sector number of fsinfo structure
+    uint16_t backupbootsector;       // 0x32 - sector number of a copy of the boot sector
+    uint8_t  reserved0[12];          // 0x34 - reserved
+    uint8_t  drivenum;               // 0x40 - physical drive number
+    uint8_t  reserved1;              // 0x41 - reserved (always 0x00)
+    uint8_t  bootsig;                // 0x42 - extended boot signature (0x29)
+    uint32_t volumeid;               // 0x43 - volume serial number
+    char     volumelabel[11];        // 0x47 - volume label
+    char     filesystemtype[8];      // 0x52 - filesystem type string ("fat32   ")
+    uint8_t  bootcode[420];          // 0x5A - boot code
+    uint16_t bootsignature;          // 0x1FE - boot sector signature (0xAA55)
+} fat32_ebpb_t;
+
+// --- complete boot sector structure ---
+
+// this structure combines the bpb and the fat32 ebpb, as fat32 is the largest structure.
+typedef struct {
+    fat_bpb_t bpb;
+    // this union covers the two different layouts for the ebpb area
+    union {
+        fat16_ebpb_t fat16;
+        fat32_ebpb_t fat32;
+    } ebpb;
+    // we use a buffer to catch the rest of the 512 bytes for a full read
+    uint8_t filler[512 - sizeof(fat_bpb_t) - sizeof(fat32_ebpb_t)];
+} fat_boot_sector_t;
+
+
+// --- vfat long file name (lfn) directory entry ---
+
+typedef struct {
+    uint8_t  ord;        // 0x00 - order of entry, bit 6 is last lfn entry
+    uint16_t name1[5];   // 0x01 - characters 1-5 of the lfn (unicode)
+    uint8_t  attr;       // 0x0B - attributes (must be 0x0F)
+    uint8_t  type;       // 0x0C - reserved (must be 0x00)
+    uint8_t  chksum;     // 0x0D - checksum of the short file name
+    uint16_t name2[6];   // 0x0E - characters 6-11 of the lfn
+    uint16_t firstcluslow; // 0x1A - reserved (must be 0x0000)
+    uint16_t name3[2];   // 0x1C - characters 12-13 of the lfn
+} fat_lfn_entry_t;
+
+// --- short file name (sfn) directory entry ---
+
+typedef struct {
+    uint8_t  name[8];            // 0x00 - file name (8 chars)
+    uint8_t  ext[3];             // 0x08 - file extension (3 chars)
+    uint8_t  attr;               // 0x0B - file attributes
+    uint8_t  ntres;              // 0x0C - reserved for nt
+    uint8_t  crt_time_tenth;     // 0x0D - creation time in tenths of a second
+    uint16_t crt_time;           // 0x0E - creation time
+    uint16_t crt_date;           // 0x10 - creation date
+    uint16_t last_acc_date;      // 0x12 - last access date
+    uint16_t firstclus_high;     // 0x14 - high 16 bits of first cluster (fat32 only)
+    uint16_t wrt_time;           // 0x16 - last write time
+    uint16_t wrt_date;           // 0x18 - last write date
+    uint16_t firstclus_low;      // 0x1A - low 16 bits of first cluster
+    uint32_t filesize;           // 0x1C - file size in bytes
+} fat_sfn_entry_t;
+
+#pragma pack(pop)
+
+// --- constants ---
+#define BOOT_SECTOR_SIZE 512
+#define BOOT_SIGNATURE 0xAA55
+
+// --- helper functions ---
+
+/**
+ * \brief converts a null-padded string from the disk structure to a printable c string.
+ * \param src the source buffer from the disk structure.
+ * \param len the length of the source buffer.
+ * \param dest the destination c string buffer.
+ */
+void trim_copy(const char *src, size_t len, char *dest) {
+    size_t i = 0;
+    while (i < len && src[i] != ' ') {
+        dest[i] = src[i];
+        i++;
+    }
+    dest[i] = '\0'; // null-terminate the c string
+}
+
+/**
+ * \brief calculates the type of the fat filesystem (fat12, fat16, or fat32).
+ * \param bpb pointer to the parsed fat_bpb_t structure.
+ * \return a string describing the fat type.
+ */
+const char* calculate_fat_type(const fat_bpb_t *bpb) {
+    uint32_t rootdirsectors;
+    uint32_t fatsectors;
+    uint32_t totalsize;
+    uint32_t datasectors;
+    uint32_t countofclusters;
+
+    // determine the size of the root directory
+    rootdirsectors = ((bpb->rootentrycount * sizeof(fat_sfn_entry_t)) + (bpb->bytespersector - 1)) / bpb->bytespersector;
+
+    // determine the fat size
+    fatsectors = (bpb->fatsize16 != 0) ? bpb->fatsize16 : ((fat_boot_sector_t*)bpb)->ebpb.fat32.fatsize32;
+
+    // determine total sectors
+    totalsize = (bpb->totalsectors16 != 0) ? bpb->totalsectors16 : bpb->totalsectors32;
+
+    // calculate data sectors
+    datasectors = totalsize - (bpb->reservedsectorcount + (bpb->numfats * fatsectors) + rootdirsectors);
+
+    // calculate total clusters in the data region
+    countofclusters = datasectors / bpb->sectorspercluster;
+
+    if (countofclusters < 4085) {
+        return "fat12";
+    } else if (countofclusters < 65525) {
+        return "fat16";
+    } else {
+        return "fat32";
+    }
+}
+
+/**
+ * \brief parses and displays the contents of the boot sector.
+ * \param bs pointer to the raw fat_boot_sector_t buffer.
+ */
+void display_boot_sector_info(const fat_boot_sector_t *bs) {
+    const fat_bpb_t *bpb = &bs->bpb;
+    char oemname_str[9];
+    char fs_type_str[9];
+    const char *fat_type = calculate_fat_type(bpb);
+
+    trim_copy(bpb->oemname, 8, oemname_str);
+
+    printf("--- vfat volume information (boot sector) ---\n");
+    printf("oem name:                   %s\n", oemname_str);
+    printf("bytes per sector:           %u\n", bpb->bytespersector);
+    printf("sectors per cluster:        %u\n", bpb->sectorspercluster);
+    printf("reserved sectors:           %u\n", bpb->reservedsectorcount);
+    printf("number of fats:             %u\n", bpb->numfats);
+
+    // common calculations
+    uint32_t total_sectors = (bpb->totalsectors16 != 0) ? bpb->totalsectors16 : bpb->totalsectors32;
+    uint32_t fat_sectors = (bpb->fatsize16 != 0) ? bpb->fatsize16 : bs->ebpb.fat32.fatsize32;
+    uint32_t root_entry_count = bpb->rootentrycount;
+    uint32_t root_dir_sectors = ((root_entry_count * 32) + (bpb->bytespersector - 1)) / bpb->bytespersector;
+    uint32_t first_data_sector = bpb->reservedsectorcount + (bpb->numfats * fat_sectors) + root_dir_sectors;
+
+    printf("total sectors:              %u\n", total_sectors);
+    printf("fat size (sectors):         %u\n", fat_sectors);
+    printf("root entries (fat12/16):    %u\n", root_entry_count);
+    printf("first data sector:          %u\n", first_data_sector);
+
+    printf("\n--- extended bpb (%s) ---\n", fat_type);
+
+    if (strcmp(fat_type, "fat32") == 0) {
+        const fat32_ebpb_t *ebpb32 = &bs->ebpb.fat32;
+        trim_copy(ebpb32->filesystemtype, 8, fs_type_str);
+
+        printf("filesystem type:            %s\n", fs_type_str);
+        printf("volume label:               %.11s\n", ebpb32->volumelabel);
+        printf("root directory cluster:     %u\n", ebpb32->rootcluster);
+        printf("fs info sector:             %u\n", ebpb32->fsinfo);
+    } else {
+        const fat16_ebpb_t *ebpb16 = &bs->ebpb.fat16;
+        trim_copy(ebpb16->filesystemtype, 8, fs_type_str);
+
+        printf("filesystem type:            %s\n", fs_type_str);
+        printf("volume label:               %.11s\n", ebpb16->volumelabel);
+        // root directory starts immediately after fat sectors on fat12/16
+        printf("root directory sector:      %u\n", bpb->reservedsectorcount + (bpb->numfats * fat_sectors));
+    }
+}
+
+/**
+ * \brief prints the usage guide for the vfat_tool.
+ * \param prog_name the name of the executable (argv[0]).
+ */
+void print_usage(const char *prog_name) {
+    fprintf(stderr, "usage: %s <disk_image_file> [options]\n", prog_name);
+    fprintf(stderr, "\noptions:\n");
+    fprintf(stderr, "  -i, --inputdir <path>  : specify a local directory to read files from (for mtools-like copy to image)\n");
+    fprintf(stderr, "  -o, --outputdir <path> : specify a local directory to write files to (for mtools-like copy from image)\n");
+    fprintf(stderr, "\nexample: %s disk.img -o /tmp/extracted_files\n", prog_name);
+}
+
+// --- main program ---
+
+int main(int argc, char *argv[]) {
+    char *disk_image_path = NULL;
+    char *input_dir_path = NULL;  // for mtools-like mcopy from host to image
+    char *output_dir_path = NULL; // for mtools-like mcopy from image to host
+
+    // --- 1. argument parsing ---
+
+    for (int i = 1; i < argc; i++) {
+        if ((strcmp(argv[i], "-i") == 0) || (strcmp(argv[i], "--inputdir") == 0)) {
+            if (i + 1 < argc) {
+                input_dir_path = argv[++i];
+            } else {
+                fprintf(stderr, "error: %s requires an argument.\n", argv[i-1]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if ((strcmp(argv[i], "-o") == 0) || (strcmp(argv[i], "--outputdir") == 0)) {
+            if (i + 1 < argc) {
+                output_dir_path = argv[++i];
+            } else {
+                fprintf(stderr, "error: %s requires an argument.\n", argv[i-1]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else {
+            // assume the first non-option argument is the disk image path
+            if (disk_image_path == NULL) {
+                disk_image_path = argv[i];
+            } else {
+                fprintf(stderr, "error: too many arguments. unknown argument '%s'.\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+    }
+
+    if (disk_image_path == NULL) {
+        fprintf(stderr, "error: disk image file path is required.\n");
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // show parsed options (for debugging/proof of concept)
+    printf("parsed arguments:\n");
+    printf("  disk image: %s\n", disk_image_path);
+    printf("  input dir:  %s\n", input_dir_path ? input_dir_path : "(none)");
+    printf("  output dir: %s\n", output_dir_path ? output_dir_path : "(none)");
+    printf("\n");
+
+    // --- 2. core logic (read boot sector) ---
+
+    FILE *fp = NULL;
+    fat_boot_sector_t boot_sector;
+    int ret = 0;
+
+    // open the disk image file
+    fp = fopen(disk_image_path, "rb");
+    if (!fp) {
+        fprintf(stderr, "error: could not open file '%s'. %s\n", disk_image_path, strerror(errno));
+        return 1;
+    }
+
+    // read the first 512 bytes (the boot sector)
+    if (fread(&boot_sector, 1, BOOT_SECTOR_SIZE, fp) != BOOT_SECTOR_SIZE) {
+        fprintf(stderr, "error: could not read 512 bytes from '%s'. check file size.\n", disk_image_path);
+        ret = 1;
+        goto cleanup;
+    }
+
+    // check for the magic boot signature 0xAA55
+    if (boot_sector.ebpb.fat16.bootsignature != BOOT_SIGNATURE) {
+        fprintf(stderr, "error: invalid boot signature (0x%04x). not a vfat filesystem.\n",
+            boot_sector.ebpb.fat16.bootsignature);
+        ret = 1;
+        goto cleanup;
+    }
+
+    // if all checks pass, display the parsed info
+    display_boot_sector_info(&boot_sector);
+
+    printf("\n\n-- next steps for full mtools functionality --\n");
+    printf("1. use 'input dir' for copying files from host to image (mcopy).\n");
+    printf("2. use 'output dir' for copying files from image to host (mcopy).\n");
+    printf("3. implement a function to map a cluster number to its starting sector offset.\n");
+
+
+cleanup:
+    if (fp) {
+        fclose(fp);
+    }
+    return ret;
+}

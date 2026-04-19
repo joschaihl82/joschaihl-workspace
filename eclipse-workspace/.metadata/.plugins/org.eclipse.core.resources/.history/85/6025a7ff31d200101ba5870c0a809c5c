@@ -1,0 +1,32 @@
+# Makefile for building bootx64.efi using mingw-w64 + gnu-efi
+# Requires: x86_64-w64-mingw32-gcc, objcopy, qemu-system-x86_64, gnu-efi libs
+
+EFI_ARCH = x86_64
+CC = x86_64-w64-mingw32-gcc
+CFLAGS = -I/usr/include/efi -I/usr/include/efi/$(EFI_ARCH) -ffreestanding -fshort-wchar -mno-red-zone -Wall -O2
+LDFLAGS = -nostdlib -T /usr/lib/gnu-efi/elf_$(EFI_ARCH)_efi.lds -shared -Bsymbolic
+LIBS = /usr/lib/gnu-efi/crt0-efi-$(EFI_ARCH).o -lefi -lgnuefi
+
+TARGET = bootx64.efi
+OBJ = bootx64.o
+
+all: $(TARGET)
+
+$(OBJ): bootx64.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJ)
+	$(CC) $(LDFLAGS) $^ $(LIBS) -o bootx64.so
+	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
+	       -j .rel -j .rela -j .reloc --target=efi-app-$(EFI_ARCH) bootx64.so $@
+
+run: $(TARGET)
+	qemu-system-x86_64 -bios /usr/share/OVMF/OVMF.fd -drive format=raw,file=fat:rw:./qemu_disk
+
+# Prepare FAT folder structure for QEMU
+qemu_disk:
+	mkdir -p qemu_disk/EFI/BOOT
+	cp bootx64.efi qemu_disk/EFI/BOOT/BOOTX64.EFI
+
+clean:
+	rm -f *.o *.so *.efi

@@ -1,0 +1,77 @@
+# Makefile for building the minimal x64 UEFI OS and running it in QEMU (OVMF)
+# Usage:
+#   make			# build BOOTX64.EFI
+#   make run		# run QEMU with OVMF and the FAT image
+#   make clean
+
+# Toolchain (adjust if needed)
+CC		:= x86_64-w64-mingw32-gcc
+LD		:= x86_64-w64-mingw32-ld
+OBJCOPY   := x86_64-w64-mingw32-objcopy
+CFLAGS	:= -ffreestanding -fno-stack-protector -fno-asynchronous-unwind-tables -O2 -Wall -Wextra -nostdlib
+LDFLAGS   := -T nul -e efi_main --subsystem=efi --image-base 0
+
+# QEMU / OVMF
+QEMU		:= qemu-system-x86_64
+OVMF_CODE   := /usr/share/ovmf/OVMF_CODE.fd
+OVMF_VARS   := /usr/share/ovmf/OVMF_VARS.fd
+QEMU_MEM	:= 512M
+
+# Files and directories
+EFI_DIR	 := efi_disk
+EFI_BOOTDIR := $(EFI_DIR)/EFI/BOOT
+OUT_EFI	 := BOOTX64.EFI
+
+# Source files
+KERNEL_SRC  := kernel.c
+# SH_SRC	  := sh.c
+
+# Derived objects
+SH_OBJ	  := sh.o
+INIT_BIN	:= init_sh.bin
+INIT_BLOB   := init_sh_blob.o
+KERNEL_OBJ  := kernel.o
+
+.PHONY: all run clean distclean
+
+all: $(OUT_EFI)
+
+# build userspace shell object
+$(SH_OBJ): $(SH_SRC)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# convert .o -> raw binary (text section)
+#$(INIT_BIN): $(SH_OBJ)
+#	$(OBJCOPY) -O binary -j .text $< $@
+
+# wrap binary as relocatable object with symbols _binary_*_start/_end
+$(INIT_BLOB): $(INIT_BIN)
+	$(LD) -r -b binary $< -o $@
+
+# compile kernel
+$(KERNEL_OBJ): $(KERNEL_SRC)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# link final EFI executable
+$(OUT_EFI): $(KERNEL_OBJ) $(INIT_BLOB)
+	$(LD) $(KERNEL_OBJ) $(INIT_BLOB) $(LDFLAGS) -o $@
+
+# prepare FAT image with EFI/BOOT/BOOTX64.EFI
+$(EFI_BOOTDIR)/BOOTX64.EFI: $(OUT_EFI)
+	mkdir -p $(EFI_BOOTDIR)
+	cp $< $(EFI_BOOTDIR)/BOOTX64.EFI
+
+# run target: ensures FAT image exists and launches QEMU with OVMF
+run: $(EFI_BOOTDIR)/BOOTX64.EFI
+	@echo "Starting QEMU with OVMF..."
+	$(QEMU) -machine q35,accel=kvm -m $(QEMU_MEM) \
+	  -drive if=pflash,format=raw,readonly,file=$(OVMF_CODE) \
+	  -drive if=pflash,format=raw,file=$(OVMF_VARS) \
+	  -drive format=raw,file=fat:rw:$(EFI_DIR) \
+	-serial stdio
+
+clean:
+	-rm -f $(SH_OBJ) $(INIT_BIN) $(INIT_BLOB) $(KERNEL_OBJ) $(OUT_EFI)
+	-rm -rf $(EFI_DIR)
+
+distclean: clean

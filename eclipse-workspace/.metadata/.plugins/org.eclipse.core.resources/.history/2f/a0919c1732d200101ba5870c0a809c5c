@@ -1,0 +1,451 @@
+/* create_gpt_fat32_disk.c
+ *
+ * Create a 64 MiB disk image with GPT and a single FAT32 partition,
+ * then write ./BOOTX64.EFI into /EFI/BOOT/BOOTX64.EFI inside the partition.
+ *
+ * No external tools required. Works by writing the partition table,
+ * FAT32 boot sector, FATs, and directory entries directly into the image file.
+ *
+ * Limitations / assumptions:
+ * - 512-byte sectors
+ * - 8 sectors per cluster (4 KiB clusters)
+ * - single partition starting at LBA 2048
+ * - uses short 8.3 names only (EFI, BOOT, BOOTX64.EFI)
+ * - not a full-featured FAT implementation, but sufficient for placing one file
+ *
+ * Compile: gcc -O2 -o create_gpt_fat32_disk create_gpt_fat32_disk.c
+ * Run: ./create_gpt_fat32_disk [disk.img]
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+static void die(const char *msg) { perror(msg); exit(1); }
+
+static void write_at(FILE *f, uint64_t off, const void *buf, size_t n) {
+    if (fseek(f, (long)off, SEEK_SET) != 0) die("fseek");
+    if (fwrite(buf, 1, n, f) != n) die("fwrite");
+}
+
+/* Helpers to write little-endian integers */
+static void write_le16(uint8_t *p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v>>8)&0xFF; }
+static void write_le32(uint8_t *p, uint32_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF; }
+static void write_le64(uint8_t *p, uint64_t v) {
+    for (int i=0;i<8;i++) p[i] = (v>>(8*i)) & 0xFF;
+}
+
+/* GUID helper: write 16-byte GUID from components (as in GPT) */
+static void guid_write(uint8_t *p, uint32_t a, uint16_t b, uint16_t c, const uint8_t d[8]) {
+    write_le32(p, a);
+    write_le16(p+4, b);
+    write_le16(p+6, c);
+    memcpy(p+8, d, 8);
+}
+
+/* CRC32 (polynomial 0x04C11DB7) for GPT header checksum.
+   Simple implementation for our small use (not optimized). */
+static uint32_t crc32(const uint8_t *buf, size_t len) {
+    uint32_t crc = ~0u;
+    for (size_t i=0;i<len;i++) {
+        crc ^= (uint32_t)buf[i];
+        for (int j=0;j<8;j++) crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320u : (crc >> 1);
+    }
+    return ~crc;
+}
+
+/* Create protective MBR at LBA 0 */
+static void write_protective_mbr(FILE *f, uint64_t total_sectors) {
+    uint8_t mbr[512];
+    memset(mbr, 0, sizeof(mbr));
+    /* Partition entry 1: type 0xEE, starting LBA 1, size = min(total_sectors-1, 0xFFFFFFFF) */
+    mbr[0x1BE + 0] = 0x00; /* boot flag */
+    mbr[0x1BE + 4] = 0xEE; /* partition type protective */
+    uint32_t start = 1;
+    uint32_t size = (total_sectors - 1 > 0xFFFFFFFFu) ? 0xFFFFFFFFu : (uint32_t)(total_sectors - 1);
+    write_le32(mbr + 0x1BE + 8, start);
+    write_le32(mbr + 0x1BE + 12, size);
+    mbr[510] = 0x55; mbr[511] = 0xAA;
+    write_at(f, 0, mbr, 512);
+}
+
+/* Write GPT header and partition entry array (one partition) */
+static void write_gpt(FILE *f, uint64_t total_sectors, uint64_t part_lba_first, uint64_t part_lba_last) {
+    /* Partition entry array: we'll place it at LBA 2 (immediately after header),
+       with room for 128 entries (standard). */
+    const uint64_t part_entries_lba = 2;
+    const uint32_t part_entry_size = 128;
+    const uint32_t num_entries = 128;
+    uint8_t part_array[128 * 128];
+    memset(part_array, 0, sizeof(part_array));
+
+    /* Partition type GUID: EFI System Partition: {28732AC1-1FF8-4A8A-9A0B-...}
+       Use the standard GUID: {C12A7328-F81F-11D2-BA4B-00A0C93EC93B} (EFI System Partition) */
+    uint8_t efi_guid_d[8] = {0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B};
+    guid_write(part_array + 0, 0xC12A7328, 0xF81F, 0x11D2, efi_guid_d);
+
+    /* Unique partition GUID: make a simple pseudo-random GUID from time */
+    uint8_t uniq_d[8] = {0x10,0x32,0x54,0x76,0x98,0xBA,0xDC,0xFE};
+    guid_write(part_array + 16, 0x11223344, 0x5566, 0x7788, uniq_d);
+
+    /* First LBA and Last LBA */
+    write_le64(part_array + 32, part_lba_first);
+    write_le64(part_array + 40, part_lba_last);
+
+    /* Attributes (0) and partition name (UTF-16) */
+    /* Name "EFI System" in UTF-16 (we can leave empty) */
+
+    /* Write partition array to disk at LBA 2 */
+    write_at(f, part_entries_lba * 512, part_array, sizeof(part_array));
+
+    /* Primary GPT header at LBA 1 */
+    uint8_t hdr[512];
+    memset(hdr, 0, sizeof(hdr));
+    memcpy(hdr, "EFI PART", 8);
+    write_le32(hdr + 8, 0x00010000); /* revision 1.0 */
+    write_le32(hdr + 12, 92); /* header size */
+    /* header CRC set later */
+    write_le64(hdr + 24, 1); /* current LBA */
+    write_le64(hdr + 32, total_sectors - 1); /* backup LBA */
+    write_le64(hdr + 40, part_entries_lba); /* first usable LBA for entries array */
+    write_le32(hdr + 72, part_entry_size);
+    write_le32(hdr + 76, num_entries);
+    write_le64(hdr + 48, part_entries_lba); /* partition entries starting LBA */
+    /* Disk GUID */
+    uint8_t disk_guid_d[8] = {0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF};
+    guid_write(hdr + 56, 0xA1A2A3A4, 0xB1B2, 0xC1C2, disk_guid_d);
+
+    /* Compute CRC32 of partition array */
+    uint32_t part_crc = crc32(part_array, sizeof(part_array));
+    write_le32(hdr + 88, part_crc);
+
+    /* Zero header CRC field, compute CRC over header size bytes */
+    write_le32(hdr + 16, 0);
+    uint32_t hdr_crc = crc32(hdr, 92);
+    write_le32(hdr + 16, hdr_crc);
+
+    /* Write header to LBA 1 */
+    write_at(f, 512, hdr, 512);
+
+    /* Backup partition array and header at end of disk */
+    uint64_t backup_part_lba = total_sectors - 33; /* typical location */
+    write_at(f, backup_part_lba * 512, part_array, sizeof(part_array));
+
+    /* Backup header at last LBA (total_sectors - 1) */
+    uint8_t hdr_b[512];
+    memcpy(hdr_b, hdr, 512);
+    /* swap current and backup LBAs */
+    write_le64(hdr_b + 24, total_sectors - 1); /* current LBA becomes backup */
+    write_le64(hdr_b + 32, 1); /* backup LBA becomes primary */
+    /* partition entries starting LBA becomes backup_part_lba */
+    write_le64(hdr_b + 48, backup_part_lba);
+    /* recompute header CRC */
+    write_le32(hdr_b + 16, 0);
+    uint32_t hdr_b_crc = crc32(hdr_b, 92);
+    write_le32(hdr_b + 16, hdr_b_crc);
+    write_at(f, (total_sectors - 1) * 512, hdr_b, 512);
+}
+
+/* Minimal FAT32 creation on the partition area.
+   partition_offset_bytes: byte offset where partition begins
+   partition_sectors: number of sectors in partition
+   bootfile: path to source file to copy
+*/
+static void create_fat32_and_copy(FILE *f, uint64_t partition_offset_bytes, uint64_t partition_sectors, const char *bootfile) {
+    const uint32_t bytes_per_sector = 512;
+    const uint32_t sectors_per_cluster = 8; /* 8 * 512 = 4096 bytes per cluster */
+    const uint32_t reserved_sectors = 32; /* includes boot sector and FSInfo */
+    const uint32_t num_fats = 2;
+    const uint32_t root_cluster = 2;
+
+    uint64_t total_sectors = partition_sectors;
+
+    /* Compute number of clusters: we must choose FAT size accordingly.
+       Let data_sectors = total_sectors - reserved - num_fats * fat_sectors
+       clusters = data_sectors / sectors_per_cluster
+       fat_sectors = ceil((clusters + 2) * 4 / bytes_per_sector)
+       Solve iteratively. */
+    uint32_t fat_sectors = 0;
+    uint32_t clusters = 0;
+    for (int iter=0; iter<100; iter++) {
+        uint64_t data_sectors = total_sectors - reserved_sectors - (uint64_t)num_fats * fat_sectors;
+        clusters = data_sectors / sectors_per_cluster;
+        uint64_t fat_entries = (uint64_t)clusters + 2;
+        uint32_t new_fat_sectors = (uint32_t)((fat_entries * 4 + bytes_per_sector - 1) / bytes_per_sector);
+        if (new_fat_sectors == fat_sectors) break;
+        fat_sectors = new_fat_sectors;
+    }
+    if (fat_sectors == 0) die("fat_sectors calculation failed");
+
+    uint64_t data_sectors = total_sectors - reserved_sectors - (uint64_t)num_fats * fat_sectors;
+    clusters = data_sectors / sectors_per_cluster;
+
+    /* Prepare BPB/boot sector */
+    uint8_t sector[512];
+    memset(sector, 0, sizeof(sector));
+    sector[0] = 0xEB; sector[1] = 0x58; sector[2] = 0x90; /* JMP + NOP */
+    memcpy(sector + 3, "MSDOS5.0", 8); /* OEM name */
+    write_le16(sector + 11, bytes_per_sector);
+    sector[13] = sectors_per_cluster;
+    write_le16(sector + 14, reserved_sectors);
+    sector[16] = num_fats;
+    write_le16(sector + 17, 0); /* root entries (FAT12/16) */
+    write_le16(sector + 19, 0); /* total sectors (small) */
+    sector[21] = 0xF8; /* media */
+    write_le16(sector + 22, 0); /* fat size 16 */
+    write_le16(sector + 24, 0); /* sectors per track */
+    write_le16(sector + 26, 0); /* heads */
+    write_le32(sector + 28, 0); /* hidden sectors */
+    write_le32(sector + 32, (uint32_t)total_sectors); /* total sectors (large) */
+
+    write_le32(sector + 36, fat_sectors); /* FAT size 32 */
+    write_le16(sector + 40, 0); /* ext flags */
+    write_le16(sector + 42, 0); /* FS version */
+    write_le32(sector + 44, root_cluster); /* root cluster */
+    write_le16(sector + 48, 1); /* FSInfo sector (relative) */
+    write_le16(sector + 50, 6); /* backup boot sector */
+    /* drive number, reserved, boot signature */
+    sector[64] = 0x80;
+    sector[66] = 0x29;
+    /* volume serial */
+    write_le32(sector + 67, 0x12345678);
+    memcpy(sector + 71, "NO NAME    ", 11);
+    memcpy(sector + 82, "FAT32   ", 8);
+
+    /* FSInfo sector */
+    uint8_t fsinfo[512];
+    memset(fsinfo, 0, sizeof(fsinfo));
+    write_le32(fsinfo + 0, 0x41615252);
+    write_le32(fsinfo + 484, 0x61417272);
+    write_le32(fsinfo + 488, 0xFFFFFFFF);
+
+    /* Write boot sector and FSInfo and backup boot */
+    uint64_t part_off = partition_offset_bytes;
+    write_at(f, part_off + 0 * 512, sector, 512);
+    write_at(f, part_off + 1 * 512, fsinfo, 512);
+    /* backup boot at sector 6 */
+    write_at(f, part_off + 6 * 512, sector, 512);
+
+    /* Initialize FATs: each FAT is fat_sectors sectors long */
+    uint64_t fat0_off = part_off + (uint64_t)reserved_sectors * 512;
+    uint64_t fat1_off = fat0_off + (uint64_t)fat_sectors * 512;
+
+    /* Prepare initial FAT content: first two entries */
+    /* FAT[0] = media descriptor & reserved bits; FAT[1] = 0xFFFFFFFF (EOC) */
+    size_t fat_bytes = (size_t)fat_sectors * 512;
+    uint8_t *fatbuf = calloc(1, fat_bytes);
+    if (!fatbuf) die("calloc fatbuf");
+    /* entry 0 */
+    fatbuf[0] = 0xF8; fatbuf[1] = 0xFF; fatbuf[2] = 0xFF; fatbuf[3] = 0x0F;
+    /* entry 1 */
+    fatbuf[4] = 0xFF; fatbuf[5] = 0xFF; fatbuf[6] = 0xFF; fatbuf[7] = 0x0F;
+
+    /* We'll allocate clusters sequentially starting at cluster 2.
+       Reserve clusters for root dir (1 cluster), EFI dir (1 cluster), BOOT dir (1 cluster),
+       and file clusters as needed. */
+    /* Read bootfile */
+    FILE *bf = fopen(bootfile, "rb");
+    if (!bf) die("open bootfile");
+    if (fseek(bf, 0, SEEK_END) != 0) die("fseek bootfile");
+    long bsize = ftell(bf);
+    if (bsize < 0) die("ftell bootfile");
+    rewind(bf);
+
+    uint32_t file_clusters = (bsize + (sectors_per_cluster * bytes_per_sector) - 1) / (sectors_per_cluster * bytes_per_sector);
+
+    uint32_t next_cluster = 2; /* first usable cluster */
+    uint32_t root_cluster_num = next_cluster++; /* cluster 2 */
+    uint32_t efi_cluster = next_cluster++;      /* cluster 3 */
+    uint32_t boot_cluster = next_cluster++;     /* cluster 4 */
+    uint32_t file_start_cluster = next_cluster; /* cluster 5 */
+    /* mark clusters in FAT: allocate root, efi, boot, file clusters */
+    /* mark root cluster as EOC */
+    uint32_t mark_cluster = root_cluster_num;
+    uint32_t fat_index = mark_cluster * 4;
+    fatbuf[fat_index + 0] = 0xFF; fatbuf[fat_index + 1] = 0xFF; fatbuf[fat_index + 2] = 0xFF; fatbuf[fat_index + 3] = 0x0F;
+
+    /* efi dir cluster */
+    mark_cluster = efi_cluster;
+    fat_index = mark_cluster * 4;
+    fatbuf[fat_index + 0] = 0xFF; fatbuf[fat_index + 1] = 0xFF; fatbuf[fat_index + 2] = 0xFF; fatbuf[fat_index + 3] = 0x0F;
+
+    /* boot dir cluster */
+    mark_cluster = boot_cluster;
+    fat_index = mark_cluster * 4;
+    fatbuf[fat_index + 0] = 0xFF; fatbuf[fat_index + 1] = 0xFF; fatbuf[fat_index + 2] = 0xFF; fatbuf[fat_index + 3] = 0x0F;
+
+    /* file clusters chain */
+    uint32_t prev = 0;
+    for (uint32_t i = 0; i < file_clusters; i++) {
+        uint32_t c = file_start_cluster + i;
+        uint32_t idx = c * 4;
+        if (i + 1 == file_clusters) {
+            /* last cluster -> EOC */
+            fatbuf[idx + 0] = 0xFF; fatbuf[idx + 1] = 0xFF; fatbuf[idx + 2] = 0xFF; fatbuf[idx + 3] = 0x0F;
+        } else {
+            uint32_t next = c + 1;
+            fatbuf[idx + 0] = next & 0xFF;
+            fatbuf[idx + 1] = (next >> 8) & 0xFF;
+            fatbuf[idx + 2] = (next >> 16) & 0xFF;
+            fatbuf[idx + 3] = (next >> 24) & 0x0F;
+        }
+        if (prev) {
+            uint32_t pidx = prev * 4;
+            uint32_t val = c;
+            fatbuf[pidx + 0] = val & 0xFF;
+            fatbuf[pidx + 1] = (val >> 8) & 0xFF;
+            fatbuf[pidx + 2] = (val >> 16) & 0xFF;
+            fatbuf[pidx + 3] = (val >> 24) & 0x0F;
+        }
+        prev = c;
+    }
+
+    /* Write FATs */
+    write_at(f, fat0_off, fatbuf, fat_bytes);
+    write_at(f, fat1_off, fatbuf, fat_bytes);
+
+    /* Prepare cluster area zeroed */
+    uint64_t data_off = part_off + (reserved_sectors + (uint64_t)num_fats * fat_sectors) * 512;
+    uint64_t cluster_size = sectors_per_cluster * bytes_per_sector;
+
+    /* Zero all data clusters (optional but safe) */
+    uint8_t *zero = calloc(1, cluster_size);
+    if (!zero) die("calloc zero");
+    for (uint32_t c = 0; c < clusters; c++) {
+        write_at(f, data_off + (uint64_t)c * cluster_size, zero, cluster_size);
+    }
+
+    /* Create directory entries:
+       Root directory (cluster root_cluster_num) contains entry for "EFI" (dir)
+       EFI cluster contains entry for "BOOT" (dir)
+       BOOT cluster contains file entry "BOOTX64EFI" (short name BOOTX64.EFI)
+    */
+    /* Directory entry structure: 32 bytes */
+    struct direntry { uint8_t name[11]; uint8_t attr; uint8_t nt; uint8_t crtTimeTenth; uint16_t crtTime; uint16_t crtDate; uint16_t lstAccDate; uint16_t fstClusHI; uint16_t wrtTime; uint16_t wrtDate; uint16_t fstClusLO; uint32_t fileSize; } __attribute__((packed));
+
+    /* Helper to create short name padded */
+    auto make_short_name = [](const char *s, uint8_t out[11]) {
+        memset(out, ' ', 11);
+        const char *dot = strchr(s, '.');
+        size_t nlen = dot ? (size_t)(dot - s) : strlen(s);
+        size_t elen = dot ? strlen(dot+1) : 0;
+        for (size_t i=0;i<nlen && i<8;i++) out[i] = (uint8_t)toupper((unsigned char)s[i]);
+        for (size_t i=0;i<elen && i<3;i++) out[8+i] = (uint8_t)toupper((unsigned char)dot[1+i]);
+    };
+
+    /* Root cluster buffer */
+    uint8_t *rootbuf = calloc(1, cluster_size);
+    uint8_t *efibuf = calloc(1, cluster_size);
+    uint8_t *bootbuf = calloc(1, cluster_size);
+    if (!rootbuf || !efibuf || !bootbuf) die("calloc dir buffers");
+
+    /* Create "EFI" directory entry in root */
+    struct direntry efi_de;
+    memset(&efi_de, 0, sizeof(efi_de));
+    make_short_name("EFI", efi_de.name);
+    efi_de.attr = 0x10; /* directory */
+    efi_de.fstClusHI = 0;
+    efi_de.fstClusLO = (uint16_t)efi_cluster;
+    efi_de.fileSize = 0;
+    memcpy(rootbuf, &efi_de, sizeof(efi_de));
+
+    /* Create "BOOT" directory entry in EFI dir */
+    struct direntry boot_de;
+    memset(&boot_de, 0, sizeof(boot_de));
+    make_short_name("BOOT", boot_de.name);
+    boot_de.attr = 0x10;
+    boot_de.fstClusHI = 0;
+    boot_de.fstClusLO = (uint16_t)boot_cluster;
+    memcpy(efibuf, &boot_de, sizeof(boot_de));
+
+    /* Create file entry in BOOT dir: BOOTX64.EFI */
+    struct direntry file_de;
+    memset(&file_de, 0, sizeof(file_de));
+    make_short_name("BOOTX64.EFI", file_de.name);
+    file_de.attr = 0x20; /* archive (file) */
+    file_de.fstClusHI = 0;
+    file_de.fstClusLO = (uint16_t)file_start_cluster;
+    file_de.fileSize = (uint32_t)bsize;
+    memcpy(bootbuf, &file_de, sizeof(file_de));
+
+    /* Write directory clusters to disk (cluster numbers are 1-based offset from cluster 2) */
+    uint64_t root_off = data_off + (uint64_t)(root_cluster_num - 2) * cluster_size;
+    uint64_t efi_off  = data_off + (uint64_t)(efi_cluster - 2) * cluster_size;
+    uint64_t boot_off = data_off + (uint64_t)(boot_cluster - 2) * cluster_size;
+    write_at(f, root_off, rootbuf, cluster_size);
+    write_at(f, efi_off, efibuf, cluster_size);
+    write_at(f, boot_off, bootbuf, cluster_size);
+
+    /* Write file data into file clusters */
+    uint8_t *filebuf = malloc(cluster_size);
+    if (!filebuf) die("malloc filebuf");
+    uint32_t written = 0;
+    for (uint32_t i=0;i<file_clusters;i++) {
+        size_t toread = cluster_size;
+        if ((long)written + (long)toread > bsize) toread = bsize - written;
+        memset(filebuf, 0, cluster_size);
+        if (toread) {
+            size_t r = fread(filebuf, 1, toread, bf);
+            if (r != toread) die("fread bootfile");
+        }
+        uint64_t off = data_off + (uint64_t)(file_start_cluster + i - 2) * cluster_size;
+        write_at(f, off, filebuf, cluster_size);
+        written += toread;
+    }
+
+    /* cleanup */
+    free(fatbuf);
+    free(zero);
+    free(rootbuf);
+    free(efibuf);
+    free(bootbuf);
+    free(filebuf);
+    fclose(bf);
+}
+
+/* Main */
+int main(int argc, char **argv) {
+    const char *img = (argc > 1) ? argv[1] : "disk.img";
+    const char *bootfile = "./BOOTX64.EFI";
+    const uint64_t size_mb = 64;
+    const uint64_t total_bytes = size_mb * 1024ULL * 1024ULL;
+    const uint64_t total_sectors = total_bytes / 512ULL;
+
+    struct stat st;
+    if (stat(bootfile, &st) != 0) {
+        fprintf(stderr, "boot file '%s' not found in current directory\n", bootfile);
+        return 1;
+    }
+
+    FILE *f = fopen(img, "wb+");
+    if (!f) die("fopen image");
+
+    /* Create sparse file of requested size by seeking and writing a zero byte at end */
+    if (fseek(f, (long)(total_bytes - 1), SEEK_SET) != 0) die("fseek end");
+    if (fwrite("\0", 1, 1, f) != 1) die("fwrite end");
+
+    /* Protective MBR */
+    write_protective_mbr(f, total_sectors);
+
+    /* Partition: choose first usable LBA = 2048, last usable = total_sectors - 34 (reserve space for GPT backup) */
+    uint64_t part_first = 2048;
+    uint64_t part_last = total_sectors - 34;
+
+    /* Write GPT primary and backup */
+    write_gpt(f, total_sectors, part_first, part_last);
+
+    /* Create FAT32 filesystem in partition and copy file */
+    uint64_t partition_offset_bytes = part_first * 512ULL;
+    uint64_t partition_sectors = part_last - part_first + 1;
+    create_fat32_and_copy(f, partition_offset_bytes, partition_sectors, bootfile);
+
+    fclose(f);
+    printf("Created image '%s' (%" PRIu64 " MiB) with GPT and FAT32 partition containing /EFI/BOOT/BOOTX64.EFI\n", img, size_mb);
+    return 0;
+}
+

@@ -1,0 +1,505 @@
+/* bootx64.c
+ * Post-ExitBootServices NVMe hexdump (standalone ring-0 stub)
+ *
+ * This is a single-file UEFI application which:
+ * 1) Before ExitBootServices:
+ *    - Locates an NVMe controller via the PCI IO protocol
+ *    - Reads BAR0 (MMIO base) and saves it
+ *    - Grabs the Graphics Output Protocol framebuffer info for text output
+ *    - Allocates page-aligned buffers for NVMe submission/completion queues
+ *    - Allocates a data buffer to receive an LBA (512 bytes)
+ *    - Collects the memory map and exits boot services
+ * 2) After ExitBootServices (we are still running in ring 0):
+ *    - Uses the previously-read BAR0 physical address to access NVMe registers
+ *    - Programs controller Admin SQ/CQ registers to point at our allocated pages
+ *    - Sends NVMe Admin Identify + IO Read (LBA 0) via PRP1 pointing to our data buffer
+ *    - Polls the completion queue for completion
+ *    - Renders a simple hexdump of the returned 512 bytes to the framebuffer
+ *
+ * CAVEATS & WARNINGS
+ * - This code assumes the firmware keeps identity mappings for allocated pages
+ *   and that the BAR physical address can be directly dereferenced after
+ *   ExitBootServices. This works on many OVMF/UEFI implementations but is
+ *   NOT guaranteed by the specification.
+ * - This program performs raw reads from storage. Use carefully.
+ * - This code is for educational / testing purposes and is not hardened.
+ *
+ * Build notes (example using GNU-EFI and mingw-w64 cross compiler):
+ *   see the canvas "bootx64.c - UEFI hexdump (GNU-EFI)" for build hints.
+ */
+
+#include <efi.h>
+#include <efilib.h>
+
+// NVMe register offsets (from the specification)
+#define NVME_REG_CAP 0x0000
+#define NVME_REG_VS  0x0008
+#define NVME_REG_CC  0x0014
+#define NVME_REG_CSTS 0x001c
+#define NVME_REG_AQA 0x0024
+#define NVME_REG_ASQ 0x0028
+#define NVME_REG_ACQ 0x0030
+
+// Doorbells base: 4K-aligned after regs (controller specific). We'll use offset 0x1000
+#define NVME_DOORBELL_OFFSET 0x1000
+
+// Admin opcodes
+#define NVME_ADMIN_IDENTIFY 0x06
+#define NVME_CMD_READ 0x02
+
+// Sizes we'll use
+#define PAGE_SIZE 4096
+#define ADMIN_Q_ENTRIES 16
+#define IO_Q_ENTRIES  16
+#define DATA_BUFFER_SIZE 4096 // read one 512-byte LBA into 4K
+
+// Simple framebuffer text helper (we capture GOP before EBS)
+typedef struct {
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINT32 FrameBufferWidth;
+    UINT32 FrameBufferHeight;
+    UINT32 PixelsPerScanLine;
+    EFI_GRAPHICS_PIXEL_FORMAT PixelFormat;
+} FB_INFO;
+
+// Saved state gathered before ExitBootServices
+typedef struct {
+    EFI_PHYSICAL_ADDRESS NvmeBar; // physical mmio base (BAR0)
+    FB_INFO fb;
+    EFI_PHYSICAL_ADDRESS AdminSqPhys; // physical addresses of our queues & buffers
+    EFI_PHYSICAL_ADDRESS AdminCqPhys;
+    EFI_PHYSICAL_ADDRESS DataBufPhys;
+    VOID *AdminSqVirt;
+    VOID *AdminCqVirt;
+    VOID *DataBufVirt;
+    UINTN MemMapSize;
+    EFI_MEMORY_DESCRIPTOR *MemMap;
+    UINTN MapKey;
+    UINTN DescriptorSize;
+    UINT32 DescriptorVersion;
+} SAVED_STATE;
+
+STATIC SAVED_STATE S;
+
+// Simple memory copy helpers (we cannot rely on libc after EBS)
+STATIC VOID *my_memcpy(VOID *dst, const VOID *src, UINTN len){
+    UINT8 *d = dst; const UINT8 *s = src;
+    while (len--) *d++ = *s++;
+    return dst;
+}
+STATIC VOID *my_memset(VOID *dst, INT32 val, UINTN len){
+    UINT8 *d = dst; while (len--) *d++ = (UINT8)val; return dst;
+}
+
+// Framebuffer pixel write (we'll render monochrome text glyphs simple)
+// To keep this example short we render text as 8x16 bitmap font built-in for hex characters
+
+// Tiny 8x16 font for ASCII 32..127 would be big; instead we'll render hex hexdump
+// using a very small 6x8 font for chars 0-9 A-F :
+static const UINT8 hex6x8[][6] = {
+    // '0'..'9'
+    {0x3E,0x51,0x49,0x45,0x3E,0x00}, //0
+    {0x00,0x42,0x7F,0x40,0x00,0x00}, //1
+    {0x62,0x51,0x49,0x49,0x46,0x00}, //2
+    {0x22,0x41,0x49,0x49,0x36,0x00}, //3
+    {0x18,0x14,0x12,0x7F,0x10,0x00}, //4
+    {0x27,0x45,0x45,0x45,0x39,0x00}, //5
+    {0x3C,0x4A,0x49,0x49,0x30,0x00}, //6
+    {0x01,0x71,0x09,0x05,0x03,0x00}, //7
+    {0x36,0x49,0x49,0x49,0x36,0x00}, //8
+    {0x06,0x49,0x49,0x29,0x1E,0x00}, //9
+};
+static const UINT8 hexAtoF[][6] = {
+    {0x7E,0x09,0x09,0x09,0x7E,0x00}, //A
+    {0x7F,0x49,0x49,0x49,0x36,0x00}, //B
+    {0x3E,0x41,0x41,0x41,0x22,0x00}, //C
+    {0x7F,0x41,0x41,0x22,0x1C,0x00}, //D
+    {0x7F,0x49,0x49,0x49,0x41,0x00}, //E
+    {0x7F,0x09,0x09,0x09,0x01,0x00}  //F
+};
+
+// Draw a pixel in 32bpp (we won't set colors beyond black/white)
+STATIC VOID fb_put_pixel(UINTN x, UINTN y, UINT8 intensity){
+    FB_INFO *fb = &S.fb;
+    if (x >= fb->FrameBufferWidth || y >= fb->FrameBufferHeight) return;
+    UINT8 *pix = (UINT8*)(UINTN)fb->FrameBufferBase + (y * fb->PixelsPerScanLine + x) * 4;
+    // simple: white for intensity>0, black otherwise
+    if (intensity) {
+        pix[0] = 0xFF; pix[1] = 0xFF; pix[2] = 0xFF; pix[3] = 0x00;
+    } else {
+        pix[0] = pix[1] = pix[2] = 0x00; pix[3] = 0x00;
+    }
+}
+
+STATIC VOID fb_draw_char_hex(UINTN sx, UINTN sy, CHAR8 c){
+    const UINT8 *glyph;
+    if (c >= '0' && c <= '9') glyph = hex6x8[c - '0'];
+    else if (c >= 'A' && c <= 'F') glyph = hexAtoF[c - 'A'];
+    else return;
+    for (UINTN row=0; row<8; ++row){
+        UINT8 b = glyph[row%6]; // glyph height assumed 6 but we iterate 8; ok
+        for (UINTN col=0; col<6; ++col){
+            fb_put_pixel(sx + col, sy + row, (b & (1 << (7 - col))) ? 1 : 0);
+        }
+    }
+}
+
+STATIC VOID fb_draw_string_hex(UINTN sx, UINTN sy, const CHAR8 *s){
+    while (*s){
+        fb_draw_char_hex(sx, sy, *s);
+        sx += 7; // 6 pixels + 1 spacing
+        ++s;
+    }
+}
+
+// Helper: print ASCII lines (we'll only print hex via fb_draw_string_hex)
+
+// ----------------------------------
+// NVMe helpers (MMIO access)
+// We'll use 32-bit reads/writes to the controller MMIO
+
+STATIC inline UINT32 mmio_read32(UINT64 base, UINTN off){
+    volatile UINT32 *ptr = (volatile UINT32 *)(UINTN)(base + off);
+    return *ptr;
+}
+STATIC inline VOID mmio_write32(UINT64 base, UINTN off, UINT32 v){
+    volatile UINT32 *ptr = (volatile UINT32 *)(UINTN)(base + off);
+    *ptr = v;
+}
+STATIC inline UINT64 mmio_read64(UINT64 base, UINTN off){
+    volatile UINT64 *ptr = (volatile UINT64 *)(UINTN)(base + off);
+    return *ptr;
+}
+STATIC inline VOID mmio_write64(UINT64 base, UINTN off, UINT64 v){
+    volatile UINT64 *ptr = (volatile UINT64 *)(UINTN)(base + off);
+    *ptr = v;
+}
+
+// NVMe submission/completion entry structs (simplified)
+#pragma pack(push,1)
+typedef struct {
+    UINT32 cdw0;
+    UINT32 nsid;
+    UINT64 reserved1;
+    UINT64 mptr;
+    UINT64 prp1;
+    UINT64 prp2;
+    UINT32 cdw10;
+    UINT32 cdw11;
+    UINT32 cdw12;
+    UINT32 cdw13;
+    UINT32 cdw14;
+    UINT32 cdw15;
+} nvme_sqe_t;
+
+typedef struct {
+    UINT32 result;
+    UINT32 sq_head_sq_id;
+    UINT16 command_id;
+    UINT16 status;
+} nvme_cqe_t;
+#pragma pack(pop)
+
+// Utilities to build SQE
+STATIC VOID nvme_build_identify(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT32 cns){
+    my_memset(sqe, 0, sizeof(*sqe));
+    sqe->cdw0 = (NVME_ADMIN_IDENTIFY & 0xFF) | (0 << 8); // opcode
+    sqe->nsid = nsid;
+    sqe->prp1 = prp1;
+    sqe->cdw10 = cns; // CNS field
+    // set cid in appropriate place? we'll rely on tracking by index
+}
+
+STATIC VOID nvme_build_read(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT64 slba, UINT16 nblocks){
+    my_memset(sqe, 0, sizeof(*sqe));
+    sqe->cdw0 = (NVME_CMD_READ & 0xFF);
+    sqe->nsid = nsid;
+    sqe->prp1 = prp1;
+    // SLBA in cdw10..11
+    sqe->cdw10 = (UINT32)(slba & 0xFFFFFFFF);
+    sqe->cdw11 = (UINT32)(slba >> 32);
+    // NLB is 0-based count
+    sqe->cdw12 = (UINT32)(nblocks - 1);
+}
+
+// Doorbell write: write to doorbell array at offset NVME_DOORBELL_OFFSET
+STATIC VOID doorbell_write(UINT64 base, UINT32 qid, UINT32 val){
+    // per spec: doorbells are 32-bit, two per queue: sq and cq
+    // SQ doorbell offset: NB * (2*qid) * 4 + NVME_DOORBELL_OFFSET? Simpler: assume SQ doorbells start at base + 0x1000
+    UINTN off = NVME_DOORBELL_OFFSET + (qid * 8); // sq doorbell at +8*qid
+    mmio_write32(base, off, val);
+}
+
+// Poll completion queue entry at host memory
+STATIC INT nvme_poll_cq(nvme_cqe_t *cq, UINT32 qentries, UINT16 *seen_phase, UINT32 *cq_head_ref){
+    UINT32 head = *cq_head_ref;
+    nvme_cqe_t *entry = &cq[head];
+    if (((entry->status >> 1) & 1) == *seen_phase){
+        // found new entry
+        UINT16 cid = entry->command_id;
+        UINT32 res = entry->result;
+        // advance head
+        head = (head + 1) % qentries;
+        *cq_head_ref = head;
+        // toggle phase if wrapped
+        if (head == 0) *seen_phase ^= 1;
+        return cid | (res<<16);
+    }
+    return -1;
+}
+
+// ----------------------------------
+// High level sequence executed after ExitBootServices
+
+STATIC VOID do_nvme_after_ebs(UINT64 nvme_mmio_base){
+    // For readability: many simplifications & assumptions are made
+    UINT64 base = nvme_mmio_base;
+    Print(L"[ring0] NVMe MMIO base: 0x%lx
+", base);
+
+    // Read CAP to check controller
+    UINT64 cap = mmio_read64(base, NVME_REG_CAP);
+    Print(L"CAP: 0x%lx
+", cap);
+
+    // We'll use single admin queue with ADMIN_Q_ENTRIES
+    // Our Admin SQ/CQ pages were allocated pre-EBS and their physical addresses saved in S
+    nvme_sqe_t *asq = (nvme_sqe_t*)(UINTN)S.AdminSqPhys; // we mapped them identity
+    nvme_cqe_t *acq = (nvme_cqe_t*)(UINTN)S.AdminCqPhys;
+
+    // zero the SQ/CQ memory
+    my_memset(asq, 0, PAGE_SIZE);
+    my_memset(acq, 0, PAGE_SIZE);
+
+    // Program Admin Queue Attributes (AQA): (CQ entries -1) << 16 | (SQ entries -1)
+    UINT32 aqa = ((ADMIN_Q_ENTRIES - 1) << 16) | (ADMIN_Q_ENTRIES - 1);
+    mmio_write32(base, NVME_REG_AQA, aqa);
+    // ASQ/ACQ require 64-bit addresses
+    mmio_write64(base, NVME_REG_ASQ, (UINT64)S.AdminSqPhys);
+    mmio_write64(base, NVME_REG_ACQ, (UINT64)S.AdminCqPhys);
+
+    // Ensure controller is enabled: set CC.EN = 1; write CC
+    UINT32 cc = mmio_read32(base, NVME_REG_CC);
+    cc |= 1; // EN = 1
+    mmio_write32(base, NVME_REG_CC, cc);
+
+    // Wait for CSTS.RDY
+    for (int i=0;i<100000;i++){
+        UINT32 csts = mmio_read32(base, NVME_REG_CSTS);
+        if (csts & 1) break;
+    }
+
+    // Build Identify Admin command (CNS = 1 namespace? we'll use CNS=1 for namespace ID list)
+    // Build SQE at index 0
+    nvme_build_identify(&asq[0], 0, 0, (UINT64)S.DataBufPhys, 1);
+    // ring SQ doorbell 0 -> 1
+    doorbell_write(base, 0, 1);
+
+    // Poll ACQ for completion
+    UINT16 phase = 1;
+    UINT32 cq_head = 0;
+    int cid_res = -1;
+    for (int t=0; t<1000000; ++t){
+        int r = nvme_poll_cq(acq, ADMIN_Q_ENTRIES, &phase, &cq_head);
+        if (r != -1){ cid_res = r; break; }
+    }
+    if (cid_res == -1) {
+        Print(L"Identify failed or timeout
+");
+    } else {
+        Print(L"Identify completed, CID/res: 0x%x
+", cid_res);
+    }
+
+    // Next: Issue IO Read LBA 0 (we assume namespace 1)
+    nvme_build_read(&asq[1], 1, 1, (UINT64)S.DataBufPhys, 0, 1);
+    // ring SQ doorbell for queue 0 with value 2
+    doorbell_write(base, 0, 2);
+
+    // Poll for completion
+    phase = 1; cq_head = 0; cid_res = -1;
+    for (int t=0; t<1000000; ++t){
+        int r = nvme_poll_cq(acq, ADMIN_Q_ENTRIES, &phase, &cq_head);
+        if (r != -1){ cid_res = r; break; }
+    }
+    if (cid_res == -1){
+        Print(L"Read LBA failed or timeout
+");
+    } else {
+        Print(L"Read LBA completed, CID/res: 0x%x
+", cid_res);
+    }
+
+    // Now dump data buffer (first 512 bytes) to framebuffer using hex rendering
+    UINT8 *data = (UINT8*)(UINTN)S.DataBufPhys;
+    // Prepare a small line buffer for hex ASCII
+    CHAR8 line[64];
+    for (UINTN row = 0; row < 32; ++row){ // 32 * 16 = 512 bytes (if we used 16 bytes per row)
+        UINTN offset = row * 16;
+        UINTN pos = 0;
+        for (UINTN i=0;i<16;i++){
+            UINT8 b = data[offset + i];
+            UINT8 hi = (b >> 4) & 0xF;
+            UINT8 lo = b & 0xF;
+            line[pos++] = (hi < 10) ? ('0' + hi) : ('A' + (hi - 10));
+            line[pos++] = (lo < 10) ? ('0' + lo) : ('A' + (lo - 10));
+            line[pos++] = ' ';
+        }
+        line[pos] = 0;
+        // Draw at position. Each char 7 pixels wide, 8 tall. We'll place rows vertically.
+        UINTN x = 10;
+        UINTN y = 10 + row * 9;
+        fb_draw_string_hex(x, y, line);
+    }
+}
+
+// ----------------------------------
+// Pre-ExitBootServices setup: find NVMe by scanning handles with PCI_IO or by checking class code
+
+STATIC EFI_STATUS find_nvme_and_prepare(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable){
+    EFI_STATUS Status;
+    UINTN HandleCount = 0;
+    EFI_HANDLE *HandleBuffer = NULL;
+
+    // Locate all handles supporting EFI_PCI_IO_PROTOCOL
+    Status = uefi_call_wrapper(BS->LocateHandleBuffer, 5, ByProtocol, &gEfiPciIoProtocolGuid, NULL, &HandleCount, &HandleBuffer);
+    if (EFI_ERROR(Status)){
+        Print(L"LocateHandleBuffer(PciIo) failed: %r
+", Status);
+        return Status;
+    }
+
+    Print(L"Found %u PCI handles
+", (UINT32)HandleCount);
+
+    for (UINTN i=0;i<HandleCount;i++){
+        EFI_PCI_IO_PROTOCOL *PciIo = NULL;
+        Status = uefi_call_wrapper(BS->HandleProtocol, 3, HandleBuffer[i], &gEfiPciIoProtocolGuid, (VOID**)&PciIo);
+        if (EFI_ERROR(Status) || !PciIo) continue;
+
+        // Read PCI class code (offset 0x0B)
+        UINT8 class_code[3];
+        Status = uefi_call_wrapper(PciIo->Pci.Read, 5, PciIo, EfiPciIoWidthUint8, 0x0B, 3, class_code);
+        if (EFI_ERROR(Status)) continue;
+        // NVMe class is 01 (Mass storage) subclass 08, prog IF 02
+        if (class_code[2] == 0x01 && class_code[1] == 0x08 && class_code[0] == 0x02){
+            // Found NVMe
+            Print(L"Found NVMe PCI device at handle %u
+", (UINT32)i);
+            // Read BAR0 (offset 0x10, 64-bit BARs)
+            UINT32 barlow; UINT32 barhigh;
+            Status = uefi_call_wrapper(PciIo->Pci.Read, 5, PciIo, EfiPciIoWidthUint32, 0x10, 1, &barlow);
+            if (EFI_ERROR(Status)) continue;
+            Status = uefi_call_wrapper(PciIo->Pci.Read, 5, PciIo, EfiPciIoWidthUint32, 0x14, 1, &barhigh);
+            if (EFI_ERROR(Status)) continue;
+            UINT64 bar = ((UINT64)barhigh << 32) | (barlow & ~0xF);
+            Print(L"NVMe BAR0 physical: 0x%lx
+", bar);
+            S.NvmeBar = bar;
+
+            // Grab Graphics Output Protocol for framebuffer
+            EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
+            Status = uefi_call_wrapper(BS->LocateProtocol, 3, &gEfiGraphicsOutputProtocolGuid, NULL, (VOID**)&Gop);
+            if (!EFI_ERROR(Status) && Gop){
+                S.fb.FrameBufferBase = (EFI_PHYSICAL_ADDRESS)Gop->Mode->FrameBufferBase;
+                S.fb.FrameBufferWidth = Gop->Mode->Info->HorizontalResolution;
+                S.fb.FrameBufferHeight = Gop->Mode->Info->VerticalResolution;
+                S.fb.PixelsPerScanLine = Gop->Mode->Info->PixelsPerScanLine;
+                S.fb.PixelFormat = Gop->Mode->Info->PixelFormat;
+                Print(L"GOP FB base: 0x%lx res %ux%u
+", S.fb.FrameBufferBase, S.fb.FrameBufferWidth, S.fb.FrameBufferHeight);
+            }
+
+            // Allocate pages for Admin SQ & CQ and data buffer (aligned)
+            EFI_PHYSICAL_ADDRESS pages;
+            // Admin SQ
+            Status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pages);
+            if (EFI_ERROR(Status)) { Print(L"AllocatePages ASQ failed
+"); return Status; }
+            S.AdminSqPhys = pages;
+            S.AdminSqVirt = (VOID*)(UINTN)pages;
+            // Admin CQ
+            Status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pages);
+            if (EFI_ERROR(Status)) { Print(L"AllocatePages ACQ failed
+"); return Status; }
+            S.AdminCqPhys = pages;
+            S.AdminCqVirt = (VOID*)(UINTN)pages;
+            // Data buffer
+            Status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, 1, &pages);
+            if (EFI_ERROR(Status)) { Print(L"AllocatePages DBUF failed
+"); return Status; }
+            S.DataBufPhys = pages;
+            S.DataBufVirt = (VOID*)(UINTN)pages;
+
+            // Zero them
+            my_memset(S.AdminSqVirt, 0, PAGE_SIZE);
+            my_memset(S.AdminCqVirt, 0, PAGE_SIZE);
+            my_memset(S.DataBufVirt, 0, PAGE_SIZE);
+
+            // Save memory map for EBS
+            UINTN MapSize = 0; EFI_MEMORY_DESCRIPTOR *Map = NULL; UINTN MapKey; UINTN DescSize; UINT32 DescVersion;
+            // Get size first
+            Status = uefi_call_wrapper(BS->GetMemoryMap, 5, &MapSize, Map, &MapKey, &DescSize, &DescVersion);
+            if (Status == EFI_BUFFER_TOO_SMALL){
+                // allocate pages to hold map
+                UINTN pages_needed = (MapSize + PAGE_SIZE -1)/PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS memmap_addr = 0;
+                Status = uefi_call_wrapper(BS->AllocatePages, 4, AllocateAnyPages, EfiLoaderData, pages_needed, &memmap_addr);
+                if (EFI_ERROR(Status)) { Print(L"AllocatePages memmap failed
+"); return Status; }
+                Map = (EFI_MEMORY_DESCRIPTOR*)(UINTN)memmap_addr;
+                Status = uefi_call_wrapper(BS->GetMemoryMap, 5, &MapSize, Map, &MapKey, &DescSize, &DescVersion);
+                if (EFI_ERROR(Status)) { Print(L"GetMemoryMap failed second: %r
+", Status); return Status; }
+                S.MemMapSize = MapSize; S.MemMap = Map; S.MapKey = MapKey; S.DescriptorSize = DescSize; S.DescriptorVersion = DescVersion;
+            } else {
+                Print(L"GetMemoryMap initial failed: %r
+", Status);
+                return Status;
+            }
+
+            // free handle buffer
+            uefi_call_wrapper(BS->FreePool, 1, HandleBuffer);
+            return EFI_SUCCESS;
+        }
+    }
+
+    if (HandleBuffer) uefi_call_wrapper(BS->FreePool, 1, HandleBuffer);
+    return EFI_NOT_FOUND;
+}
+
+// -------------------------------
+// Entry point
+EFI_STATUS efi_main (EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    EFI_STATUS Status;
+    InitializeLib(ImageHandle, SystemTable);
+
+    Print(L"UEFI NVMe post-EBS hexdump starter
+");
+
+    Status = find_nvme_and_prepare(ImageHandle, SystemTable);
+    if (EFI_ERROR(Status)){
+        Print(L"NVMe prepare failed: %r
+", Status);
+        return Status;
+    }
+
+    Print(L"About to ExitBootServices. Make sure no other drivers are using the buffers.
+");
+
+    // ExitBootServices
+    Status = uefi_call_wrapper(BS->ExitBootServices, 2, ImageHandle, S.MapKey);
+    if (EFI_ERROR(Status)){
+        Print(L"ExitBootServices failed: %r
+", Status);
+        return Status;
+    }
+
+    // At this point, protocols and BS services are gone. We're in ring0 reserved mode.
+    // Call the post-EBS NVMe routine using S.NvmeBar and our allocated buffers.
+    do_nvme_after_ebs((UINT64)S.NvmeBar);
+
+    // Halt
+    for(;;) __asm__ volatile ("hlt");
+    return EFI_SUCCESS;
+}

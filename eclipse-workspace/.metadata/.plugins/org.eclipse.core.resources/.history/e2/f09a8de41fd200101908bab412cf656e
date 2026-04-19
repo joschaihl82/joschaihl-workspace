@@ -1,0 +1,534 @@
+// kernel.c
+// Single-file minimal x64 UEFI kernel with framebuffer console and simple syscalls.
+// Build notes:
+//   Compile userspace shell (sh.c) to a binary blob and wrap it:
+//     x86_64-w64-mingw32-gcc -ffreestanding -fno-pic -nostdlib -O2 -c sh.c -o sh.o
+//     x86_64-w64-mingw32-objcopy -O binary -j .text sh.o init_sh.bin
+//     x86_64-w64-mingw32-ld -r -b binary init_sh.bin -o init_sh_blob.o
+//   Build kernel and link with blob:
+//     x86_64-w64-mingw32-gcc -ffreestanding -fno-stack-protector -O2 -nostdlib -c kernel.c -o kernel.o
+//     x86_64-w64-mingw32-ld kernel.o init_sh_blob.o -T nul -e efi_main --subsystem=efi --image-base 0 -o BOOTX64.EFI
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+/* ---------------- Minimal UEFI types ---------------- */
+typedef uint64_t EFI_STATUS;
+typedef void* EFI_HANDLE;
+
+typedef struct EFI_TABLE_HEADER {
+    uint64_t Signature;
+    uint32_t Revision;
+    uint32_t HeaderSize;
+    uint32_t CRC32;
+    uint32_t Reserved;
+} EFI_TABLE_HEADER;
+
+typedef EFI_STATUS (*EFI_SIMPLE_TEXT_OUTPUT_STRING)(void *This, uint16_t *String);
+typedef EFI_STATUS (*EFI_LOCATE_PROTOCOL)(void *Protocol, void *Registration, void **Interface);
+
+typedef struct EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
+
+typedef struct EFI_SYSTEM_TABLE {
+    EFI_TABLE_HEADER Hdr;
+    void *FirmwareVendor;
+    uint32_t FirmwareRevision;
+    void *ConsoleInHandle;
+    void *ConIn;
+    void *ConsoleOutHandle;
+    void *ConOut;
+    void *StandardErrorHandle;
+    void *StdErr;
+    void *RuntimeServices;
+    EFI_BOOT_SERVICES *BootServices;
+    /* Config tables omitted */
+} EFI_SYSTEM_TABLE;
+
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(
+    uint64_t *MemoryMapSize, void *MemoryMap, uint64_t *MapKey,
+    uint64_t *DescriptorSize, uint32_t *DescriptorVersion
+);
+
+struct EFI_BOOT_SERVICES {
+    EFI_TABLE_HEADER Hdr;
+    void *RaiseTPL;
+    void *RestoreTPL;
+    void *AllocatePages;
+    void *FreePages;
+    EFI_GET_MEMORY_MAP GetMemoryMap;
+    EFI_STATUS (*AllocatePool)(uint32_t, uint64_t, void**);
+    EFI_STATUS (*FreePool)(void*);
+    EFI_STATUS (*CreateEvent)(uint32_t, uint64_t, void*, void*, void**);
+    EFI_STATUS (*SetTimer)(void*, uint32_t, uint64_t);
+    EFI_STATUS (*WaitForEvent)(uint64_t, void**, uint64_t*);
+    EFI_STATUS (*SignalEvent)(void*);
+    EFI_STATUS (*CloseEvent)(void*);
+    EFI_STATUS (*InstallProtocolInterface)(void**, void*, uint32_t, void*);
+    EFI_STATUS (*UninstallProtocolInterface)(void*, void*, void*);
+    EFI_STATUS (*HandleProtocol)(void*, void*, void**);
+    EFI_STATUS (*ExitBootServices)(EFI_HANDLE, uint64_t);
+    EFI_LOCATE_PROTOCOL LocateProtocol;
+};
+
+#define EFI_SUCCESS 0
+
+/* ---------------- Graphics Output Protocol (GOP) ---------------- */
+typedef struct {
+    uint32_t MaxMode;
+    uint32_t Mode;
+    void* Info;
+    uint64_t SizeOfInfo;
+    void* FrameBufferBase;
+    uint64_t FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+typedef struct {
+    uint32_t Version;
+    uint32_t HorizontalResolution;
+    uint32_t VerticalResolution;
+    uint32_t PixelFormat;
+    uint32_t PixelInformation[4];
+    uint32_t PixelsPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+static const struct { uint32_t a; uint16_t b; uint16_t c; uint8_t d[8]; } EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =
+    {0x9042a9de, 0x23dc, 0x4a38, {0x96,0xfb,0x7a,0xde,0xd0,0x80,0x51,0x6a}};
+
+/* ---------------- Low-level CPU helpers ---------------- */
+#define MSR_STAR   0xC0000081
+#define MSR_LSTAR  0xC0000082
+#define MSR_SFMASK 0xC0000084
+#define MSR_EFER   0xC0000080
+
+static inline void wrmsr(uint32_t msr, uint64_t val) {
+    uint32_t lo = (uint32_t)val, hi = (uint32_t)(val >> 32);
+    __asm__ __volatile__("wrmsr" : : "c"(msr), "a"(lo), "d"(hi));
+}
+static inline uint64_t rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+struct __attribute__((packed)) GDTEntry { uint16_t limit; uint16_t base_lo; uint8_t base_mid; uint8_t access; uint8_t gran; uint8_t base_hi; };
+struct __attribute__((packed)) GDTR { uint16_t size; uint64_t base; };
+struct __attribute__((packed)) IDTEntry { uint16_t off_lo; uint16_t sel; uint8_t ist; uint8_t type_attr; uint16_t off_mid; uint32_t off_hi; uint32_t zero; };
+struct __attribute__((packed)) IDTR { uint16_t size; uint64_t base; };
+
+static struct GDTEntry GDT[6];
+static struct GDTR gdtr;
+static struct IDTEntry IDT[256];
+static struct IDTR idtr;
+
+#define KERN_CS 0x08
+#define KERN_DS 0x10
+#define USER_CS 0x23
+#define USER_DS 0x1b
+
+static inline void lgdt(struct GDTR *g) { __asm__ __volatile__("lgdt %0" : : "m"(*g)); }
+static inline void lidt(struct IDTR *i) { __asm__ __volatile__("lidt %0" : : "m"(*i)); }
+
+/* load_segments: set data segments and reload CS via far return */
+static inline void load_segments(uint16_t cs, uint16_t ds) {
+    __asm__ __volatile__ (
+        "movw %w[dsw], %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%ss\n\t"
+        :
+        : [dsw] "i" (ds)
+        : "rax", "memory"
+    );
+
+    __asm__ __volatile__ (
+        "pushq %[cs64]\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "pushq %%rax\n\t"
+        "lretq\n\t"
+        "1:\n\t"
+        :
+        : [cs64] "r" ((uint64_t)cs)
+        : "rax", "memory"
+    );
+}
+
+/* GDT/IDT init */
+static void gdt_init() {
+    memset(GDT, 0, sizeof(GDT));
+    GDT[1].access = 0x9A; GDT[1].gran = 0x20; // kernel code
+    GDT[2].access = 0x92;                      // kernel data
+    GDT[3].access = 0xFA; GDT[3].gran = 0x20; // user code
+    GDT[4].access = 0xF2;                      // user data
+    gdtr.size = sizeof(GDT)-1; gdtr.base = (uint64_t)&GDT[0];
+    lgdt(&gdtr);
+    load_segments(KERN_CS, KERN_DS);
+}
+
+/* simple ISR stub */
+static void isr_default(void *frame) { (void)frame; }
+
+static void idt_set_gate(int vec, void (*fn)(void), uint16_t sel, uint8_t attr) {
+    uint64_t off = (uint64_t)fn;
+    IDT[vec].off_lo = off & 0xFFFF;
+    IDT[vec].sel = sel;
+    IDT[vec].ist = 0;
+    IDT[vec].type_attr = attr;
+    IDT[vec].off_mid = (off >> 16) & 0xFFFF;
+    IDT[vec].off_hi = (off >> 32);
+    IDT[vec].zero = 0;
+}
+static void idt_init() {
+    for (int i=0;i<256;i++) idt_set_gate(i, (void(*)(void))isr_default, KERN_CS, 0x8E);
+    idtr.size = sizeof(IDT)-1; idtr.base = (uint64_t)&IDT[0];
+    lidt(&idtr);
+}
+
+/* ---------------- Paging: identity map first 1 GiB ---------------- */
+#define PAGE_SIZE 4096
+static uint64_t *PML4,*PDPT,*PD,*PT;
+static EFI_BOOT_SERVICES *BS = NULL;
+
+static void paging_init_identity_1g() {
+    void *p;
+    BS->AllocatePool(0, PAGE_SIZE, &p); PML4 = p;
+    BS->AllocatePool(0, PAGE_SIZE, &p); PDPT = p;
+    BS->AllocatePool(0, PAGE_SIZE, &p); PD = p;
+    BS->AllocatePool(0, PAGE_SIZE, &p); PT = p;
+    memset(PML4,0,PAGE_SIZE); memset(PDPT,0,PAGE_SIZE); memset(PD,0,PAGE_SIZE); memset(PT,0,PAGE_SIZE);
+    PML4[0] = (uint64_t)PDPT | 0x003;
+    PDPT[0] = (uint64_t)PD | 0x003;
+    PD[0]   = (uint64_t)PT | 0x003;
+    for (int i=0;i<512;i++) PT[i] = ((uint64_t)i*PAGE_SIZE) | 0x003;
+    __asm__ __volatile__("mov %0, %%cr3" : : "r"(PML4) : "memory");
+}
+
+/* ---------------- Syscall/Sysret ---------------- */
+extern void syscall_entry(void);
+uint64_t syscall_handler_asm(void) __attribute__((used));
+
+static void syscall_init() {
+    uint64_t star = ((uint64_t)KERN_CS << 32) | ((uint64_t)USER_CS << 48);
+    wrmsr(MSR_STAR, star);
+    wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
+    wrmsr(MSR_SFMASK, (1ULL<<9) /*IF*/ | (1ULL<<10) /*DF*/);
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1); // SCE
+}
+
+__asm__(
+".global syscall_entry\n"
+"syscall_entry:\n"
+"    swapgs\n"
+"    /* save registers we clobber */\n"
+"    pushq %r15\n"
+"    pushq %r14\n"
+"    pushq %r13\n"
+"    pushq %r12\n"
+"    pushq %r11\n"
+"    pushq %r10\n"
+"    pushq %r9\n"
+"    pushq %r8\n"
+"    pushq %rsi\n"
+"    pushq %rdi\n"
+"    pushq %rbp\n"
+"    pushq %rdx\n"
+"    pushq %rcx\n"
+"    pushq %rbx\n"
+"    pushq %rax\n"
+"    /* move syscall number (in rax) into rdi for C handler */\n"
+"    movq %rax, %rdi\n"
+"    call syscall_handler_asm\n"
+"    /* restore registers in reverse order */\n"
+"    popq %rax\n"
+"    popq %rbx\n"
+"    popq %rcx\n"
+"    popq %rdx\n"
+"    popq %rbp\n"
+"    popq %rdi\n"
+"    popq %rsi\n"
+"    popq %r8\n"
+"    popq %r9\n"
+"    popq %r10\n"
+"    popq %r11\n"
+"    popq %r12\n"
+"    popq %r13\n"
+"    popq %r14\n"
+"    popq %r15\n"
+"    swapgs\n"
+"    sysretq\n"
+);
+
+/* ---------------- Framebuffer text console via GOP ---------------- */
+static void *fb_base = NULL;
+static uint32_t fb_width = 0, fb_height = 0, fb_pitch = 0;
+static uint32_t fb_bpp = 32;
+static uint32_t cursor_x = 0, cursor_y = 0;
+static const uint32_t fg_rgb = 0x00FFFFFF; // white (assume XRGB)
+static const uint32_t bg_rgb = 0x00000000; // black
+
+static void fb_clear() {
+    if (!fb_base) return;
+    uint8_t *p = (uint8_t*)fb_base;
+    for (uint32_t y=0; y<fb_height; y++) {
+        uint32_t *row = (uint32_t*)(p + y*fb_pitch);
+        for (uint32_t x=0; x<fb_width; x++) row[x] = bg_rgb;
+    }
+    cursor_x = 0; cursor_y = 0;
+}
+
+/* 8x8 font (ASCII 32..127) */
+static const uint8_t font8x8[96][8] = {
+    {0,0,0,0,0,0,0,0}, {0x18,0x18,0x18,0x18,0x18,0,0x18,0}, {0x36,0x36,0x24,0,0,0,0,0},
+    {0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0}, {0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0},
+    {0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0}, {0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0}, {0x0C,0x0C,0x08,0,0,0,0,0},
+    {0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0}, {0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0}, {0,0x66,0x3C,0xFF,0x3C,0x66,0,0},
+    {0,0x0C,0x0C,0x3F,0x0C,0x0C,0,0}, {0,0,0,0,0x0C,0x0C,0x08,0}, {0,0,0,0x3F,0,0,0,0},
+    {0,0,0,0,0,0x0C,0x0C,0}, {0x60,0x30,0x18,0x0C,0x06,0x03,0,0}, {0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0},
+    {0x0C,0x0E,0x0F,0x0C,0x0C,0x0C,0x3F,0}, {0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0}, {0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0},
+    {0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0}, {0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0}, {0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0},
+    {0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0}, {0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0}, {0,0x0C,0x0C,0,0,0x0C,0x0C,0},
+    {0,0x0C,0x0C,0,0x0C,0x0C,0x08,0}, {0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0}, {0,0,0x3F,0,0x3F,0,0,0},
+    {0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0}, {0x1E,0x33,0x30,0x18,0x0C,0,0x0C,0}, {0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0},
+    {0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0}, {0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0}, {0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0},
+    {0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0}, {0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0}, {0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0},
+    {0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0}, {0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0}, {0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0},
+    {0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0}, {0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0}, {0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0},
+    {0x63,0x77,0x7F,0x6B,0x63,0x63,0x63,0}, {0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0}, {0x1E,0x33,0x33,0x33,0x33,0x33,0x1E,0},
+    {0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0}, {0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0}, {0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0},
+    {0x1E,0x33,0x06,0x0C,0x18,0x33,0x1E,0}, {0x7F,0x59,0x18,0x18,0x18,0x18,0x3C,0}, {0x33,0x33,0x33,0x33,0x33,0x33,0x1E,0},
+    {0x63,0x63,0x63,0x63,0x36,0x1C,0x08,0}, {0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0}, {0x63,0x63,0x36,0x1C,0x36,0x63,0x63,0},
+    {0x66,0x66,0x66,0x3C,0x18,0x18,0x3C,0}, {0x7F,0x63,0x31,0x18,0x0C,0x46,0x7F,0}, {0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0},
+    {0x03,0x06,0x0C,0x18,0x30,0x60,0,0}, {0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0}, {0x08,0x1C,0x36,0x63,0,0,0,0},
+    {0,0,0,0,0,0,0x7F,0}, {0x0C,0x0C,0x08,0,0,0,0,0}, {0,0,0x1E,0x30,0x3E,0x33,0x6E,0},
+    {0x07,0x06,0x06,0x3E,0x66,0x66,0x3E,0}, {0,0,0x1E,0x33,0x03,0x33,0x1E,0}, {0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0},
+    {0,0,0x1E,0x33,0x3F,0x03,0x1E,0}, {0x3C,0x66,0x06,0x0F,0x06,0x06,0x0F,0}, {0,0,0x6E,0x33,0x33,0x3E,0x30,0x1E},
+    {0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0}, {0,0x0C,0,0x0E,0x0C,0x0C,0x1E,0}, {0x30,0x30,0,0x38,0x30,0x30,0x33,0x1E},
+    {0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0}, {0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0}, {0,0,0x33,0x7F,0x7F,0x6B,0x63,0},
+    {0,0,0x1B,0x37,0x33,0x33,0x33,0}, {0,0,0x1E,0x33,0x33,0x33,0x1E,0}, {0,0,0x3E,0x33,0x33,0x3E,0x03,0x07},
+    {0,0,0x1E,0x33,0x33,0x3E,0x30,0x38}, {0,0,0x3B,0x36,0x06,0x06,0x0F,0}, {0,0,0x3E,0x03,0x1E,0x30,0x1F,0},
+    {0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0}, {0,0,0x33,0x33,0x33,0x33,0x6E,0}, {0,0,0x63,0x63,0x36,0x1C,0x08,0},
+    {0,0,0x63,0x6B,0x7F,0x7F,0x36,0}, {0,0,0x63,0x36,0x1C,0x36,0x63,0}, {0,0,0x33,0x33,0x33,0x3E,0x30,0x1E},
+    {0,0,0x3F,0x19,0x0C,0x26,0x3F,0}, {0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0}, {0x18,0x18,0x18,0,0x18,0x18,0x18,0},
+    {0x36,0x6F,0x00,0,0,0,0,0}, {0,0,0,0,0,0,0,0}
+};
+
+static void fb_draw_char(uint32_t cx, uint32_t cy, unsigned char ch) {
+    if (!fb_base) return;
+    if (ch < 32 || ch > 127) ch = '?';
+    const uint8_t *glyph = font8x8[ch - 32];
+    uint8_t *base = (uint8_t*)fb_base + cy * fb_pitch + cx * 4;
+    for (int row=0; row<8; row++) {
+        uint32_t *pix = (uint32_t*)(base + row*fb_pitch);
+        uint8_t bits = glyph[row];
+        for (int col=0; col<8; col++) {
+            uint32_t color = (bits & (1 << (7 - col))) ? fg_rgb : bg_rgb;
+            pix[col] = color;
+        }
+    }
+}
+
+static void fb_putc(char ch) {
+    if (!fb_base) return;
+    if (ch == '\n') {
+        cursor_x = 0;
+        cursor_y += 8;
+        if (cursor_y + 8 >= fb_height) { fb_clear(); }
+        return;
+    }
+    fb_draw_char(cursor_x, cursor_y, (unsigned char)ch);
+    cursor_x += 8;
+    if (cursor_x + 8 >= fb_width) { cursor_x = 0; cursor_y += 8; }
+    if (cursor_y + 8 >= fb_height) { fb_clear(); }
+}
+
+static void fb_write(const char *s, size_t n) {
+    for (size_t i=0; i<n; i++) fb_putc(s[i]);
+}
+
+/* ---------------- Minimal ramfs and file descriptors ---------------- */
+#define MAX_FD 32
+typedef struct { const uint8_t *data; uint64_t size; uint64_t pos; int used; } fd_t;
+static fd_t fdtab[MAX_FD];
+
+typedef struct { const char *name; const uint8_t *data; uint64_t size; } ramfs_file_t;
+extern uint8_t _binary_init_sh_start[], _binary_init_sh_end[];
+
+static const char profile_txt[] =
+    "echo Welcome to minimal UEFI OS\n"
+    "echo Running /etc/profile.sh via /bin/sh\n";
+
+static ramfs_file_t ramfs[] = {
+    { "/bin/sh", _binary_init_sh_start, 0 },
+    { "/etc/profile.sh", (const uint8_t*)profile_txt, sizeof(profile_txt)-1 },
+    { NULL, NULL, 0 }
+};
+
+static const ramfs_file_t* ramfs_find(const char *path) {
+    for (int i=0; ramfs[i].name; i++) if (strcmp(ramfs[i].name, path)==0) return &ramfs[i];
+    return NULL;
+}
+
+static int alloc_fd(const uint8_t *data, uint64_t size) {
+    for (int i=0;i<MAX_FD;i++) if (!fdtab[i].used) { fdtab[i]=(fd_t){data,size,0,1}; return i; }
+    return -1;
+}
+
+static uint64_t sys_open(const char *path, uint64_t flags) {
+    (void)flags;
+    const ramfs_file_t *f = ramfs_find(path);
+    if (!f) return (uint64_t)-2;
+    int fd = alloc_fd(f->data, f->size);
+    return fd < 0 ? (uint64_t)-24 : (uint64_t)fd;
+}
+static uint64_t sys_close(uint64_t fd) {
+    if (fd >= MAX_FD || !fdtab[fd].used) return (uint64_t)-9;
+    fdtab[fd].used = 0; return 0;
+}
+static uint64_t sys_read(uint64_t fd, void *buf, uint64_t len) {
+    if (fd >= MAX_FD || !fdtab[fd].used) return (uint64_t)-9;
+    fd_t *e = &fdtab[fd];
+    uint64_t rem = e->size - e->pos; if (len > rem) len = rem;
+    memcpy(buf, e->data + e->pos, len);
+    e->pos += len; return len;
+}
+static uint64_t sys_write(uint64_t fd, const void *buf, uint64_t len) {
+    (void)fd;
+    fb_write((const char*)buf, (size_t)len);
+    return len;
+}
+static uint64_t sys_lseek(uint64_t fd, int64_t off, uint64_t whence) {
+    if (fd >= MAX_FD || !fdtab[fd].used) return (uint64_t)-9;
+    fd_t *e = &fdtab[fd];
+    uint64_t np = e->pos;
+    if (whence == 0) np = off;
+    else if (whence == 1) np += off;
+    else if (whence == 2) np = e->size + off;
+    if (np > e->size) return (uint64_t)-22;
+    e->pos = np; return np;
+}
+static uint64_t sys_exit(int code) { (void)code; for(;;) __asm__ __volatile__("hlt"); return 0; }
+static uint64_t sys_getpid(void) { return 1; }
+static uint8_t *user_heap_brk  = (uint8_t*)0x40000000ULL;
+static uint64_t sys_brk(void *addr) { if (!addr) return (uint64_t)user_heap_brk; user_heap_brk = addr; return (uint64_t)user_heap_brk; }
+
+static uint64_t syscall_dispatch(uint64_t num, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5) {
+    (void)a3; (void)a4; (void)a5;
+    switch (num) {
+        case 1: return sys_write(a0, (const void*)a1, a2);
+        case 0: return sys_read(a0, (void*)a1, a2);
+        case 2: return sys_open((const char*)a0, a1);
+        case 3: return sys_close(a0);
+        case 8: return sys_lseek(a0, (int64_t)a1, a2);
+        case 60: return sys_exit((int)a0);
+        case 12: return sys_brk((void*)a0);
+        case 39: return sys_getpid();
+        default: return (uint64_t)-38;
+    }
+}
+
+uint64_t syscall_handler_asm(void) {
+    register uint64_t nr __asm__("rdi");
+    register uint64_t a0 __asm__("rsi");
+    register uint64_t a1 __asm__("rdx");
+    register uint64_t a2 __asm__("r10");
+    register uint64_t a3 __asm__("r8");
+    register uint64_t a4 __asm__("r9");
+    return syscall_dispatch(nr, a0, a1, a2, a3, a4, 0);
+}
+
+/* ---------------- Enter user mode ---------------- */
+extern void enter_user(void *rip, void *rsp, uint64_t arg);
+__asm__(
+".global enter_user\n"
+"enter_user:\n"
+"    /* set user data segments (16-bit moves) */\n"
+"    movw $0x23, %ax\n"
+"    movw %ax, %ds\n"
+"    movw %ax, %es\n"
+"    movw %ax, %ss\n"
+"    /* set user stack pointer (rsp passed in rsi) */\n"
+"    movq %rsi, %rsp\n"
+"    /* build iret frame: SS, RSP, RFLAGS, CS, RIP */\n"
+"    pushq $0x23\n"
+"    pushq %rsi\n"
+"    pushq $0x202\n"
+"    pushq $0x23\n"
+"    pushq %rdi\n"
+"    iretq\n"
+);
+
+/* ---------------- GOP init before ExitBootServices ---------------- */
+static void gop_init(EFI_BOOT_SERVICES *bs) {
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+    if (bs->LocateProtocol((void*)&EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void**)&gop) != EFI_SUCCESS || !gop)
+        return;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = (EFI_GRAPHICS_OUTPUT_MODE_INFORMATION*)gop->Info;
+    fb_base = gop->FrameBufferBase;
+    fb_height = info->VerticalResolution;
+    fb_width  = info->HorizontalResolution;
+    fb_pitch  = info->PixelsPerScanLine * 4; // assume 32bpp
+    fb_bpp    = 32;
+    fb_clear();
+}
+
+/* ---------------- UEFI console output (pre-exit) ---------------- */
+static EFI_SYSTEM_TABLE *Sys = NULL;
+static void efi_puts(const char *s) {
+    if (!Sys || !Sys->ConOut) return;
+    uint16_t buf[256]; size_t i = 0;
+    while (s[i] && i < 255) { buf[i] = (uint16_t)s[i]; i++; }
+    buf[i] = 0;
+    EFI_SIMPLE_TEXT_OUTPUT_STRING out = *(EFI_SIMPLE_TEXT_OUTPUT_STRING*)((uint8_t*)Sys->ConOut);
+    if (out) out(Sys->ConOut, buf);
+}
+
+/* ---------------- Exec /bin/sh ---------------- */
+static void map_user_region(uint64_t gva, uint64_t size) { (void)gva; (void)size; /* identity for demo */ }
+
+static uint64_t sys_execve(const char *path, char *const argv[], char *const envp[]) {
+    (void)argv; (void)envp;
+    const ramfs_file_t *f = ramfs_find(path);
+    if (!f) return (uint64_t)-2;
+    uint64_t user_code = 0x00400000ULL;
+    uint64_t user_stack = 0x00800000ULL;
+    map_user_region(user_code, f->size);
+    map_user_region(user_stack, PAGE_SIZE * 4);
+    memcpy((void*)user_code, f->data, f->size);
+    enter_user((void*)user_code, (void*)user_stack, 0);
+    return 0;
+}
+
+/* ---------------- UEFI entry point ---------------- */
+EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    Sys = SystemTable;
+    BS = Sys->BootServices;
+
+    /* Fill sizes for ramfs entries */
+    ramfs[0].size = (uint64_t)(_binary_init_sh_end - _binary_init_sh_start);
+
+    efi_puts("Booting minimal UEFI OS...\r\n");
+
+    gdt_init();
+    idt_init();
+    paging_init_identity_1g();
+    syscall_init();
+
+    /* Initialize GOP for framebuffer console */
+    gop_init(BS);
+    fb_write("Framebuffer ready.\n", 19);
+
+    /* Exit Boot Services */
+    uint64_t MapSize=0, MapKey=0, DescSize=0; uint32_t DescVer=0;
+    BS->GetMemoryMap(&MapSize, NULL, &MapKey, &DescSize, &DescVer);
+    void *MemMap = NULL; BS->AllocatePool(0, MapSize + 4096, &MemMap);
+    BS->GetMemoryMap(&MapSize, MemMap, &MapKey, &DescSize, &DescVer);
+    BS->ExitBootServices(ImageHandle, MapKey);
+
+    fb_write("Minimal x64-UEFI OS with userspace shell\n", 39);
+
+    /* Exec /bin/sh */
+    //sys_execve("/bin/sh", NULL, NULL);
+
+    for(;;) __asm__ __volatile__("hlt");
+    return EFI_SUCCESS;
+}

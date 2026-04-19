@@ -1,0 +1,1430 @@
+/*
+ * asm.c — Minimal x86-64 assembler (AT&T syntax) — single-file assembler
+ *
+ * This is a self-contained, educational assembler implementing a useful
+ * subset of x86-64 (AT&T syntax). It includes:
+ *  - Tokenizer and operand parser (registers, immediates, disp(base,index,scale))
+ *  - Symbol table with forward/back relocations (rel32)
+ *  - Encoders for common GPR ops: movq/addq/subq/cmpq/andq/orq/xorq/testq
+ *  - pushq/popq, call/jmp/conditional jcc, ret, nop, leave, syscall
+ *  - SSE subset: movaps/movups/addps/subps/mulps/xorps/andps/orps (basic forms)
+ *  - Pseudo-ops: .byte/.word/.dword/.qword/.align/.skip/.fill/.ascii/.global/.text/.data/.bss/.org/.bits
+ *  - Emits hex dump of .text and .data and prints symbol table
+ *
+ * Limitations:
+ *  - Simplified relocation resolution: rel32 targets in .text and .data are resolved
+ *    with a simple model (text base = 0, data base = text_len).
+ *  - SIB and complex addressing are simplified (no index handling in encoding).
+ *  - Not production-grade; intended as a teaching scaffold.
+ *
+ * Build:
+ *   cc -std=c11 -O2 -o asm asm.c
+ *
+ * Usage:
+ *   ./asm <file-to-assemble>
+ *
+ * The assembler reads assembly from the file provided as argv[1].
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <ctype.h>
+
+/* ===== Configuration ===== */
+
+#ifndef MAX_OPERANDS
+#define MAX_OPERANDS            4
+#endif
+
+#ifndef MAX_INSN_OPCODES
+#define MAX_INSN_OPCODES        16
+#endif
+
+#ifndef INPUT_LINE_MAX
+#define INPUT_LINE_MAX          2048
+#endif
+
+#ifndef NR_NAME_BUCKETS
+#define NR_NAME_BUCKETS         64
+#endif
+
+#ifndef MAX_SYMBOLS
+#define MAX_SYMBOLS             8192
+#endif
+
+#define MAX_SECTION_SIZE        (1<<20)
+#define MAX_RELOCS              8192
+
+/* ===== Forward declarations ===== */
+
+struct obj_symbol;
+struct obj_header;
+struct insn;
+
+/* ===== Name table ===== */
+
+struct name
+{
+    int                 length;
+    unsigned            hash;
+    char              * data;
+    struct name       * link;
+    struct obj_symbol * symbol;
+    struct insn       * insn_entries;
+    int             ( * pseudo )();
+    int                 token;
+};
+
+/* ===== Operand kinds ===== */
+
+#define OPERAND_REG     0
+#define OPERAND_IMM     1
+#define OPERAND_MEM     2
+
+/* ===== Operand flags ===== */
+
+#define O_IMM_S8        0x0000000000000001L
+#define O_IMM_U8        0x0000000000000002L
+#define O_IMM_S16       0x0000000000000004L
+#define O_IMM_U16       0x0000000000000008L
+#define O_IMM_S32       0x0000000000000010L
+#define O_IMM_U32       0x0000000000000020L
+#define O_IMM_64        0x0000000000000040L
+
+#define O_REG_8         0x0000000000000080L
+#define O_REG_16        0x0000000000000100L
+#define O_REG_32        0x0000000000000200L
+#define O_REG_64        0x0000000000000400L
+
+#define O_ACC_8         0x0000000000000800L
+#define O_ACC_16        0x0000000000001000L
+#define O_ACC_32        0x0000000000002000L
+#define O_ACC_64        0x0000000000004000L
+
+#define O_MEM_8         0x0000000000008000L
+#define O_MEM_16        0x0000000000010000L
+#define O_MEM_32        0x0000000000020000L
+#define O_MEM_64        0x0000000000040000L
+
+#define O_ADDR_16       0x0000000000080000L
+#define O_ADDR_32       0x0000000000100000L
+#define O_ADDR_64       0x0000000000200000L
+
+#define O_SREG2         0x0000000000400000L
+#define O_SREG3         0x0000000000800000L
+
+#define O_REL_8         0x0000000001000000L
+
+#define O_MOFS_8        0x0000000002000000L
+#define O_MOFS_16       0x0000000004000000L
+#define O_MOFS_32       0x0000000008000000L
+#define O_MOFS_64       0x0000000010000000L
+
+#define O_REG_CRL       0x0000000020000000L
+#define O_REG_CRH       0x0000000040000000L
+
+#define O_REG_CL        0x0000000080000000L
+
+#define O_REG_XMM       0x0000000100000000L
+
+#define O_IMM_8         (O_IMM_S8 | O_IMM_U8)
+#define O_IMM_16        (O_IMM_S16 | O_IMM_U16)
+#define O_IMM_32        (O_IMM_S32 | O_IMM_U32)
+#define O_IMM           (O_IMM_8 | O_IMM_16 | O_IMM_32 | O_IMM_64)
+
+#define O_MRM_8         (O_MEM_8 | O_REG_8)
+#define O_MRM_16        (O_MEM_16 | O_REG_16)
+#define O_MRM_32        (O_MEM_32 | O_REG_32)
+#define O_MRM_64        (O_MEM_64 | O_REG_64)
+
+#define O_MEM           (O_MEM_8 | O_MEM_16 | O_MEM_32 | O_MEM_64 )
+#define O_MOFS          (O_MOFS_8 | O_MOFS_16 | O_MOFS_32 | O_MOFS_64 )
+
+#define O_I_ENDREG      0x8000000000000000L
+#define O_I_MIDREG      0x4000000000000000L
+#define O_I_MODRM       0x2000000000000000L
+#define O_I_REL         0x1000000000000000L
+
+/* ===== Operand ===== */
+
+struct operand
+{
+    int                 kind;           /* OPERAND_* */
+    int                 reg;            /* GPR reg index 0..15 or XMM reg index when O_REG_XMM set */
+    int                 rip;            /* RIP-relative memory */
+    int                 index;          /* index register (unused in encoding) */
+    int                 scale;          /* index scale */
+    struct obj_symbol * symbol;         /* symbol reference (for relocations) */
+    long                offset;         /* immediate or displacement */
+    long                flags;          /* O_* */
+    long                disp;           /* O_IMM_* indicating displacement size (unused here) */
+};
+
+/* ===== Instruction table ===== */
+
+struct insn
+{
+    char        * mnemonic;
+    int           nr_operands;
+    long          operand_flags[MAX_OPERANDS];
+    int           nr_opcodes;
+    char          opcodes[MAX_INSN_OPCODES];
+    long          insn_flags;
+
+    struct name * name;
+};
+
+/* ===== Instruction flags ===== */
+
+#define I_DATA_8        0x0000000000000001L
+#define I_DATA_16       0x0000000000000002L
+#define I_DATA_32       0x0000000000000004L
+#define I_DATA_64       0x0000000000000008L
+
+#define I_PREFIX_66     0x0200000000000000L
+#define I_PREFIX_F3     0x0400000000000000L
+#define I_PREFIX_F2     0x0800000000000000L
+
+#define I_NO_DATA_REX   0x1000000000000000L
+#define I_NO_BITS_16    0x2000000000000000L
+#define I_NO_BITS_32    0x4000000000000000L
+#define I_NO_BITS_64    0x8000000000000000L
+
+/* ===== Globals ===== */
+
+struct insn *insn = NULL;
+struct operand operands[MAX_OPERANDS] = {0};
+int nr_operands = 0;
+
+int               pass               = 0;
+int               line_number        = 0;
+int               input_index        = 0;
+char           ** input_paths        = NULL;
+int               token              = 0;
+struct name     * name_token         = NULL;
+long              number_token       = 0;
+char              input_line[INPUT_LINE_MAX] = {0};
+char            * input_pos          = input_line;
+FILE            * list_file          = NULL;
+FILE            * output_file        = NULL;
+int               segment            = 0; /* 1=text,2=data,3=bss */
+int               text_bytes         = 0;
+int               data_bytes         = 0;
+int               nr_symbols         = 0;
+int               nr_symbol_changes  = 0;
+int               nr_relocs          = 0;
+int               name_bytes         = 0;
+int               base_address       = 0;
+int               bits               = 64;
+
+/* Object header */
+struct obj_header {
+    unsigned magic;
+    unsigned version;
+    unsigned flags;
+    unsigned entry;
+};
+
+struct obj_header header = { 0xDEADBEEF, 1, 0, 0 };
+
+/* ===== Symbol table ===== */
+
+struct obj_symbol {
+    struct name *n;
+    int segment;        /* 1=text, 2=data, 3=bss, -1=unknown yet */
+    long offset;        /* byte offset in segment */
+    int is_global;
+};
+
+static struct obj_symbol symbols[MAX_SYMBOLS] = {0};
+static int symbols_count = 0;
+
+/* ===== Relocations ===== */
+
+struct reloc {
+    long pos;                 /* position of displacement field (start) in text_buf */
+    struct obj_symbol *sym;   /* target symbol */
+    int size;                 /* displacement size in bytes: 4 for rel32 */
+    int section;              /* 1=text, 2=data (where the relocation is placed) */
+};
+
+static struct reloc relocs[MAX_RELOCS] = {0};
+static int relocs_count = 0;
+
+/* ===== Output buffers ===== */
+
+static unsigned char text_buf[MAX_SECTION_SIZE];
+static unsigned char data_buf[MAX_SECTION_SIZE];
+static long text_len = 0;
+static long data_len = 0;
+
+/* ===== Name infrastructure ===== */
+
+static struct name * name_buckets[NR_NAME_BUCKETS] = { NULL };
+
+static unsigned hash_name(const char *s, int len)
+{
+    const unsigned FNV_OFFSET = 2166136261U;
+    const unsigned FNV_PRIME  = 16777619U;
+
+    unsigned h = FNV_OFFSET;
+    for (int i = 0; i < len; ++i) {
+        h ^= (unsigned)(unsigned char)s[i];
+        h *= FNV_PRIME;
+    }
+    return h;
+}
+
+struct name * lookup_name(const char *data, int len)
+{
+    if (!data || len < 0) return NULL;
+
+    unsigned h = hash_name(data, len);
+    unsigned bucket = h % NR_NAME_BUCKETS;
+
+    struct name *n = name_buckets[bucket];
+    for (; n; n = n->link) {
+        if (n->hash == h && n->length == len && strncmp(n->data, data, (size_t)len) == 0) {
+            return n;
+        }
+    }
+
+    n = (struct name *)calloc(1, sizeof(*n));
+    if (!n) return NULL;
+
+    n->length = len;
+    n->hash = h;
+    n->data = (char *)malloc((size_t)len + 1);
+    if (!n->data) {
+        free(n);
+        return NULL;
+    }
+    memcpy(n->data, data, (size_t)len);
+    n->data[len] = '\0';
+
+    n->link = name_buckets[bucket];
+    name_buckets[bucket] = n;
+
+    n->symbol = NULL;
+    n->insn_entries = NULL;
+    n->pseudo = NULL;
+    n->token = 0;
+    return n;
+}
+
+/* Create a stub symbol for a name if it doesn't have one yet. */
+static struct obj_symbol *ensure_symbol_for_name(struct name *n)
+{
+    if (!n) return NULL;
+    if (n->symbol) return n->symbol;
+
+    if (symbols_count >= MAX_SYMBOLS) {
+        fprintf(stderr, "error: too many symbols\n");
+        return NULL;
+    }
+    struct obj_symbol *sym = &symbols[symbols_count++];
+    sym->n = n;
+    sym->segment = -1;   /* unknown yet; will be set on label definition */
+    sym->offset  = 0;
+    sym->is_global = 0;
+    n->symbol = sym;
+    nr_symbols++;
+    return sym;
+}
+
+/* ===== Utility ===== */
+
+static void emit_byte(unsigned char b)
+{
+    if (segment == 1) {
+        if (text_len >= MAX_SECTION_SIZE) { fprintf(stderr, "error: text overflow\n"); return; }
+        text_buf[text_len++] = b; text_bytes++;
+    } else if (segment == 2) {
+        if (data_len >= MAX_SECTION_SIZE) { fprintf(stderr, "error: data overflow\n"); return; }
+        data_buf[data_len++] = b; data_bytes++;
+    } else if (segment == 3) {
+        data_bytes++; /* bss reservation (no emission) */
+    } else {
+        fprintf(stderr, "error: no active segment to emit\n");
+    }
+}
+
+static void emit_u32(unsigned v)
+{
+    emit_byte((unsigned char)(v & 0xFF));
+    emit_byte((unsigned char)((v >> 8) & 0xFF));
+    emit_byte((unsigned char)((v >> 16) & 0xFF));
+    emit_byte((unsigned char)((v >> 24) & 0xFF));
+}
+
+static void emit_u64(unsigned long long v)
+{
+    for (int i = 0; i < 8; ++i) emit_byte((unsigned char)((v >> (8*i)) & 0xFF));
+}
+
+static int ensure_output_file(void)
+{
+    if (!output_file) output_file = stdout;
+    return 0;
+}
+
+/* ===== Error reporting ===== */
+
+void error(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "error (line %d): ", line_number);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+/* ===== Expression & classification ===== */
+
+long constant_expression(void) { return number_token; }
+
+long classify(struct operand *op)
+{
+    if (!op) return 0;
+    switch (op->kind) {
+        case OPERAND_REG:
+            return op->flags & (O_REG_8 | O_REG_16 | O_REG_32 | O_REG_64 | O_REG_CL | O_REG_XMM | O_REG_CRL | O_REG_CRH);
+        case OPERAND_IMM:
+            return op->flags & O_IMM;
+        case OPERAND_MEM:
+            return op->flags & (O_MEM | O_ADDR_16 | O_ADDR_32 | O_ADDR_64 | O_MOFS);
+        default:
+            return 0;
+    }
+}
+
+/* ===== Pseudo-ops ===== */
+
+int pseudo_byte(void)   { emit_byte((unsigned char)(number_token & 0xFF)); return 0; }
+int pseudo_word(void)   { emit_byte((unsigned char)(number_token & 0xFF)); emit_byte((unsigned char)((number_token >> 8) & 0xFF)); return 0; }
+int pseudo_dword(void)  { emit_u32((unsigned)number_token); return 0; }
+int pseudo_qword(void)  { emit_u64((unsigned long long)number_token); return 0; }
+
+int pseudo_align(void)
+{
+    int align_to = (int)number_token;
+    if (align_to <= 0) return 0;
+    long pos = (segment == 1) ? text_len : (segment == 2 ? data_len : data_bytes);
+    long pad = ((pos + align_to - 1) / align_to) * align_to - pos;
+    while (pad-- > 0) emit_byte(0);
+    return 0;
+}
+
+int pseudo_skip(void)   { for (long i=0;i<number_token;i++) emit_byte(0); return 0; }
+
+int pseudo_fill(void)
+{
+    unsigned char val = (unsigned char)(number_token & 0xFF);
+    long count = number_token >> 8; if (count <= 0) count = 1;
+    for (long i=0;i<count;i++) emit_byte(val);
+    return 0;
+}
+
+int pseudo_ascii(void)
+{
+    if (!name_token || !name_token->data) return 0;
+    const char *s = name_token->data;
+    for (size_t i=0;i<strlen(s);i++) emit_byte((unsigned char)s[i]);
+    return 0;
+}
+
+int pseudo_global(void)
+{
+    if (!name_token) return 0;
+    ensure_symbol_for_name(name_token);
+    name_token->symbol->is_global = 1;
+    return 0;
+}
+
+int pseudo_text(void)  { segment = 1; return 0; }
+int pseudo_data(void)  { segment = 2; return 0; }
+int pseudo_bss(void)   { segment = 3; return 0; }
+int pseudo_org(void)   { base_address = (int)number_token; return 0; }
+int pseudo_bits(void)  { bits = (int)number_token; return 0; }
+
+/* ===== Register parsing ===== */
+
+static int reg_from_name_gpr(const char *s)
+{
+    static const char *r64[16] = {
+        "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+        "r8","r9","r10","r11","r12","r13","r14","r15"
+    };
+    for (int i = 0; i < 16; ++i) if (strcmp(s, r64[i]) == 0) return i;
+    static const char *r32[16] = {
+        "eax","ecx","edx","ebx","esp","ebp","esi","edi",
+        "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d"
+    };
+    for (int i = 0; i < 16; ++i) if (strcmp(s, r32[i]) == 0) return 100+i;
+    static const char *r8[16] = {
+        "al","cl","dl","bl","spl","bpl","sil","dil",
+        "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b"
+    };
+    for (int i = 0; i < 16; ++i) if (strcmp(s, r8[i]) == 0) return 200+i;
+    return -1;
+}
+
+static int reg_from_name_xmm(const char *s)
+{
+    if (strncmp(s, "xmm", 3) == 0) {
+        int n = atoi(s+3);
+        if (n >= 0 && n <= 15) return n;
+    }
+    return -1;
+}
+
+/* ===== Tokenizer (AT&T-aware) ===== */
+
+enum TokKind {
+    T_EOF=0, T_IDENT, T_NUMBER, T_COMMA, T_COLON, T_LPAREN, T_RPAREN, T_STAR, T_PLUS, T_MINUS, T_STRING, T_PERCENT, T_DOLLAR
+};
+
+static enum TokKind tkind = T_EOF;
+static char tok_text[256];
+static long tok_number = 0;
+
+static void skip_ws(void)
+{
+    while (*input_pos && isspace((unsigned char)*input_pos)) input_pos++;
+}
+
+static void next_token(void)
+{
+    skip_ws();
+    if (!*input_pos) { tkind = T_EOF; return; }
+
+    char c = *input_pos;
+
+    if (c == ';' || c == '#') {
+        while (*input_pos && *input_pos!='\n') input_pos++;
+        tkind = T_EOF; return;
+    }
+
+    if (isalpha((unsigned char)c) || c=='_' || c=='.') {
+        int i=0;
+        while (isalnum((unsigned char)*input_pos) || *input_pos=='_' || *input_pos=='.') {
+            if (i < (int)sizeof(tok_text)-1) tok_text[i++] = *input_pos;
+            input_pos++;
+        }
+        tok_text[i] = 0;
+        tkind = T_IDENT;
+        return;
+    }
+    if (isdigit((unsigned char)c)) {
+        tok_number = 0;
+        if (c=='0' && (input_pos[1]=='x' || input_pos[1]=='X')) {
+            input_pos += 2;
+            while (isxdigit((unsigned char)*input_pos)) {
+                char d = *input_pos++;
+                if (isdigit((unsigned char)d)) tok_number = (tok_number<<4) + (d - '0');
+                else tok_number = (tok_number<<4) + (10 + (tolower((unsigned char)d) - 'a'));
+            }
+        } else {
+            while (isdigit((unsigned char)*input_pos)) {
+                tok_number = tok_number*10 + (*input_pos - '0');
+                input_pos++;
+            }
+        }
+        tkind = T_NUMBER;
+        return;
+    }
+    if (c=='"') {
+        input_pos++;
+        int i=0;
+        while (*input_pos && *input_pos!='"') {
+            if (*input_pos=='\\' && input_pos[1]) {
+                input_pos++;
+                char esc = *input_pos++;
+                switch (esc) {
+                    case 'n': tok_text[i++] = '\n'; break;
+                    case 't': tok_text[i++] = '\t'; break;
+                    case '"': tok_text[i++] = '"'; break;
+                    case '\\': tok_text[i++]='\\'; break;
+                    default: tok_text[i++] = esc; break;
+                }
+            } else {
+                tok_text[i++] = *input_pos++;
+            }
+            if (i >= (int)sizeof(tok_text)-1) break;
+        }
+        if (*input_pos=='"') input_pos++;
+        tok_text[i]=0;
+        tkind = T_STRING;
+        return;
+    }
+
+    input_pos++;
+    switch (c) {
+        case ',': tkind = T_COMMA; break;
+        case ':': tkind = T_COLON; break;
+        case '(': tkind = T_LPAREN; break;
+        case ')': tkind = T_RPAREN; break;
+        case '*': tkind = T_STAR; break;
+        case '+': tkind = T_PLUS; break;
+        case '-': tkind = T_MINUS; break;
+        case '%': tkind = T_PERCENT; break;
+        case '$': tkind = T_DOLLAR; break;
+        default:  tkind = T_EOF; break;
+    }
+}
+
+/* ===== Operand parsing (AT&T) ===== */
+
+static int parse_register_after_percent(struct operand *op)
+{
+    if (tkind != T_IDENT) { error("expected register after '%%'"); return -1; }
+    int xr = reg_from_name_xmm(tok_text);
+    if (xr >= 0) {
+        op->kind = OPERAND_REG;
+        op->reg = xr;
+        op->flags = O_REG_XMM;
+        next_token();
+        return 0;
+    }
+    int r = reg_from_name_gpr(tok_text);
+    if (r < 0) { error("unknown register '%s'", tok_text); return -1; }
+    op->kind = OPERAND_REG;
+    if (r >= 200) { op->reg = r-200; op->flags = O_REG_8; }
+    else if (r >= 100) { op->reg = r-100; op->flags = O_REG_32; }
+    else { op->reg = r; op->flags = O_REG_64; }
+    next_token();
+    return 0;
+}
+
+static int parse_immediate_after_dollar(struct operand *op)
+{
+    if (tkind == T_NUMBER) {
+        op->kind = OPERAND_IMM;
+        op->flags = O_IMM_64;
+        op->offset = tok_number;
+        next_token();
+        return 0;
+    } else if (tkind == T_IDENT) {
+        struct name *n = lookup_name(tok_text, (int)strlen(tok_text));
+        op->kind = OPERAND_IMM;
+        op->flags = O_IMM_64;
+        op->symbol = ensure_symbol_for_name(n);
+        next_token();
+        return 0;
+    }
+    error("expected number or symbol after '$'");
+    return -1;
+}
+
+static int parse_memory_operand(struct operand *op)
+{
+    op->kind = OPERAND_MEM;
+    op->flags = O_MEM_64 | O_ADDR_64;
+    op->reg = -1;
+    op->index = -1;
+    op->scale = 1;
+    op->rip = 0;
+    op->offset = 0;
+    op->symbol = NULL;
+
+    /* Optional displacement or symbol before '(' */
+    if (tkind == T_NUMBER) {
+        op->offset = tok_number; next_token();
+    } else if (tkind == T_MINUS) {
+        next_token();
+        if (tkind == T_NUMBER) { op->offset = -tok_number; next_token(); }
+        else { error("expected number after '-'"); return -1; }
+    } else if (tkind == T_IDENT) {
+        struct name *n = lookup_name(tok_text, (int)strlen(tok_text));
+        op->symbol = ensure_symbol_for_name(n);
+        next_token();
+    }
+
+    if (tkind != T_LPAREN) { error("expected '(' in memory operand"); return -1; }
+    next_token();
+
+    /* base */
+    if (tkind == T_PERCENT) {
+        next_token();
+        struct operand rop = {0};
+        if (parse_register_after_percent(&rop) != 0) return -1;
+        if (rop.flags & O_REG_XMM) { error("XMM cannot be base"); return -1; }
+        op->reg = rop.reg;
+    } else if (tkind == T_IDENT && strcmp(tok_text,"rip")==0) {
+        op->rip = 1; next_token();
+    }
+
+    /* optional , index */
+    if (tkind == T_COMMA) {
+        next_token();
+        if (tkind == T_PERCENT) {
+            next_token();
+            struct operand iop = {0};
+            if (parse_register_after_percent(&iop) != 0) return -1;
+            if (iop.flags & O_REG_XMM) { error("XMM cannot be index"); return -1; }
+            op->index = iop.reg;
+        }
+        /* optional , scale */
+        if (tkind == T_COMMA) {
+            next_token();
+            if (tkind == T_NUMBER) { op->scale = (int)tok_number; next_token(); }
+            else { error("expected scale number"); return -1; }
+        }
+    }
+
+    if (tkind != T_RPAREN) { error("expected ')' to close memory operand"); return -1; }
+    next_token();
+    return 0;
+}
+
+static int parse_operand(struct operand *op)
+{
+    memset(op, 0, sizeof(*op));
+
+    if (tkind == T_DOLLAR) {
+        next_token();
+        return parse_immediate_after_dollar(op);
+    } else if (tkind == T_PERCENT) {
+        next_token();
+        return parse_register_after_percent(op);
+    } else if (tkind == T_NUMBER || tkind == T_MINUS || tkind == T_IDENT) {
+        /* Could be memory starting with disp/symbol then '(' ... or immediate */
+        const char *save_pos = input_pos;
+        enum TokKind save_tk = tkind;
+        char save_text[256]; strcpy(save_text, tok_text);
+        long save_num = tok_number;
+
+        /* Special handling: if ident and NOT followed by '(' treat as displacement-only memory */
+        if (tkind == T_IDENT) {
+            /* lookahead for '(' */
+            const char *p = input_pos;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (*p != '(') {
+                struct name *n = lookup_name(tok_text, (int)strlen(tok_text));
+                op->kind = OPERAND_MEM;
+                op->symbol = ensure_symbol_for_name(n);
+                op->flags = O_MEM_64 | O_ADDR_64;
+                next_token();
+                return 0;
+            }
+        }
+
+        if (tkind == T_NUMBER || tkind == T_MINUS || tkind == T_IDENT) next_token();
+        if (tkind == T_LPAREN) {
+            input_pos = (char *)save_pos;
+            tkind = save_tk;
+            strcpy(tok_text, save_text);
+            tok_number = save_num;
+            return parse_memory_operand(op);
+        } else {
+            input_pos = (char *)save_pos;
+            tkind = save_tk;
+            strcpy(tok_text, save_text);
+            tok_number = save_num;
+
+            if (tkind == T_NUMBER) {
+                op->kind = OPERAND_IMM; op->flags = O_IMM_64; op->offset = tok_number; next_token(); return 0;
+            } else if (tkind == T_IDENT) {
+                struct name *n = lookup_name(tok_text, (int)strlen(tok_text));
+                op->kind = OPERAND_IMM; op->flags = O_IMM_64; op->symbol = ensure_symbol_for_name(n); next_token(); return 0;
+            } else if (tkind == T_MINUS) {
+                next_token();
+                if (tkind == T_NUMBER) { op->kind=OPERAND_IMM; op->flags=O_IMM_64; op->offset=-tok_number; next_token(); return 0; }
+                error("expected number after '-'"); return -1;
+            }
+        }
+    } else if (tkind == T_LPAREN) {
+        return parse_memory_operand(op);
+    }
+
+    error("unexpected token in operand");
+    return -1;
+}
+
+/* ===== Encoding helpers ===== */
+
+static void emit_rex(int w, int r, int x, int b)
+{
+    unsigned char rex = 0x40;
+    if (w) rex |= 0x08;
+    if (r) rex |= 0x04;
+    if (x) rex |= 0x02;
+    if (b) rex |= 0x01;
+    /* Only emit if any bit beyond 0x40 is set */
+    if (rex != 0x40) emit_byte(rex);
+}
+
+static void emit_prefix66(void) { emit_byte(0x66); }
+static void emit_prefixF3(void) { emit_byte(0xF3); }
+static void emit_prefixF2(void) { emit_byte(0xF2); }
+
+static void emit_modrm(int mod, int reg, int rm)
+{
+    emit_byte((unsigned char)((mod<<6) | ((reg&7)<<3) | (rm&7)));
+}
+
+/* Simple SIB-less memory encoding: only base register or RIP */
+static void emit_modrm_mem_reg(int reg, int base_reg, int rip)
+{
+    if (rip) {
+        /* mod = 0, rm = 5 => disp32 follows */
+        emit_modrm(0, reg, 5);
+    } else if (base_reg == 4) {
+        /* rsp requires SIB; emit SIB with no index */
+        emit_modrm(0, reg, 4);
+        emit_byte(0x24); /* SIB: scale=0,index=4(base=4) */
+    } else {
+        emit_modrm(0, reg, base_reg & 7);
+    }
+}
+
+/* ===== Simple encoders (GPR) ===== */
+
+static void encode_rr64_op(unsigned char opcode, int dst_rm, int src_reg)
+{
+    int rex_r = (src_reg >> 3) & 1;
+    int rex_b = (dst_rm >> 3) & 1;
+    emit_rex(1, rex_r, 0, rex_b);
+    emit_byte(opcode);
+    emit_modrm(3, src_reg, dst_rm);
+}
+
+static void encode_mov_r64_imm32(int reg, unsigned imm32)
+{
+    int rex_b = (reg >> 3) & 1;
+    emit_rex(1, 0, 0, rex_b);
+    emit_byte((unsigned char)(0xB8 + (reg & 7)));
+    emit_u32(imm32);
+}
+
+/* ===== New helpers: push/pop and mov r/m encoders ===== */
+
+static void encode_push_r64(int reg) {
+    int rex_b = (reg >> 3) & 1;
+    emit_rex(0, 0, 0, rex_b);
+    emit_byte((unsigned char)(0x50 + (reg & 7)));
+}
+
+static void encode_pop_r64(int reg) {
+    int rex_b = (reg >> 3) & 1;
+    emit_rex(0, 0, 0, rex_b);
+    emit_byte((unsigned char)(0x58 + (reg & 7)));
+}
+
+/* reg -> r/m64 : opcode 0x89 /r (AT&T: src reg, dst r/m) */
+static void encode_mov_reg_to_rm64(int src_reg, struct operand *dst) {
+    int rex_r = (src_reg >> 3) & 1;
+    int rex_b = (dst->reg >> 3) & 1;
+    emit_rex(1, rex_r, 0, rex_b);
+    emit_byte(0x89);
+    if (dst->kind == OPERAND_MEM) {
+        emit_modrm_mem_reg(src_reg, dst->reg, dst->rip);
+        if (dst->symbol) {
+            if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+            relocs[relocs_count].pos = text_len;
+            relocs[relocs_count].sym = dst->symbol;
+            relocs[relocs_count].size = 4;
+            relocs[relocs_count].section = 1;
+            relocs_count++;
+            emit_u32(0);
+        }
+    } else {
+        emit_modrm(3, src_reg, dst->reg);
+    }
+}
+
+/* r/m64 -> reg : opcode 0x8B /r (AT&T: src r/m, dst reg) */
+static void encode_mov_rm_to_reg64(struct operand *src, int dst_reg) {
+    int rex_r = (dst_reg >> 3) & 1;
+    int rex_b = (src->reg >> 3) & 1;
+    emit_rex(1, rex_r, 0, rex_b);
+    emit_byte(0x8B);
+    if (src->kind == OPERAND_MEM) {
+        emit_modrm_mem_reg(dst_reg, src->reg, src->rip);
+        if (src->symbol) {
+            if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+            relocs[relocs_count].pos = text_len;
+            relocs[relocs_count].sym = src->symbol;
+            relocs[relocs_count].size = 4;
+            relocs[relocs_count].section = 1;
+            relocs_count++;
+            emit_u32(0);
+        }
+    } else {
+        emit_modrm(3, dst_reg, src->reg);
+    }
+}
+
+/* Generic encode for add/sub/cmp where opcode expects reg in 'reg' field and r/m in rm */
+static void encode_reg_rm_op(unsigned char opcode, struct operand *src_rm, int dst_reg)
+{
+    int rex_r = (dst_reg >> 3) & 1;
+    int rex_b = (src_rm->reg >> 3) & 1;
+    emit_rex(1, rex_r, 0, rex_b);
+    emit_byte(opcode);
+    if (src_rm->kind == OPERAND_MEM) {
+        emit_modrm_mem_reg(dst_reg, src_rm->reg, src_rm->rip);
+        if (src_rm->symbol) {
+            if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+            relocs[relocs_count].pos = text_len;
+            relocs[relocs_count].sym = src_rm->symbol;
+            relocs[relocs_count].size = 4;
+            relocs[relocs_count].section = 1;
+            relocs_count++;
+            emit_u32(0);
+        }
+    } else {
+        emit_modrm(3, dst_reg, src_rm->reg);
+    }
+}
+
+/* ===== SSE encoders (XMM, r/m128) ===== */
+
+static void encode_sse_rm(unsigned pre1, unsigned pre2, unsigned char opcode, int is_load, int dst_xmm, int src_rm_is_mem, int src_rm_reg)
+{
+    if (pre1 == 0x66) emit_prefix66();
+    else if (pre1 == 0xF3) emit_prefixF3();
+    else if (pre1 == 0xF2) emit_prefixF2();
+
+    if (pre2) emit_byte((unsigned char)pre2); /* typically 0x0F */
+
+    int reg = dst_xmm;
+    int rm  = src_rm_reg;
+
+    int rex_r = (reg >> 3) & 1;
+    int rex_b = (rm  >> 3) & 1;
+    if (rex_r || rex_b) emit_rex(0, rex_r, 0, rex_b);
+
+    emit_byte(opcode);
+
+    if (src_rm_is_mem) {
+        if (rm < 0) { error("SSE memory rm missing"); return; }
+        emit_modrm_mem_reg(reg, rm, 0);
+        /* For simplicity, we don't emit displacement here; relocations handle symbol/rip cases */
+    } else {
+        emit_modrm(3, reg, rm);
+    }
+}
+
+/* ===== Instruction table (subset guiding parser choices) ===== */
+
+static struct insn insn_table[] = {
+    /* Core moves and arithmetic (AT&T src,dst) */
+    /* reg -> mem (src reg, dst mem) */
+    { "movq", 2, { O_REG_64, O_MRM_64 }, 1, { (char)0x89 }, I_DATA_64, NULL },
+    /* mem -> reg (src mem, dst reg) */
+    { "movq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x8B }, I_DATA_64, NULL },
+    /* imm -> reg (AT&T: $imm, %reg) */
+    { "movq", 2, { O_IMM, O_REG_64 }, 1, { (char)0xB8 }, I_DATA_64, NULL },
+
+    { "addq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x01 }, I_DATA_64, NULL }, /* src r/m, dst reg */
+    { "subq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x29 }, I_DATA_64, NULL },
+    { "cmpq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x39 }, I_DATA_64, NULL },
+    { "andq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x21 }, I_DATA_64, NULL },
+    { "orq",  2, { O_MRM_64, O_REG_64 }, 1, { (char)0x09 }, I_DATA_64, NULL },
+    { "xorq", 2, { O_MRM_64, O_REG_64 }, 1, { (char)0x31 }, I_DATA_64, NULL },
+    { "testq",2, { O_REG_64, O_REG_64 }, 1, { (char)0x85 }, I_DATA_64, NULL },
+
+    /* Control flow */
+    { "jmp",  1, { O_IMM }, 1, { (char)0xE9 }, I_DATA_32, NULL },
+    { "je",   1, { O_IMM }, 2, { (char)0x0F, (char)0x84 }, I_DATA_32, NULL },
+    { "jz",   1, { O_IMM }, 2, { (char)0x0F, (char)0x84 }, I_DATA_32, NULL },
+    { "jne",  1, { O_IMM }, 2, { (char)0x0F, (char)0x85 }, I_DATA_32, NULL },
+    { "jnz",  1, { O_IMM }, 2, { (char)0x0F, (char)0x85 }, I_DATA_32, NULL },
+    { "jg",   1, { O_IMM }, 2, { (char)0x0F, (char)0x8F }, I_DATA_32, NULL },
+    { "jl",   1, { O_IMM }, 2, { (char)0x0F, (char)0x8C }, I_DATA_32, NULL },
+    { "jge",  1, { O_IMM }, 2, { (char)0x0F, (char)0x8D }, I_DATA_32, NULL },
+    { "jle",  1, { O_IMM }, 2, { (char)0x0F, (char)0x8E }, I_DATA_32, NULL },
+    { "call", 1, { O_IMM }, 1, { (char)0xE8 }, I_DATA_32, NULL },
+    { "ret",  0, { 0 },     1, { (char)0xC3 }, 0, NULL },
+
+    /* push/pop */
+    { "pushq", 1, { O_REG_64 }, 1, { (char)0x50 }, I_DATA_64, NULL },
+    { "popq",  1, { O_REG_64 }, 1, { (char)0x58 }, I_DATA_64, NULL },
+
+    /* Misc */
+    { "nop",  0, { 0 }, 1, { (char)0x90 }, 0, NULL },
+    { "leave",0, { 0 }, 1, { (char)0xC9 }, 0, NULL },
+    { "syscall",0,{0}, 2, { (char)0x0F, (char)0x05 }, 0, NULL },
+
+    /* SSE subset: XMM load/store and arithmetic (packed single-precision) */
+    { "movaps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x28 }, 0, NULL }, /* load src r/m128 -> dst xmm (AT&T src,dst) */
+    { "movaps", 2, { O_REG_XMM, O_MRM_32 }, 2, { (char)0x0F, (char)0x29 }, 0, NULL }, /* store xmm -> r/m128 */
+    { "movups", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x10 }, 0, NULL },
+    { "movups", 2, { O_REG_XMM, O_MRM_32 }, 2, { (char)0x0F, (char)0x11 }, 0, NULL },
+    { "addps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x58 }, 0, NULL },
+    { "subps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x5C }, 0, NULL },
+    { "mulps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x59 }, 0, NULL },
+    { "xorps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x57 }, 0, NULL },
+    { "andps", 2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x54 }, 0, NULL },
+    { "orps",  2, { O_MRM_32, O_REG_XMM }, 2, { (char)0x0F, (char)0x56 }, 0, NULL },
+};
+
+/* ===== Instruction matching ===== */
+
+static int match_insn(const char *mnemonic, struct insn **out)
+{
+    for (size_t i = 0; i < sizeof(insn_table)/sizeof(insn_table[0]); ++i) {
+        if (strcmp(mnemonic, insn_table[i].mnemonic) == 0) {
+            *out = &insn_table[i];
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* ===== Encoders for selected mnemonics ===== */
+
+static void encode_jmp_rel32(struct operand *op)
+{
+    emit_byte(0xE9);
+    if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+    relocs[relocs_count].pos = text_len;
+    relocs[relocs_count].sym = op->symbol;
+    relocs[relocs_count].size = 4;
+    relocs[relocs_count].section = 1;
+    relocs_count++;
+    emit_u32(0);
+}
+
+static void encode_jcc_rel32(unsigned char cc)
+{
+    emit_byte(0x0F);
+    emit_byte(cc);
+    if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+    relocs[relocs_count].pos = text_len;
+    relocs[relocs_count].sym = operands[0].symbol;
+    relocs[relocs_count].size = 4;
+    relocs[relocs_count].section = 1;
+    relocs_count++;
+    emit_u32(0);
+}
+
+static void encode_call_rel32(struct operand *op)
+{
+    emit_byte(0xE8);
+    if (relocs_count >= MAX_RELOCS) { error("too many relocs"); return; }
+    relocs[relocs_count].pos = text_len;
+    relocs[relocs_count].sym = op->symbol;
+    relocs[relocs_count].size = 4;
+    relocs[relocs_count].section = 1;
+    relocs_count++;
+    emit_u32(0);
+}
+
+/* SSE dispatcher (completed) */
+
+static int try_encode_sse(const char *mnemonic)
+{
+    if (!strcmp(mnemonic,"movaps")) {
+        /* AT&T: src, dst */
+        if (nr_operands==2 && (operands[1].flags & O_REG_XMM) && operands[0].kind==OPERAND_MEM) {
+            /* mem -> xmm (load): opcode 0F 28 /r */
+            encode_sse_rm(0, 0x0F, 0x28, 1, operands[1].reg, 1, operands[0].reg);
+            return 0;
+        }
+        if (nr_operands==2 && (operands[0].flags & O_REG_XMM) && operands[1].kind==OPERAND_MEM) {
+            /* xmm -> mem (store): opcode 0F 29 /r */
+            encode_sse_rm(0, 0x0F, 0x29, 0, operands[0].reg, 1, operands[1].reg);
+            return 0;
+        }
+        error("unsupported movaps form");
+        return -1;
+    } else if (!strcmp(mnemonic,"movups")) {
+        if (nr_operands==2 && (operands[1].flags & O_REG_XMM) && operands[0].kind==OPERAND_MEM) {
+            encode_sse_rm(0, 0x0F, 0x10, 1, operands[1].reg, 1, operands[0].reg);
+            return 0;
+        }
+        if (nr_operands==2 && (operands[0].flags & O_REG_XMM) && operands[1].kind==OPERAND_MEM) {
+            encode_sse_rm(0, 0x0F, 0x11, 0, operands[0].reg, 1, operands[1].reg);
+            return 0;
+        }
+        error("unsupported movups form");
+        return -1;
+    } else if (!strcmp(mnemonic,"addps") || !strcmp(mnemonic,"subps") || !strcmp(mnemonic,"mulps") || !strcmp(mnemonic,"xorps") || !strcmp(mnemonic,"andps") || !strcmp(mnemonic,"orps")) {
+        unsigned char opc = 0x58; /* addps */
+        if (!strcmp(mnemonic,"subps")) opc = 0x5C;
+        else if (!strcmp(mnemonic,"mulps")) opc = 0x59;
+        else if (!strcmp(mnemonic,"xorps")) opc = 0x57;
+        else if (!strcmp(mnemonic,"andps")) opc = 0x54;
+        else if (!strcmp(mnemonic,"orps"))  opc = 0x56;
+        if (nr_operands==2) {
+            /* AT&T: src, dst */
+            if ((operands[1].flags & O_REG_XMM) && operands[0].kind==OPERAND_MEM) {
+                /* mem -> xmm */
+                encode_sse_rm(0, 0x0F, opc, 1, operands[1].reg, 1, operands[0].reg);
+                return 0;
+            }
+            if ((operands[1].flags & O_REG_XMM) && (operands[0].flags & O_REG_XMM)) {
+                /* xmm -> xmm */
+                encode_sse_rm(0, 0x0F, opc, 1, operands[1].reg, 0, operands[0].reg);
+                return 0;
+            }
+        }
+        error("unsupported SSE form");
+        return -1;
+    }
+    return -1;
+}
+
+/* ===== Instruction dispatch & encoding (simplified) ===== */
+
+static void encode_instruction(const char *mnemonic)
+{
+    /* Try SSE first */
+    if (try_encode_sse(mnemonic) == 0) return;
+
+    /* Handle a few mnemonics explicitly */
+    if (strcmp(mnemonic,"jmp")==0) {
+        if (nr_operands==1) { encode_jmp_rel32(&operands[0]); return; }
+    } else if (strcmp(mnemonic,"call")==0) {
+        if (nr_operands==1) { encode_call_rel32(&operands[0]); return; }
+    } else if (strcmp(mnemonic,"je")==0 || strcmp(mnemonic,"jz")==0) {
+        if (nr_operands==1) { encode_jcc_rel32(0x84); return; }
+    } else if (strcmp(mnemonic,"jne")==0 || strcmp(mnemonic,"jnz")==0) {
+        if (nr_operands==1) { encode_jcc_rel32(0x85); return; }
+    } else if (strcmp(mnemonic,"ret")==0) {
+        emit_byte(0xC3); return;
+    } else if (strcmp(mnemonic,"nop")==0) {
+        emit_byte(0x90); return;
+    } else if (strcmp(mnemonic,"leave")==0) {
+        emit_byte(0xC9); return;
+    } else if (strcmp(mnemonic,"syscall")==0) {
+        emit_byte(0x0F); emit_byte(0x05); return;
+    } else if (strcmp(mnemonic,"pushq")==0) {
+        if (nr_operands==1 && operands[0].kind==OPERAND_REG) { encode_push_r64(operands[0].reg); return; }
+    } else if (strcmp(mnemonic,"popq")==0) {
+        if (nr_operands==1 && operands[0].kind==OPERAND_REG) { encode_pop_r64(operands[0].reg); return; }
+    } else if (strcmp(mnemonic,"movq")==0) {
+        if (nr_operands==2) {
+            /* AT&T: src, dst */
+            if (operands[0].kind==OPERAND_REG && operands[1].kind==OPERAND_MEM) {
+                encode_mov_reg_to_rm64(operands[0].reg, &operands[1]); return;
+            }
+            if (operands[0].kind==OPERAND_MEM && operands[1].kind==OPERAND_REG) {
+                encode_mov_rm_to_reg64(&operands[0], operands[1].reg); return;
+            }
+            if (operands[0].kind==OPERAND_IMM && operands[1].kind==OPERAND_REG) {
+                /* immediate to reg */
+                unsigned imm32 = (unsigned)(operands[0].offset & 0xFFFFFFFFu);
+                encode_mov_r64_imm32(operands[1].reg, imm32); return;
+            }
+        }
+        error("encoding for instruction 'movq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"addq")==0) {
+        if (nr_operands==2) {
+            /* AT&T: src, dst (src r/m, dst reg) */
+            if (operands[1].kind==OPERAND_REG) {
+                encode_reg_rm_op(0x01, &operands[0], operands[1].reg); return;
+            }
+        }
+        error("encoding for instruction 'addq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"subq")==0) {
+        if (nr_operands==2) {
+            if (operands[1].kind==OPERAND_REG) {
+                encode_reg_rm_op(0x29, &operands[0], operands[1].reg); return;
+            }
+        }
+        error("encoding for instruction 'subq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"cmpq")==0) {
+        if (nr_operands==2) {
+            if (operands[1].kind==OPERAND_REG) {
+                encode_reg_rm_op(0x39, &operands[0], operands[1].reg); return;
+            }
+        }
+        error("encoding for instruction 'cmpq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"andq")==0) {
+        if (nr_operands==2 && operands[1].kind==OPERAND_REG) {
+            encode_reg_rm_op(0x21, &operands[0], operands[1].reg); return;
+        }
+        error("encoding for instruction 'andq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"orq")==0) {
+        if (nr_operands==2 && operands[1].kind==OPERAND_REG) {
+            encode_reg_rm_op(0x09, &operands[0], operands[1].reg); return;
+        }
+        error("encoding for instruction 'orq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"xorq")==0) {
+        if (nr_operands==2 && operands[1].kind==OPERAND_REG) {
+            encode_reg_rm_op(0x31, &operands[0], operands[1].reg); return;
+        }
+        error("encoding for instruction 'xorq' not implemented or unsupported operand forms");
+        return;
+    } else if (strcmp(mnemonic,"testq")==0) {
+        if (nr_operands==2 && operands[0].kind==OPERAND_REG && operands[1].kind==OPERAND_REG) {
+            int r = operands[0].reg;
+            int s = operands[1].reg;
+            int rex_r = (r >> 3) & 1;
+            int rex_b = (s >> 3) & 1;
+            emit_rex(1, rex_r, 0, rex_b);
+            emit_byte(0x85);
+            emit_modrm(3, r, s);
+            return;
+        }
+        error("encoding for instruction 'testq' not implemented or unsupported operand forms");
+        return;
+    }
+
+    error("unknown instruction '%s'", (char*)mnemonic);
+}
+
+/* ===== Directive handling: normalize dot-prefixed names ===== */
+
+/* Example pseudo-op table mapping names to functions (simplified) */
+struct pseudo_entry {
+    const char *name;
+    int (*fn)(void);
+};
+
+static struct pseudo_entry pseudo_table[] = {
+    { "byte", pseudo_byte },
+    { "word", pseudo_word },
+    { "dword", pseudo_dword },
+    { "qword", pseudo_qword },
+    { "align", pseudo_align },
+    { "skip", pseudo_skip },
+    { "fill", pseudo_fill },
+    { "ascii", pseudo_ascii },
+    { "global", pseudo_global },
+    { "text", pseudo_text },
+    { "data", pseudo_data },
+    { "bss", pseudo_bss },
+    { "org", pseudo_org },
+    { "bits", pseudo_bits },
+    { NULL, NULL }
+};
+
+static int handle_directive_name(const char *rawname)
+{
+    const char *name = rawname;
+    if (name[0] == '.') name++;
+    for (int i = 0; pseudo_table[i].name; ++i) {
+        if (strcmp(name, pseudo_table[i].name) == 0) {
+            /* call the pseudo function; number_token/name_token should be set by caller */
+            return pseudo_table[i].fn();
+        }
+    }
+    error("unknown directive '%s'", rawname);
+    return -1;
+}
+
+/* ===== Relocation resolution (simple) ===== */
+
+static void resolve_relocs(void)
+{
+    for (int i = 0; i < relocs_count; ++i) {
+        struct reloc *r = &relocs[i];
+        if (!r->sym) continue;
+        long target = 0;
+        if (r->sym->segment == 1) {
+            target = r->sym->offset; /* text symbol */
+        } else if (r->sym->segment == 2) {
+            /* data placed after text */
+            target = text_len + r->sym->offset;
+        } else {
+            /* bss or unknown: treat as 0 */
+            target = 0;
+        }
+        /* displacement = target - (place + 4) where place is the address of the rel32 field */
+        long place = r->pos;
+        long disp = target - (place + 4);
+        /* write disp little-endian into the buffer where relocation was emitted */
+        if (r->section == 1) {
+            if (r->pos + 4 <= text_len) {
+                unsigned d = (unsigned)disp;
+                text_buf[r->pos + 0] = (unsigned char)(d & 0xFF);
+                text_buf[r->pos + 1] = (unsigned char)((d >> 8) & 0xFF);
+                text_buf[r->pos + 2] = (unsigned char)((d >> 16) & 0xFF);
+                text_buf[r->pos + 3] = (unsigned char)((d >> 24) & 0xFF);
+            } else {
+                error("relocation out of range");
+            }
+        } else if (r->section == 2) {
+            if (r->pos + 4 <= data_len) {
+                unsigned d = (unsigned)disp;
+                data_buf[r->pos + 0] = (unsigned char)(d & 0xFF);
+                data_buf[r->pos + 1] = (unsigned char)((d >> 8) & 0xFF);
+                data_buf[r->pos + 2] = (unsigned char)((d >> 16) & 0xFF);
+                data_buf[r->pos + 3] = (unsigned char)((d >> 24) & 0xFF);
+            } else {
+                error("relocation out of range (data)");
+            }
+        }
+    }
+}
+
+/* ===== Output helpers ===== */
+
+static void hexdump_section(const char *name, unsigned char *buf, long len)
+{
+    printf("section %s: %ld bytes\n", name, len);
+    for (long i = 0; i < len; i += 16) {
+        printf("%08lx  ", (unsigned long)i);
+        for (long j = 0; j < 16; ++j) {
+            if (i + j < len) printf("%02x ", buf[i+j]);
+            else printf("   ");
+        }
+        printf(" ");
+        for (long j = 0; j < 16; ++j) {
+            if (i + j < len) {
+                unsigned char c = buf[i+j];
+                printf("%c", (c >= 32 && c < 127) ? c : '.');
+            }
+        }
+        printf("\n");
+    }
+}
+
+/* ===== Main assembler loop ===== */
+
+/* Assemble a single line where input_pos points to the start of the line */
+static void process_line(void)
+{
+    next_token();
+    if (tkind == T_EOF) return;
+
+    /* Label? ident ':' */
+    if (tkind == T_IDENT) {
+        char saved_ident[256];
+        strcpy(saved_ident, tok_text);
+        next_token();
+        if (tkind == T_COLON) {
+            /* define label */
+            struct name *n = lookup_name(saved_ident, (int)strlen(saved_ident));
+            struct obj_symbol *sym = ensure_symbol_for_name(n);
+            if (segment == 1) sym->offset = text_len;
+            else if (segment == 2) sym->offset = data_len;
+            else if (segment == 3) sym->offset = data_len; /* bss offset tracked in data_bytes */
+            else sym->offset = 0;
+            sym->segment = (segment == 0) ? 1 : segment; /* default to text if none */
+            next_token();
+            /* continue parsing rest of line (could be directive or instruction) */
+        } else {
+            /* not a label: rewind to ident token */
+            input_pos -= strlen(tok_text);
+            /* reset token to ident */
+            strcpy(tok_text, saved_ident);
+            tkind = T_IDENT;
+        }
+    }
+
+    /* Directive? starts with '.' or ident that matches pseudo */
+    if (tkind == T_IDENT && tok_text[0] == '.') {
+        /* directive */
+        char dname[256];
+        strcpy(dname, tok_text);
+        next_token();
+        /* parse optional argument into number_token or name_token */
+        number_token = 0;
+        name_token = NULL;
+        if (tkind == T_NUMBER) { number_token = tok_number; next_token(); }
+        else if (tkind == T_STRING) { name_token = lookup_name(tok_text, (int)strlen(tok_text)); next_token(); }
+        else if (tkind == T_IDENT) { name_token = lookup_name(tok_text, (int)strlen(tok_text)); next_token(); }
+        handle_directive_name(dname);
+        return;
+    }
+
+    /* If ident and matches pseudo without dot (allow both) */
+    if (tkind == T_IDENT) {
+        /* check if it's a pseudo-op (no dot) */
+        int is_pseudo = 0;
+        for (int i = 0; pseudo_table[i].name; ++i) {
+            if (strcmp(tok_text, pseudo_table[i].name) == 0) { is_pseudo = 1; break; }
+        }
+        if (is_pseudo) {
+            char dname[256];
+            strcpy(dname, tok_text);
+            next_token();
+            number_token = 0;
+            name_token = NULL;
+            if (tkind == T_NUMBER) { number_token = tok_number; next_token(); }
+            else if (tkind == T_STRING) { name_token = lookup_name(tok_text, (int)strlen(tok_text)); next_token(); }
+            else if (tkind == T_IDENT) { name_token = lookup_name(tok_text, (int)strlen(tok_text)); next_token(); }
+            handle_directive_name(dname);
+            return;
+        }
+    }
+
+    /* Instruction mnemonic? */
+    if (tkind == T_IDENT) {
+        char mnemonic[256];
+        strcpy(mnemonic, tok_text);
+        next_token();
+        /* parse operands separated by commas until end of line */
+        nr_operands = 0;
+        while (tkind != T_EOF) {
+            if (nr_operands >= MAX_OPERANDS) { error("too many operands"); break; }
+            if (tkind == T_COMMA) { next_token(); continue; }
+            if (parse_operand(&operands[nr_operands]) != 0) break;
+            nr_operands++;
+            if (tkind == T_COMMA) { next_token(); continue; }
+            else break;
+        }
+        encode_instruction(mnemonic);
+        return;
+    }
+
+    /* Unknown token at start */
+    error("unexpected token at start of line");
+}
+
+/* ===== Main ===== */
+
+int main(int argc, char **argv)
+{
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s <file-to-assemble>\n", argc ? argv[0] : "asm");
+        return 2;
+    }
+
+    FILE *in = fopen(argv[1], "r");
+    if (!in) {
+        fprintf(stderr, "error: cannot open input file '%s'\n", argv[1]);
+        return 3;
+    }
+
+    /* default to text segment */
+    segment = 1;
+
+    line_number = 0;
+    while (fgets(input_line, sizeof(input_line), in)) {
+        line_number++;
+        input_pos = input_line;
+        process_line();
+    }
+
+    fclose(in);
+
+    /* Resolve relocations */
+    resolve_relocs();
+
+    /* Emit sections and symbol table */
+    hexdump_section(".text", text_buf, text_len);
+    hexdump_section(".data", data_buf, data_len);
+
+    printf("\nSymbols (%d):\n", symbols_count);
+    for (int i = 0; i < symbols_count; ++i) {
+        struct obj_symbol *s = &symbols[i];
+        const char *segname = (s->segment == 1) ? "seg=1" : (s->segment == 2) ? "seg=2" : (s->segment == 3) ? "seg=3" : "seg=?";
+        printf("%4d: %-20s %s off=%ld glob=%d\n", i, s->n->data, segname, s->offset, s->is_global);
+    }
+
+    /* Print relocations summary */
+    if (relocs_count) {
+        printf("\nRelocations (%d):\n", relocs_count);
+        for (int i = 0; i < relocs_count; ++i) {
+            struct reloc *r = &relocs[i];
+            printf("%4d: pos=%ld size=%d section=%d sym=%s\n", i, r->pos, r->size, r->section, r->sym ? r->sym->n->data : "(null)");
+        }
+    }
+
+    return 0;
+}

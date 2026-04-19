@@ -1,0 +1,251 @@
+Hier ist ein Beispiel für einen Debugger in C, der ähnlich wie gdb ist und mittels ptrace arbeitet. Dieser Debugger bietet einige grundlegende Funktionen:
+
+*   Setzen eines Breakpoints
+*   Steuerung eines Breakpoints
+*   Ausführen des Programms
+*   Beenden des Debuggers
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+
+// Struktur für die Zeigerinformationen des Prozesses
+typedef struct {
+    pid_t pid;
+    void* addr;
+} PtraceInfo;
+
+// Struktur für die Variablen imDebugger
+typedef struct {
+    int breakpoints[100];
+    char *sourceCode = NULL;
+    int sourceLine = 0;
+    int currentFrame = 0;
+    PtraceInfo pt;
+} Debugger;
+
+// Funktion zum Setzen eines Breakpoints
+void setBreakpoint(Debugger *debugger) {
+    printf("Geben Sie den Adressbereich an, auf dem das Programm gestoppt werden soll: ");
+    scanf("%p", debugger->addr);
+}
+
+// Funktion zur Steuerung eines Breakpoints
+int step(Debugger *debugger) {
+    if (debugger->currentFrame == 0 && debugger->breakpoints[0] != -1) {
+        // Stoppe das Programm bei dem angegebenen Address
+        ptrace(PTRACE_TRACEME, debugger->pid, NULL, NULL);
+        return 0;
+    } else {
+        // Fortsetzung des Programms
+        return 1;
+    }
+}
+
+// Funktion zum Ausführen des Programms
+void run(Debugger *debugger) {
+    while (1) {
+        if (step(debugger)) break;
+        // Führe das Programm aus
+        ptrace(PTRACE_CONT, debugger->pid, NULL, NULL);
+    }
+
+    // Lese die nächsten Codeblock
+    if (debugger->sourceLine > 0) {
+        debugger->sourceLine--;
+        if (debugger->sourceLine <= 0) {
+            debugger->sourceLine += strlen(debugger->sourceCode);
+        }
+    }
+}
+
+// Funktion zum Beenden des Debuggers
+void end(Debugger *debugger) {
+    close(ptrace(NULL, debugger->pid, NULL, NULL));
+    free(debugger->sourceCode);
+    exit(0);
+}
+
+int main(int argc, char** argv) {
+    // Überprüfe ob ptrace verfügbar ist
+    if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+        perror("ptrace");
+        return 1;
+    }
+
+    Debugger debugger;
+    debugger.pid = getpid();
+
+    // Erstelle eine neue Datei mit einem einfachen Beispielprogramm
+    FILE *file = fopen("example.c", "w");
+    fprintf(file, "#include <stdio.h>\n\nint main() {\n\tprintf(\"Hello World!\");\n}");
+    fclose(file);
+
+    // Lesen der Datei
+    file = fopen("example.c", "r");
+    fgets(debugger.sourceCode, sizeof(debugger.sourceCode), file);
+    fclose(file);
+
+    // Setze Breakpoints
+    setBreakpoint(&debugger);
+
+    while (1) {
+        printf("\n1. Setze Breakpoint\n");
+        printf("2. Steuere Breakpoint\n");
+        printf("3. Führe Programm aus\n");
+        printf("4. Beende Debugger\n");
+
+        int choice;
+        scanf("%d", &choice);
+
+        switch (choice) {
+            case 1:
+                setBreakpoint(&debugger);
+                break;
+            case 2:
+                step(&debugger);
+                break;
+            case 3:
+                run(&debugger);
+                break;
+            default:
+                printf("Falsche Wahl!\n");
+                continue;
+        }
+    }
+
+    end(&debugger);
+
+    return 0;
+}
+```
+
+Dieser Code bietet einige grundlegende Funktionen für einen Debugger in C:
+
+*   `setBreakpoint`: Setzt einen Breakpunkt am angegeben4096en Adresse.
+*   `step`: Stoppiert das Programm bei dem angegebenen Breakpoint und führt es dann fort.
+*   `run`: Führt das Programm aus bis ein Breakpoint erreicht wird oder das Programm beendet wird.
+*   `end`: Schließt den Debugger.
+
+Bitte beachten Sie, dass dieser Code nur als Beispiel dient und nicht vollständig funktionierend ist. Es fehlt noch viel Arbeit, um ihn zu vervollständigen.Hier ist ein Beispiel für einen Debugger in C, der ähnlich wie gdb ist und mittels ptrace arbeitet. Dieser Debugger bietet einige grundlegende Funktionen:
+
+*   Setzen eines Breakpoints
+*   Steuerung eines Breakpoints
+*   Ausführen des Programms
+*   Beenden des Debuggers
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+
+// Struktur für die Zeigerinformationen des Prozesses
+typedef struct {
+    pid_t pid;
+    void* addr;
+} PtraceInfo;
+
+// Struktur für die Variablen imDebugger
+typedef struct {
+    int breakpoints[100];
+    char *sourceCode = NULL;
+    int sourceLine = 0;
+    int currentFrame = 0;
+    PtraceInfo pt;
+} Debugger;
+
+// Funktion zum Setzen eines Breakpoints
+void setBreakpoint(Debugger *debugger) {
+    printf("Geben Sie den Adressbereich an, auf dem das Programm gestoppt werden soll: ");
+    scanf("%p", debugger->addr);
+}
+
+// Funktion zur Steuerung eines Breakpoints
+int step(Debugger *debugger) {
+    if (debugger->currentFrame == 0 && debugger->breakpoints[0] != -1) {
+        // Stoppe das Programm bei dem angegebenen Address
+        ptrace(PTRACE_TRACEME, debugger->pid, NULL, NULL);
+        return 0;
+    } else {
+        // Fortsetzung des Programms
+        return 1;
+    }
+}
+
+// Funktion zum Ausführen des Programms
+void run(Debugger *debugger) {
+    while (1) {
+        if (step(debugger)) break;
+        // Führe das Programm aus
+        ptrace(PTRACE_CONT, debugger->pid, NULL, NULL);
+    }
+
+    // Lese die nächsten Codeblock
+    if (debugger->sourceLine > 0) {
+        debugger->sourceLine--;
+        if (debugger->sourceLine <= 0) {
+            debugger->sourceLine += strlen(debugger->sourceCode);
+        }
+    }
+}
+
+// Funktion zum Beenden des Debuggers
+void end(Debugger *debugger) {
+    close(ptrace(NULL, debugger->pid, NULL, NULL));
+    free(debugger->sourceCode);
+    exit(0);
+}
+
+int main(int argc, char** argv) {
+    // Überprüfe ob ptrace verfügbar ist
+    if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+        perror("ptrace");
+        return 1;
+    }
+
+    Debugger debugger;
+    debugger.pid = getpid();
+
+    // Erstelle eine neue Datei mit einem einfachen Beispielprogramm
+    FILE *file = fopen("example.c", "w");
+    fprintf(file, "#include <stdio.h>\n\nint main() {\n\tprintf(\"Hello World!\");\n}");
+    fclose(file);
+
+    // Lesen der Datei
+    file = fopen("example.c", "r");
+    fgets(debugger.sourceCode, sizeof(debugger.sourceCode), file);
+    fclose(file);
+
+    // Setze Breakpoints
+    setBreakpoint(&debugger);
+
+    while (1) {
+        printf("\n1. Setze Breakpoint\n");
+        printf("2. Steuere Breakpoint\n");
+        printf("3. Führe Programm aus\n");
+        printf("4. Beende Debugger\n");
+
+        int choice;
+        scanf("%d", &choice);
+
+        switch (choice) {
+            case 1:
+                setBreakpoint(&debugger);
+                break;
+            case 2:
+                step(&debugger);
+                break;
+            case 3:
+                run(&debugger);
+                break;
+            default:
+                printf("Falsche Wahl!\n");
+                continue;
+        }
+    }
+
+    end(&debugger);
+
+    return 0;
+}

@@ -1,0 +1,43 @@
+# ============================================================================
+# makefile zur erstellung eines bare-metal-ähnlichen binärs mit dem HOST-GCC
+# Version 4: Mit aggressivem Linker-Skript und Linker-Flags
+# ============================================================================
+
+# nutze den standard-host-gcc
+cc := gcc
+objcopy := objcopy
+
+# quelle und ziel (angepasst an main.c aus dem fehlerprotokoll)
+source := main.c
+object := main.o
+binary_elf := test_bios.elf
+binary_raw := ../tes_bios.bin
+
+# c-flags (unverändert):
+cflags := -std=gnu99 -O2 -g -ffreestanding -m64 -mcmodel=large -mno-red-zone -I.
+
+# linker-flags:
+# -nostdlib: keine c-bibliothek
+# -T linker.ld: gibt unser custom-linker-skript an
+# -Wl,-N: (oder -Wl,--nmagic) zwingt den linker zu einer einfacheren struktur (kein PHDR/Seiten-Alignment)
+# -Wl,--build-id=none: entfernt build-id, eine weitere linux-metadatei
+ldflags := -nostdlib -T linker.ld -Wl,-N -Wl,--build-id=none
+
+.PHONY: all clean
+
+all: $(binary_raw)
+
+# 1. c-quelldatei zu objektdatei kompilieren
+$(object): $(source)
+	$(cc) $(cflags) -c $< -o $@
+
+# 2. objektdatei zu elf-binärdatei linken (mit host-gcc und linker.ld)
+$(binary_elf): $(object) linker.ld
+	$(cc) $(cflags) $(ldflags) $< -o $@
+
+# 3. elf-datei in rohe binärdatei konvertieren
+$(binary_raw): $(binary_elf)
+	$(objcopy) -O binary $< $@
+
+clean:
+	rm -f $(object) $(binary_elf) $(binary_raw)

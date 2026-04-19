@@ -1,0 +1,83 @@
+# Makefile: build kernel.efi and run with QEMU+OVMF
+# Usage:
+#   make			-> build kernel.efi
+#   make image	  -> create fat.img with EFI/BOOT/BOOTX64.EFI
+#   make qemu	   -> build + create image + run QEMU
+#   make clean	  -> remove artifacts
+#
+# Requirements:
+#  - cross toolchain (default x86_64-w64-mingw32-*)
+#  - qemu-system-x86_64
+#  - OVMF firmware file (set OVMF variable below)
+#  - mtools (recommended) OR mkfs.vfat + sudo mount (fallback)
+
+CROSS ?= x86_64-w64-mingw32-
+CC	:= $(CROSS)gcc
+LD	:= $(CROSS)ld
+
+SRC := kernel.c
+OBJ := kernel.o
+OUT := kernel.efi
+EFI_NAME := BOOTX64.EFI
+
+# Image and temp
+FAT_IMG := fat.img
+FAT_SIZE := 64M
+MTOOLS := $(shell command -v mcopy 2>/dev/null || true)
+
+# OVMF firmware (edit to match your system)
+# Examples:
+#  - Debian/Ubuntu: /usr/share/OVMF/OVMF_CODE.fd
+#  - Fedora: /usr/share/edk2/ovmf/OVMF_CODE.fd
+OVMF ?= /usr/share/OVMF/OVMF_CODE.fd
+
+# Compiler / linker flags
+CFLAGS := -ffreestanding -fno-stack-protector -O2 -nostdlib -Wall -Wextra -c
+LDFLAGS := -Tlinker.ld -e efi_main --subsystem=efi --image-base 0
+
+QEMU := qemu-system-x86_64
+QEMU_OPTS := -m 512 -serial mon:stdio -display none
+
+.PHONY: all build image qemu clean
+
+all: $(OUT)
+
+build: $(OUT)
+
+$(OBJ): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(OUT): $(OBJ)
+	$(LD) $(OBJ) $(LDFLAGS) -o $@
+
+# Create FAT image and copy EFI binary into EFI/BOOT/BOOTX64.EFI
+# Prefer mtools (no sudo). Fallback to loop mount (requires sudo).
+image: $(OUT)
+	@echo "Creating FAT image: $(FAT_IMG)"
+	@if [ -n "$(MTOOLS)" ]; then \
+	  echo "Using mtools to create and populate image"; \
+	  rm -f $(FAT_IMG); dd if=/dev/zero of=$(FAT_IMG) bs=1 count=0 seek=$(FAT_SIZE) >/dev/null 2>&1; \
+	  mkfs.vfat -n EFIIMG $(FAT_IMG) >/dev/null 2>&1 || true; \
+	  mmd -i $(FAT_IMG) ::/EFI || true; \
+	  mmd -i $(FAT_IMG) ::/EFI/BOOT || true; \
+	  mcopy -i $(FAT_IMG) $(OUT) ::/EFI/BOOT/$(EFI_NAME); \
+	else \
+	  echo "mtools not found: falling back to loop mount (requires sudo)"; \
+	  rm -f $(FAT_IMG); dd if=/dev/zero of=$(FAT_IMG) bs=1 count=0 seek=$(FAT_SIZE); \
+	  mkfs.vfat -n EFIIMG $(FAT_IMG); \
+	  tmpdir=$$(mktemp -d); sudo mount -o loop $(FAT_IMG) $$tmpdir; \
+	  sudo mkdir -p $$tmpdir/EFI/BOOT; sudo cp $(OUT) $$tmpdir/EFI/BOOT/$(EFI_NAME); sync; sudo umount $$tmpdir; sudo rmdir $$tmpdir; \
+	fi
+	@echo "Image ready: $(FAT_IMG)"
+
+# Build, create image, and run QEMU with OVMF
+qemu: all image
+	@if [ ! -f "$(OVMF)" ]; then \
+	  echo "ERROR: OVMF firmware not found at $(OVMF)"; \
+	  echo "Set OVMF variable to your OVMF_CODE.fd path, e.g. make qemu OVMF=/usr/share/OVMF/OVMF_CODE.fd"; exit 1; \
+	fi
+	@echo "Starting QEMU with OVMF..."
+	$(QEMU) $(QEMU_OPTS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) -drive file=$(FAT_IMG),format=raw,if=virtio
+
+clean:
+	-rm -f $(OBJ) $(OUT) $(FAT_IMG)

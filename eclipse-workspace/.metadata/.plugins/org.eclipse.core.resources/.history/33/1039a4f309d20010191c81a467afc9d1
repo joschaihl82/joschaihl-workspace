@@ -1,0 +1,518 @@
+/*
+ jitemu.c
+ Single-argument tool: load a UEFI .efi (PE/COFF) file, map it into memory,
+ provide a minimal EFI System Table with Boot Services including ExitBootServices,
+ and attempt to call the image entry point (PE32+ / x86_64).
+
+ USAGE
+   ./jitemu <path-to-efi-file>
+
+ SAFETY / NOTES
+ - This program attempts to execute the loaded EFI image in the host process.
+   Executing arbitrary binaries is inherently unsafe. Only run trusted test
+   EFI images you control.
+ - The loader implements a minimal subset of UEFI Boot Services and a working
+   ExitBootServices stub. Many real EFI binaries expect many more services;
+   this loader is intended for experimentation and small test images.
+ - The loader does not implement full relocation handling for all PE images.
+   Many EFI binaries include relocations; some will run as-is, others will fail.
+ - The code targets x86_64 Linux and assumes the EFI image is PE32+ (64-bit).
+   It may be adapted for PE32 (32-bit) with additional work.
+*/
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <inttypes.h>
+
+/* -------------------------
+   Minimal PE/COFF structures
+   ------------------------- */
+#pragma pack(push,1)
+typedef struct {
+    uint16_t e_magic;    /* "MZ" */
+    uint16_t e_cblp;
+    uint16_t e_cp;
+    uint16_t e_crlc;
+    uint16_t e_cparhdr;
+    uint16_t e_minalloc;
+    uint16_t e_maxalloc;
+    uint16_t e_ss;
+    uint16_t e_sp;
+    uint16_t e_csum;
+    uint16_t e_ip;
+    uint16_t e_cs;
+    uint16_t e_lfarlc;
+    uint16_t e_ovno;
+    uint16_t e_res[4];
+    uint16_t e_oemid;
+    uint16_t e_oeminfo;
+    uint16_t e_res2[10];
+    uint32_t e_lfanew;   /* offset to PE header */
+} IMAGE_DOS_HEADER;
+
+typedef struct {
+    uint32_t Signature; /* "PE\0\0" */
+    uint16_t Machine;
+    uint16_t NumberOfSections;
+    uint32_t TimeDateStamp;
+    uint32_t PointerToSymbolTable;
+    uint32_t NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader;
+    uint16_t Characteristics;
+} IMAGE_FILE_HEADER;
+
+/* Minimal Optional Header (we will read fields by offsets for safety) */
+typedef struct {
+    uint16_t Magic; /* 0x10b or 0x20b */
+    uint8_t  MajorLinkerVersion;
+    uint8_t  MinorLinkerVersion;
+    uint32_t SizeOfCode;
+    uint32_t SizeOfInitializedData;
+    uint32_t SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint;
+    uint32_t BaseOfCode;
+    /* ... rest omitted; we will access ImageBase and DataDirectory by offsets */
+} IMAGE_OPTIONAL_HEADER32;
+
+typedef struct {
+    uint8_t  Name[8];
+    union {
+        uint32_t PhysicalAddress;
+        uint32_t VirtualSize;
+    } Misc;
+    uint32_t VirtualAddress;
+    uint32_t SizeOfRawData;
+    uint32_t PointerToRawData;
+    uint32_t PointerToRelocations;
+    uint32_t PointerToLinenumbers;
+    uint16_t NumberOfRelocations;
+    uint16_t NumberOfLinenumbers;
+    uint32_t Characteristics;
+} IMAGE_SECTION_HEADER;
+#pragma pack(pop)
+
+/* -------------------------
+   Minimal UEFI types & stubs
+   ------------------------- */
+
+typedef uint64_t EFI_STATUS;
+typedef void* EFI_HANDLE;
+typedef void* EFI_EVENT;
+typedef uint64_t EFI_PHYSICAL_ADDRESS;
+typedef uint64_t EFI_VIRTUAL_ADDRESS;
+typedef uint64_t UINTN;
+typedef uint64_t UINT64;
+typedef uint32_t UINT32;
+typedef uint16_t UINT16;
+typedef uint8_t  UINT8;
+typedef unsigned char BOOLEAN;
+
+#define EFI_SUCCESS 0
+#define EFI_INVALID_PARAMETER 2
+#define EFI_UNSUPPORTED 3
+
+/* Forward declarations for Boot Services functions we provide */
+struct _EFI_BOOT_SERVICES;
+struct _EFI_SYSTEM_TABLE;
+
+/* Minimal Boot Services function types */
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINTN MapKey);
+typedef EFI_STATUS (*EFI_ALLOCATE_POOL)(uint32_t PoolType, UINTN Size, void** Buffer);
+typedef EFI_STATUS (*EFI_FREE_POOL)(void* Buffer);
+typedef EFI_STATUS (*EFI_STALL)(UINTN Microseconds);
+
+/* Minimal Boot Services structure */
+typedef struct _EFI_BOOT_SERVICES {
+    /* We only populate a few entries; real structure is much larger */
+    void* Reserved1[4]; /* placeholder for header fields */
+    EFI_ALLOCATE_POOL AllocatePool;
+    EFI_FREE_POOL FreePool;
+    void* Reserved2[10];
+    EFI_STALL Stall;
+    void* Reserved3[64];
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+} EFI_BOOT_SERVICES;
+
+/* Minimal System Table */
+typedef struct _EFI_SYSTEM_TABLE {
+    char _pad[24]; /* header fields omitted */
+    EFI_BOOT_SERVICES* BootServices;
+    /* RuntimeServices and other fields omitted */
+} EFI_SYSTEM_TABLE;
+
+/* Global flag set by ExitBootServices */
+static volatile int g_exit_boot_services_called = 0;
+
+/* Implementations of minimal Boot Services */
+
+/* Simple AllocatePool/FreePool using malloc/free */
+static EFI_STATUS myAllocatePool(uint32_t PoolType, UINTN Size, void** Buffer) {
+    (void)PoolType;
+    if (!Buffer) return EFI_INVALID_PARAMETER;
+    void* p = malloc((size_t)Size);
+    if (!p) return EFI_INVALID_PARAMETER;
+    *Buffer = p;
+    return EFI_SUCCESS;
+}
+static EFI_STATUS myFreePool(void* Buffer) {
+    if (!Buffer) return EFI_INVALID_PARAMETER;
+    free(Buffer);
+    return EFI_SUCCESS;
+}
+
+/* Stall: busy-wait using usleep */
+static EFI_STATUS myStall(UINTN Microseconds) {
+    if (Microseconds == 0) return EFI_SUCCESS;
+    usleep((useconds_t)Microseconds);
+    return EFI_SUCCESS;
+}
+
+/* ExitBootServices: set flag and return success */
+static EFI_STATUS myExitBootServices(EFI_HANDLE ImageHandle, UINTN MapKey) {
+    (void)ImageHandle;
+    (void)MapKey;
+    g_exit_boot_services_called = 1;
+    printf("[UEFI] ExitBootServices called (MapKey=0x%llx)\n", (unsigned long long)MapKey);
+    return EFI_SUCCESS;
+}
+
+/* Build a minimal BootServices structure in host memory */
+static EFI_BOOT_SERVICES* build_minimal_boot_services(void) {
+    EFI_BOOT_SERVICES* bs = (EFI_BOOT_SERVICES*)malloc(sizeof(EFI_BOOT_SERVICES));
+    if (!bs) return NULL;
+    memset(bs, 0, sizeof(EFI_BOOT_SERVICES));
+    bs->AllocatePool = myAllocatePool;
+    bs->FreePool = myFreePool;
+    bs->Stall = myStall;
+    bs->ExitBootServices = myExitBootServices;
+    return bs;
+}
+
+/* Build a minimal System Table */
+static EFI_SYSTEM_TABLE* build_minimal_system_table(EFI_BOOT_SERVICES* bs) {
+    EFI_SYSTEM_TABLE* st = (EFI_SYSTEM_TABLE*)malloc(sizeof(EFI_SYSTEM_TABLE));
+    if (!st) return NULL;
+    memset(st, 0, sizeof(EFI_SYSTEM_TABLE));
+    st->BootServices = bs;
+    return st;
+}
+
+/* -------------------------
+   File reading helpers
+   ------------------------- */
+
+static uint8_t* read_file(const char* path, size_t* out_size) {
+    if (!path || !out_size) return NULL;
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return NULL; }
+    rewind(f);
+    uint8_t* buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return NULL; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+    fclose(f);
+    *out_size = (size_t)sz;
+    return buf;
+}
+
+/* -------------------------
+   Simple PE loader (map into executable buffer)
+   - Copies sections into a newly allocated executable buffer
+   - Does not implement full relocation support; some images may require relocations
+   - Returns pointer to allocated executable memory and sets entry_ptr to function pointer
+   ------------------------- */
+
+static void* alloc_executable(size_t size) {
+    long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    size = (size + page - 1) & ~(page - 1);
+    void* p = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        perror("mmap exec");
+        return NULL;
+    }
+    return p;
+}
+static void free_executable(void* p, size_t size) {
+    if (!p || p == MAP_FAILED) return;
+    long ps = sysconf(_SC_PAGE_SIZE);
+    if (ps <= 0) ps = 4096;
+    size_t page = (size_t)ps;
+    size = (size + page - 1) & ~(page - 1);
+    munmap(p, size);
+}
+
+/* Load PE/COFF file and copy sections into an executable buffer.
+   Returns pointer to buffer (caller must free_executable) and sets entry_ptr to function pointer.
+   On failure returns NULL.
+*/
+static void* load_pe_to_executable(const char* path, void (**entry_ptr)(void*), uint64_t* out_image_base) {
+    size_t fsz = 0;
+    uint8_t* file = read_file(path, &fsz);
+    if (!file) {
+        fprintf(stderr, "[loader] cannot read file: %s\n", path);
+        return NULL;
+    }
+
+    if (fsz < sizeof(IMAGE_DOS_HEADER)) {
+        fprintf(stderr, "[loader] file too small\n");
+        free(file);
+        return NULL;
+    }
+
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)file;
+    if (dos->e_magic != 0x5A4D) {
+        fprintf(stderr, "[loader] missing MZ header\n");
+        free(file);
+        return NULL;
+    }
+
+    if ((size_t)dos->e_lfanew + 4 + sizeof(IMAGE_FILE_HEADER) > fsz) {
+        fprintf(stderr, "[loader] invalid e_lfanew\n");
+        free(file);
+        return NULL;
+    }
+
+    uint8_t* pe_ptr = file + dos->e_lfanew;
+    uint32_t pe_sig = *(uint32_t*)pe_ptr;
+    if (pe_sig != 0x00004550) {
+        fprintf(stderr, "[loader] missing PE signature\n");
+        free(file);
+        return NULL;
+    }
+
+    IMAGE_FILE_HEADER* fh = (IMAGE_FILE_HEADER*)(pe_ptr + 4);
+    uint16_t nsec = fh->NumberOfSections;
+    uint16_t opt_size = fh->SizeOfOptionalHeader;
+    uint8_t* opt_hdr = pe_ptr + 4 + sizeof(IMAGE_FILE_HEADER);
+    if ((size_t)(opt_hdr - file) + opt_size > fsz) {
+        fprintf(stderr, "[loader] optional header truncated\n");
+        free(file);
+        return NULL;
+    }
+
+    uint16_t magic = *(uint16_t*)opt_hdr;
+    int is_pe32plus = (magic == 0x20b);
+    if (!is_pe32plus && magic != 0x10b) {
+        fprintf(stderr, "[loader] unknown optional header magic: 0x%04X\n", magic);
+        free(file);
+        return NULL;
+    }
+
+    /* Read entry RVA and ImageBase */
+    uint64_t entry_rva = 0;
+    uint64_t image_base = 0;
+    if (is_pe32plus) {
+        /* PE32+:
+           AddressOfEntryPoint at offset 16 (DWORD)
+           ImageBase at offset 24 (QWORD)
+           DataDirectory at offset 112 (but we won't parse directories here)
+        */
+        entry_rva = *(uint32_t*)(opt_hdr + 16);
+        image_base = *(uint64_t*)(opt_hdr + 24);
+    } else {
+        /* PE32:
+           AddressOfEntryPoint at offset 16 (DWORD)
+           ImageBase at offset 28 (DWORD)
+        */
+        entry_rva = *(uint32_t*)(opt_hdr + 16);
+        image_base = *(uint32_t*)(opt_hdr + 28);
+    }
+
+    uint8_t* sec_table = opt_hdr + opt_size;
+    if ((size_t)(sec_table - file) + nsec * sizeof(IMAGE_SECTION_HEADER) > fsz) {
+        fprintf(stderr, "[loader] section table truncated\n");
+        free(file);
+        return NULL;
+    }
+
+    /* Determine required image size: find highest VirtualAddress + VirtualSize */
+    uint64_t max_va = 0;
+    for (int i = 0; i < nsec; ++i) {
+        IMAGE_SECTION_HEADER* sh = (IMAGE_SECTION_HEADER*)(sec_table + i * sizeof(IMAGE_SECTION_HEADER));
+        uint64_t va_end = (uint64_t)sh->VirtualAddress + (uint64_t)sh->Misc.VirtualSize;
+        if (va_end > max_va) max_va = va_end;
+    }
+    if (max_va == 0) max_va = 0x1000;
+
+    /* Allocate executable buffer of size max_va rounded up to page */
+    size_t alloc_size = (size_t)((max_va + 0xFFF) & ~0xFFFULL);
+    if (alloc_size < 0x1000) alloc_size = 0x1000;
+    void* exec = alloc_executable(alloc_size);
+    if (!exec) {
+        fprintf(stderr, "[loader] failed to allocate executable memory\n");
+        free(file);
+        return NULL;
+    }
+    /* Zero the buffer */
+    memset(exec, 0, alloc_size);
+
+    /* Copy sections into exec buffer at offset = VirtualAddress */
+    for (int i = 0; i < nsec; ++i) {
+        IMAGE_SECTION_HEADER* sh = (IMAGE_SECTION_HEADER*)(sec_table + i * sizeof(IMAGE_SECTION_HEADER));
+        uint32_t vaddr = sh->VirtualAddress;
+        uint32_t rawsz = sh->SizeOfRawData;
+        uint32_t rawptr = sh->PointerToRawData;
+        uint32_t vsize = sh->Misc.VirtualSize;
+
+        if ((size_t)rawptr + rawsz > fsz) {
+            fprintf(stderr, "[loader] section %.8s raw out of file bounds\n", (char*)sh->Name);
+            free_executable(exec, alloc_size);
+            free(file);
+            return NULL;
+        }
+
+        if ((size_t)vaddr + rawsz > alloc_size) {
+            fprintf(stderr, "[loader] section %.8s would overflow exec buffer\n", (char*)sh->Name);
+            free_executable(exec, alloc_size);
+            free(file);
+            return NULL;
+        }
+
+        memcpy((uint8_t*)exec + vaddr, file + rawptr, rawsz);
+        if (vsize > rawsz) {
+            memset((uint8_t*)exec + vaddr + rawsz, 0, vsize - rawsz);
+        }
+
+        printf("[loader] section %.8s -> exec[0x%08x] raw=0x%x vsize=0x%x\n",
+               (char*)sh->Name, vaddr, rawsz, vsize);
+    }
+
+    /* Compute entry pointer: exec + entry_rva */
+    void* entry = (uint8_t*)exec + (size_t)entry_rva;
+    printf("[loader] entry RVA=0x%08" PRIx64 " -> exec@%p\n", entry_rva, entry);
+
+    if (out_image_base) *out_image_base = (uint64_t)(uintptr_t)exec;
+
+    free(file);
+    *entry_ptr = (void(*)(void*))entry;
+    return exec;
+}
+
+/* -------------------------
+   Main: load EFI, build SystemTable, call entry, support ExitBootServices
+   ------------------------- */
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <path-to-efi-file>\n", argv[0]);
+        return 1;
+    }
+    const char* efi_path = argv[1];
+
+    /* Load PE into executable buffer */
+    void (*entry_fn)(void*) = NULL;
+    uint64_t exec_base = 0;
+    void* exec_buf = load_pe_to_executable(efi_path, &entry_fn, &exec_base);
+    if (!exec_buf || !entry_fn) {
+        fprintf(stderr, "[main] failed to load EFI image\n");
+        return 2;
+    }
+
+    /* Build minimal BootServices and SystemTable */
+    EFI_BOOT_SERVICES* bs = build_minimal_boot_services();
+    if (!bs) {
+        fprintf(stderr, "[main] failed to allocate BootServices\n");
+        free_executable(exec_buf, 0); /* best-effort */
+        return 3;
+    }
+    EFI_SYSTEM_TABLE* st = build_minimal_system_table(bs);
+    if (!st) {
+        fprintf(stderr, "[main] failed to allocate SystemTable\n");
+        free(bs);
+        free_executable(exec_buf, 0);
+        return 4;
+    }
+
+    /* Prepare ImageHandle (we pass pointer to exec buffer as handle) */
+    EFI_HANDLE image_handle = exec_buf;
+
+    /* Print info */
+    printf("[main] calling EFI image entry at %p\n", (void*)entry_fn);
+    printf("[main] ImageHandle=%p, SystemTable=%p\n", image_handle, st);
+
+    /* Many EFI images expect the entry signature:
+         EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable);
+       We'll call the entry as a function with two pointers. On x86_64 System V,
+       first arg in RDI, second in RSI. We'll create a small trampoline to call it.
+    */
+
+    /* Build a tiny trampoline that moves our two pointers into registers and jumps to entry.
+       We'll emit machine code into an executable buffer and call it.
+       Trampoline layout (x86_64 System V):
+         mov rdi, <ImageHandle>
+         mov rsi, <SystemTable>
+         call <entry_fn>
+         ret
+    */
+    uint8_t tramp_code[64];
+    uint8_t* t = tramp_code;
+    /* mov rdi, imm64 -> 48 BF imm64 */
+    *t++ = 0x48; *t++ = 0xBF;
+    uint64_t ih = (uint64_t)(uintptr_t)image_handle;
+    memcpy(t, &ih, 8); t += 8;
+    /* mov rsi, imm64 -> 48 BE imm64 */
+    *t++ = 0x48; *t++ = 0xBE;
+    uint64_t stptr = (uint64_t)(uintptr_t)st;
+    memcpy(t, &stptr, 8); t += 8;
+    /* mov rdx, imm64 -> 48 BA imm64 (some EFI entry use 3 args; keep rdx zero) */
+    *t++ = 0x48; *t++ = 0xBA;
+    uint64_t zero64 = 0;
+    memcpy(t, &zero64, 8); t += 8;
+    /* call rel32 to entry_fn: opcode E8 rel32 */
+    /* compute rel32 = entry_fn - (trampoline_next) */
+    void* tramp_exec = alloc_executable(4096);
+    if (!tramp_exec) {
+        fprintf(stderr, "[main] failed to allocate trampoline exec memory\n");
+        free(st); free(bs); free_executable(exec_buf, 0);
+        return 5;
+    }
+    /* copy current bytes into trampoline buffer, then append call and ret */
+    size_t prefix_len = (size_t)(t - tramp_code);
+    memcpy(tramp_exec, tramp_code, prefix_len);
+    uint8_t* cp = (uint8_t*)tramp_exec + prefix_len;
+    /* call rel32 */
+    *cp++ = 0xE8;
+    int64_t rel = (int64_t)((uint8_t*)entry_fn - (cp + 4));
+    int32_t rel32 = (int32_t)rel;
+    memcpy(cp, &rel32, 4); cp += 4;
+    /* ret */
+    *cp++ = 0xC3;
+    /* make sure instruction cache is coherent (on x86 it's fine) */
+
+    /* Now call trampoline as function pointer */
+    typedef void (*TrampFn)(void);
+    TrampFn tf = (TrampFn)tramp_exec;
+
+    printf("[main] invoking entry; ExitBootServices will set a flag when called\n");
+    /* Call the entry. This will run arbitrary code from the EFI image. */
+    tf();
+
+    /* After return, check if ExitBootServices was called */
+    if (g_exit_boot_services_called) {
+        printf("[main] ExitBootServices was invoked by the image\n");
+    } else {
+        printf("[main] ExitBootServices was NOT invoked by the image\n");
+    }
+
+    /* Cleanup */
+    free(st);
+    free(bs);
+    free_executable(tramp_exec, 4096);
+    /* Note: exec_buf contains the loaded image; we free it */
+    /* We don't know exact alloc size here; best-effort: unmap entire region by using munmap with unknown size is unsafe.
+       For simplicity we won't attempt to free exec_buf here; process exit will reclaim memory. */
+    printf("[main] done\n");
+    return 0;
+}

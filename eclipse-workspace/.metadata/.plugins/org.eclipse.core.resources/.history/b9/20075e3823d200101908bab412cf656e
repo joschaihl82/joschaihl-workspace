@@ -1,0 +1,70 @@
+# Makefile (mtools-only image creation)
+CROSS ?= x86_64-w64-mingw32-
+CC	:= $(CROSS)gcc
+
+SRC := kernel.c
+OBJS := kernel.o
+OUT := kernel.efi
+EFI_NAME := BOOTX64.EFI
+
+LDSCRIPT := linker.ld
+
+# Image and QEMU settings
+FAT_IMG := fat.img
+# Default image size (adjust if you need a larger image)
+FAT_SIZE := 2M
+
+OVMF ?= /usr/share/OVMF/OVMF_CODE.fd
+QEMU := qemu-system-x86_64
+QEMU_OPTS := -m 512 -serial mon:stdio -display none
+
+CFLAGS := -ffreestanding -fno-stack-protector -O2 -nostdlib -Wall -Wextra -c
+LINKER_FLAGS := -Wl,-T,$(LDSCRIPT) -Wl,-e,efi_main -Wl,--subsystem,10 -Wl,--image-base,0
+
+# mtools utilities (required)
+MFORMAT := $(shell command -v mformat 2>/dev/null || true)
+MCOPY   := $(shell command -v mcopy 2>/dev/null || true)
+MMD	 := $(shell command -v mmd 2>/dev/null || true)
+
+.PHONY: all clean image qemu
+
+all: $(OUT)
+
+# compile
+%.o: %.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+# link (use -nostdlib to avoid CRT)
+$(OUT): $(OBJS) $(LDSCRIPT)
+	$(CC) -nostdlib $(OBJS) $(LINKER_FLAGS) -o $@
+
+# Create FAT image and copy EFI binary using mtools only
+# Requires: mformat, mmd, mcopy
+image: $(OUT)
+	@if [ -z "$(MFORMAT)" ] || [ -z "$(MCOPY)" ] || [ -z "$(MMD)" ]; then \
+	  echo "ERROR: mtools (mformat, mcopy, mmd) not found in PATH. Install mtools and retry."; exit 1; \
+	fi
+	@echo "Creating FAT image $(FAT_IMG) (size=$(FAT_SIZE)) using mtools..."
+	-rm -f $(FAT_IMG)
+	# create sparse file of requested size
+	dd if=/dev/zero of=$(FAT_IMG) bs=1 count=0 seek=$(FAT_SIZE)
+	# format the image with mformat (mtools will create a FAT filesystem inside the file)
+	# -i specifies the image file; -F forces creation; -f 1440 is a common floppy size fallback if needed.
+	# For most mtools versions the simple invocation below formats the image; adjust options if your mformat requires them.
+	mformat -i $(FAT_IMG) ::
+	# create directories and copy EFI binary
+	mmd -i $(FAT_IMG) ::/EFI || true
+	mmd -i $(FAT_IMG) ::/EFI/BOOT || true
+	# copy the EFI binary into the image
+	mcopy -i $(FAT_IMG) $(OUT) ::/EFI/BOOT/$(EFI_NAME)
+	@echo "Image ready: $(FAT_IMG)"
+
+# build, create image, and run in QEMU with OVMF
+qemu: all image
+	@if [ ! -f "$(OVMF)" ]; then \
+	  echo "OVMF firmware not found at $(OVMF); set OVMF to your OVMF_CODE.fd path."; exit 1; \
+	fi
+	$(QEMU) $(QEMU_OPTS) -drive if=pflash,format=raw,readonly=on,file=$(OVMF) -drive file=$(FAT_IMG),format=raw,if=virtio
+
+clean:
+	-rm -f $(OBJS) $(OUT) $(FAT_IMG)

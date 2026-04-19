@@ -1,0 +1,1963 @@
+// Define _POSIX_C_SOURCE suppress the warning against use of `strndup()`
+#define _POSIX_C_SOURCE 200809L
+
+#include <ctype.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* -------------------------
+   Types and forward decls
+   ------------------------- */
+
+typedef struct Type Type;
+typedef struct Member Member;
+
+//
+// token.c
+//
+
+// Kind of tokens
+typedef enum {
+  TK_RESERVED, // Symbol
+  TK_SIZEOF,   // `sizeof` operator
+  TK_IDENT,    // Identifier
+  TK_STR,      // String literals
+  TK_NUM,      // Integer literals
+  TK_EOF,      // Token representing the end of input
+} TokenKind;
+
+// Type of tokens
+typedef struct Token Token;
+struct Token {
+  TokenKind kind; // Type of a token
+  Token *next;    // Next token
+  int val;        // Value of a token if its kind is TK_NUM
+  char *str;      // String of a token
+  int len;        // Length of a token
+
+  // Strings
+  char *contents; // String literal contents including terminating '\0'
+  int cont_len;   // String literal length
+};
+
+// Type of variables
+typedef struct Var Var;
+struct Var {
+  char *name;    // Name of a variable
+  Type *type;    // Type of a variable
+  bool is_local; // Whether a variable is local or not (global)
+
+  // Local variable
+  int offset; // Offset from RBP (base pointer)
+
+  // Global variable
+  char *contents; // String literal contents including terminating '\0'
+  int cont_len;   // String literal length
+};
+
+// List of variables
+typedef struct VarList VarList;
+struct VarList {
+  VarList *next;
+  Var *var;
+};
+
+void error(char *fmt, ...);
+void error_tok(Token *tok, char *fmt, ...);
+Token *peek(char *s);
+Token *consume(char *op);
+Token *consume_ident();
+void expect(char *s);
+int expect_number();
+char *expect_ident();
+Token *tokenize();
+
+extern char *filename;
+extern char *user_input;
+extern Token *token;
+
+//
+// parse.c
+//
+
+// Kind of nodes in an abstract syntax tree (AST)
+typedef enum {
+  ND_ADD,       // num + num
+  ND_PTR_ADD,   // ptr + num or num + ptr
+  ND_SUB,       // num - num
+  ND_PTR_SUB,   // ptr - num
+  ND_PTR_DIFF,  // ptr - ptr
+  ND_MUL,       // *
+  ND_DIV,       // /
+  ND_EQ,        // ==
+  ND_NE,        // !=
+  ND_LT,        // <
+  ND_LE,        // <=
+  ND_ASSIGN,    // =
+  ND_MEMBER,    // . (struct member access)
+  ND_ADDR,      // & (address-of operator)
+  ND_DEREF,     // * (dereference operator)
+  ND_RETURN,    // "return"
+  ND_IF,        // "if"
+  ND_WHILE,     // "while"
+  ND_FOR,       // "for"
+  ND_EXPR_STMT, // Expression statement
+  ND_STMT_EXPR, // GNU statement expression
+  ND_BLOCK,     // Block (compound) statement { ... }
+  ND_CALL,      // Function call
+  ND_VAR,       // Variable
+  ND_NUM,       // Integer
+  ND_NULL,      // Empty expression
+} NodeKind;
+
+// Type of nodes in an abstract syntax tree (AST)
+typedef struct Node Node;
+struct Node {
+  NodeKind kind; // Kind of a node
+  Node *next;    // Next node
+  Token *tok;    // Representative token
+  Type *type;    // Type of a node
+
+  Node *lhs; // Left-hand side
+  Node *rhs; // Right-hand side
+
+  // "if", "while" or "for" statement
+  Node *cond; // Condition in "if", "while" or "for"
+  Node *cons; // Consequence in "if", "whle" or "for"
+  Node *alt;  // Alternative in "if"
+  Node *init; // Initialization in "for"
+  Node *updt; // Update in "for"
+
+  // Block, function body, or statement expression
+  Node *body;
+
+  // Struct member
+  Member *member;
+
+  // Function call or definition
+  char *func_name; // Function name
+  Node *args;      // Function arguments
+
+  Var *var; // Variable itself if kind is ND_VAR
+  long val; // Value of an integer if kind is ND_NUM
+};
+
+// Type of functions
+typedef struct Function Function;
+struct Function {
+  char *name;      // Name of a function
+  VarList *params; // Parameters of a function
+
+  Node *node;      // The first statement in a function
+  VarList *locals; // Local variables
+  int stack_size;  // Stack size
+
+  Function *next; // Next function
+};
+
+typedef struct {
+  VarList *globals;
+  Function *fns;
+} Program;
+
+Program *program();
+
+//
+// codegen.c
+//
+
+void codegen(Program *prog);
+
+//
+// type.c
+//
+
+typedef enum {
+  TYPE_CHAR,
+  TYPE_INT,
+  TYPE_PTR,
+  TYPE_ARRAY,
+  TYPE_STRUCT,
+} TypeKind;
+
+struct Type {
+  TypeKind kind;   // Kind of type
+  int size;        // sizeof() value
+  int align;       // Alignment
+  Type *base;      // Base type
+  int array_len;   // Length of an array
+  Member *members; // Struct members
+};
+
+// Struct member
+struct Member {
+  Member *next;
+  Type *type;
+  char *name;
+  int offset;
+};
+
+bool is_integer(Type *type);
+int align_to(int n, int align);
+Type *pointer_to(Type *type);
+Type *array_of(Type *base, int size);
+void add_type(Node *node);
+
+extern Type *char_type;
+extern Type *int_type;
+
+
+/* -------------------------
+   Global variables
+   ------------------------- */
+
+// Source code file name
+char *filename;
+// User input source code
+char *user_input;
+
+// Current token
+Token *token;
+
+/* -------------------------
+   Utilities and error handling
+   ------------------------- */
+
+// Prints an error.
+void error(char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  exit(1);
+}
+
+// Reports an error message in the following format and exit.
+//
+// file.c:10: x = y + 1;
+//                ^ <error message here>
+void verror_at(char *loc, char *fmt, va_list ap) {
+  // Find a line containing `loc`
+  char *line = loc;
+  while (user_input < line && line[-1] != '\n') {
+    line--;
+  }
+
+  char *end = loc;
+  while (*end != '\n' && *end != '\0') {
+    end++;
+  }
+
+  // Get a line number
+  int line_num = 1;
+  for (char *p = user_input; p < line; p++) {
+    if (*p == '\n') {
+      line_num++;
+    }
+  }
+
+  // Print out the line
+  int indent = fprintf(stderr, "%s:%d: ", filename ? filename : "<input>", line_num);
+  fprintf(stderr, "%.*s\n", (int)(end - line), line);
+
+  // Show the error message
+  int pos = (int)(loc - line) + indent;
+  fprintf(stderr, "%*s^ ", pos, ""); // Print leading whitespaces
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  exit(1);
+}
+
+void error_at(char *loc, char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verror_at(loc, fmt, ap);
+}
+
+void error_tok(Token *tok, char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verror_at(tok->str, fmt, ap);
+}
+
+/* -------------------------
+   Token helpers and tokenizer
+   ------------------------- */
+
+// Returns its token if the current token matches a given string s which is a
+// reserved keyword or an operator, otherwise returns NULL.
+Token *peek(char *s) {
+  if (token->kind != TK_RESERVED || strlen(s) != token->len ||
+      strncmp(token->str, s, token->len)) {
+    return NULL;
+  }
+  return token;
+}
+
+// Consumes the current token and returns true if it matches `op`, otherwise
+// does nothing and returns false.
+Token *consume(char *op) {
+  if (token->kind != TK_RESERVED || strlen(op) != token->len ||
+      strncmp(token->str, op, token->len)) {
+    return NULL;
+  }
+
+  Token *t = token;
+  // Advance the current token
+  token = token->next;
+  return t;
+}
+
+// Consumes the current token and returns an identifier if it is an identifier,
+// otherwise does nothing and returns NULL.
+Token *consume_ident() {
+  if (token->kind != TK_IDENT) {
+    return NULL;
+  }
+
+  Token *tok = token;
+  // Advance the current token
+  token = token->next;
+  return tok;
+}
+
+// Advances to a next token if the next token is an expected symbol,
+// otherwise reports an error.
+void expect(char *s) {
+  if (!peek(s)) {
+    error_tok(token, "Expected \"%s\"", s);
+  }
+  token = token->next;
+}
+
+// Returns an integer and advances to a next token if the current token is an
+// integer, otherwise reports an error.
+int expect_number() {
+  if (token->kind != TK_NUM) {
+    error_tok(token, "Expected an integer, but got a non-integer.");
+  }
+  int val = token->val;
+  token = token->next;
+  return val;
+}
+
+// Returns an identifier and advances to a next token if the current token is an
+// identifier, otherwise reports an error.
+char *expect_ident() {
+  if (token->kind != TK_IDENT) {
+    error_tok(token, "Expected an identifier, but got a non-identifier.");
+  }
+  char *s = strndup(token->str, token->len);
+  token = token->next;
+  return s;
+}
+
+// Creates a new token and links it to the current token `cur`.
+Token *new_token(TokenKind kind, Token *cur, char *str, int len) {
+  Token *tok = calloc(1, sizeof(Token));
+  tok->kind = kind;
+  tok->str = str;
+  tok->len = len;
+  cur->next = tok;
+  return tok;
+}
+
+bool start_with(char *s, char *prefix) {
+  return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+bool is_alpha(char c) {
+  return ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z') || (c == '_');
+}
+
+bool is_alphanum(char c) { return is_alpha(c) || ('0' <= c && c <= '9'); }
+
+// Reads a reserved symbol or keyword from `p`. If no reserved token is found,
+// it returns NULL.
+char *read_reserved(char *p) {
+  // Keywords
+  char *kw[] = {"return", "if",   "else",   "while",  "for",
+                "int",    "char", "struct", "sizeof", "typedef"};
+
+  for (int i = 0; i < (int)(sizeof(kw) / sizeof(*kw)); i++) {
+    int len = (int)strlen(kw[i]);
+    if (start_with(p, kw[i]) && !is_alphanum(p[len])) {
+      return kw[i];
+    }
+  }
+
+  // Multi-letter punctuators
+  char *ops[] = {"==", "!=", "<=", ">=", "->"};
+
+  for (int i = 0; i < (int)(sizeof(ops) / sizeof(*ops)); i++) {
+    if (start_with(p, ops[i])) {
+      return ops[i];
+    }
+  }
+
+  return NULL;
+}
+
+char get_escape_char(char c) {
+  switch (c) {
+  case 'a':
+    return '\a';
+  case 'b':
+    return '\b';
+  case 't':
+    return '\t';
+  case 'n':
+    return '\n';
+  case 'v':
+    return '\v';
+  case 'f':
+    return '\f';
+  case 'r':
+    return '\r';
+  case 'e':
+    return 27;
+  case '0':
+    return 0;
+  default:
+    return c;
+  }
+}
+
+Token *read_string_literal(Token *cur, char *start) {
+  char *p = start + 1;
+  char buf[1024];
+  int len = 0;
+
+  for (;;) {
+    if (len == (int)sizeof(buf)) {
+      error_at(start, "string literal too large");
+    }
+    if (*p == '\0') {
+      error_at(start, "unclosed string literal");
+    }
+    if (*p == '"') {
+      break;
+    }
+
+    if (*p == '\\') {
+      p++;
+      buf[len] = get_escape_char(*p);
+    } else {
+      buf[len] = *p;
+    }
+    len++;
+    p++;
+  }
+
+  Token *tok = new_token(TK_STR, cur, start, (int)(p - start + 1));
+  tok->contents = strndup(buf, len);
+  tok->cont_len = len + 1;
+  return tok;
+}
+
+// Tokenizes an input string `p` and returns the first token.
+Token *tokenize() {
+  char *p = user_input;
+  Token head = {};
+  Token *cur = &head;
+
+  while (*p) {
+    // Whitespaces
+    if (isspace((unsigned char)*p)) {
+      p++;
+      continue;
+    }
+
+    // Skip a line comment
+    if (start_with(p, "//")) {
+      p += 2;
+      while (*p && *p != '\n') {
+        p++;
+      }
+      continue;
+    }
+
+    // Skip a block comment
+    if (start_with(p, "/*")) {
+      char *start = strstr(p + 2, "*/");
+      if (!start) {
+        error_at(p, "unclosed block comment");
+      }
+      p = start + 2;
+      continue;
+    }
+
+    // String literals
+    if (*p == '"') {
+      cur = read_string_literal(cur, p);
+      p += cur->len;
+      continue;
+    }
+
+    // Keywords or multi-letter punctuators
+    char *kw = read_reserved(p);
+    if (kw) {
+      int len = (int)strlen(kw);
+      cur = new_token(TK_RESERVED, cur, p, len);
+      p += len;
+      continue;
+    }
+
+    // Identifiers
+    if (is_alpha(*p)) {
+      char *name = p;
+      while (is_alphanum(*p)) {
+        p++;
+      }
+      cur = new_token(TK_IDENT, cur, name, (int)(p - name));
+      continue;
+    }
+
+    // Single-letter punctuators
+    if (ispunct((unsigned char)*p)) {
+      cur = new_token(TK_RESERVED, cur, p++, 1);
+      continue;
+    }
+
+    // Numbers
+    if (isdigit((unsigned char)*p)) {
+      cur = new_token(TK_NUM, cur, p, 0);
+      char *prev = p;
+      cur->val = (int)strtol(p, &p, 10);
+      cur->len = (int)(p - prev);
+      continue;
+    }
+
+    error_at(p, "Could not tokenize the string.");
+  }
+
+  new_token(TK_EOF, cur, p, 0);
+  return head.next;
+}
+
+/* -------------------------
+   Types and type helpers
+   ------------------------- */
+
+Type *char_type = &(Type){.kind = TYPE_CHAR, .size = 1, .align = 1};
+Type *int_type = &(Type){.kind = TYPE_INT, .size = 8, .align = 8};
+
+bool is_integer(Type *type) {
+  return type->kind == TYPE_CHAR || type->kind == TYPE_INT;
+}
+
+// Aligns `n` to the multiple of `align`.
+//
+// How to compute padding is explained at
+// https://en.wikipedia.org/wiki/Data_structure_alignment#Computing_padding.
+int align_to(int n, int align) { return (n + align - 1) & ~(align - 1); }
+
+Type *new_type(TypeKind kind, int size, int align) {
+  Type *type = calloc(1, sizeof(Type));
+  type->kind = kind;
+  type->size = size;
+  type->align = align;
+  return type;
+}
+
+Type *pointer_to(Type *base) {
+  Type *type = new_type(TYPE_PTR, 8, 8);
+  type->base = base;
+  return type;
+}
+
+Type *array_of(Type *base, int len) {
+  Type *type = new_type(TYPE_ARRAY, base->size * len, base->align);
+  type->base = base;
+  type->array_len = len;
+  return type;
+}
+
+/* -------------------------
+   AST type propagation
+   ------------------------- */
+
+void add_type(Node *node) {
+  if (!node || node->type) {
+    return;
+  }
+
+  add_type(node->lhs);
+  add_type(node->rhs);
+  add_type(node->cond);
+  add_type(node->cons);
+  add_type(node->alt);
+  add_type(node->init);
+  add_type(node->updt);
+
+  for (Node *n = node->body; n; n = n->next) {
+    add_type(n);
+  }
+  for (Node *n = node->args; n; n = n->next) {
+    add_type(n);
+  }
+
+  switch (node->kind) {
+  case ND_ADD:
+  case ND_SUB:
+  case ND_PTR_DIFF:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_CALL:
+  case ND_NUM:
+    node->type = int_type;
+    return;
+  case ND_PTR_ADD:
+  case ND_PTR_SUB:
+  case ND_ASSIGN:
+    node->type = node->lhs->type;
+    return;
+  case ND_VAR:
+    node->type = node->var->type;
+    return;
+  case ND_MEMBER:
+    node->type = node->member->type;
+    return;
+  case ND_ADDR:
+    if (node->lhs->type->kind == TYPE_ARRAY) {
+      node->type = pointer_to(node->lhs->type->base);
+    } else {
+      node->type = pointer_to(node->lhs->type);
+    }
+    return;
+  case ND_DEREF:
+    if (!node->lhs->type->base) {
+      error_tok(node->tok, "invalid pointer dereference");
+    }
+    node->type = node->lhs->type->base;
+    return;
+  case ND_STMT_EXPR: {
+    // Get the last statement
+    Node *last = node->body;
+    while (last->next) {
+      last = last->next;
+    }
+
+    node->type = last->type;
+    return;
+  }
+  default:
+    // This section is meaningless but added to suppress -Wswitch compiler
+    // warning
+    break;
+  }
+}
+
+/* -------------------------
+   Scopes and variables
+   ------------------------- */
+
+// Scope for local variables, global variables and typedefs
+typedef struct VarScope VarScope;
+struct VarScope {
+  VarScope *next;
+  char *name;
+  Var *var;
+  Type *type_def;
+};
+
+// Scope for struct tags
+typedef struct TagScope TagScope;
+struct TagScope {
+  TagScope *next;
+  char *name;
+  Type *type;
+};
+
+typedef struct {
+  VarScope *var_scope;
+  TagScope *tag_scope;
+} Scope;
+
+// All local and global variable instances created during parsing are
+// accumulated to these lists respectively.
+VarList *locals;
+VarList *globals;
+
+// C has two block scopes; one is for variables/typedefs and the other is for
+// struct tags.
+VarScope *var_scope;
+TagScope *tag_scope;
+
+// Begins a block scope.
+Scope *enter_scope() {
+  Scope *sc = calloc(1, sizeof(Scope));
+  sc->var_scope = var_scope;
+  sc->tag_scope = tag_scope;
+  return sc;
+}
+
+// Ends the block scope.
+void leave_scope(Scope *sc) {
+  var_scope = sc->var_scope;
+  tag_scope = sc->tag_scope;
+}
+
+// Finds a variable or a typedef by name. If a variable with the name is not
+// found, it returns NULL.
+VarScope *find_var(Token *tok) {
+  for (VarScope *sc = var_scope; sc; sc = sc->next) {
+    if (strlen(sc->name) == (size_t)tok->len &&
+        !strncmp(tok->str, sc->name, tok->len)) {
+      return sc;
+    }
+  }
+
+  return NULL;
+}
+
+// Finds a struct tag by name. If a struct tag with the name is not found,
+// it returns NULL.
+TagScope *find_tag(Token *tok) {
+  for (TagScope *sc = tag_scope; sc; sc = sc->next) {
+    if (strlen(sc->name) == (size_t)tok->len &&
+        !strncmp(tok->str, sc->name, tok->len)) {
+      return sc;
+    }
+  }
+  return NULL;
+}
+
+Node *new_node(NodeKind kind, Token *tok) {
+  Node *node = calloc(1, sizeof(Node));
+  node->kind = kind;
+  node->tok = tok;
+  return node;
+}
+
+Node *new_unary(NodeKind kind, Node *expr, Token *tok) {
+  Node *node = new_node(kind, tok);
+  node->lhs = expr;
+  return node;
+}
+
+Node *new_binary(NodeKind kind, Node *lhs, Node *rhs, Token *tok) {
+  Node *node = new_node(kind, tok);
+  node->lhs = lhs;
+  node->rhs = rhs;
+  return node;
+}
+
+Node *new_num(int val, Token *tok) {
+  Node *node = new_node(ND_NUM, tok);
+  node->val = val;
+  return node;
+}
+
+VarScope *push_scope(char *name) {
+  VarScope *sc = calloc(1, sizeof(VarScope));
+  sc->name = name;
+  sc->next = var_scope;
+  var_scope = sc;
+  return sc;
+}
+
+// Creates a list of variables.
+VarList *new_var_list(Var *var) {
+  VarList *vl = calloc(1, sizeof(VarList));
+  vl->var = var;
+  return vl;
+}
+
+// Creates a new local or global variable with the given name, based on
+// `is_local` flag.
+Var *new_var(char *name, Type *type, bool is_local) {
+  Var *var = calloc(1, sizeof(Var));
+  var->name = name;
+  var->type = type;
+  var->is_local = is_local;
+  return var;
+}
+
+// Creates a new local variable with the given name.
+Var *new_local_var(char *name, Type *type) {
+  Var *var = new_var(name, type, true);
+  push_scope(name)->var = var;
+
+  VarList *vl = new_var_list(var);
+  vl->next = locals;
+  locals = vl;
+
+  return var;
+}
+
+// Creates a new global variable with the given name.
+Var *new_global_var(char *name, Type *type) {
+  Var *var = new_var(name, type, false);
+  push_scope(name)->var = var;
+
+  VarList *vl = new_var_list(var);
+  vl->next = globals;
+  globals = vl;
+
+  return var;
+}
+
+// Creates a new local variable node with the given name.
+Node *new_var_node(Var *var, Token *tok) {
+  Node *node = new_node(ND_VAR, tok);
+  node->var = var;
+  return node;
+}
+
+// Finds a typedef by a token. If a typedef specified by the token is not found,
+// it returns NULL.
+Type *find_typedef(Token *tok) {
+  if (tok->kind == TK_IDENT) {
+    VarScope *sc = find_var(tok);
+    if (sc) {
+      return sc->type_def;
+    }
+  }
+  return NULL;
+}
+
+bool at_eof(void) { return token->kind == TK_EOF; }
+
+/* -------------------------
+   Parser forward declarations
+   ------------------------- */
+
+// Function declarations
+Type *basetype();
+Type *struct_decl();
+Member *struct_member();
+void global_var();
+Function *function();
+Node *stmt();
+Node *stmt_inner();
+Node *declaration();
+Node *expr();
+Node *assign();
+Node *equality();
+Node *relational();
+Node *add();
+Node *mul();
+Node *unary();
+Node *postfix();
+Node *primary();
+Node *stmt_expr();
+Node *func_args();
+
+/* -------------------------
+   Parser implementation
+   ------------------------- */
+
+// Determines whether the next top-level item is a function or a global variable
+// by looking ahead input tokens.
+bool is_function() {
+  Token *tok = token;
+  basetype();
+  bool is_func = consume_ident() && consume("(");
+  token = tok;
+  return is_func;
+}
+
+// program = (global-var | function)*
+Program *program() {
+  Function head = {};
+  Function *cur = &head;
+  globals = NULL;
+
+  while (!at_eof()) {
+    if (is_function()) {
+      cur->next = function();
+      cur = cur->next;
+    } else {
+      global_var();
+    }
+  }
+
+  Program *prog = calloc(1, sizeof(Program));
+  prog->globals = globals;
+  prog->fns = head.next;
+  return prog;
+}
+
+// Returns true if the next token represents a type.
+bool is_type_name(Token *tok) {
+  return peek("char") || peek("int") || peek("struct") || find_typedef(token);
+}
+
+// basetype = ("char" | "int" | struct-decl | typedef-name) "*"*
+Type *basetype() {
+  if (!is_type_name(token)) {
+    error_tok(token, "unknown type name");
+  }
+
+  // Parse type name
+  Type *type;
+  if (consume("char")) {
+    type = char_type;
+  } else if (consume("int")) {
+    type = int_type;
+  } else if (consume("struct")) {
+    type = struct_decl();
+  } else {
+    type = find_var(consume_ident())->type_def;
+  }
+
+  // Parse pointer symbols
+  while (consume("*")) {
+    type = pointer_to(type);
+  }
+
+  return type;
+}
+
+void push_tag_scope(Token *tok, Type *type) {
+  TagScope *sc = calloc(1, sizeof(TagScope));
+  sc->next = tag_scope;
+  sc->name = strndup(tok->str, tok->len);
+  sc->type = type;
+  tag_scope = sc;
+}
+
+// struct-decl = "struct" ident
+//             | "struct" ident? "{" struct-member* "}"
+Type *struct_decl() {
+  // Read a struct tag
+  Token *tag = consume_ident();
+  if (tag && !peek("{")) {
+    TagScope *sc = find_tag(tag);
+    if (!sc) {
+      error_tok(tag, "unknown struct type");
+    }
+    return sc->type;
+  }
+
+  expect("{");
+
+  // Read struct members
+  Member head = {};
+  Member *cur = &head;
+  while (!consume("}")) {
+    cur->next = struct_member();
+    cur = cur->next;
+  }
+
+  Type *type = calloc(1, sizeof(Type));
+  type->kind = TYPE_STRUCT;
+  type->members = head.next;
+
+  // Assign offsets within the struct to members
+  int offset = 0;
+  for (Member *m = type->members; m; m = m->next) {
+    offset = align_to(offset, m->type->align);
+    m->offset = offset;
+    offset += m->type->size;
+
+    if (type->align < m->type->align) {
+      type->align = m->type->align;
+    }
+  }
+  type->size = align_to(offset, type->align);
+
+  // Register the struct type if a name is given
+  if (tag) {
+    push_tag_scope(tag, type);
+  }
+
+  return type;
+}
+
+Type *read_type_suffix(Type *base) {
+  if (!consume("[")) {
+    return base;
+  }
+
+  // Parse array declaration
+  int size = expect_number();
+  expect("]");
+  base = read_type_suffix(base);
+  return array_of(base, size);
+}
+
+// struct-member = basetype ident ("[" num "]")* ";"
+Member *struct_member() {
+  Member *m = calloc(1, sizeof(Member));
+  m->type = basetype();
+  m->name = expect_ident();
+  m->type = read_type_suffix(m->type);
+  expect(";");
+  return m;
+}
+
+// global-var = basetype ident ("[" num "]")* ";"
+void global_var() {
+  Type *type = basetype();
+  char *name = expect_ident();
+  type = read_type_suffix(type);
+  expect(";");
+  new_global_var(name, type);
+}
+
+VarList *read_func_param() {
+  Type *type = basetype();
+  char *name = expect_ident();
+  type = read_type_suffix(type);
+  return new_var_list(new_local_var(name, type));
+}
+
+// Reads function parameters and returns a list of them.
+VarList *read_func_params() {
+  if (consume(")")) {
+    return NULL;
+  }
+
+  VarList *head = read_func_param();
+  VarList *cur = head;
+
+  while (!consume(")")) {
+    expect(",");
+    cur->next = read_func_param();
+    cur = cur->next;
+  }
+
+  return head;
+}
+
+// function = basetype ident "(" params? ")" "{" stmt* "}"
+// params   = param ("," param)*
+// param    = basetype ident
+Function *function() {
+  // Initialie a list of local variables
+  locals = NULL;
+
+  // Start parsing a function
+  basetype();
+  char *name = expect_ident();
+
+  // Parse function arguments
+  expect("(");
+  Scope *sc = enter_scope();
+  VarList *params = read_func_params();
+
+  // Parse function body
+  expect("{");
+  Node head = {};
+  Node *cur = &head;
+  while (!consume("}")) {
+    cur->next = stmt();
+    cur = cur->next;
+  }
+  leave_scope(sc);
+
+  // Create a Function node
+  Function *fn = calloc(1, sizeof(Function));
+  fn->name = name;
+  fn->params = params;
+  fn->node = head.next;
+  fn->locals = locals;
+
+  return fn;
+}
+
+// Parses an expression statement and creates a new ND_EXPR_STMT node.
+Node *read_expr_stmt() {
+  Token *tok = token;
+  return new_unary(ND_EXPR_STMT, expr(), tok);
+}
+
+Node *stmt() {
+  Node *node = stmt_inner();
+  add_type(node);
+  return node;
+}
+
+// stmt = "if" "(" expr ")" stmt ("else" stmt)?
+//      | "while" "(" expr ")" stmt
+//      | "for" "(" expr ";" expr ";" expr ")" stmt
+//      | "return" expr ";"
+//      | "{" stmt* "}"
+//      | "typedef" basetype ident ("[" num "]")* ";"
+//      | declaration
+//      | expr ";"
+Node *stmt_inner() {
+  Token *tok;
+
+  // Parse "if"-"else" statement
+  if ((tok = consume("if"))) {
+    Node *node = new_node(ND_IF, tok);
+    expect("(");
+    node->cond = expr();
+    expect(")");
+    node->cons = stmt();
+    if (consume("else")) {
+      node->alt = stmt();
+    }
+    return node;
+  }
+
+  // Parse "while" statement
+  if ((tok = consume("while"))) {
+    Node *node = new_node(ND_WHILE, tok);
+    expect("(");
+    node->cond = expr();
+    expect(")");
+    node->cons = stmt();
+    return node;
+  }
+
+  // Parse "for" statement
+  if ((tok = consume("for"))) {
+    Node *node = new_node(ND_FOR, tok);
+    expect("(");
+    if (!consume(";")) {
+      node->init = read_expr_stmt();
+      expect(";");
+    }
+    if (!consume(";")) {
+      node->cond = expr();
+      expect(";");
+    }
+    if (!consume(")")) {
+      node->updt = read_expr_stmt();
+      expect(")");
+    }
+    node->cons = stmt();
+    return node;
+  }
+
+  // Parse "return" statement
+  if ((tok = consume("return"))) {
+    Node *node = new_unary(ND_RETURN, expr(), tok);
+    expect(";");
+    return node;
+  }
+
+  // Parse block (compound) statement
+  if ((tok = consume("{"))) {
+    Node head = {};
+    Node *cur = &head;
+
+    Scope *sc = enter_scope();
+    while (!consume("}")) {
+      cur->next = stmt();
+      cur = cur->next;
+    }
+    leave_scope(sc);
+
+    Node *node = new_node(ND_BLOCK, tok);
+    node->body = head.next;
+    return node;
+  }
+
+  if ((tok = consume("typedef"))) {
+    Type *type = basetype();
+    char *name = expect_ident();
+    type = read_type_suffix(type);
+    expect(";");
+    push_scope(name)->type_def = type;
+    return new_node(ND_NULL, tok);
+  }
+
+  if (is_type_name(token)) {
+    return declaration();
+  }
+
+  // Parse expression statement
+  Node *node = read_expr_stmt();
+  expect(";");
+  return node;
+}
+
+// declaration = basetype ident ("[" num "]")* ("=" expr)? ";"
+//             | basetype ";"
+Node *declaration() {
+  Token *tok = token;
+  Type *type = basetype();
+  if (consume(";")) {
+    return new_node(ND_NULL, tok);
+  }
+
+  char *name = expect_ident();
+  type = read_type_suffix(type);
+  Var *var = new_local_var(name, type);
+
+  if (consume(";")) {
+    return new_node(ND_NULL, tok);
+  }
+
+  expect("=");
+  Node *lhs = new_var_node(var, tok);
+  Node *rhs = expr();
+  expect(";");
+  Node *node = new_binary(ND_ASSIGN, lhs, rhs, tok);
+  return new_unary(ND_EXPR_STMT, node, tok);
+}
+
+// expr = assign
+Node *expr() { return assign(); }
+
+// assign = equality ("=" assign)?
+Node *assign() {
+  Node *node = equality();
+  Token *tok = consume("=");
+  if (tok) {
+    node = new_binary(ND_ASSIGN, node, assign(), tok);
+  }
+  return node;
+}
+
+// equality = relational ("==" relational | "!=" relational)*
+Node *equality() {
+  Node *node = relational();
+  Token *tok;
+
+  for (;;) {
+    if ((tok = consume("=="))) {
+      node = new_binary(ND_EQ, node, relational(), tok);
+    } else if ((tok = consume("!="))) {
+      node = new_binary(ND_NE, node, relational(), tok);
+    } else {
+      return node;
+    }
+  }
+}
+
+// relational = add ("<" add | "<=" add | ">" add | ">=" add)*
+Node *relational() {
+  Node *node = add();
+  Token *tok;
+
+  for (;;) {
+    if ((tok = consume("<"))) {
+      node = new_binary(ND_LT, node, add(), tok);
+    } else if ((tok = consume("<="))) {
+      node = new_binary(ND_LE, node, add(), tok);
+    } else if ((tok = consume(">"))) {
+      node = new_binary(ND_LT, add(), node, tok);
+    } else if ((tok = consume(">="))) {
+      node = new_binary(ND_LE, add(), node, tok);
+    } else {
+      return node;
+    }
+  }
+}
+
+Node *new_add(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+
+  if (is_integer(lhs->type) && is_integer(rhs->type)) {
+    return new_binary(ND_ADD, lhs, rhs, tok);
+  } else if (lhs->type->base && is_integer(rhs->type)) {
+    return new_binary(ND_PTR_ADD, lhs, rhs, tok);
+  } else if (is_integer(lhs->type) && rhs->type->base) {
+    return new_binary(ND_PTR_ADD, rhs, lhs, tok);
+  }
+
+  error_tok(tok, "invalid operands");
+  // Never reach here
+  return NULL;
+}
+
+Node *new_sub(Node *lhs, Node *rhs, Token *tok) {
+  add_type(lhs);
+  add_type(rhs);
+
+  if (is_integer(lhs->type) && is_integer(rhs->type)) {
+    return new_binary(ND_SUB, lhs, rhs, tok);
+  } else if (lhs->type->base && is_integer(rhs->type)) {
+    return new_binary(ND_PTR_SUB, lhs, rhs, tok);
+  } else if (lhs->type->base && rhs->type->base) {
+    return new_binary(ND_PTR_DIFF, lhs, rhs, tok);
+  }
+
+  error_tok(tok, "invalid operands");
+  // Never reach here
+  return NULL;
+}
+
+// add = mul ("+" mul | "-" mul)*
+Node *add() {
+  Node *node = mul();
+  Token *tok;
+
+  for (;;) {
+    if ((tok = consume("+"))) {
+      node = new_add(node, mul(), tok);
+    } else if ((tok = consume("-"))) {
+      node = new_sub(node, mul(), tok);
+    } else {
+      return node;
+    }
+  }
+}
+
+// mul = unary ("*" unary | "/" unary)*
+Node *mul() {
+  Node *node = unary();
+  Token *tok;
+
+  for (;;) {
+    if ((tok = consume("*"))) {
+      node = new_binary(ND_MUL, node, unary(), tok);
+    } else if ((tok = consume("/"))) {
+      node = new_binary(ND_DIV, node, unary(), tok);
+    } else {
+      return node;
+    }
+  }
+}
+
+// unary = ("+" | "-" | "&" | "*" | "sizeof")? unary
+//       | postfix
+Node *unary() {
+  Token *tok;
+  if ((tok = consume("+"))) {
+    return unary();
+  } else if ((tok = consume("-"))) {
+    return new_binary(ND_SUB, new_num(0, tok), unary(), tok);
+  } else if ((tok = consume("&"))) {
+    return new_unary(ND_ADDR, unary(), tok);
+  } else if ((tok = consume("*"))) {
+    return new_unary(ND_DEREF, unary(), tok);
+  } else if ((tok = consume("sizeof"))) {
+    Node *node = unary();
+    add_type(node);
+    return new_num(node->type->size, tok);
+  } else {
+    return postfix();
+  }
+}
+
+Member *find_member(Type *type, char *name) {
+  for (Member *m = type->members; m; m = m->next) {
+    if (!strcmp(m->name, name)) {
+      return m;
+    }
+  }
+  return NULL;
+}
+
+Node *struct_ref(Node *lhs) {
+  add_type(lhs);
+  if (lhs->type->kind != TYPE_STRUCT) {
+    error_tok(lhs->tok, "not a struct");
+  }
+
+  Token *tok = token;
+  Member *m = find_member(lhs->type, expect_ident());
+  if (!m) {
+    error_tok(tok, "no such member");
+  }
+
+  Node *node = new_unary(ND_MEMBER, lhs, tok);
+  node->member = m;
+  return node;
+}
+
+// postfix = primary ("[" expr "]" | "." ident | "->" ident)*
+Node *postfix() {
+  Node *node = primary();
+  Token *tok;
+
+  for (;;) {
+    if ((tok = consume("["))) {
+      // x[y] is short for *(x+y)
+      Node *idx = new_add(node, expr(), tok);
+      expect("]");
+      node = new_unary(ND_DEREF, idx, tok);
+      continue;
+    }
+
+    if ((tok = consume("."))) {
+      node = struct_ref(node);
+      continue;
+    }
+
+    if ((tok = consume("->"))) {
+      // x->y is short for (*x).y
+      node = struct_ref(new_unary(ND_DEREF, node, tok));
+      continue;
+    }
+
+    return node;
+  }
+}
+
+/* -------------------------
+   Label generator
+   ------------------------- */
+
+char *new_label() {
+  static int cnt = 0;
+  char buf[32];
+  snprintf(buf, sizeof(buf), ".L%d", cnt++);
+  return strndup(buf, (int)strlen(buf));
+}
+
+/* -------------------------
+   Parser: primary, stmt_expr, func_args
+   (full implementations)
+   ------------------------- */
+
+// Forward: helper to parse function argument list into Node linked list
+Node *func_args() {
+  if (consume(")")) {
+    return NULL;
+  }
+  Node *head = NULL;
+  Node *cur = NULL;
+  while (1) {
+    Node *arg = expr();
+    if (!head) {
+      head = arg;
+      cur = arg;
+    } else {
+      cur->next = arg;
+      cur = cur->next;
+    }
+    if (consume(")")) break;
+    expect(",");
+  }
+  return head;
+}
+
+// stmt_expr: GNU statement expression: ({ stmt* expr; })
+Node *stmt_expr() {
+  Token *tok = token;
+  expect("{");
+  Node head = {};
+  Node *cur = &head;
+  while (!peek("}")) {
+    cur->next = stmt();
+    cur = cur->next;
+  }
+  expect("}");
+  Node *node = new_node(ND_STMT_EXPR, tok);
+  node->body = head.next;
+  return node;
+}
+
+// primary = "(" "{" stmt* "}" ")"  // statement expression
+//         | "(" expr ")"
+//         | ident ("(" func-args? ")")?
+//         | str
+//         | num
+Node *primary() {
+  Token *tok;
+
+  // Statement expression: ({ ... })
+  if (consume("(") && peek("{")) {
+    token = token; // already consumed "("
+    Node *n = stmt_expr();
+    expect(")");
+    return n;
+  }
+
+  if (consume("(")) {
+    Node *node = expr();
+    expect(")");
+    return node;
+  }
+
+  if (token->kind == TK_IDENT) {
+    tok = token;
+    char *name = strndup(tok->str, tok->len);
+    token = token->next;
+
+    // Function call
+    if (consume("(")) {
+      Node *node = new_node(ND_CALL, tok);
+      node->func_name = name;
+      node->args = func_args();
+      return node;
+    }
+
+    // Variable
+    VarScope *sc = find_var(tok);
+    if (!sc || !sc->var) {
+      error_tok(tok, "undefined variable");
+    }
+    return new_var_node(sc->var, tok);
+  }
+
+  if (token->kind == TK_STR) {
+    Token *t = token;
+    token = token->next;
+    Node *node = new_node(ND_NUM, t);
+    // Represent string literal as a global variable
+    char *label = new_label();
+    Var *g = new_global_var(label, array_of(char_type, t->cont_len));
+    g->contents = t->contents;
+    g->cont_len = t->cont_len;
+    node->val = 0; // placeholder
+    node->type = g->type;
+    // Return address-of global variable
+    Node *addr = new_unary(ND_ADDR, new_var_node(g, t), t);
+    return addr;
+  }
+
+  if (token->kind == TK_NUM) {
+    Node *node = new_num(token->val, token);
+    token = token->next;
+    return node;
+  }
+
+  error_tok(token, "expected an expression");
+  return NULL;
+}
+
+/* -------------------------
+   Code generation
+   ------------------------- */
+
+/*
+  Strategy:
+  - Use a stack-machine style codegen: evaluate expressions and push results
+    to the stack, then pop into registers as needed.
+  - Follow System V AMD64 calling convention for function calls.
+  - Emit assembly to stdout.
+*/
+
+static int label_seq = 0;
+
+static void gen_lval(Node *node);
+
+// push rax onto stack
+static void push_rax() { printf("  push rax\n"); }
+
+// pop into rdi (used for binary ops)
+static void pop_rdi() { printf("  pop rdi\n"); }
+
+// pop into rax
+static void pop_rax() { printf("  pop rax\n"); }
+
+static void gen_addr(Node *node) {
+  if (node->kind == ND_VAR) {
+    Var *v = node->var;
+    if (v->is_local) {
+      printf("  lea rax, [rbp-%d]\n", v->offset);
+      push_rax();
+      return;
+    } else {
+      printf("  lea rax, %s[rip]\n", v->name);
+      push_rax();
+      return;
+    }
+  }
+
+  if (node->kind == ND_DEREF) {
+    gen_lval(node->lhs);
+    return;
+  }
+
+  if (node->kind == ND_MEMBER) {
+    gen_addr(node->lhs);
+    pop_rax();
+    printf("  add rax, %d\n", node->member->offset);
+    push_rax();
+    return;
+  }
+
+  error_tok(node->tok, "not an lvalue");
+}
+
+static void gen_lval(Node *node) {
+  if (node->kind == ND_DEREF) {
+    gen(node->lhs);
+    return;
+  }
+
+  if (node->kind == ND_VAR) {
+    Var *v = node->var;
+    if (v->is_local) {
+      printf("  lea rax, [rbp-%d]\n", v->offset);
+      push_rax();
+      return;
+    } else {
+      printf("  lea rax, %s[rip]\n", v->name);
+      push_rax();
+      return;
+    }
+  }
+
+  if (node->kind == ND_MEMBER) {
+    gen_addr(node->lhs);
+    pop_rax();
+    printf("  add rax, %d\n", node->member->offset);
+    push_rax();
+    return;
+  }
+
+  error_tok(node->tok, "not an lvalue");
+}
+
+static void gen(Node *node) {
+  if (!node) return;
+
+  switch (node->kind) {
+  case ND_NUM:
+    printf("  mov rax, %ld\n", node->val);
+    push_rax();
+    return;
+  case ND_NULL:
+    printf("  mov rax, 0\n");
+    push_rax();
+    return;
+  case ND_VAR:
+    gen_lval(node);
+    pop_rax();
+    if (node->var->is_local) {
+      printf("  mov rax, [rax]\n");
+    } else {
+      printf("  mov rax, [rax]\n");
+    }
+    push_rax();
+    return;
+  case ND_ADDR:
+    gen_addr(node->lhs);
+    return;
+  case ND_DEREF:
+    gen(node->lhs);
+    pop_rax();
+    printf("  mov rax, [rax]\n");
+    push_rax();
+    return;
+  case ND_MEMBER:
+    gen_addr(node->lhs);
+    pop_rax();
+    printf("  mov rax, [rax]\n");
+    push_rax();
+    return;
+  case ND_ASSIGN:
+    gen_lval(node->lhs);
+    gen(node->rhs);
+    pop_rax(); // rhs value
+    pop_rdi(); // lval address
+    printf("  mov [rdi], rax\n");
+    push_rax();
+    return;
+  case ND_RETURN:
+    gen(node->lhs);
+    pop_rax();
+    printf("  mov rsp, rbp\n");
+    printf("  pop rbp\n");
+    printf("  ret\n");
+    return;
+  case ND_IF: {
+    char *else_label = new_label();
+    char *end_label = new_label();
+    gen(node->cond);
+    pop_rax();
+    printf("  cmp rax, 0\n");
+    if (node->alt) {
+      printf("  je %s\n", else_label);
+      gen(node->cons);
+      printf("  jmp %s\n", end_label);
+      printf("%s:\n", else_label);
+      gen(node->alt);
+      printf("%s:\n", end_label);
+    } else {
+      printf("  je %s\n", end_label);
+      gen(node->cons);
+      printf("%s:\n", end_label);
+    }
+    return;
+  }
+  case ND_WHILE: {
+    char *begin = new_label();
+    char *end = new_label();
+    printf("%s:\n", begin);
+    gen(node->cond);
+    pop_rax();
+    printf("  cmp rax, 0\n");
+    printf("  je %s\n", end);
+    gen(node->cons);
+    printf("  jmp %s\n", begin);
+    printf("%s:\n", end);
+    return;
+  }
+  case ND_FOR: {
+    char *begin = new_label();
+    char *end = new_label();
+    if (node->init) gen(node->init);
+    printf("%s:\n", begin);
+    if (node->cond) {
+      gen(node->cond);
+      pop_rax();
+      printf("  cmp rax, 0\n");
+      printf("  je %s\n", end);
+    }
+    gen(node->cons);
+    if (node->updt) gen(node->updt);
+    printf("  jmp %s\n", begin);
+    printf("%s:\n", end);
+    return;
+  }
+  case ND_BLOCK: {
+    for (Node *n = node->body; n; n = n->next) {
+      gen(n);
+      // pop result of expression statements
+      if (n->kind != ND_RETURN) {
+        pop_rax();
+      }
+    }
+    // push 0 as block value
+    printf("  mov rax, 0\n");
+    push_rax();
+    return;
+  }
+  case ND_EXPR_STMT:
+    gen(node->lhs);
+    return;
+  case ND_STMT_EXPR: {
+    for (Node *n = node->body; n; n = n->next) {
+      gen(n);
+      // pop intermediate results except last
+      if (n->next) pop_rax();
+    }
+    return;
+  }
+  case ND_CALL: {
+    // Evaluate args and place into registers
+    // Supported up to 6 integer args: rdi, rsi, rdx, rcx, r8, r9
+    const char *argregs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    int nargs = 0;
+    for (Node *a = node->args; a; a = a->next) nargs++;
+    // Evaluate args in reverse order so that first arg ends up in rdi
+    Node *args[16];
+    int i = 0;
+    for (Node *a = node->args; a; a = a->next) {
+      args[i++] = a;
+    }
+    for (int j = i - 1; j >= 0; j--) {
+      gen(args[j]);
+    }
+    // Pop into registers
+    for (int j = 0; j < i && j < 6; j++) {
+      pop_rax();
+      printf("  mov %s, rax\n", argregs[j]);
+    }
+    // For extra args, push on stack (not implemented)
+    printf("  mov rax, 0\n");
+    printf("  call %s\n", node->func_name);
+    push_rax();
+    return;
+  }
+  case ND_ADD:
+  case ND_SUB:
+  case ND_MUL:
+  case ND_DIV:
+  case ND_EQ:
+  case ND_NE:
+  case ND_LT:
+  case ND_LE:
+  case ND_PTR_ADD:
+  case ND_PTR_SUB:
+  case ND_PTR_DIFF: {
+    gen(node->lhs);
+    gen(node->rhs);
+    pop_rax(); // rhs
+    pop_rdi(); // lhs
+    if (node->kind == ND_ADD || node->kind == ND_PTR_ADD) {
+      if (node->kind == ND_PTR_ADD) {
+        // scale rhs by base size
+        int sz = node->rhs->type->size;
+        if (sz != 1) printf("  imul rax, %d\n", sz);
+      }
+      printf("  add rax, rdi\n");
+      push_rax();
+      return;
+    }
+    if (node->kind == ND_SUB || node->kind == ND_PTR_SUB) {
+      if (node->kind == ND_PTR_SUB && node->rhs->type->kind != TYPE_ARRAY) {
+        int sz = node->rhs->type->size;
+        if (sz != 1) printf("  imul rax, %d\n", sz);
+      }
+      printf("  sub rdi, rax\n");
+      printf("  mov rax, rdi\n");
+      push_rax();
+      return;
+    }
+    if (node->kind == ND_PTR_DIFF) {
+      printf("  sub rdi, rax\n");
+      int sz = node->lhs->type->base->size;
+      if (sz != 1) printf("  cqo\n  mov rdx, %d\n  idiv rdx\n", sz);
+      push_rax();
+      return;
+    }
+    if (node->kind == ND_MUL) {
+      printf("  imul rax, rdi\n");
+      push_rax();
+      return;
+    }
+    if (node->kind == ND_DIV) {
+      printf("  mov rdx, 0\n");
+      printf("  mov rbx, rdi\n");
+      printf("  mov rdi, rax\n");
+      printf("  mov rax, rbx\n");
+      printf("  cqo\n");
+      printf("  idiv rdi\n");
+      printf("  mov rax, rax\n");
+      push_rax();
+      return;
+    }
+    // Comparisons: compute rax = (lhs op rhs)
+    if (node->kind == ND_EQ || node->kind == ND_NE || node->kind == ND_LT || node->kind == ND_LE) {
+      printf("  cmp rdi, rax\n");
+      if (node->kind == ND_EQ) printf("  sete al\n");
+      if (node->kind == ND_NE) printf("  setne al\n");
+      if (node->kind == ND_LT) printf("  setl al\n");
+      if (node->kind == ND_LE) printf("  setle al\n");
+      printf("  movzb rax, al\n");
+      push_rax();
+      return;
+    }
+    return;
+  }
+  default:
+    error_tok(node->tok, "codegen: unsupported node kind");
+  }
+}
+
+/* -------------------------
+   Top-level codegen: emit assembly
+   ------------------------- */
+
+static int assign_lvar_offsets(Function *fn) {
+  int offset = 0;
+  for (VarList *vl = fn->locals; vl; vl = vl->next) {
+    Var *v = vl->var;
+    offset = align_to(offset + v->type->size, v->type->align);
+    v->offset = offset;
+  }
+  // Round up to 16
+  if (offset % 16) offset = align_to(offset, 16);
+  return offset;
+}
+
+void codegen(Program *prog) {
+  // Emit data for globals (string literals and global variables)
+  printf("  .intel_syntax noprefix\n");
+  printf("  .data\n");
+  for (VarList *vl = prog->globals; vl; vl = vl->next) {
+    Var *g = vl->var;
+    printf("%s:\n", g->name);
+    if (g->contents) {
+      // string literal
+      printf("  .string \"%s\"\n", g->contents);
+    } else {
+      // zero-initialized
+      int n = g->type->size;
+      if (n > 0) printf("  .zero %d\n", n);
+    }
+  }
+
+  // Emit text (functions)
+  printf("  .text\n");
+  for (Function *fn = prog->fns; fn; fn = fn->next) {
+    printf("  .global %s\n", fn->name);
+    printf("%s:\n", fn->name);
+    // Prologue
+    printf("  push rbp\n");
+    printf("  mov rbp, rsp\n");
+
+    // Assign offsets for locals
+    int stack_size = assign_lvar_offsets(fn);
+    if (stack_size > 0) {
+      printf("  sub rsp, %d\n", stack_size);
+    }
+
+    // Move function parameters into local variables
+    const char *argregs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    int i = 0;
+    for (VarList *vl = fn->params; vl; vl = vl->next) {
+      Var *v = vl->var;
+      if (i < 6) {
+        printf("  mov rax, %s\n", argregs[i++]);
+        printf("  mov [rbp-%d], rax\n", v->offset);
+      } else {
+        // Not handling stack args in this simple backend
+        i++;
+      }
+    }
+
+    // Generate code for function body
+    for (Node *n = fn->node; n; n = n->next) {
+      gen(n);
+      // pop leftover expression results
+      if (n->kind != ND_RETURN) {
+        printf("  pop rax\n");
+      }
+    }
+
+    // Epilogue (if no return encountered)
+    printf("  mov rsp, rbp\n");
+    printf("  pop rbp\n");
+    printf("  ret\n");
+  }
+}
+
+/* -------------------------
+   Minimal stubs for missing pieces removed (all implemented)
+   ------------------------- */
+
+/* -------------------------
+   Main: read file, tokenize, parse, codegen
+   ------------------------- */
+
+static char *read_file(char *path) {
+  FILE *fp = fopen(path, "rb");
+  if (!fp) {
+    fprintf(stderr, "cannot open %s: %s\n", path, strerror(errno));
+    exit(1);
+  }
+  if (fseek(fp, 0, SEEK_END) != 0) {
+    fclose(fp);
+    perror("fseek");
+    exit(1);
+  }
+  long sz = ftell(fp);
+  if (sz < 0) {
+    fclose(fp);
+    perror("ftell");
+    exit(1);
+  }
+  rewind(fp);
+  char *buf = malloc((size_t)sz + 1);
+  if (!buf) {
+    fclose(fp);
+    perror("malloc");
+    exit(1);
+  }
+  if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+    fclose(fp);
+    free(buf);
+    perror("fread");
+    exit(1);
+  }
+  buf[sz] = '\0';
+  fclose(fp);
+  return buf;
+}
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "Usage: %s <input.c>\n", argv[0]);
+    return 1;
+  }
+
+  filename = argv[1];
+  user_input = read_file(filename);
+  token = tokenize();
+  Program *prog = program();
+  codegen(prog);
+  return 0;
+}

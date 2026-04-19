@@ -1,0 +1,861 @@
+// tinycc_parse_then_codegen.c
+// Toy C-like compiler: scan -> token linked list -> parse -> AST -> x86-64 assembly
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+#include <assert.h>
+
+// -----------------------------------------------------------------------------
+// Token types
+// -----------------------------------------------------------------------------
+typedef enum {
+    T_EOF = 0,
+    T_KEYWORD, T_IDENT, T_NUMBER, T_CHAR, T_STRING,
+    T_OP, // single-char operator token stored in .op
+    T_LE, T_GE, T_EQ, T_NE, T_LOG_AND, T_LOG_OR, T_PTR_OP
+} token_type;
+
+const char* keywords[] = {
+    "asm", "if", "else", "while", "break", "continue", "return", "int", "char", "void"
+};
+enum { KEYWORD_COUNT = sizeof(keywords)/sizeof(keywords[0]) };
+
+// -----------------------------------------------------------------------------
+// Token linked list
+// -----------------------------------------------------------------------------
+typedef struct token {
+    token_type type;
+    int kw_index;        // if type == T_KEYWORD
+    char op;             // if type == T_OP
+    long long number;    // if type == T_NUMBER
+    char text[256];      // identifier, string, char literal
+    int line;
+    int col;
+    struct token* next;
+} token;
+
+token* token_head = NULL;
+token* token_tail = NULL;
+token* cur_tok = NULL;
+
+// -----------------------------------------------------------------------------
+// AST node types
+// -----------------------------------------------------------------------------
+enum {
+    node_const, node_var, node_call, node_assign, node_op_unary, node_op_binary, node_if, node_while,
+    node_return, node_block, node_declaration, node_break, node_continue, node_empty
+};
+
+typedef struct ast_node {
+    int type;
+    union {
+        long long val; // node_const
+        struct { char name[64]; int offset; int data_type; struct ast_node* init; } var; // var/declaration
+        struct { int op; char name[64]; struct ast_node* operand; struct ast_node** args; int arg_count; } unary; // unary/call
+        struct { int op; struct ast_node* left; struct ast_node* right; } binary; // binary
+        struct { struct ast_node* cond; struct ast_node* body_true; struct ast_node* body_false; } if_stmt;
+        struct { struct ast_node* cond; struct ast_node* body; } while_stmt;
+        struct { struct ast_node* expr; } ret_stmt;
+        struct { struct ast_node** stmts; int stmt_count; } block;
+    };
+} ast_node;
+
+// -----------------------------------------------------------------------------
+// Function representation (top-level parsed unit)
+// -----------------------------------------------------------------------------
+typedef struct {
+    char name[64];
+    int return_type; // keyword index for return type
+    int param_count;
+    char param_names[16][64];
+    int param_types[16];
+    ast_node* body; // function body AST (node_block)
+    int is_global_var; // 1 if this entry is a global variable (no body)
+    int global_offset; // for global .comm size (if is_global_var)
+} function_t;
+
+// -----------------------------------------------------------------------------
+// Globals for scanning, symbol table, codegen
+// -----------------------------------------------------------------------------
+FILE* src_file = NULL;
+FILE* dst_file = NULL;
+int line_number = 1;
+int col_number = 0;
+
+typedef struct { char name[64]; int offset; int type; } variable;
+variable locals[1024];
+int local_count = 0;
+
+const char* regs[] = { "r8", "r9", "r11", "rax" };
+enum { CACHE_SIZE = sizeof(regs)/sizeof(regs[0]) };
+int cache[CACHE_SIZE];
+int stack_size = 0;
+int label_counter = 0;
+int while_labels[256];
+int while_level = -1;
+
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
+void error_at_token(token* t, const char* fmt, ...) {
+    fprintf(stderr, "%d:%d: error: ", t ? t->line : line_number, t ? t->col : col_number);
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
+void errorf(const char* fmt, ...) {
+    fprintf(stderr, "%d:%d: error: ", line_number, col_number);
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
+void output(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt); vfprintf(dst_file, fmt, ap); va_end(ap);
+}
+
+// -----------------------------------------------------------------------------
+// Scanner helpers
+// -----------------------------------------------------------------------------
+static int peek_char() { return fgetc(src_file); }
+static void unpeek_char(int c) { if(c != EOF) ungetc(c, src_file); }
+
+static void add_token(token* t) {
+    if(!token_head) token_head = token_tail = t;
+    else { token_tail->next = t; token_tail = t; }
+}
+
+static token* make_token(token_type type, int line, int col) {
+    token* t = (token*)calloc(1, sizeof(token));
+    t->type = type; t->line = line; t->col = col; t->next = NULL;
+    return t;
+}
+
+static int is_ident_start(int c) { return isalpha(c) || c == '_'; }
+static int is_ident_cont(int c) { return isalnum(c) || c == '_'; }
+
+void scan_all() {
+    int c;
+    while((c = fgetc(src_file)) != EOF) {
+        col_number++;
+        if(c == '\n') { line_number++; col_number = 0; continue; }
+        if(isspace(c)) { continue; }
+
+        // comments
+        if(c == '/') {
+            int n = fgetc(src_file);
+            if(n == '/') {
+                while((n = fgetc(src_file)) != EOF && n != '\n');
+                if(n == '\n') { line_number++; col_number = 0; }
+                continue;
+            } else if(n == '*') {
+                int a = fgetc(src_file), b = fgetc(src_file);
+                while(a != EOF && b != EOF) {
+                    if(a == '*' && b == '/') break;
+                    if(a == '\n') { line_number++; col_number = 0; }
+                    a = b; b = fgetc(src_file);
+                }
+                if(a == EOF || b == EOF) errorf("unclosed comment");
+                continue;
+            } else {
+                unpeek_char(n);
+                token* t = make_token(T_OP, line_number, col_number);
+                t->op = '/'; add_token(t);
+                continue;
+            }
+        }
+
+        // preprocessor line skip
+        if(c == '#') {
+            while((c = fgetc(src_file)) != EOF && c != '\n');
+            if(c == '\n') { line_number++; col_number = 0; }
+            continue;
+        }
+
+        // operators and two-char ops
+        if(strchr("+-*%&|~!=<>;:()[],@{}.", c)) {
+            int next = fgetc(src_file);
+            if(next == EOF) next = 0;
+            if(c == '<' && next == '=') { token* t = make_token(T_LE, line_number, col_number); add_token(t); continue; }
+            if(c == '>' && next == '=') { token* t = make_token(T_GE, line_number, col_number); add_token(t); continue; }
+            if(c == '=' && next == '=') { token* t = make_token(T_EQ, line_number, col_number); add_token(t); continue; }
+            if(c == '!' && next == '=') { token* t = make_token(T_NE, line_number, col_number); add_token(t); continue; }
+            if(c == '&' && next == '&') { token* t = make_token(T_LOG_AND, line_number, col_number); add_token(t); continue; }
+            if(c == '|' && next == '|') { token* t = make_token(T_LOG_OR, line_number, col_number); add_token(t); continue; }
+            if(c == '-' && next == '>') { token* t = make_token(T_PTR_OP, line_number, col_number); add_token(t); continue; }
+            if(next) unpeek_char(next);
+            token* t = make_token(T_OP, line_number, col_number);
+            t->op = (char)c;
+            add_token(t);
+            continue;
+        }
+
+        // char literal
+        if(c == '\'') {
+            token* t = make_token(T_CHAR, line_number, col_number);
+            int ch = fgetc(src_file);
+            if(ch == '\\') {
+                int esc = fgetc(src_file);
+                if(esc == 'n') t->text[0] = '\n';
+                else t->text[0] = (char)esc;
+                ch = fgetc(src_file); // closing '
+            } else {
+                t->text[0] = (char)ch;
+                ch = fgetc(src_file); // closing '
+            }
+            if(ch != '\'') errorf("bad character literal");
+            t->text[1] = '\0';
+            add_token(t);
+            continue;
+        }
+
+        // string literal
+        if(c == '"') {
+            token* t = make_token(T_STRING, line_number, col_number);
+            int i = 0;
+            int ch;
+            while((ch = fgetc(src_file)) != EOF && ch != '"') {
+                if(ch == '\\') {
+                    int esc = fgetc(src_file);
+                    if(esc == 'n') t->text[i++] = '\n';
+                    else t->text[i++] = (char)esc;
+                } else {
+                    t->text[i++] = (char)ch;
+                }
+                if(i >= (int)sizeof(t->text)-1) errorf("string too long");
+            }
+            if(ch != '"') errorf("unclosed string literal");
+            t->text[i] = '\0';
+            add_token(t);
+            continue;
+        }
+
+        // number
+        if(isdigit(c)) {
+            token* t = make_token(T_NUMBER, line_number, col_number);
+            long long val = c - '0';
+            int ch;
+            while((ch = fgetc(src_file)) != EOF && isdigit(ch)) {
+                val = val * 10 + (ch - '0');
+            }
+            if(ch != EOF) unpeek_char(ch);
+            t->number = val;
+            add_token(t);
+            continue;
+        }
+
+        // identifier or keyword
+        if(isalpha(c) || c == '_') {
+            char buf[256]; int i = 0;
+            buf[i++] = c;
+            int ch;
+            while((ch = fgetc(src_file)) != EOF && (isalnum(ch) || ch == '_')) {
+                if(i < (int)sizeof(buf)-1) buf[i++] = ch;
+            }
+            if(ch != EOF) unpeek_char(ch);
+            buf[i] = '\0';
+            int k;
+            for(k = 0; k < KEYWORD_COUNT; k++) if(strcmp(buf, keywords[k]) == 0) break;
+            if(k < KEYWORD_COUNT) {
+                token* t = make_token(T_KEYWORD, line_number, col_number);
+                t->kw_index = k;
+                add_token(t);
+            } else {
+                token* t = make_token(T_IDENT, line_number, col_number);
+                strncpy(t->text, buf, sizeof(t->text)-1);
+                add_token(t);
+            }
+            continue;
+        }
+
+        // unknown char
+        errorf("unknown character '%c' at %d:%d", c, line_number, col_number);
+    }
+
+    // EOF token
+    token* t = make_token(T_EOF, line_number, col_number);
+    add_token(t);
+}
+
+// -----------------------------------------------------------------------------
+// Token cursor helpers for parser
+// -----------------------------------------------------------------------------
+static token* peek() { return cur_tok; }
+static token* advance_tok() { if(cur_tok) cur_tok = cur_tok->next; return cur_tok; }
+static int tok_is_op(char op) { return cur_tok && cur_tok->type == T_OP && cur_tok->op == op; }
+static int tok_is_keyword(const char* kw) {
+    return cur_tok && cur_tok->type == T_KEYWORD && strcmp(keywords[cur_tok->kw_index], kw) == 0;
+}
+static void expect_op(char op) {
+    if(!tok_is_op(op)) error_at_token(cur_tok, "expected '%c'", op);
+    advance_tok();
+}
+static void expect_keyword(const char* kw) {
+    if(!tok_is_keyword(kw)) error_at_token(cur_tok, "expected keyword '%s'", kw);
+    advance_tok();
+}
+
+// -----------------------------------------------------------------------------
+// AST helpers
+// -----------------------------------------------------------------------------
+ast_node* new_node(int type) {
+    ast_node* n = (ast_node*)calloc(1, sizeof(ast_node));
+    if(!n) errorf("out of memory");
+    n->type = type;
+    return n;
+}
+
+// symbol table helpers
+variable* lookup_local_by_name(const char* name) {
+    for(int i = 0; i < local_count; i++) if(strcmp(name, locals[i].name) == 0) return &locals[i];
+    return NULL;
+}
+void add_local(const char* name, int offset, int type) {
+    if(local_count >= 1024) errorf("too many locals");
+    strcpy(locals[local_count].name, name);
+    locals[local_count].offset = offset;
+    locals[local_count].type = type;
+    local_count++;
+}
+
+// -----------------------------------------------------------------------------
+// Parser (recursive descent) using token linked list
+// -----------------------------------------------------------------------------
+int is_type_keyword_tok(token* t) {
+    if(!t) return 0;
+    if(t->type != T_KEYWORD) return 0;
+    int k = t->kw_index;
+    return (k >= 7 && k <= 9); // int, char, void (based on keywords array)
+}
+
+int is_expr_beginning_tok(token* t) {
+    if(!t) return 0;
+    if(t->type == T_NUMBER || t->type == T_CHAR || t->type == T_STRING || t->type == T_IDENT) return 1;
+    if(t->type == T_OP && (t->op == '-' || t->op == '!' || t->op == '*' || t->op == '(')) return 1;
+    return 0;
+}
+
+ast_node* expression(); // forward
+ast_node* statement();  // forward
+
+// level 0: unary and primary
+ast_node* expr_level_zero() {
+    token* t = peek();
+    if(!t) errorf("unexpected end in expression");
+    if(t->type == T_OP && t->op == '!') {
+        advance_tok();
+        ast_node* n = new_node(node_op_unary);
+        n->unary.op = '!';
+        n->unary.operand = expr_level_zero();
+        return n;
+    }
+    if(t->type == T_OP && t->op == '*') {
+        advance_tok();
+        ast_node* n = new_node(node_op_unary);
+        n->unary.op = '*';
+        n->unary.operand = expr_level_zero();
+        return n;
+    }
+    if(t->type == T_OP && t->op == '-') {
+        advance_tok();
+        if(peek() && peek()->type == T_NUMBER) {
+            ast_node* n = new_node(node_const);
+            n->val = - (peek()->number);
+            advance_tok();
+            return n;
+        } else {
+            ast_node* n = new_node(node_op_unary);
+            n->unary.op = '-';
+            n->unary.operand = expr_level_zero();
+            return n;
+        }
+    }
+    if(t->type == T_NUMBER) {
+        ast_node* n = new_node(node_const);
+        n->val = t->number;
+        advance_tok();
+        return n;
+    }
+    if(t->type == T_CHAR) {
+        ast_node* n = new_node(node_const);
+        n->val = (unsigned char)t->text[0];
+        advance_tok();
+        return n;
+    }
+    if(t->type == T_OP && t->op == '(') {
+        advance_tok();
+        ast_node* n = expression();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ')')) error_at_token(peek(), "expected ')'");
+        advance_tok();
+        return n;
+    }
+    if(t->type == T_IDENT) {
+        char name[64]; strncpy(name, t->text, sizeof(name)-1);
+        advance_tok();
+        if(peek() && peek()->type == T_OP && peek()->op == '(') {
+            advance_tok(); // consume '('
+            ast_node* n = new_node(node_call);
+            n->unary.arg_count = 0;
+            n->unary.args = NULL;
+            strncpy(n->unary.name, name, sizeof(n->unary.name)-1);
+            if(peek() && !(peek()->type == T_OP && peek()->op == ')')) {
+                int cap = 4; n->unary.args = malloc(cap * sizeof(ast_node*));
+                while(1) {
+                    if(n->unary.arg_count >= cap) { cap *= 2; n->unary.args = realloc(n->unary.args, cap * sizeof(ast_node*)); }
+                    n->unary.args[n->unary.arg_count++] = expression();
+                    if(peek() && peek()->type == T_OP && peek()->op == ',') { advance_tok(); continue; }
+                    break;
+                }
+            }
+            if(!peek() || !(peek()->type == T_OP && peek()->op == ')')) error_at_token(peek(), "expected ')'");
+            advance_tok();
+            return n;
+        } else if(peek() && peek()->type == T_OP && peek()->op == '=') {
+            ast_node* n = new_node(node_assign);
+            n->binary.left = new_node(node_var);
+            strncpy(n->binary.left->var.name, name, sizeof(n->binary.left->var.name)-1);
+            advance_tok(); // consume '='
+            n->binary.right = expression();
+            return n;
+        } else {
+            ast_node* n = new_node(node_var);
+            strncpy(n->var.name, name, sizeof(n->var.name)-1);
+            return n;
+        }
+    }
+    if(t->type == T_STRING) {
+        error_at_token(t, "string literal not supported in expressions");
+    }
+    error_at_token(t, "bad expression start");
+    return NULL;
+}
+
+// generic binary level helper
+ast_node* expr_level_bin(ast_node* (*next)(), const char* ops) {
+    ast_node* left = next();
+    while(peek() && ((peek()->type == T_OP && strchr(ops, peek()->op)) ||
+          peek()->type == T_LE || peek()->type == T_GE || peek()->type == T_EQ || peek()->type == T_NE ||
+          peek()->type == T_LOG_AND || peek()->type == T_LOG_OR)) {
+        int op_token_type = peek()->type;
+        int op_char = 0;
+        if(op_token_type == T_OP) op_char = peek()->op;
+        advance_tok();
+        ast_node* right = next();
+        ast_node* n = new_node(node_op_binary);
+        n->binary.op = (op_token_type == T_OP) ? op_char : op_token_type; // store token type for multi-char ops
+        n->binary.left = left;
+        n->binary.right = right;
+        left = n;
+    }
+    return left;
+}
+
+ast_node* expr_level_one() { return expr_level_bin(expr_level_zero, "*/%"); }
+ast_node* expr_level_two() { return expr_level_bin(expr_level_one, "+-"); }
+ast_node* expr_level_three() { return expr_level_bin(expr_level_two, "<>"); }
+ast_node* expr_level_four() { return expr_level_bin(expr_level_three, ""); } // ==, != handled by token types
+ast_node* expr_level_five() { return expr_level_bin(expr_level_four, "&"); }
+ast_node* expr_level_six() { return expr_level_bin(expr_level_five, "|"); }
+ast_node* expr_level_seven() { return expr_level_bin(expr_level_six, ""); } // && handled by token type
+
+ast_node* expression() {
+    return expr_level_bin(expr_level_seven, ""); // top-level (|| handled by token type)
+}
+
+// statement parsing
+ast_node* statement_list();
+
+ast_node* statement() {
+    token* t = peek();
+    if(!t) errorf("unexpected EOF in statement");
+    if(t->type == T_OP && t->op == '{') {
+        advance_tok();
+        ast_node* b = statement_list();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '}')) error_at_token(peek(), "expected '}'");
+        advance_tok();
+        return b;
+    }
+    if(is_type_keyword_tok(t)) {
+        int dtype = t->kw_index; // store keyword index as type
+        advance_tok(); // consume type
+        if(!peek() || peek()->type != T_IDENT) error_at_token(peek(), "expected identifier in declaration");
+        ast_node* n = new_node(node_declaration);
+        strncpy(n->var.name, peek()->text, sizeof(n->var.name)-1);
+        n->var.data_type = dtype;
+        n->var.offset = local_count * 8 + 8;
+        add_local(n->var.name, n->var.offset, n->var.data_type);
+        advance_tok(); // consume ident
+        if(peek() && peek()->type == T_OP && peek()->op == '=') {
+            advance_tok();
+            n->var.init = expression();
+        } else n->var.init = NULL;
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ';')) error_at_token(peek(), "expected ';' after declaration");
+        advance_tok();
+        return n;
+    }
+    if(t->type == T_KEYWORD && strcmp(keywords[t->kw_index], "if") == 0) {
+        advance_tok(); // consume if
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '(')) error_at_token(peek(), "expected '(' after if");
+        advance_tok();
+        ast_node* n = new_node(node_if);
+        n->if_stmt.cond = expression();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ')')) error_at_token(peek(), "expected ')'");
+        advance_tok();
+        n->if_stmt.body_true = statement();
+        if(peek() && peek()->type == T_KEYWORD && strcmp(keywords[peek()->kw_index], "else") == 0) {
+            advance_tok();
+            n->if_stmt.body_false = statement();
+        } else n->if_stmt.body_false = NULL;
+        return n;
+    }
+    if(t->type == T_KEYWORD && strcmp(keywords[t->kw_index], "while") == 0) {
+        advance_tok();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '(')) error_at_token(peek(), "expected '(' after while");
+        advance_tok();
+        ast_node* n = new_node(node_while);
+        n->while_stmt.cond = expression();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ')')) error_at_token(peek(), "expected ')'");
+        advance_tok();
+        n->while_stmt.body = statement();
+        return n;
+    }
+    if(t->type == T_KEYWORD && strcmp(keywords[t->kw_index], "return") == 0) {
+        advance_tok();
+        ast_node* n = new_node(node_return);
+        if(is_expr_beginning_tok(peek())) n->ret_stmt.expr = expression(); else n->ret_stmt.expr = NULL;
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ';')) error_at_token(peek(), "expected ';' after return");
+        advance_tok();
+        return n;
+    }
+    if(t->type == T_KEYWORD && strcmp(keywords[t->kw_index], "break") == 0) {
+        advance_tok();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ';')) error_at_token(peek(), "expected ';' after break");
+        advance_tok();
+        return new_node(node_break);
+    }
+    if(t->type == T_KEYWORD && strcmp(keywords[t->kw_index], "continue") == 0) {
+        advance_tok();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ';')) error_at_token(peek(), "expected ';' after continue");
+        advance_tok();
+        return new_node(node_continue);
+    }
+    if(is_expr_beginning_tok(peek())) {
+        ast_node* e = expression();
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ';')) error_at_token(peek(), "expected ';' after expression");
+        advance_tok();
+        return e;
+    }
+    if(peek() && peek()->type == T_OP && peek()->op == ';') { advance_tok(); return new_node(node_empty); }
+    error_at_token(peek(), "unexpected token in statement");
+    return NULL;
+}
+
+ast_node* statement_list() {
+    ast_node* block = new_node(node_block);
+    block->block.stmts = malloc(16 * sizeof(ast_node*));
+    block->block.stmt_count = 0;
+    int cap = 16;
+    while(peek() && (peek()->type != T_EOF) && !(peek()->type == T_OP && peek()->op == '}')) {
+        if(block->block.stmt_count >= cap) { cap *= 2; block->block.stmts = realloc(block->block.stmts, cap * sizeof(ast_node*)); }
+        block->block.stmts[block->block.stmt_count++] = statement();
+    }
+    return block;
+}
+
+// -----------------------------------------------------------------------------
+// Codegen helpers (unchanged)
+// -----------------------------------------------------------------------------
+const char* regname(int i) { return regs[cache[i]]; }
+void init_cache() { for(int i = 0; i < CACHE_SIZE; i++) cache[i] = i; stack_size = 0; }
+void push_reg() {
+    int i = CACHE_SIZE - 1; int tmp = cache[i];
+    if(stack_size >= CACHE_SIZE) output("\tpush %s\n", regs[tmp]);
+    while(i > 0) { cache[i] = cache[i-1]; i--; }
+    cache[0] = tmp; stack_size++;
+}
+void pop_reg() {
+    stack_size--;
+    if(stack_size < 0) { stack_size = 0; return; }
+    if(stack_size == 0) init_cache();
+    else {
+        int i = 0; int tmp = cache[0];
+        while(i < CACHE_SIZE - 1) { cache[i] = cache[i+1]; i++; }
+        cache[i] = tmp;
+        if(stack_size >= CACHE_SIZE) output("\tpop %s\n", regs[i]);
+    }
+}
+
+void codegen_expr(ast_node* n) {
+    if(!n) return;
+    variable* v;
+    switch(n->type) {
+        case node_const:
+            push_reg(); output("\tmov %s, %lld\n", regname(0), n->val); break;
+        case node_var:
+            v = lookup_local_by_name(n->var.name);
+            if(!v) errorf("variable '%s' not found", n->var.name);
+            push_reg();
+            output("\tmov %s, qword ptr [rbp - %d]\n", regname(0), v->offset);
+            break;
+        case node_assign:
+            if(n->binary.left->type != node_var) errorf("assignment target must be variable");
+            codegen_expr(n->binary.right);
+            v = lookup_local_by_name(n->binary.left->var.name);
+            if(!v) errorf("assignment target not found");
+            output("\tmov qword ptr [rbp - %d], %s\n", v->offset, regname(0));
+            break;
+        case node_op_unary:
+            codegen_expr(n->unary.operand);
+            if(n->unary.op == '-') output("\tneg %s\n", regname(0));
+            else if(n->unary.op == '!') {
+                output("\ttest %s, %s\n", regname(0), regname(0));
+                output("\tsetz cl\n"); output("\tmovzx %s, cl\n", regname(0));
+            } else if(n->unary.op == '*') {
+                output("\tmov %s, qword ptr [%s]\n", regname(0), regname(0));
+            }
+            break;
+        case node_op_binary:
+            codegen_expr(n->binary.left);
+            codegen_expr(n->binary.right);
+            {
+                int op = n->binary.op;
+                if(op == '+') { output("\tadd %s, %s\n", regname(1), regname(0)); pop_reg(); }
+                else if(op == '-') { output("\tsub %s, %s\n", regname(1), regname(0)); pop_reg(); }
+                else if(op == '*') { output("\timul %s, %s\n", regname(1), regname(0)); pop_reg(); }
+                else if(op == '/') {
+                    output("\tmov rax, %s\n", regname(1)); output("\tcqo\n"); output("\tidiv %s\n", regname(0)); pop_reg();
+                    output("\tmov %s, rax\n", regname(0));
+                } else if(op == T_LE || op == T_GE || op == T_EQ || op == T_NE || op == '<' || op == '>') {
+                    const char* comp;
+                    if(op == '<') comp = "l"; else if(op == '>') comp = "g";
+                    else if(op == T_LE) comp = "le"; else if(op == T_GE) comp = "ge";
+                    else if(op == T_EQ) comp = "e"; else comp = "ne";
+                    output("\tcmp %s, %s\n", regname(1), regname(0));
+                    output("\tset%s cl\n", comp); output("\tmovzx %s, cl\n", regname(1)); pop_reg();
+                } else if(op == T_LOG_AND) { output("\tand %s, %s\n", regname(1), regname(0)); pop_reg(); }
+                else if(op == T_LOG_OR) { output("\tor %s, %s\n", regname(1), regname(0)); pop_reg(); }
+                else errorf("unknown binary op in codegen");
+            }
+            break;
+        case node_call:
+            for(int i = 0; i < n->unary.arg_count && i < 6; i++) {
+                codegen_expr(n->unary.args[i]);
+                const char* dest = (i==0?"rdi":(i==1?"rsi":(i==2?"rdx":(i==3?"rcx":(i==4?"r8":"r9")))));
+                output("\tmov %s, %s\n", dest, regname(0));
+                pop_reg();
+            }
+            output("\tcall %s\n", n->unary.name);
+            push_reg(); output("\tmov %s, rax\n", regname(0));
+            break;
+        default:
+            errorf("unhandled expr node type %d", n->type);
+    }
+}
+
+void codegen_stmt(ast_node* n) {
+    if(!n) return;
+    int l_end, l_next, l_begin;
+    switch(n->type) {
+        case node_empty: break;
+        case node_declaration:
+            if(n->var.init) {
+                codegen_expr(n->var.init);
+                output("\tmov qword ptr [rbp - %d], %s\n", n->var.offset, regname(0));
+                pop_reg();
+            }
+            break;
+        case node_assign:
+            codegen_expr(n);
+            pop_reg();
+            break;
+        case node_op_binary:
+            codegen_expr(n);
+            pop_reg();
+            break;
+        case node_block:
+            for(int i = 0; i < n->block.stmt_count; i++) codegen_stmt(n->block.stmts[i]);
+            break;
+        case node_if:
+            codegen_expr(n->if_stmt.cond);
+            l_end = label_counter++; l_next = label_counter++;
+            output("\ttest %s, %s\n", regname(0), regname(0));
+            output("\tjz .L%d\n", l_next);
+            init_cache(); pop_reg();
+            codegen_stmt(n->if_stmt.body_true);
+            output("\tjmp .L%d\n", l_end);
+            output(".L%d:\n", l_next);
+            if(n->if_stmt.body_false) { init_cache(); codegen_stmt(n->if_stmt.body_false); }
+            output(".L%d:\n", l_end);
+            break;
+        case node_while:
+            while_level++;
+            if(while_level == 256) errorf("while nesting limit exceeded");
+            while_labels[while_level] = label_counter; label_counter += 2;
+            l_begin = while_labels[while_level]; l_end = while_labels[while_level] + 1;
+            output(".L%d:\n", l_begin);
+            codegen_expr(n->while_stmt.cond);
+            output("\ttest %s, %s\n", regname(0), regname(0));
+            output("\tjz .L%d\n", l_end);
+            init_cache(); pop_reg();
+            codegen_stmt(n->while_stmt.body);
+            output("\tjmp .L%d\n", l_begin);
+            output(".L%d:\n", l_end);
+            while_level--;
+            break;
+        case node_return:
+            if(n->ret_stmt.expr) {
+                codegen_expr(n->ret_stmt.expr);
+                if(strcmp(regname(0), "rax") != 0) output("\tmov rax, %s\n", regname(0));
+                pop_reg();
+            }
+            output("\tleave\n\tret\n");
+            break;
+        case node_break:
+            if(while_level < 0) errorf("break without while");
+            output("\tjmp .L%d\n", while_labels[while_level] + 1);
+            break;
+        case node_continue:
+            if(while_level < 0) errorf("continue without while");
+            output("\tjmp .L%d\n", while_labels[while_level]);
+            break;
+        default:
+            errorf("unknown statement node type %d", n->type);
+    }
+}
+
+// -----------------------------------------------------------------------------
+// parse(): build array of function_t from token list (top-level parsing)
+// -----------------------------------------------------------------------------
+function_t* parsed_functions = NULL;
+int parsed_function_count = 0;
+
+void ensure_parsed_capacity(int need) {
+    if(!parsed_functions) {
+        parsed_functions = calloc(16, sizeof(function_t));
+        parsed_function_count = 0;
+    }
+    // grow if needed
+    static int cap = 16;
+    if(parsed_function_count + need > cap) {
+        cap *= 2;
+        parsed_functions = realloc(parsed_functions, cap * sizeof(function_t));
+    }
+}
+
+void parse() {
+    // cur_tok must be set to token_head before calling parse()
+    parsed_function_count = 0;
+    local_count = 0; // clear any previous locals
+    while(peek() && peek()->type != T_EOF) {
+        if(!is_type_keyword_tok(peek())) error_at_token(peek(), "expected type keyword at top level");
+        int ret_type = peek()->kw_index;
+        advance_tok(); // consume type
+        if(!peek() || peek()->type != T_IDENT) error_at_token(peek(), "expected identifier after type");
+        function_t f; memset(&f, 0, sizeof(f));
+        strncpy(f.name, peek()->text, sizeof(f.name)-1);
+        f.return_type = ret_type;
+        advance_tok(); // consume ident
+
+        // global variable (e.g., "int x;")
+        if(peek() && peek()->type == T_OP && peek()->op == ';') {
+            f.is_global_var = 1;
+            f.global_offset = 8; // default size
+            ensure_parsed_capacity(1);
+            parsed_functions[parsed_function_count++] = f;
+            advance_tok(); // consume ';'
+            continue;
+        }
+
+        // function: expect '('
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '(')) error_at_token(peek(), "expected '(' after function name");
+        advance_tok(); // consume '('
+
+        // parse parameters (very simplified)
+        f.param_count = 0;
+        if(peek() && !(peek()->type == T_OP && peek()->op == ')')) {
+            while(1) {
+                if(!is_type_keyword_tok(peek())) error_at_token(peek(), "expected parameter type");
+                int ptype = peek()->kw_index;
+                advance_tok(); // type
+                if(peek() && peek()->type == T_OP && peek()->op == '*') advance_tok(); // optional pointer
+                if(!peek() || peek()->type != T_IDENT) error_at_token(peek(), "expected parameter name");
+                strncpy(f.param_names[f.param_count], peek()->text, sizeof(f.param_names[0])-1);
+                f.param_types[f.param_count] = ptype;
+                f.param_count++;
+                advance_tok(); // name
+                if(peek() && peek()->type == T_OP && peek()->op == ',') { advance_tok(); continue; }
+                break;
+            }
+        }
+        if(!peek() || !(peek()->type == T_OP && peek()->op == ')')) error_at_token(peek(), "expected ')'");
+        advance_tok(); // consume ')'
+
+        // function body
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '{')) error_at_token(peek(), "expected function body");
+        advance_tok(); // consume '{'
+
+        // reset locals for function scope and add parameters as locals
+        local_count = 0;
+        for(int i = 0; i < f.param_count; i++) {
+            add_local(f.param_names[i], (local_count+1)*8, f.param_types[i]);
+        }
+
+        // parse body into AST
+        f.body = statement_list();
+
+        if(!peek() || !(peek()->type == T_OP && peek()->op == '}')) error_at_token(peek(), "expected '}' at end of function");
+        advance_tok(); // consume '}'
+
+        ensure_parsed_capacity(1);
+        parsed_functions[parsed_function_count++] = f;
+
+        // reset locals for next top-level entity
+        local_count = 0;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// codegen_program: emit assembly from parsed_functions
+// -----------------------------------------------------------------------------
+void codegen_program() {
+    output("\t.intel_syntax noprefix\n\t.text\n");
+    for(int fi = 0; fi < parsed_function_count; fi++) {
+        function_t* f = &parsed_functions[fi];
+        if(f->is_global_var) {
+            output("\t.comm %s, %d, %d\n", f->name, f->global_offset, 8);
+            continue;
+        }
+        output("\t.globl %s\n%s:\n\tpush rbp\n\tmov rbp, rsp\n", f->name, f->name);
+        // compute frame size (simple): number of locals * 8 + 8
+        int frame = local_count * 8 + 8;
+        if(frame > 0) output("\tsub rsp, %d\n", frame);
+        init_cache();
+        codegen_stmt(f->body);
+        output("\tleave\n\tret\n");
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+void cleanup() {
+    if(src_file) fclose(src_file);
+    if(dst_file && dst_file != stdout) fclose(dst_file);
+}
+
+int main(int argc, char** argv) {
+    if(argc < 2 || argc > 3) { fprintf(stderr, "usage: %s <source> [output]\n", argv[0]); return 1; }
+    src_file = fopen(argv[1], "r");
+    if(!src_file) { perror("open source"); return 1; }
+    if(argc == 3) { dst_file = fopen(argv[2], "w"); if(!dst_file) { perror("open out"); return 1; } }
+    else dst_file = stdout;
+    atexit(cleanup);
+
+    scan_all();
+    cur_tok = token_head;
+    parse();               // <-- new parse stage builds parsed_functions[]
+    codegen_program();     // codegen now consumes parsed_functions
+    return 0;
+}

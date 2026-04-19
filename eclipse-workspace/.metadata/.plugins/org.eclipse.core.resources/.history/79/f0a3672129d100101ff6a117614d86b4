@@ -1,0 +1,41 @@
+# ============================================================================
+# makefile zur erstellung eines bare-metal-ähnlichen binärs mit dem HOST-GCC
+# Version 3: Erzwingt die Linker-Struktur über ein Linker-Skript
+# ============================================================================
+
+# nutze den standard-host-gcc
+cc := gcc
+objcopy := objcopy
+
+# quelle und ziel
+source := test_bios.c
+object := test_bios.o
+binary_elf := test_bios.elf
+binary_raw := test_bios.bin
+
+# c-flags (unverändert):
+cflags := -std=gnu99 -O2 -g -ffreestanding -m64 -mcmodel=large -mno-red-zone -I.
+
+# linker-flags:
+# -nostdlib: weiterhin notwendig
+# -T linker.ld: gibt unser custom-linker-skript an
+ldflags := -nostdlib -T linker.ld
+
+.PHONY: all clean
+
+all: $(binary_raw)
+
+# 1. c-quelldatei zu objektdatei kompilieren
+$(object): $(source)
+	$(cc) $(cflags) -c $< -o $@
+
+# 2. objektdatei zu elf-binärdatei linken (mit host-gcc und linker.ld)
+$(binary_elf): $(object) linker.ld
+	$(cc) $(cflags) $(ldflags) $< -o $@
+
+# 3. elf-datei in rohe binärdatei konvertieren
+$(binary_raw): $(binary_elf)
+	$(objcopy) -O binary $< $@
+
+clean:
+	rm -f $(object) $(binary_elf) $(binary_raw)

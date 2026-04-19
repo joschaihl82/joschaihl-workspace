@@ -1,0 +1,1201 @@
+```cpp
+// xmpp.cpp
+// Monolithic Qt6 + QXmpp + ALSA VoIP client scaffold (amalgamated)
+// - Connection Setup Window
+// - Registration Window with server combobox
+// - Userlist with add/remove, Call/Hangup, Chat windows
+// - System tray, notifications, settings
+// - ALSA-only audio engine with AGC
+// - Tone generator (waiting/ring/busy/wrong-number)
+// - G.711 μ-law (PCMU) encoder/decoder for voice payloads
+// - Mock mode for offline testing
+//
+// Save as xmpp.cpp. Build with CMakeLists.txt that enables AUTOMOC and links Qt6::Widgets, Qt6::Network, Qt6::Multimedia (if needed), QXmpp, and -lasound.
+// The file includes Q_OBJECT macros; ensure AUTOMOC is enabled so xmpp.moc is generated and included at the end.
+//
+// NOTE: This is a scaffold and educational example. Replace stubs and mock behavior with real RTP/Jingle/Opus/ICE implementations for production use.
+
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QMainWindow>
+#include <QtWidgets/QWidget>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QPushButton>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QListWidget>
+#include <QtWidgets/QListWidgetItem>
+#include <QtWidgets/QPlainTextEdit>
+#include <QtWidgets/QTextEdit>
+#include <QtWidgets/QComboBox>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QSpinBox>
+#include <QtWidgets/QSlider>
+#include <QtWidgets/QTabWidget>
+#include <QtWidgets/QStackedWidget>
+#include <QtWidgets/QSplitter>
+#include <QtWidgets/QToolBar>
+#include <QtWidgets/QStatusBar>
+#include <QtWidgets/QMenuBar>
+#include <QtWidgets/QMenu>
+#include <QtWidgets/QSystemTrayIcon>
+#include <QtWidgets/QStyle>
+#include <QtWidgets/QFileDialog>
+#include <QtWidgets/QMessageBox>
+#include <QtWidgets/QInputDialog>
+#include <QtWidgets/QScrollArea>
+#include <QtWidgets/QFrame>
+#include <QtCore/QTimer>
+#include <QtCore/QThread>
+#include <QtCore/QMutex>
+#include <QtCore/QMutexLocker>
+#include <QtCore/QSettings>
+#include <QtCore/QFile>
+#include <QtCore/QTextStream>
+#include <QtCore/QDateTime>
+#include <QtCore/QRandomGenerator>
+#include <QtCore/QCommandLineParser>
+#include <QtCore/QStandardPaths>
+#include <QtNetwork/QNetworkAccessManager>
+#include <QtNetwork/QNetworkReply>
+
+#include <thread>
+#include <chrono>
+#include <cmath>
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <map>
+#include <functional>
+#include <sstream>
+#include <mutex>
+
+// QXmpp includes (adjust include path depending on your installation)
+#include <QXmppClient.h>
+#include <QXmppConfiguration.h>
+#include <QXmppRosterManager.h>
+#include <QXmppPresence.h>
+#include <QXmppLogger.h>
+#include <QXmppCallManager.h>
+#include <QXmppCall.h>
+#include <QXmppMessage.h>
+
+// ALSA
+#include <alsa/asoundlib.h>
+
+// -----------------------------------------------------------------------------
+// Utility helpers
+// -----------------------------------------------------------------------------
+static QString nowString() {
+    return QDateTime::currentDateTime().toString(Qt::ISODate);
+}
+
+static QString appDataPath() {
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+}
+
+static void ensureDirExists(const QString &path) {
+    QDir d(path);
+    if (!d.exists()) d.mkpath(".");
+}
+
+// -----------------------------------------------------------------------------
+// Logger - logs to file and UI sink
+// -----------------------------------------------------------------------------
+class Logger : public QObject {
+    Q_OBJECT
+public:
+    explicit Logger(QObject *parent = nullptr) : QObject(parent) {
+        ensureDirExists(appDataPath());
+        QString logFile = appDataPath() + "/xmpp_voip.log";
+        m_file.setFileName(logFile);
+        m_file.open(QIODevice::Append | QIODevice::Text);
+    }
+    ~Logger() override {
+        if (m_file.isOpen()) m_file.close();
+    }
+    void log(const QString &msg) {
+        QString line = QString("[%1] %2").arg(nowString(), msg);
+        emit newLog(line);
+        if (m_file.isOpen()) {
+            QTextStream ts(&m_file);
+            ts << line << "\n";
+            ts.flush();
+        }
+        qDebug().noquote() << line;
+    }
+signals:
+    void newLog(const QString &line);
+private:
+    QFile m_file;
+};
+
+// -----------------------------------------------------------------------------
+// SettingsManager - wrapper around QSettings
+// -----------------------------------------------------------------------------
+class SettingsManager {
+public:
+    SettingsManager() : m_settings("ExampleOrg", "xmpp_voip_expanded") {}
+    void setValue(const QString &k, const QVariant &v) { m_settings.setValue(k, v); }
+    QVariant value(const QString &k, const QVariant &def = QVariant()) { return m_settings.value(k, def); }
+    void sync() { m_settings.sync(); }
+private:
+    QSettings m_settings;
+};
+
+// -----------------------------------------------------------------------------
+// ToneGenerator - generates PCM tone patterns (16-bit LE, 8000 Hz mono)
+// -----------------------------------------------------------------------------
+class ToneGenerator {
+public:
+    ToneGenerator(int sampleRate = 8000) : m_sampleRate(sampleRate) {}
+    QByteArray sineTone(int ms, double freq, double amplitude = 3000.0) {
+        int samples = (m_sampleRate * ms) / 1000;
+        QByteArray ba;
+        ba.resize(samples * 2);
+        qint16 *ptr = reinterpret_cast<qint16 *>(ba.data());
+        for (int i = 0; i < samples; ++i) {
+            double t = static_cast<double>(i) / m_sampleRate;
+            double v = sin(2.0 * M_PI * freq * t) * amplitude;
+            ptr[i] = static_cast<qint16>(v);
+        }
+        return ba;
+    }
+    QByteArray silence(int ms) {
+        int samples = (m_sampleRate * ms) / 1000;
+        QByteArray ba;
+        ba.resize(samples * 2);
+        memset(ba.data(), 0, ba.size());
+        return ba;
+    }
+    QByteArray waitingPattern() {
+        QByteArray out;
+        out.append(sineTone(1000, 440.0, 4000.0));
+        out.append(silence(3000));
+        return out;
+    }
+    QByteArray busyPattern() {
+        QByteArray out;
+        out.append(sineTone(500, 480.0, 3500.0));
+        out.append(sineTone(500, 620.0, 3500.0));
+        return out;
+    }
+    QByteArray wrongNumberPattern() {
+        QByteArray out;
+        out.append(sineTone(200, 600.0, 4000.0));
+        out.append(silence(100));
+        out.append(sineTone(200, 600.0, 4000.0));
+        return out;
+    }
+    QByteArray ringPattern() {
+        QByteArray out;
+        out.append(sineTone(200, 440.0, 4000.0));
+        out.append(silence(200));
+        out.append(sineTone(200, 440.0, 4000.0));
+        out.append(silence(2000));
+        return out;
+    }
+private:
+    int m_sampleRate;
+};
+
+// -----------------------------------------------------------------------------
+// G.711 μ-law (PCMU) encoder/decoder
+// -----------------------------------------------------------------------------
+static const int G711_BIAS = 0x84; // 132
+static const int G711_CLIP = 32635;
+
+static inline unsigned char linear2ulaw_sample(int pcm_val) {
+    int mask;
+    int seg;
+    unsigned char uval;
+    if (pcm_val < 0) {
+        pcm_val = -pcm_val;
+        mask = 0x7F;
+    } else {
+        mask = 0xFF;
+    }
+    if (pcm_val > G711_CLIP) pcm_val = G711_CLIP;
+    pcm_val += G711_BIAS;
+    // find segment
+    int value = pcm_val;
+    seg = 0;
+    for (int v = value >> 7; v; v >>= 1) seg++;
+    // compute u-law byte
+    if (seg >= 8) seg = 7;
+    uval = (unsigned char)((seg << 4) | ((pcm_val >> (seg + 3)) & 0x0F));
+    uval ^= mask;
+    return uval;
+}
+
+static inline int ulaw2linear_sample(unsigned char u_val) {
+    u_val = ~u_val;
+    int sign = (u_val & 0x80);
+    int seg = (u_val & 0x70) >> 4;
+    int quant = u_val & 0x0F;
+    int t = ((quant << 3) + G711_BIAS) << (seg ? (seg - 1) : 0);
+    if (seg > 0) t = ((quant << 3) + G711_BIAS) << (seg - 1);
+    return sign ? -t : t;
+}
+
+static QByteArray pcm16_to_g711u(const QByteArray &pcm16le) {
+    int samples = pcm16le.size() / 2;
+    QByteArray out;
+    out.resize(samples);
+    const qint16 *in = reinterpret_cast<const qint16 *>(pcm16le.constData());
+    for (int i = 0; i < samples; ++i) {
+        int sample = static_cast<int>(in[i]);
+        out[i] = static_cast<char>(linear2ulaw_sample(sample));
+    }
+    return out;
+}
+
+static QByteArray g711u_to_pcm16(const QByteArray &g711) {
+    int samples = g711.size();
+    QByteArray out;
+    out.resize(samples * 2);
+    qint16 *ptr = reinterpret_cast<qint16 *>(out.data());
+    for (int i = 0; i < samples; ++i) {
+        unsigned char u = static_cast<unsigned char>(g711.at(i));
+        int s = ulaw2linear_sample(u);
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+        ptr[i] = static_cast<qint16>(s);
+    }
+    return out;
+}
+
+// -----------------------------------------------------------------------------
+// AlsaAudioEngine - ALSA-only audio engine with AGC and Qt signal
+// -----------------------------------------------------------------------------
+class AlsaAudioEngine : public QObject {
+    Q_OBJECT
+public:
+    AlsaAudioEngine(QObject *parent = nullptr)
+        : QObject(parent),
+          m_deviceName("default"),
+          m_sampleRate(8000),
+          m_channels(1),
+          m_captureHandle(nullptr),
+          m_playbackHandle(nullptr),
+          m_running(false),
+          m_agcEnabled(true),
+          m_agcTargetRms(1000.0),
+          m_agcGain(1.0),
+          m_agcAttack(0.02),
+          m_agcRelease(0.1),
+          m_muted(false)
+    {
+    }
+
+    ~AlsaAudioEngine() override {
+        stop();
+    }
+
+    static QStringList availableDevices() {
+        QStringList list;
+        list << "default";
+        void **hints = nullptr;
+        if (snd_device_name_hint(-1, "pcm", &hints) == 0 && hints) {
+            for (void **n = hints; *n != nullptr; ++n) {
+                char *name = snd_device_name_get_hint(*n, "NAME");
+                if (name) {
+                    QString s = QString::fromLocal8Bit(name);
+                    if (!list.contains(s)) list << s;
+                    free(name);
+                }
+            }
+            snd_device_name_free_hint(hints);
+        }
+        return list;
+    }
+
+    void setDeviceName(const QString &dev) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_deviceName = dev.toStdString();
+    }
+
+    QString deviceName() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return QString::fromStdString(m_deviceName);
+    }
+
+    void setSampleRate(unsigned int rate) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_sampleRate = rate;
+    }
+
+    unsigned int sampleRate() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_sampleRate;
+    }
+
+    void setChannels(unsigned int ch) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_channels = ch;
+    }
+
+    unsigned int channels() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_channels;
+    }
+
+    void setAgcEnabled(bool on) { m_agcEnabled = on; }
+    void setAgcTargetRms(double v) { m_agcTargetRms = v; }
+    void setAgcAttack(double v) { m_agcAttack = v; }
+    void setAgcRelease(double v) { m_agcRelease = v; }
+    void setMuted(bool m) { m_muted = m; }
+
+    bool init() {
+        return initCapture() && initPlayback();
+    }
+
+    bool initCapture() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_captureHandle) return true;
+        int err;
+        snd_pcm_hw_params_t *params = nullptr;
+        snd_pcm_t *handle = nullptr;
+        if ((err = snd_pcm_open(&handle, m_deviceName.c_str(), SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+            qWarning() << "ALSA capture open error:" << snd_strerror(err);
+            return false;
+        }
+        snd_pcm_hw_params_malloc(&params);
+        snd_pcm_hw_params_any(handle, params);
+        snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16_LE);
+        snd_pcm_hw_params_set_channels(handle, params, m_channels);
+        unsigned int rate = m_sampleRate;
+        snd_pcm_hw_params_set_rate_near(handle, params, &rate, 0);
+        snd_pcm_hw_params(handle, params);
+        snd_pcm_hw_params_free(params);
+        snd_pcm_prepare(handle);
+        m_captureHandle = handle;
+        return true;
+    }
+
+    bool initPlayback() {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_playbackHandle) return true;
+        int err;
+        snd_pcm_hw_params_t *params = nullptr;
+        snd_pcm_t *handle = nullptr;
+        if ((err = snd_pcm_open(&handle, m_deviceName.c_str(), SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+            qWarning() << "ALSA playback open error:" << snd_strerror(err);
+            return false;
+        }
+        snd_pcm_hw_params_malloc(&params);
+        snd_pcm_hw_params_any(handle, params);
+        snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+        snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16_LE);
+        snd_pcm_hw_params_set_channels(handle, params, m_channels);
+        unsigned int rate = m_sampleRate;
+        snd_pcm_hw_params_set_rate_near(handle, params, &rate, 0);
+        snd_pcm_hw_params(handle, params);
+        snd_pcm_hw_params_free(params);
+        snd_pcm_prepare(handle);
+        m_playbackHandle = handle;
+        return true;
+    }
+
+    void start() {
+        if (m_running.load()) return;
+        if (!init()) {
+            qWarning() << "AlsaAudioEngine: init failed";
+            return;
+        }
+        m_running.store(true);
+        m_thread = std::thread([this]() { this->captureLoop(); });
+    }
+
+    void stop() {
+        if (!m_running.load()) return;
+        m_running.store(false);
+        if (m_thread.joinable()) m_thread.join();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_captureHandle) { snd_pcm_close(m_captureHandle); m_captureHandle = nullptr; }
+        if (m_playbackHandle) { snd_pcm_close(m_playbackHandle); m_playbackHandle = nullptr; }
+    }
+
+    ssize_t writePlayback(const char *data, size_t bytes) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_playbackHandle) return -1;
+        snd_pcm_sframes_t frames = snd_pcm_writei(m_playbackHandle, data, bytes / (2 * m_channels));
+        if (frames < 0) frames = snd_pcm_recover(m_playbackHandle, frames, 0);
+        if (frames < 0) {
+            qWarning() << "ALSA write error:" << snd_strerror(frames);
+            return -1;
+        }
+        return frames * (2 * m_channels);
+    }
+
+    void playPcm(const QByteArray &pcm) {
+        if (m_muted) return;
+        writePlayback(pcm.constData(), static_cast<size_t>(pcm.size()));
+    }
+
+signals:
+    void frameCaptured(const QByteArray &pcm);
+
+private:
+    void captureLoop() {
+        const size_t bufferBytes = 3200;
+        std::vector<char> buffer(bufferBytes);
+        while (m_running.load()) {
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_captureHandle) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
+            }
+            snd_pcm_sframes_t frames = snd_pcm_readi(m_captureHandle, buffer.data(), bufferBytes / (2 * m_channels));
+            if (frames < 0) {
+                frames = snd_pcm_recover(m_captureHandle, frames, 0);
+            }
+            if (frames < 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+            size_t bytes = static_cast<size_t>(frames) * 2 * m_channels;
+            QByteArray pcm(buffer.data(), static_cast<int>(bytes));
+            if (m_agcEnabled) pcm = applyAgc(pcm);
+            QMetaObject::invokeMethod(this, "emitFrameCaptured", Qt::QueuedConnection, Q_ARG(QByteArray, pcm));
+        }
+    }
+
+    Q_SLOT void emitFrameCaptured(const QByteArray &pcm) {
+        emit frameCaptured(pcm);
+    }
+
+    QByteArray applyAgc(const QByteArray &pcm) {
+        if (pcm.isEmpty()) return pcm;
+        int samples = pcm.size() / 2;
+        const qint16 *in = reinterpret_cast<const qint16 *>(pcm.constData());
+        QByteArray out;
+        out.resize(pcm.size());
+        qint16 *outPtr = reinterpret_cast<qint16 *>(out.data());
+        double sum = 0.0;
+        for (int i = 0; i < samples; ++i) {
+            double s = static_cast<double>(in[i]);
+            sum += s * s;
+        }
+        double rms = (samples > 0) ? sqrt(sum / samples) : 0.0;
+        double desiredGain = 1.0;
+        if (rms > 1e-6) desiredGain = m_agcTargetRms / rms;
+        if (desiredGain > 10.0) desiredGain = 10.0;
+        if (desiredGain < 0.1) desiredGain = 0.1;
+        if (desiredGain > m_agcGain) {
+            m_agcGain += (desiredGain - m_agcGain) * m_agcAttack;
+        } else {
+            m_agcGain += (desiredGain - m_agcGain) * m_agcRelease;
+        }
+        for (int i = 0; i < samples; ++i) {
+            double v = static_cast<double>(in[i]) * m_agcGain;
+            if (v > 32767.0) v = 32767.0;
+            if (v < -32768.0) v = -32768.0;
+            outPtr[i] = static_cast<qint16>(v);
+        }
+        return out;
+    }
+
+    // members
+    std::string m_deviceName;
+    unsigned int m_sampleRate;
+    unsigned int m_channels;
+    snd_pcm_t *m_captureHandle;
+    snd_pcm_t *m_playbackHandle;
+    std::thread m_thread;
+    std::atomic<bool> m_running;
+    std::mutex m_mutex;
+
+    std::atomic<bool> m_agcEnabled;
+    double m_agcTargetRms;
+    double m_agcGain;
+    double m_agcAttack;
+    double m_agcRelease;
+
+    std::atomic<bool> m_muted;
+};
+
+// -----------------------------------------------------------------------------
+// CallManager - integrates with AlsaAudioEngine, uses G.711 for payloads, plays tones
+// -----------------------------------------------------------------------------
+class CallManager : public QObject {
+    Q_OBJECT
+public:
+    CallManager(AlsaAudioEngine *audio, Logger *logger, QObject *parent = nullptr)
+        : QObject(parent), m_audio(audio), m_logger(logger), m_active(false), m_tonePlaying(false),
+          m_toneGen(8000), m_mockRemote(false)
+    {
+        if (m_audio) connect(m_audio, &AlsaAudioEngine::frameCaptured, this, &CallManager::onLocalFrame);
+    }
+
+    ~CallManager() override {
+        stopCall();
+    }
+
+    void startCall(const QString &peerJid) {
+        if (m_active) return;
+        m_peer = peerJid;
+        m_logger->log(QString("Starting call to %1").arg(peerJid));
+        if (m_audio) m_audio->start();
+        m_active = true;
+        playRingback();
+        emit callStarted(peerJid);
+    }
+
+    void stopCall() {
+        if (!m_active) return;
+        stopTone();
+        if (m_audio) m_audio->stop();
+        m_logger->log(QString("Stopped call with %1").arg(m_peer));
+        emit callEnded(m_peer);
+        m_active = false;
+        m_peer.clear();
+    }
+
+    void hangup() { stopCall(); }
+
+    void playRingback() {
+        stopTone();
+        m_tonePlaying = true;
+        m_toneTimer = std::make_unique<QTimer>();
+        connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+            QByteArray p = m_toneGen.waitingPattern();
+            if (m_audio) m_audio->playPcm(p);
+        });
+        if (m_audio) m_audio->playPcm(m_toneGen.waitingPattern());
+        m_toneTimer->start(4000);
+    }
+
+    void playBusy() {
+        stopTone();
+        m_tonePlaying = true;
+        m_toneTimer = std::make_unique<QTimer>();
+        connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+            QByteArray p = m_toneGen.busyPattern();
+            if (m_audio) m_audio->playPcm(p);
+        });
+        if (m_audio) m_audio->playPcm(m_toneGen.busyPattern());
+        m_toneTimer->start(1000);
+    }
+
+    void playWrongNumber() {
+        stopTone();
+        m_tonePlaying = true;
+        QByteArray p = m_toneGen.wrongNumberPattern();
+        if (m_audio) m_audio->playPcm(p);
+        QTimer::singleShot(1200, this, [this]() { this->m_tonePlaying = false; });
+    }
+
+    void playRing() {
+        stopTone();
+        m_tonePlaying = true;
+        m_toneTimer = std::make_unique<QTimer>();
+        connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+            QByteArray p = m_toneGen.ringPattern();
+            if (m_audio) m_audio->playPcm(p);
+        });
+        if (m_audio) m_audio->playPcm(m_toneGen.ringPattern());
+        m_toneTimer->start(2600);
+    }
+
+    void stopTone() {
+        m_tonePlaying = false;
+        if (m_toneTimer) {
+            m_toneTimer->stop();
+            m_toneTimer.reset();
+        }
+    }
+
+    void setMockRemote(bool on) { m_mockRemote = on; }
+
+signals:
+    void callStarted(const QString &jid);
+    void callEnded(const QString &jid);
+    void remoteFrame(const QByteArray &pcmEncoded); // encoded G.711 payload
+
+private slots:
+    // Called when local PCM frames are captured (16-bit LE)
+    void onLocalFrame(const QByteArray &pcm16le) {
+        if (!m_active) return;
+
+        // Encode to G.711 μ-law
+        QByteArray g711 = pcm16_to_g711u(pcm16le);
+
+        // In a real implementation, send g711 over RTP/SRTP to remote
+        // For mock mode, simulate remote receive and playback
+        if (m_mockRemote) {
+            QByteArray payload = g711;
+            QTimer::singleShot(30 + QRandomGenerator::global()->bounded(40), this, [this, payload]() {
+                QByteArray pcmOut = g711u_to_pcm16(payload);
+                if (m_audio) m_audio->playPcm(pcmOut);
+                emit remoteFrame(payload);
+            });
+        } else {
+            // Local loopback for testing: decode and play
+            if (!m_tonePlaying && m_audio) {
+                QByteArray pcmOut = g711u_to_pcm16(g711);
+                m_audio->playPcm(pcmOut);
+            }
+        }
+    }
+
+private:
+    AlsaAudioEngine *m_audio;
+    Logger *m_logger;
+    bool m_active;
+    QString m_peer;
+    bool m_tonePlaying;
+    std::unique_ptr<QTimer> m_toneTimer;
+    ToneGenerator m_toneGen;
+    bool m_mockRemote;
+};
+
+// -----------------------------------------------------------------------------
+// XmppController - manages QXmppClient and basic messaging/roster
+// -----------------------------------------------------------------------------
+class XmppController : public QObject {
+    Q_OBJECT
+public:
+    XmppController(Logger *logger, QObject *parent = nullptr)
+        : QObject(parent), m_logger(logger), m_client(new QXmppClient()), m_rosterMgr(nullptr) {
+        connect(m_client.get(), &QXmppClient::connected, this, &XmppController::onConnected);
+        connect(m_client.get(), &QXmppClient::disconnected, this, &XmppController::onDisconnected);
+        connect(m_client.get(), &QXmppClient::error, this, &XmppController::onError);
+        connect(m_client.get(), &QXmppClient::messageReceived, this, &XmppController::onMessageReceived);
+        m_rosterMgr = m_client->findExtension<QXmppRosterManager>();
+        if (m_rosterMgr) {
+            connect(m_rosterMgr, &QXmppRosterManager::rosterReceived, this, &XmppController::onRosterReceived);
+            connect(m_rosterMgr, &QXmppRosterManager::presenceChanged, this, &XmppController::onPresenceChanged);
+        }
+    }
+
+    ~XmppController() override {
+        if (m_client->isConnected()) m_client->disconnectFromServer();
+    }
+
+    void connectToServer(const QString &jid, const QString &password, const QString &host = QString(), int port = 5222) {
+        QXmppConfiguration cfg;
+        cfg.setJid(jid);
+        cfg.setPassword(password);
+        if (!host.isEmpty()) cfg.setHost(host);
+        cfg.setPort(port);
+        m_logger->log(QString("Connecting to XMPP: %1").arg(jid));
+        m_client->connectToServer(cfg);
+    }
+
+    void disconnectFromServer() {
+        if (m_client->isConnected()) {
+            m_client->disconnectFromServer();
+            m_logger->log("Disconnecting from XMPP");
+        }
+    }
+
+    bool isConnected() const { return m_client->isConnected(); }
+    QString currentJid() const { return m_client->configuration().jid(); }
+
+    QStringList rosterJids() const {
+        return m_localRoster;
+    }
+
+    void addRosterItem(const QString &jid) {
+        if (!m_localRoster.contains(jid)) m_localRoster << jid;
+        if (m_rosterMgr) m_rosterMgr->addItem(jid);
+        emit rosterUpdated();
+    }
+
+    void removeRosterItem(const QString &jid) {
+        m_localRoster.removeAll(jid);
+        if (m_rosterMgr) m_rosterMgr->removeItem(jid);
+        emit rosterUpdated();
+    }
+
+    void sendMessage(const QString &to, const QString &body) {
+        QXmppMessage msg;
+        msg.setTo(to);
+        msg.setBody(body);
+        m_client->sendPacket(msg);
+        m_logger->log(QString("Sent message to %1: %2").arg(to, body));
+    }
+
+signals:
+    void connected();
+    void disconnected();
+    void rosterUpdated();
+    void presenceUpdated(const QString &jid, const QString &resource);
+    void messageReceived(const QString &from, const QString &body);
+
+private slots:
+    void onConnected() {
+        m_logger->log("XMPP connected");
+        emit connected();
+    }
+    void onDisconnected() {
+        m_logger->log("XMPP disconnected");
+        emit disconnected();
+    }
+    void onError(QXmppClient::Error err) {
+        Q_UNUSED(err);
+        m_logger->log("XMPP error occurred");
+    }
+    void onRosterReceived() {
+        m_logger->log("Roster received");
+        emit rosterUpdated();
+    }
+    void onPresenceChanged(const QString &jid, const QString &resource) {
+        m_logger->log(QString("Presence changed: %1 (%2)").arg(jid, resource));
+        emit presenceUpdated(jid, resource);
+    }
+    void onMessageReceived(const QXmppMessage &msg) {
+        QString from = msg.from();
+        QString body = msg.body();
+        m_logger->log(QString("Message received from %1: %2").arg(from, body));
+        emit messageReceived(from, body);
+    }
+
+private:
+    Logger *m_logger;
+    std::unique_ptr<QXmppClient> m_client;
+    QXmppRosterManager *m_rosterMgr;
+    QStringList m_localRoster;
+};
+
+// -----------------------------------------------------------------------------
+// RegistrationWindow - registration UI with server combobox
+// -----------------------------------------------------------------------------
+class RegistrationWindow : public QDialog {
+    Q_OBJECT
+public:
+    RegistrationWindow(QWidget *parent = nullptr) : QDialog(parent) {
+        setWindowTitle("Register New Account");
+        setModal(true);
+        auto *layout = new QVBoxLayout(this);
+        auto *form = new QFormLayout();
+        m_usernameEdit = new QLineEdit(this);
+        m_domainCombo = new QComboBox(this);
+        m_domainCombo->addItem("example.org");
+        m_domainCombo->addItem("jabber.org");
+        m_domainCombo->addItem("xmpp.jp");
+        m_domainCombo->addItem("localhost");
+        m_passwordEdit = new QLineEdit(this);
+        m_passwordEdit->setEchoMode(QLineEdit::Password);
+        m_serverEdit = new QLineEdit(this);
+        m_serverEdit->setPlaceholderText("server host (optional)");
+        form->addRow("Username:", m_usernameEdit);
+        form->addRow("Domain:", m_domainCombo);
+        form->addRow("Password:", m_passwordEdit);
+        form->addRow("Server (optional):", m_serverEdit);
+        layout->addLayout(form);
+        auto *btnLayout = new QHBoxLayout();
+        auto *registerBtn = new QPushButton("Register", this);
+        auto *cancelBtn = new QPushButton("Cancel", this);
+        btnLayout->addWidget(registerBtn);
+        btnLayout->addWidget(cancelBtn);
+        layout->addLayout(btnLayout);
+        connect(registerBtn, &QPushButton::clicked, this, &RegistrationWindow::onRegisterClicked);
+        connect(cancelBtn, &QPushButton::clicked, this, &RegistrationWindow::reject);
+    }
+
+private slots:
+    void onRegisterClicked() {
+        QString username = m_usernameEdit->text().trimmed();
+        QString domain = m_domainCombo->currentText().trimmed();
+        QString pw = m_passwordEdit->text();
+        QString server = m_serverEdit->text().trimmed();
+        if (username.isEmpty() || domain.isEmpty() || pw.isEmpty()) {
+            QMessageBox::warning(this, "Missing fields", "Please enter username, domain and password.");
+            return;
+        }
+        QString jid = QString("%1@%2").arg(username).arg(domain);
+        QMessageBox::information(this, "Registration", QString("Registration requested for %1 on %2").arg(jid).arg(server.isEmpty() ? QString("default server") : server));
+        accept();
+    }
+
+private:
+    QLineEdit *m_usernameEdit;
+    QComboBox *m_domainCombo;
+    QLineEdit *m_passwordEdit;
+    QLineEdit *m_serverEdit;
+};
+
+// -----------------------------------------------------------------------------
+// ChatWindow - per-contact chat UI
+// -----------------------------------------------------------------------------
+class ChatWindow : public QWidget {
+    Q_OBJECT
+public:
+    ChatWindow(const QString &jid, XmppController *controller, Logger *logger, QWidget *parent = nullptr)
+        : QWidget(parent), m_jid(jid), m_controller(controller), m_logger(logger)
+    {
+        setWindowTitle(QString("Chat - %1").arg(jid));
+        resize(480, 360);
+        auto *layout = new QVBoxLayout(this);
+        m_history = new QPlainTextEdit(this);
+        m_history->setReadOnly(true);
+        m_input = new QLineEdit(this);
+        auto *btnLayout = new QHBoxLayout();
+        m_sendBtn = new QPushButton("Send", this);
+        m_closeBtn = new QPushButton("Close", this);
+        btnLayout->addWidget(m_sendBtn);
+        btnLayout->addWidget(m_closeBtn);
+        layout->addWidget(m_history);
+        layout->addWidget(m_input);
+        layout->addLayout(btnLayout);
+
+        connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::onSend);
+        connect(m_closeBtn, &QPushButton::clicked, this, &ChatWindow::close);
+        connect(m_input, &QLineEdit::returnPressed, this, &ChatWindow::onSend);
+
+        if (m_controller) {
+            connect(m_controller, &XmppController::messageReceived, this, &ChatWindow::onIncomingMessage);
+        }
+    }
+
+    void appendLocal(const QString &text) {
+        QString line = QString("[%1] Me: %2").arg(nowString()).arg(text);
+        m_history->appendPlainText(line);
+    }
+
+    void appendRemote(const QString &from, const QString &text) {
+        if (from != m_jid) return;
+        QString line = QString("[%1] %2: %3").arg(nowString()).arg(from).arg(text);
+        m_history->appendPlainText(line);
+    }
+
+private slots:
+    void onSend() {
+        QString text = m_input->text().trimmed();
+        if (text.isEmpty()) return;
+        if (m_controller) {
+            m_controller->sendMessage(m_jid, text);
+            appendLocal(text);
+            m_input->clear();
+        }
+    }
+
+    void onIncomingMessage(const QString &from, const QString &body) {
+        if (from == m_jid) appendRemote(from, body);
+    }
+
+private:
+    QString m_jid;
+    XmppController *m_controller;
+    Logger *m_logger;
+    QPlainTextEdit *m_history;
+    QLineEdit *m_input;
+    QPushButton *m_sendBtn;
+    QPushButton *m_closeBtn;
+};
+
+// -----------------------------------------------------------------------------
+// SettingsDialog - simplified settings using ALSA device enumeration
+// -----------------------------------------------------------------------------
+class SettingsDialog : public QDialog {
+    Q_OBJECT
+public:
+    SettingsDialog(SettingsManager *settings, AlsaAudioEngine *audio, QWidget *parent = nullptr)
+        : QDialog(parent), m_settings(settings), m_audio(audio)
+    {
+        setWindowTitle("Settings");
+        auto *layout = new QVBoxLayout(this);
+        auto *tabs = new QTabWidget(this);
+
+        auto *general = new QWidget(this);
+        auto *gLayout = new QFormLayout(general);
+        m_autoStart = new QCheckBox("Auto-start on login", this);
+        m_autoConnect = new QCheckBox("Auto-connect on startup", this);
+        gLayout->addRow(m_autoStart);
+        gLayout->addRow(m_autoConnect);
+        tabs->addTab(general, "General");
+
+        auto *audioTab = new QWidget(this);
+        auto *aLayout = new QFormLayout(audioTab);
+        m_inputDevice = new QComboBox(this);
+        m_outputDevice = new QComboBox(this);
+        QStringList devs = AlsaAudioEngine::availableDevices();
+        for (const QString &d : devs) m_inputDevice->addItem(d);
+        for (const QString &d : devs) m_outputDevice->addItem(d);
+        m_agcEnable = new QCheckBox("Enable AGC", this);
+        m_agcTarget = new QSpinBox(this);
+        m_agcTarget->setRange(100, 10000);
+        m_agcTarget->setValue(1000);
+        m_agcAttack = new QSlider(Qt::Horizontal, this);
+        m_agcAttack->setRange(1, 100);
+        m_agcAttack->setValue(2);
+        m_agcRelease = new QSlider(Qt::Horizontal, this);
+        m_agcRelease->setRange(1, 100);
+        m_agcRelease->setValue(10);
+        aLayout->addRow("Device:", m_inputDevice);
+        aLayout->addRow("Output device:", m_outputDevice);
+        aLayout->addRow(m_agcEnable);
+        aLayout->addRow("AGC target RMS:", m_agcTarget);
+        aLayout->addRow("AGC attack:", m_agcAttack);
+        aLayout->addRow("AGC release:", m_agcRelease);
+        tabs->addTab(audioTab, "Audio");
+
+        auto *adv = new QWidget(this);
+        auto *advLayout = new QVBoxLayout(adv);
+        m_diag = new QPlainTextEdit(this);
+        m_diag->setReadOnly(true);
+        advLayout->addWidget(m_diag);
+        tabs->addTab(adv, "Diagnostics");
+
+        layout->addWidget(tabs);
+        auto *btnLayout = new QHBoxLayout();
+        auto *ok = new QPushButton("OK", this);
+        auto *cancel = new QPushButton("Cancel", this);
+        btnLayout->addWidget(ok);
+        btnLayout->addWidget(cancel);
+        layout->addLayout(btnLayout);
+        connect(ok, &QPushButton::clicked, this, &SettingsDialog::onOk);
+        connect(cancel, &QPushButton::clicked, this, &SettingsDialog::reject);
+
+        load();
+    }
+
+    void load() {
+        m_autoStart->setChecked(m_settings->value("autoStart", false).toBool());
+        m_autoConnect->setChecked(m_settings->value("autoConnect", false).toBool());
+        QString inDev = m_settings->value("inputDevice", "").toString();
+        QString outDev = m_settings->value("outputDevice", "").toString();
+        int idx = m_inputDevice->findText(inDev);
+        if (idx >= 0) m_inputDevice->setCurrentIndex(idx);
+        idx = m_outputDevice->findText(outDev);
+        if (idx >= 0) m_outputDevice->setCurrentIndex(idx);
+        m_agcEnable->setChecked(m_settings->value("agcEnabled", true).toBool());
+        m_agcTarget->setValue(m_settings->value("agcTarget", 1000).toInt());
+        m_agcAttack->setValue(m_settings->value("agcAttack", 2).toInt());
+        m_agcRelease->setValue(m_settings->value("agcRelease", 10).toInt());
+    }
+
+private slots:
+    void onOk() {
+        m_settings->setValue("autoStart", m_autoStart->isChecked());
+        m_settings->setValue("autoConnect", m_autoConnect->isChecked());
+        m_settings->setValue("inputDevice", m_inputDevice->currentText());
+        m_settings->setValue("outputDevice", m_outputDevice->currentText());
+        m_settings->setValue("agcEnabled", m_agcEnable->isChecked());
+        m_settings->setValue("agcTarget", m_agcTarget->value());
+        m_settings->setValue("agcAttack", m_agcAttack->value());
+        m_settings->setValue("agcRelease", m_agcRelease->value());
+        m_settings->sync();
+        accept();
+    }
+
+private:
+    SettingsManager *m_settings;
+    AlsaAudioEngine *m_audio;
+    QCheckBox *m_autoStart;
+    QCheckBox *m_autoConnect;
+    QComboBox *m_inputDevice;
+    QComboBox *m_outputDevice;
+    QCheckBox *m_agcEnable;
+    QSpinBox *m_agcTarget;
+    QSlider *m_agcAttack;
+    QSlider *m_agcRelease;
+    QPlainTextEdit *m_diag;
+};
+
+// -----------------------------------------------------------------------------
+// MainWindow - orchestrates UI, controllers, audio, calls, and settings
+// -----------------------------------------------------------------------------
+class MainWindow : public QMainWindow {
+    Q_OBJECT
+public:
+    MainWindow(QWidget *parent = nullptr)
+        : QMainWindow(parent),
+          m_logger(new Logger(this)),
+          m_settings(),
+          m_audio(new AlsaAudioEngine(this)),
+          m_xmpp(new XmppController(m_logger, this)),
+          m_callManager(new CallManager(m_audio, m_logger, this))
+    {
+        setWindowTitle("XMPP VoIP Expanded");
+        resize(1100, 700);
+
+        auto *central = new QWidget(this);
+        auto *mainLayout = new QVBoxLayout(central);
+
+        auto *connGroup = new QGroupBox("Connection", this);
+        auto *connLayout = new QFormLayout(connGroup);
+        m_jid = new QLineEdit(this);
+        m_password = new QLineEdit(this);
+        m_password->setEchoMode(QLineEdit::Password);
+        m_server = new QLineEdit(this);
+        m_port = new QLineEdit(this);
+        m_port->setText("5222");
+        connLayout->addRow("JID:", m_jid);
+        connLayout->addRow("Password:", m_password);
+        connLayout->addRow("Server (optional):", m_server);
+        connLayout->addRow("Port:", m_port);
+        auto *btnRow = new QHBoxLayout();
+        m_connectBtn = new QPushButton("Connect", this);
+        m_disconnectBtn = new QPushButton("Disconnect", this);
+        m_registerBtn = new QPushButton("Register", this);
+        m_settingsBtn = new QPushButton("Settings", this);
+        btnRow->addWidget(m_connectBtn);
+        btnRow->addWidget(m_disconnectBtn);
+        btnRow->addWidget(m_registerBtn);
+        btnRow->addWidget(m_settingsBtn);
+        connLayout->addRow(btnRow);
+        mainLayout->addWidget(connGroup);
+
+        auto *split = new QSplitter(Qt::Horizontal, central);
+
+        auto *left = new QWidget(this);
+        auto *leftLayout = new QVBoxLayout(left);
+        auto *contactsGroup = new QGroupBox("Contacts", left);
+        auto *contactsLayout = new QVBoxLayout(contactsGroup);
+        m_contactsList = new QListWidget(this);
+        contactsLayout->addWidget(m_contactsList);
+        auto *contactBtns = new QHBoxLayout();
+        m_addContact = new QPushButton("+", this);
+        m_removeContact = new QPushButton("-", this);
+        m_callContact = new QPushButton("Call", this);
+        m_chatContact = new QPushButton("Chat", this);
+        contactBtns->addWidget(m_addContact);
+        contactBtns->addWidget(m_removeContact);
+        contactBtns->addWidget(m_callContact);
+        contactBtns->addWidget(m_chatContact);
+        contactsLayout->addLayout(contactBtns);
+        leftLayout->addWidget(contactsGroup);
+        split->addWidget(left);
+
+        auto *right = new QWidget(this);
+        auto *rightLayout = new QVBoxLayout(right);
+        m_tab = new QTabWidget(this);
+        m_chatArea = new QWidget(this);
+        auto *chatLayout = new QVBoxLayout(m_chatArea);
+        m_chatStack = new QStackedWidget(this);
+        chatLayout->addWidget(m_chatStack);
+        m_tab->addTab(m_chatArea, "Chats");
+        m_callsArea = new QWidget(this);
+        auto *callsLayout = new QVBoxLayout(m_callsArea);
+        m_callHistory = new QPlainTextEdit(this);
+        m_callHistory->setReadOnly(true);
+        callsLayout->addWidget(m_callHistory);
+        m_tab->addTab(m_callsArea, "Calls");
+        m_logArea = new QWidget(this);
+        auto *logLayout = new QVBoxLayout(m_logArea);
+        m_logView = new QPlainTextEdit(this);
+        m_logView->setReadOnly(true);
+        logLayout->addWidget(m_logView);
+        m_tab->addTab(m_logArea, "Activity");
+        rightLayout->addWidget(m_tab);
+        split->addWidget(right);
+
+        mainLayout->addWidget(split);
+        setCentralWidget(central);
+
+        statusBar()->showMessage("Ready");
+        setupTray();
+
+        connect(m_connectBtn, &QPushButton::clicked, this, &MainWindow::onConnect);
+        connect(m_disconnectBtn, &QPushButton::clicked, this, &MainWindow::onDisconnect);
+        connect(m_registerBtn, &QPushButton::clicked, this, &MainWindow::onRegister);
+        connect(m_settingsBtn, &QPushButton::clicked, this, &MainWindow::onSettings);
+        connect(m_addContact, &QPushButton::clicked, this, &MainWindow::onAddContact);
+        connect(m_removeContact, &QPushButton::clicked, this, &MainWindow::onRemoveContact);
+        connect(m_callContact, &QPushButton::clicked, this, &MainWindow::onCallContact);
+        connect(m_chatContact, &QPushButton::clicked, this, &MainWindow::onChatContact);
+
+        connect(m_logger, &Logger::newLog, this, &MainWindow::onNewLog);
+        connect(m_xmpp, &XmppController::connected, this, &MainWindow::onXmppConnected);
+        connect(m_xmpp, &XmppController::disconnected, this, &MainWindow::onXmppDisconnected);
+        connect(m_xmpp, &XmppController::rosterUpdated, this, &MainWindow::onRosterUpdated);
+        connect(m_xmpp, &XmppController::messageReceived, this, &MainWindow::onMessageReceived);
+        connect(m_callManager, &CallManager::callStarted, this, &MainWindow::onCallStarted);
+        connect(m_callManager, &CallManager::callEnded, this, &MainWindow::onCallEnded);
+
+        loadSettings();
+
+        if (m_settings.value("mockMode", false).toBool()) {
+            enterMockMode();
+        }
+    }
+
+    ~MainWindow() override {
+        if (m_tray) { m_tray->hide(); delete m_tray; m_tray = nullptr; }
+    }
+
+private slots:
+    void onConnect() {
+        QString jid = m_jid->text().trimmed();
+        QString pw = m_password->text();
+        QString server = m_server->text().trimmed();
+        int port = m_port->text().toInt();
+        if (jid.isEmpty() || pw.isEmpty()) {
+            QMessageBox::warning(this, "Missing", "Please enter JID and password.");
+            return;
+        }
+        m_xmpp->connectToServer(jid, pw, server, port);
+        m_logger->log(QString("Connect requested: %1").arg(jid));
+        if (m_settings.value("autoConnect", false).toBool()) {
+            m_settings.setValue("jid", jid);
+            m_settings.setValue("password", pw);
+            m_settings.setValue("server", server);
+            m_settings.sync();
+        }
+    }
+
+    void onDisconnect() {
+        m_xmpp->disconnectFromServer();
+    }
+
+    void onRegister() {
+        RegistrationWindow dlg(this);
+        dlg.exec();
+    }
+
+    void onSettings() {
+        SettingsDialog dlg(&m_settings, m_audio, this);
+        if (dlg.exec() == QDialog::Accepted) {
+            QString inDev = m_settings.value("inputDevice", "").toString();
+            QString outDev = m_settings.value("outputDevice", "").toString();
+            if (!inDev.isEmpty()) m_audio->setDeviceName(inDev);
+            if (!outDev.isEmpty()) m_audio->setDeviceName(outDev);
+            m_audio->setAgcEnabled(m_settings.value("agcEnabled", true).toBool());
+            m_audio->setAgcTargetRms(m_settings.value("agcTarget", 1000).toDouble());
+            m_audio->setAgcAttack(m_settings.value("agcAttack", 0.02).toDouble());
+            m_audio->setAgcRelease(m_settings.value("agcRelease", 0.1).toDouble());
+            m_logger->log("Settings applied");
+        }
+    }
+
+    void onAddContact() {
+        bool ok = false;
+        QString jid = QInputDialog::getText(this, "Add Contact", "JID:", QLineEdit::Normal, QString(), &ok);
+        if (ok && !jid.isEmpty()) {
+            m_xmpp->addRosterItem(jid);
+            refreshContacts();
+        }
+    }
+
+    void onRemoveContact() {
+        QListWidgetItem *it = m_contactsList->currentItem();
+        if (!it) return;
+        QString jid = it->text();
+        m_xmpp->removeRosterItem(jid);
+        refreshContacts();
+    }
+
+    void onCallContact() {
+        QListWidgetItem *it = m_contactsList->currentItem();
+        if (!it) return;
+        QString jid = it->text();
+        m_callManager->startCall(jid);
+    }
+
+    void onChatContact() {
+        QListWidgetItem *it = m_contactsList->currentItem();
+        if (!it) return;
+        QString jid = it->text();
+        openChat(jid);
+    }
+
+    void onNewLog(const QString &line) {

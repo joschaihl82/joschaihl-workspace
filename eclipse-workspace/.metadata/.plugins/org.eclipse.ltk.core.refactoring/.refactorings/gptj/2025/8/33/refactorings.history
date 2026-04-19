@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;gptj/src/gptj.cpp&apos; to &apos;start.cpp&apos;" description="Rename resource &apos;gptj.cpp&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="src/gptj.cpp" name="start.cpp" stamp="1755470271862" updateReferences="true"/>
+</session>

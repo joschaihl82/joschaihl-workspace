@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;ciacc2/ciacc.c&apos; to &apos;ciacc.c.txt&apos;" description="Rename resource &apos;ciacc.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="ciacc.c" name="ciacc.c.txt" stamp="1764988631036" updateReferences="true"/>
+</session>

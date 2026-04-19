@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<session version="1.0">
+<refactoring comment="Rename resource &apos;kernel1/vfat_tool.c&apos; to &apos;create_gpt_fat32_disk.c&apos;" description="Rename resource &apos;vfat_tool.c&apos;" flags="7" id="org.eclipse.ltk.core.refactoring.rename.resource" input="vfat_tool.c" name="create_gpt_fat32_disk.c" stamp="1764972105422" updateReferences="true"/>
+</session>

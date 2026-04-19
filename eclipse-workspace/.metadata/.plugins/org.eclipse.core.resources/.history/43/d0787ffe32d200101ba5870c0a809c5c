@@ -1,0 +1,491 @@
+/* bootx64.c
+ * Standalone UEFI application WITHOUT including any EFI headers.
+ * All needed EFI types and important function prototypes are defined here
+ * so the file is self-contained.
+ *
+ * This version:
+ *  - Fixes NVMe SQ/CQ/doorbell/phase handling
+ *  - Adds MMIO memory fences (sfence) to ensure SQE stores are visible
+ *  - Copies CQE atomically before inspecting fields to avoid torn reads
+ *  - Rings CQ head doorbell after consuming completions
+ *  - Waits for controller ready (CSTS.RDY) after enabling CC
+ *  - Adds framebuffer debug hex prints and exponential backoff in polling loops
+ *
+ * Use in QEMU/OVMF for testing. It is untested on real hardware.
+ */
+
+// ---------------------- Minimal EFI type definitions (self-contained) ----------------------
+typedef unsigned long long UINT64;
+typedef unsigned int       UINT32;
+typedef unsigned short     UINT16;
+typedef unsigned char      UINT8;
+typedef unsigned long      UINTN; /* 64-bit on x86_64 when compiled appropriately */
+typedef void               VOID;
+typedef unsigned short CHAR16;
+typedef char               CHAR8;
+
+typedef VOID *EFI_HANDLE;
+typedef UINT64 EFI_PHYSICAL_ADDRESS;
+typedef UINT64 EFI_VIRTUAL_ADDRESS;
+
+typedef UINT64 EFI_STATUS;
+#define EFI_SUCCESS 0
+#define EFI_BUFFER_TOO_SMALL 5
+
+// Forward declarations
+struct _EFI_BOOT_SERVICES;
+struct _EFI_SYSTEM_TABLE;
+
+/* Prototype types for key Boot Services functions we use */
+typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(UINT32 Type, UINT32 MemoryType, UINTN Pages, EFI_PHYSICAL_ADDRESS *Memory);
+typedef EFI_STATUS (*EFI_FREE_PAGES)(EFI_PHYSICAL_ADDRESS Memory, UINTN Pages);
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(UINTN *MemoryMapSize, void *MemoryMap, UINTN *MapKey, UINTN *DescriptorSize, UINT32 *DescriptorVersion);
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINTN MapKey);
+typedef EFI_STATUS (*EFI_LOCATE_HANDLE_BUFFER)(UINT32 SearchType, const void *Protocol, void *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
+typedef EFI_STATUS (*EFI_HANDLE_PROTOCOL)(EFI_HANDLE Handle, const void *Protocol, void **Interface);
+typedef EFI_STATUS (*EFI_FREE_POOL)(void *Buffer);
+
+/* Simple PCI IO Read prototype (we only need Uint8/Uint32 reads) */
+typedef enum { EfiPciIoWidthUint8 = 0, EfiPciIoWidthUint32 = 3 } EFI_PCI_IO_WIDTH;
+typedef struct {
+    EFI_STATUS (*Read)(void *This, EFI_PCI_IO_WIDTH Width, UINTN Offset, UINTN Count, void *Buffer);
+    EFI_STATUS (*Write)(void *This, EFI_PCI_IO_WIDTH Width, UINTN Offset, UINTN Count, void *Buffer);
+} EFI_PCI_IO_PROTOCOL;
+
+/* Graphics Output protocol (very small subset) */
+typedef enum { PixelRedGreenBlueReserved8BitPerColor = 0 } EFI_GRAPHICS_PIXEL_FORMAT;
+typedef struct {
+    UINT32 HorizontalResolution;
+    UINT32 VerticalResolution;
+    UINT32 PixelsPerScanLine;
+    EFI_GRAPHICS_PIXEL_FORMAT PixelFormat;
+} GOP_MODE_INFO;
+typedef struct {
+    UINT64 FrameBufferBase;
+    UINT64 FrameBufferSize;
+    GOP_MODE_INFO *Info;
+} GOP_MODE;
+typedef struct {
+    GOP_MODE *Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+/* Simple text output protocol */
+typedef struct {
+    EFI_STATUS (*OutputString)(void *This, CHAR16 *String);
+} SIMPLE_TEXT_OUTPUT_PROTOCOL;
+
+/* Boot services (very small) */
+typedef struct _EFI_BOOT_SERVICES {
+    void *Hdr;
+    EFI_ALLOCATE_PAGES AllocatePages;
+    void *FreePages; // not used
+    void *GetMemoryMap; // position placeholder
+    EFI_GET_MEMORY_MAP GetMemoryMap; // we'll set by offset when reading
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    EFI_LOCATE_HANDLE_BUFFER LocateHandleBuffer;
+    EFI_HANDLE_PROTOCOL HandleProtocol;
+    EFI_FREE_POOL FreePool;
+} EFI_BOOT_SERVICES;
+
+/* System Table */
+typedef struct _EFI_SYSTEM_TABLE {
+    CHAR16 *FirmwareVendor;
+    UINT32 FirmwareRevision;
+    void *ConsoleInHandle;
+    SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
+    void *ConIn; // omitted
+    EFI_BOOT_SERVICES *BootServices;
+} EFI_SYSTEM_TABLE;
+
+// Minimal GUID placeholders (we only use pointers to protocol GUIDs for LocateHandleBuffer)
+static const void *gEfiPciIoProtocolGuid = (const void*)0x01;
+static const void *gEfiGraphicsOutputProtocolGuid = (const void*)0x02;
+
+// ---------------------- Small helpers ----------------------
+static inline VOID write_u16(CHAR16 *dst, const CHAR8 *s){
+    while (*s) { *dst++ = (CHAR16)(*s++); }
+    *dst = 0;
+}
+
+static VOID PrintAscii(EFI_SYSTEM_TABLE *ST, const CHAR8 *s){
+    CHAR16 buf[512];
+    write_u16(buf, s);
+    if (ST && ST->ConOut && ST->ConOut->OutputString) ST->ConOut->OutputString(ST->ConOut, buf);
+}
+
+// ---------------------- NVMe & framebuffer code ----------------------
+#define NVME_REG_CAP 0x0000
+#define NVME_REG_VS  0x0008
+#define NVME_REG_CC  0x0014
+#define NVME_REG_CSTS 0x001c
+#define NVME_REG_AQA 0x0024
+#define NVME_REG_ASQ 0x0028
+#define NVME_REG_ACQ 0x0030
+#define NVME_DOORBELL_OFFSET 0x1000
+#define NVME_ADMIN_IDENTIFY 0x06
+#define NVME_CMD_READ 0x02
+#define PAGE_SIZE 4096
+#define ADMIN_Q_ENTRIES 16
+
+typedef struct {
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINT32 FrameBufferWidth;
+    UINT32 FrameBufferHeight;
+    UINT32 PixelsPerScanLine;
+} FB_INFO;
+
+typedef struct {
+    EFI_PHYSICAL_ADDRESS NvmeBar;
+    FB_INFO fb;
+    EFI_PHYSICAL_ADDRESS AdminSqPhys;
+    EFI_PHYSICAL_ADDRESS AdminCqPhys;
+    EFI_PHYSICAL_ADDRESS DataBufPhys;
+    VOID *AdminSqVirt;
+    VOID *AdminCqVirt;
+    VOID *DataBufVirt;
+    UINTN MemMapSize;
+    VOID *MemMap;
+    UINTN MapKey;
+    UINTN DescriptorSize;
+    UINT32 DescriptorVersion;
+} SAVED_STATE;
+
+static SAVED_STATE S;
+
+static VOID *my_memcpy(VOID *dst, const VOID *src, UINTN len){ UINT8 *d=dst; const UINT8 *s=src; while(len--) *d++=*s++; return dst; }
+static VOID *my_memset(VOID *dst, int v, UINTN len){ UINT8 *d=dst; while(len--) *d++=(UINT8)v; return dst; }
+
+/* 6x8 hex font tables */
+static const UINT8 hex6x8[][6] = {
+    {0x3E,0x51,0x49,0x45,0x3E,0x00},
+    {0x00,0x42,0x7F,0x40,0x00,0x00},
+    {0x62,0x51,0x49,0x49,0x46,0x00},
+    {0x22,0x41,0x49,0x49,0x36,0x00},
+    {0x18,0x14,0x12,0x7F,0x10,0x00},
+    {0x27,0x45,0x45,0x45,0x39,0x00},
+    {0x3C,0x4A,0x49,0x49,0x30,0x00},
+    {0x01,0x71,0x09,0x05,0x03,0x00},
+    {0x36,0x49,0x49,0x49,0x36,0x00},
+    {0x06,0x49,0x49,0x29,0x1E,0x00},
+};
+static const UINT8 hexAtoF[][6] = {
+    {0x7E,0x09,0x09,0x09,0x7E,0x00},
+    {0x7F,0x49,0x49,0x49,0x36,0x00},
+    {0x3E,0x41,0x41,0x41,0x22,0x00},
+    {0x7F,0x41,0x41,0x22,0x1C,0x00},
+    {0x7F,0x49,0x49,0x49,0x41,0x00},
+    {0x7F,0x09,0x09,0x09,0x01,0x00}
+};
+
+static inline void fb_put_pixel(UINTN x, UINTN y, UINT8 intensity){
+    FB_INFO *fb = &S.fb;
+    if (fb->FrameBufferBase==0) return;
+    if (x >= fb->FrameBufferWidth || y >= fb->FrameBufferHeight) return;
+    volatile UINT8 *pix = (volatile UINT8*)(UINTN)fb->FrameBufferBase + (y * fb->PixelsPerScanLine + x) * 4;
+    if (intensity){ pix[0]=0xFF; pix[1]=0xFF; pix[2]=0xFF; pix[3]=0x00; } else { pix[0]=pix[1]=pix[2]=0x00; pix[3]=0x00; }
+}
+static void fb_draw_char_hex(UINTN sx, UINTN sy, CHAR8 c){
+    const UINT8 *glyph;
+    if (c>='0'&&c<='9') glyph=hex6x8[c-'0'];
+    else if (c>='A'&&c<='F') glyph=hexAtoF[c-'A'];
+    else return;
+    for (UINTN row=0;row<8;++row){
+        UINT8 b=glyph[row%6];
+        for (UINTN col=0;col<6;++col) fb_put_pixel(sx+col, sy+row, (b & (1<<(7-col)))?1:0);
+    }
+}
+static void fb_draw_string_hex(UINTN sx, UINTN sy, const CHAR8 *s){ while(*s){ fb_draw_char_hex(sx,sy,*s); sx+=7; ++s; } }
+
+/* Convert 64-bit value to ASCII hex (no prefix), writes into buf (must be >=17) */
+static void u64_to_hex_ascii(UINT64 v, CHAR8 *buf){
+    const CHAR8 hex[] = "0123456789ABCDEF";
+    for (int i=0;i<16;i++){
+        int shift = (15 - i) * 4;
+        buf[i] = hex[(v >> shift) & 0xF];
+    }
+    buf[16]=0;
+}
+
+/* MMIO helpers */
+static inline UINT32 mmio_read32(UINT64 base, UINTN off){ volatile UINT32 *ptr=(volatile UINT32*)(UINTN)(base+off); return *ptr; }
+static inline void mmio_write32(UINT64 base, UINTN off, UINT32 v){ volatile UINT32 *ptr=(volatile UINT32*)(UINTN)(base+off); *ptr=v; }
+static inline UINT64 mmio_read64(UINT64 base, UINTN off){ volatile UINT64 *ptr=(volatile UINT64*)(UINTN)(base+off); return *ptr; }
+static inline void mmio_write64(UINT64 base, UINTN off, UINT64 v){ volatile UINT64 *ptr=(volatile UINT64*)(UINTN)(base+off); *ptr=v; }
+
+/* Memory barrier to ensure MMIO stores are ordered and visible to device */
+static inline void mmio_wmb(void){ __asm__ __volatile__("sfence" ::: "memory"); }
+
+#pragma pack(push,1)
+typedef struct { UINT32 cdw0; UINT32 nsid; UINT64 reserved1; UINT64 mptr; UINT64 prp1; UINT64 prp2; UINT32 cdw10; UINT32 cdw11; UINT32 cdw12; UINT32 cdw13; UINT32 cdw14; UINT32 cdw15; } nvme_sqe_t;
+typedef struct { UINT32 result; UINT32 sq_head_sq_id; UINT16 command_id; UINT16 status; } nvme_cqe_t;
+#pragma pack(pop)
+
+static void nvme_build_identify(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT32 cns){ my_memset(sqe,0,sizeof(*sqe)); sqe->cdw0=(NVME_ADMIN_IDENTIFY & 0xFF); sqe->nsid=nsid; sqe->prp1=prp1; sqe->cdw10=cns; }
+static void nvme_build_read(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT64 slba, UINT16 nblocks){ my_memset(sqe,0,sizeof(*sqe)); sqe->cdw0=(NVME_CMD_READ & 0xFF); sqe->nsid=nsid; sqe->prp1=prp1; sqe->cdw10=(UINT32)(slba & 0xFFFFFFFF); sqe->cdw11=(UINT32)(slba>>32); sqe->cdw12=(UINT32)(nblocks-1); }
+
+/* Doorbell helpers: NVMe uses 32-bit doorbells at offsets:
+ * SQ tail:  NVME_DOORBELL_OFFSET + 8*qid + 0
+ * CQ head:  NVME_DOORBELL_OFFSET + 8*qid + 4
+ */
+static inline void doorbell_write_sq(UINT64 base, UINT32 qid, UINT32 val){ UINTN off = NVME_DOORBELL_OFFSET + (qid*8) + 0; mmio_write32(base, off, val); }
+static inline void doorbell_write_cq(UINT64 base, UINT32 qid, UINT32 val){ UINTN off = NVME_DOORBELL_OFFSET + (qid*8) + 4; mmio_write32(base, off, val); }
+
+/* Submit SQ entries and ring tail reliably */
+static void submit_sq_and_ring(UINT64 base, UINT32 qid, UINT32 new_tail){
+    mmio_wmb();                 // ensure SQE writes reach device memory
+    doorbell_write_sq(base, qid, new_tail);
+    mmio_wmb();                 // ensure doorbell write is ordered
+}
+
+/* Strict CQ polling: copy CQE atomically, check phase bit (P), advance head and toggle phase when wrapping.
+ * Returns -1 if no new entry; otherwise returns cid | (result<<16) and updates cq_head_ref and seen_phase.
+ * Caller must ring CQ head doorbell after consuming entries.
+ */
+static int nvme_poll_cq_strict(nvme_cqe_t *cq, UINT32 qentries, UINT16 *seen_phase, UINT32 *cq_head_ref){
+    UINT32 head = *cq_head_ref;
+    nvme_cqe_t entry_copy;
+    my_memcpy(&entry_copy, &cq[head], sizeof(entry_copy));
+    UINT16 status = entry_copy.status;
+    UINT16 pbit = status & 1;               // P bit is LSB in many CQE layouts
+    if (pbit == *seen_phase){
+        UINT16 cid = entry_copy.command_id;
+        UINT32 res = entry_copy.result;
+        head = (head + 1) % qentries;
+        *cq_head_ref = head;
+        if (head == 0) *seen_phase ^= 1;
+        return cid | (res<<16);
+    }
+    return -1;
+}
+
+/* Poll with exponential backoff: calls poll_fn repeatedly until success or timeout.
+ * poll_fn returns -1 if no entry, otherwise non-negative result.
+ * timeout_iters is maximum number of poll attempts (not CPU cycles).
+ */
+static int poll_with_backoff(int (*poll_fn)(void), UINTN timeout_iters){
+    UINTN attempt = 0;
+    UINTN backoff = 1;
+    while (attempt < timeout_iters){
+        int r = poll_fn();
+        if (r != -1) return r;
+        /* small busy-wait backoff; use pause to be friendly to hypervisors/CPUs */
+        for (UINTN i=0;i<backoff;i++) __asm__ __volatile__("pause");
+        attempt++;
+        if (backoff < 1024) backoff <<= 1;
+    }
+    return -1;
+}
+
+/* Helper to print a 64-bit MMIO value to framebuffer at (x,y) */
+static void fb_print_hex64(UINTN x, UINTN y, UINT64 v){
+    CHAR8 buf[17];
+    u64_to_hex_ascii(v, buf);
+    fb_draw_string_hex(x, y, buf);
+}
+
+/* do_nvme_after_ebs: uses direct MMIO to configure admin queues and submit commands */
+static void do_nvme_after_ebs(UINT64 nvme_mmio_base, EFI_SYSTEM_TABLE *ST){
+    UINT64 base=nvme_mmio_base;
+    PrintAscii(ST, "[ring0] NVMe MMIO base: ");
+    /* Print CAP and VS to framebuffer if available */
+    UINT64 cap=mmio_read64(base, NVME_REG_CAP);
+    UINT64 vs = mmio_read64(base, NVME_REG_VS);
+    if (S.fb.FrameBufferBase) {
+        fb_draw_string_hex(2,2,"CAP:");
+        fb_print_hex64(2+5*7,2,cap);
+        fb_draw_string_hex(2,12,"VS:");
+        fb_print_hex64(2+3*7,12,vs);
+    }
+
+    nvme_sqe_t *asq=(nvme_sqe_t*)(UINTN)S.AdminSqPhys;
+    nvme_cqe_t *acq=(nvme_cqe_t*)(UINTN)S.AdminCqPhys;
+    my_memset(asq,0,PAGE_SIZE); my_memset(acq,0,PAGE_SIZE);
+
+    /* Configure AQA/ASQ/ACQ */
+    UINT32 aqa = ((ADMIN_Q_ENTRIES-1)<<16) | (ADMIN_Q_ENTRIES-1);
+    mmio_write32(base, NVME_REG_AQA, aqa);
+    mmio_wmb();
+    mmio_write64(base, NVME_REG_ASQ, (UINT64)S.AdminSqPhys);
+    mmio_write64(base, NVME_REG_ACQ, (UINT64)S.AdminCqPhys);
+    mmio_wmb();
+
+    /* Debug print AQA/ASQ/ACQ values */
+    if (S.fb.FrameBufferBase){
+        CHAR8 tmp[17];
+        u64_to_hex_ascii((UINT64)S.AdminSqPhys, tmp); fb_draw_string_hex(2,22,"ASQ:"); fb_draw_string_hex(2+4*7,22,tmp);
+        u64_to_hex_ascii((UINT64)S.AdminCqPhys, tmp); fb_draw_string_hex(2,32,"ACQ:"); fb_draw_string_hex(2+4*7,32,tmp);
+    }
+
+    /* Enable controller CC.EN = 1 (set bit 0 of CC) and wait for CSTS.RDY */
+    UINT32 cc = mmio_read32(base, NVME_REG_CC);
+    cc |= 1;
+    mmio_write32(base, NVME_REG_CC, cc);
+    mmio_wmb();
+
+    /* Wait for ready with timeout and backoff */
+    int ready = 0;
+    for (UINTN attempt=0, backoff=1; attempt<200000; ++attempt){
+        UINT32 csts = mmio_read32(base, NVME_REG_CSTS);
+        if (csts & 1) { ready = 1; break; }
+        for (UINTN i=0;i<backoff;i++) __asm__ __volatile__("pause");
+        if (backoff < 1024) backoff <<= 1;
+    }
+    if (!ready) PrintAscii(ST, "Controller not ready after CC.EN\n");
+    else PrintAscii(ST, "Controller ready\n");
+
+    /* Admin queue bookkeeping */
+    UINT32 sq_tail = 0;
+    UINT32 cq_head = 0;
+    UINT16 seen_phase = 1; // expected phase for new entries (controller sets P bit when new)
+    int cid_res = -1;
+
+    /* Submit IDENTIFY (SQ entry 0) */
+    nvme_build_identify(&asq[0], 0, 0, (UINT64)S.DataBufPhys, 1);
+    /* Ensure SQE is visible and ring tail = 1 */
+    sq_tail = 1;
+    submit_sq_and_ring(base, 0, sq_tail);
+
+    /* Poll for completion with exponential backoff */
+    {
+        /* wrapper to call nvme_poll_cq_strict with captured args */
+        struct poll_ctx { nvme_cqe_t *acq; UINT32 qentries; UINT16 *seen_phase; UINT32 *cq_head; } ctx = { acq, ADMIN_Q_ENTRIES, &seen_phase, &cq_head };
+        int poll_fn_wrapper(void){
+            return nvme_poll_cq_strict(ctx.acq, ctx.qentries, ctx.seen_phase, ctx.cq_head);
+        }
+        cid_res = poll_with_backoff(poll_fn_wrapper, 1000);
+        if (cid_res!=-1){
+            doorbell_write_cq(base, 0, cq_head);
+            mmio_wmb();
+        }
+    }
+    if (cid_res==-1) PrintAscii(ST, "Identify failed or timeout\n");
+    else PrintAscii(ST, "Identify completed\n");
+
+    /* Submit READ (SQ entry 1) */
+    nvme_build_read(&asq[1],1,1,(UINT64)S.DataBufPhys,0,1);
+    /* Advance tail to 2 and ring */
+    sq_tail = 2;
+    submit_sq_and_ring(base, 0, sq_tail);
+
+    /* Poll for completion with exponential backoff */
+    {
+        struct poll_ctx2 { nvme_cqe_t *acq; UINT32 qentries; UINT16 *seen_phase; UINT32 *cq_head; } ctx2 = { acq, ADMIN_Q_ENTRIES, &seen_phase, &cq_head };
+        int poll_fn_wrapper2(void){
+            return nvme_poll_cq_strict(ctx2.acq, ctx2.qentries, ctx2.seen_phase, ctx2.cq_head);
+        }
+        cid_res = poll_with_backoff(poll_fn_wrapper2, 1000);
+        if (cid_res!=-1){
+            doorbell_write_cq(base, 0, cq_head);
+            mmio_wmb();
+        }
+    }
+    if (cid_res==-1) PrintAscii(ST, "Read LBA failed or timeout\n");
+    else PrintAscii(ST, "Read LBA completed\n");
+
+    /* Dump first 32 rows of data to framebuffer as hex */
+    UINT8 *data=(UINT8*)(UINTN)S.DataBufPhys;
+    CHAR8 line[64];
+    for (UINTN row=0; row<32; ++row){
+        UINTN offset = row*16;
+        UINTN pos=0;
+        for (UINTN i=0;i<16;i++){
+            UINT8 b=data[offset+i];
+            UINT8 hi=(b>>4)&0xF;
+            UINT8 lo=b&0xF;
+            line[pos++]=(hi<10)?('0'+hi):('A'+(hi-10));
+            line[pos++]=(lo<10)?('0'+lo):('A'+(lo-10));
+            line[pos++]=' ';
+        }
+        line[pos]=0;
+        fb_draw_string_hex(10, 10 + row*9, line);
+    }
+}
+
+/* Find NVMe device via PCI IO protocol and prepare memory and GOP info */
+static EFI_STATUS find_nvme_and_prepare(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable){
+    EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
+    EFI_STATUS Status;
+    UINTN HandleCount = 0;
+    EFI_HANDLE *HandleBuffer = 0;
+    Status = BS->LocateHandleBuffer(0, gEfiPciIoProtocolGuid, 0, &HandleCount, &HandleBuffer);
+    if (Status != EFI_SUCCESS) { PrintAscii(SystemTable, "LocateHandleBuffer(PciIo) failed\n"); return Status; }
+    for (UINTN i=0;i<HandleCount;i++){
+        void *PciIoIf = 0;
+        Status = BS->HandleProtocol(HandleBuffer[i], gEfiPciIoProtocolGuid, &PciIoIf);
+        if (Status != EFI_SUCCESS || !PciIoIf) continue;
+        EFI_PCI_IO_PROTOCOL *PciIo = (EFI_PCI_IO_PROTOCOL*)PciIoIf;
+        UINT8 class_code[3];
+        Status = PciIo->Read(PciIo, EfiPciIoWidthUint8, 0x0B, 3, class_code);
+        if (Status != EFI_SUCCESS) continue;
+        if (class_code[2]==0x01 && class_code[1]==0x08 && class_code[0]==0x02){
+            PrintAscii(SystemTable, "Found NVMe device\n");
+            UINT32 barlow=0, barhigh=0;
+            Status = PciIo->Read(PciIo, EfiPciIoWidthUint32, 0x10, 1, &barlow);
+            if (Status!=EFI_SUCCESS) continue;
+            Status = PciIo->Read(PciIo, EfiPciIoWidthUint32, 0x14, 1, &barhigh);
+            if (Status!=EFI_SUCCESS) continue;
+            UINT64 bar = ((UINT64)barhigh<<32) | (barlow & ~0xF);
+            S.NvmeBar = bar;
+            PrintAscii(SystemTable, "NVMe BAR found\n");
+            // Locate GOP
+            EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = 0;
+            UINTN gopHandleCount = 0;
+            EFI_HANDLE *gopHandleBuffer = 0;
+            Status = BS->LocateHandleBuffer(0, gEfiGraphicsOutputProtocolGuid, 0, &gopHandleCount, &gopHandleBuffer);
+            if (Status==EFI_SUCCESS && gopHandleCount>0){
+                BS->HandleProtocol(gopHandleBuffer[0], gEfiGraphicsOutputProtocolGuid, (void**)&Gop);
+                if (Gop && Gop->Mode && Gop->Mode->Info){
+                    S.fb.FrameBufferBase = (EFI_PHYSICAL_ADDRESS)Gop->Mode->FrameBufferBase;
+                    S.fb.FrameBufferWidth = Gop->Mode->Info->HorizontalResolution;
+                    S.fb.FrameBufferHeight = Gop->Mode->Info->VerticalResolution;
+                    S.fb.PixelsPerScanLine = Gop->Mode->Info->PixelsPerScanLine;
+                }
+                if (gopHandleBuffer) BS->FreePool(gopHandleBuffer);
+            }
+            // Allocate pages for ASQ, ACQ, DBUF
+            EFI_PHYSICAL_ADDRESS pages = 0;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc ASQ failed\n"); return Status; }
+            S.AdminSqPhys = pages; S.AdminSqVirt = (VOID*)(UINTN)pages;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc ACQ failed\n"); return Status; }
+            S.AdminCqPhys = pages; S.AdminCqVirt = (VOID*)(UINTN)pages;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc DBUF failed\n"); return Status; }
+            S.DataBufPhys = pages; S.DataBufVirt = (VOID*)(UINTN)pages;
+            my_memset(S.AdminSqVirt,0,PAGE_SIZE); my_memset(S.AdminCqVirt,0,PAGE_SIZE); my_memset(S.DataBufVirt,0,PAGE_SIZE);
+            // Get memory map
+            UINTN MapSize=0; void *Map=0; UINTN MapKey=0; UINTN DescSize=0; UINT32 DescVersion=0;
+            Status = BS->GetMemoryMap(&MapSize, Map, &MapKey, &DescSize, &DescVersion);
+            if (Status == EFI_BUFFER_TOO_SMALL){
+                UINTN pages_needed = (MapSize + PAGE_SIZE-1)/PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS memmap_addr=0;
+                Status = BS->AllocatePages(0, 0, pages_needed, &memmap_addr);
+                if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc memmap failed\n"); return Status; }
+                Map = (void*)(UINTN)memmap_addr;
+                Status = BS->GetMemoryMap(&MapSize, Map, &MapKey, &DescSize, &DescVersion);
+                if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "GetMemoryMap failed\n"); return Status; }
+                S.MemMapSize = MapSize; S.MemMap = Map; S.MapKey = MapKey; S.DescriptorSize = DescSize; S.DescriptorVersion = DescVersion;
+            } else { PrintAscii(SystemTable, "GetMemoryMap initial failed\n"); return Status; }
+            // Free handle buffer then return
+            BS->FreePool(HandleBuffer);
+            return EFI_SUCCESS;
+        }
+    }
+    if (HandleBuffer) BS->FreePool(HandleBuffer);
+    return 1; // not found
+}
+
+// Entry point with no EFI headers: signature must match expected efi_main(ImageHandle, SystemTable)
+EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable){
+    PrintAscii(SystemTable, "UEFI NVMe post-EBS hexdump starter\n");
+    EFI_STATUS Status = find_nvme_and_prepare(ImageHandle, SystemTable);
+    if (Status!=EFI_SUCCESS){ PrintAscii(SystemTable, "NVMe prepare failed\n"); return Status; }
+    PrintAscii(SystemTable, "Exiting Boot Services...\n");
+    EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
+    Status = BS->ExitBootServices(ImageHandle, S.MapKey);
+    if (Status!=EFI_SUCCESS){ PrintAscii(SystemTable, "ExitBootServices failed\n"); return Status; }
+    do_nvme_after_ebs((UINT64)S.NvmeBar, SystemTable);
+    for(;;) __asm__("hlt");
+    return EFI_SUCCESS;
+}

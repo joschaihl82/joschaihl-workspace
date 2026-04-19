@@ -1,0 +1,36 @@
+/* linker.ld - minimal PE/COFF layout for x86_64 UEFI binary */
+OUTPUT_FORMAT("pei-x86-64")
+ENTRY(efi_main)
+
+SECTIONS
+{
+    /* place code at start (linker will respect --image-base when provided) */
+    . = ALIGN(0x1000);
+
+    .text : {
+        KEEP(*(.text*))
+        KEEP(*(.rodata*))
+        KEEP(*(.gnu.linkonce.t.*))
+    } :text
+
+    .data : {
+        KEEP(*(.data*))
+        KEEP(*(.sdata*))
+    } :data
+
+    .bss : {
+        __bss_start = .;
+        KEEP(*(.bss*))
+        KEEP(*(.sbss*))
+        *(COMMON)
+        __bss_end = .;
+    } :bss
+
+    /* Provide standard symbols used by binary blobs created with objcopy -b binary */
+    PROVIDE(_binary_init_sh_start = 0);
+    PROVIDE(_binary_init_sh_end = 0);
+    PROVIDE(_binary_init_sh_size = 0);
+
+    /* Align end */
+    . = ALIGN(0x1000);
+}

@@ -1,0 +1,1566 @@
+// ciacc.c
+// Compact tutorial-style C compiler (subset) with integrated preprocessor,
+// types: char/short/int/long (signed/unsigned), pointers, structs,
+// local variables, functions, control flow, expressions, string literals.
+// Preprocessor supports #include "file" and #include <file> (search /usr/include).
+//
+// Usage: ciacc <src.c> -o <outname>
+// Emits x86-64 assembly to <outname>.s
+//
+// Notes:
+// - This is a teaching compiler, not a full C implementation.
+// - Structs: named tags, simple field lists (no bitfields, no nested struct definitions in fields).
+// - Member access: `a.field` and `p->field` supported.
+// - Alignment: fields are laid out with natural alignment (1,2,4,8).
+// - #include <...> searches /usr/include first, then the including file's directory.
+
+#include "stdio.h"
+
+/*
+ * Minimal stdarg.h emulation tailored for this compiler's calling convention.
+ *
+ * This implementation is intentionally small and pragmatic: it assumes that
+ * function parameters (including variadic ones) are stored in the function's
+ * stack frame at fixed offsets by the compiler prologue. In the generated
+ * code produced by this compiler, incoming integer/pointer parameters are
+ * moved from registers into local stack slots (at [rbp - offset]) during the
+ * function prologue. Therefore a va_list can be implemented as a simple
+ * pointer into the caller's argument area on the stack.
+ *
+ * Notes and limitations:
+ * - This is NOT a full System V va_list implementation. It is sufficient for
+ *   typical variadic functions compiled by this compiler where the caller
+ *   places arguments into the callee's stack frame (as this compiler does).
+ * - It performs stack-style argument access with natural alignment based on
+ *   the target pointer size (8 bytes on x86-64).
+ * - It supports va_copy for convenience.
+ *
+ * Usage:
+ *   void foo(int n, ...) {
+ *     va_list ap;
+ *     va_start(ap, n);
+ *     int x = va_arg(ap, int);
+ *     char c = va_arg(ap, char);
+ *     va_end(ap);
+ *   }
+ */
+
+#ifndef CIACC_STDARG_H
+#define CIACC_STDARG_H
+
+#include <stddef.h>
+
+/* Use a raw pointer as va_list. It points to the next argument's storage. */
+typedef char *ciacc_va_list;
+
+/* Alignment unit: use pointer size for natural alignment on target (8 on x86-64). */
+#define CIACC_VA_ALIGN (sizeof(void*))
+
+/* Round up 'n' to the next multiple of CIACC_VA_ALIGN */
+#define CIACC_VA_ROUND(n) (((n) + (CIACC_VA_ALIGN - 1)) & ~(CIACC_VA_ALIGN - 1))
+
+/*
+ * va_start(ap, last)
+ *
+ * 'last' must be the identifier of the last fixed (named) parameter in the
+ * function definition. Because this compiler stores incoming parameters in
+ * the stack frame, taking the address of 'last' yields the stack slot for
+ * that parameter. We set the va_list to point just past that slot (rounded
+ * up to alignment) so subsequent va_arg reads the next argument.
+ */
+#define va_list ciacc_va_list
+#define va_start(ap, last) \
+  ((ap) = (ciacc_va_list)((char *)&(last) + CIACC_VA_ROUND(sizeof(last))))
+
+/*
+ * va_arg(ap, type)
+ *
+ * Read the next argument of type 'type' from the argument area pointed to by
+ * 'ap'. We advance 'ap' by the aligned size of 'type' and return the value
+ * located at the previous position.
+ *
+ * The expression yields an lvalue of type 'type', so it can be used in
+ * assignments or expressions directly.
+ */
+#define va_arg(ap, type) \
+  (*(type *)((ap) += CIACC_VA_ROUND(sizeof(type)), (ap) - CIACC_VA_ROUND(sizeof(type))))
+
+/* va_end: clear the pointer (no-op for this simple implementation) */
+#define va_end(ap) ((ap) = (ciacc_va_list)0)
+
+/* va_copy: copy one va_list to another */
+#define va_copy(dest, src) ((dest) = (src))
+
+#endif /* CIACC_STDARG_H */
+
+/* ------------------------------------------------------------------------- */
+/* The rest of the compiler follows (preprocessor, tokenizer, parser, codegen) */
+/* ------------------------------------------------------------------------- */
+
+//
+// Utilities
+//
+static void *xmalloc(size_t n) {
+  void *p = malloc(n);
+  if (!p) { fprintf(stderr, "out of memory\n"); exit(1); }
+  return p;
+}
+static void *xrealloc(void *p, size_t n) {
+  void *q = realloc(p, n);
+  if (!q) { fprintf(stderr, "out of memory\n"); exit(1); }
+  return q;
+}
+static char *xstrdup(const char *s) {
+  char *t = strdup(s);
+  if (!t) { fprintf(stderr, "out of memory\n"); exit(1); }
+  return t;
+}
+
+//
+// Preprocessor (simple): supports #include "..." and #include <...>, #define, #undef, #if/#ifdef/#ifndef
+//
+
+typedef struct Macro { struct Macro *next; char *name; char *replacement; } Macro;
+typedef struct IncludeStack { char *path; char *dir; struct IncludeStack *next; } IncludeStack;
+
+static Macro *macros = NULL;
+static IncludeStack *incstack = NULL;
+static const char *default_include_dir = "/usr/include";
+
+static void define_macro(const char *name, const char *replacement) {
+  for (Macro *m = macros; m; m = m->next) {
+    if (strcmp(m->name, name) == 0) {
+      free(m->replacement);
+      m->replacement = xstrdup(replacement);
+      return;
+    }
+  }
+  Macro *m = xmalloc(sizeof(Macro));
+  m->name = xstrdup(name);
+  m->replacement = xstrdup(replacement);
+  m->next = macros;
+  macros = m;
+}
+static void undef_macro(const char *name) {
+  Macro **pp = &macros;
+  while (*pp) {
+    if (strcmp((*pp)->name, name) == 0) {
+      Macro *t = *pp;
+      *pp = t->next;
+      free(t->name);
+      free(t->replacement);
+      free(t);
+      return;
+    }
+    pp = &(*pp)->next;
+  }
+}
+static const char *lookup_macro(const char *name) {
+  for (Macro *m = macros; m; m = m->next) if (strcmp(m->name, name) == 0) return m->replacement;
+  return NULL;
+}
+
+static char *dir_of(const char *path) {
+  char *p = xstrdup(path);
+  char *slash = strrchr(p, '/');
+  if (!slash) { free(p); return xstrdup("."); }
+  *slash = '\0';
+  return p;
+}
+static char *read_file(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *buf = xmalloc(sz + 1);
+  if (fread(buf, 1, sz, f) != (size_t)sz) { free(buf); fclose(f); return NULL; }
+  buf[sz] = '\0';
+  fclose(f);
+  return buf;
+}
+static char *strip_comments(const char *s) {
+  size_t cap = strlen(s) + 1;
+  char *out = xmalloc(cap);
+  size_t oi = 0;
+  for (size_t i = 0; s[i];) {
+    if (s[i] == '/' && s[i+1] == '/') { i += 2; while (s[i] && s[i] != '\n') i++; continue; }
+    if (s[i] == '/' && s[i+1] == '*') { i += 2; while (s[i] && !(s[i] == '*' && s[i+1] == '/')) i++; if (s[i]) i += 2; continue; }
+    out[oi++] = s[i++];
+    if (oi + 2 >= cap) { cap *= 2; out = xrealloc(out, cap); }
+  }
+  out[oi] = '\0';
+  return out;
+}
+static bool is_ident_char(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+static char *expand_macros_in_line(const char *line) {
+  size_t cap = strlen(line) * 2 + 1;
+  char *out = xmalloc(cap);
+  size_t oi = 0;
+  for (size_t i = 0; line[i];) {
+    if (line[i] == '"') {
+      out[oi++] = line[i++];
+      while (line[i]) {
+        if (line[i] == '\\' && line[i+1]) { out[oi++] = line[i++]; out[oi++] = line[i++]; continue; }
+        out[oi++] = line[i];
+        if (line[i++] == '"') break;
+      }
+      continue;
+    }
+    if (is_ident_char(line[i])) {
+      size_t j = i;
+      while (is_ident_char(line[j])) j++;
+      size_t len = j - i;
+      char *ident = strndup(line + i, len);
+      const char *rep = lookup_macro(ident);
+      if (rep) {
+        size_t rlen = strlen(rep);
+        if (oi + rlen + 2 >= cap) { cap = (oi + rlen + 2) * 2; out = xrealloc(out, cap); }
+        memcpy(out + oi, rep, rlen);
+        oi += rlen;
+      } else {
+        if (oi + len + 2 >= cap) { cap = (oi + len + 2) * 2; out = xrealloc(out, cap); }
+        memcpy(out + oi, line + i, len);
+        oi += len;
+      }
+      free(ident);
+      i = j;
+      continue;
+    }
+    if (oi + 2 >= cap) { cap *= 2; out = xrealloc(out, cap); }
+    out[oi++] = line[i++];
+  }
+  out[oi] = '\0';
+  return out;
+}
+
+static char *preprocess_file(const char *path); // forward
+
+static char *preprocess_buffer(const char *buf, const char *curdir, const char *curpath) {
+  size_t outcap = strlen(buf) + 1;
+  char *out = xmalloc(outcap);
+  size_t outi = 0;
+
+  typedef struct Cond { bool active; bool seen_true; struct Cond *next; } Cond;
+  Cond *cond_stack = NULL;
+
+  const char *p = buf;
+  while (*p) {
+    const char *nl = strchr(p, '\n');
+    size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+    char *line = strndup(p, linelen);
+    p = nl ? nl + 1 : p + linelen;
+
+    const char *s = line;
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    bool parent_active = true;
+    for (Cond *c = cond_stack; c; c = c->next) if (!c->active) { parent_active = false; break; }
+
+    if (*s == '#') {
+      s++;
+      while (*s && isspace((unsigned char)*s)) s++;
+      const char *q = s;
+      while (*q && isalpha((unsigned char)*q)) q++;
+      size_t dlen = q - s;
+      char *dir = strndup(s, dlen);
+      s = q;
+      while (*s && isspace((unsigned char)*s)) s++;
+
+      if (strcmp(dir, "include") == 0) {
+        if (parent_active) {
+          if (*s == '"') {
+            s++;
+            const char *endq = strchr(s, '"');
+            if (!endq) { fprintf(stderr, "malformed include in %s\n", curpath ? curpath : "(input)"); free(dir); free(line); free(out); return NULL; }
+            char *incname = strndup(s, endq - s);
+            char incpath[4096];
+            if (curdir && curdir[0]) snprintf(incpath, sizeof(incpath), "%s/%s", curdir, incname);
+            else snprintf(incpath, sizeof(incpath), "%s", incname);
+            free(incname);
+            char *incbuf = preprocess_file(incpath);
+            if (!incbuf) { fprintf(stderr, "include failed: %s\n", incpath); free(dir); free(line); free(out); return NULL; }
+            size_t need = outi + strlen(incbuf) + 1;
+            if (need >= outcap) { outcap = need * 2; out = xrealloc(out, outcap); }
+            memcpy(out + outi, incbuf, strlen(incbuf));
+            outi += strlen(incbuf);
+            free(incbuf);
+          } else if (*s == '<') {
+            s++;
+            const char *endq = strchr(s, '>');
+            if (!endq) { fprintf(stderr, "malformed include <...> in %s\n", curpath ? curpath : "(input)"); free(dir); free(line); free(out); return NULL; }
+            char *incname = strndup(s, endq - s);
+            char incpath[4096];
+            char *incbuf = NULL;
+            // search /usr/include first, then current dir
+            snprintf(incpath, sizeof(incpath), "%s/%s", default_include_dir, incname);
+            incbuf = preprocess_file(incpath);
+            if (!incbuf && curdir) {
+              snprintf(incpath, sizeof(incpath), "%s/%s", curdir, incname);
+              incbuf = preprocess_file(incpath);
+            }
+            if (!incbuf) {
+              fprintf(stderr, "include failed: <%s>\n", incname);
+              free(incname);
+              free(dir);
+              free(line);
+              free(out);
+              return NULL;
+            }
+            size_t need = outi + strlen(incbuf) + 1;
+            if (need >= outcap) { outcap = need * 2; out = xrealloc(out, outcap); }
+            memcpy(out + outi, incbuf, strlen(incbuf));
+            outi += strlen(incbuf);
+            free(incbuf);
+            free(incname);
+          } else {
+            fprintf(stderr, "warning: unsupported include syntax in %s\n", curpath ? curpath : "(input)");
+          }
+        }
+      } else if (strcmp(dir, "define") == 0) {
+        if (parent_active) {
+          const char *t = s;
+          while (*t && isspace((unsigned char)*t)) t++;
+          const char *u = t;
+          while (*u && (isalnum((unsigned char)*u) || *u == '_')) u++;
+          if (u == t) { fprintf(stderr, "malformed define in %s\n", curpath ? curpath : "(input)"); }
+          else {
+            char *name = strndup(t, u - t);
+            t = u;
+            while (*t && isspace((unsigned char)*t)) t++;
+            char *replacement = xstrdup(t);
+            char *expanded = expand_macros_in_line(replacement);
+            define_macro(name, expanded);
+            free(name);
+            free(replacement);
+            free(expanded);
+          }
+        }
+      } else if (strcmp(dir, "undef") == 0) {
+        if (parent_active) {
+          const char *t = s;
+          while (*t && isspace((unsigned char)*t)) t++;
+          const char *u = t;
+          while (*u && (isalnum((unsigned char)*u) || *u == '_')) u++;
+          if (u == t) fprintf(stderr, "malformed undef in %s\n", curpath ? curpath : "(input)");
+          else { char *name = strndup(t, u - t); undef_macro(name); free(name); }
+        }
+      } else if (strcmp(dir, "ifdef") == 0 || strcmp(dir, "ifndef") == 0) {
+        const bool is_ifndef = (strcmp(dir, "ifndef") == 0);
+        const char *t = s;
+        while (*t && isspace((unsigned char)*t)) t++;
+        const char *u = t;
+        while (*u && (isalnum((unsigned char)*u) || *u == '_')) u++;
+        if (u == t) {
+          Cond *c = xmalloc(sizeof(Cond));
+          c->active = false; c->seen_true = false; c->next = cond_stack; cond_stack = c;
+        } else {
+          char *name = strndup(t, u - t);
+          const char *rep = lookup_macro(name);
+          bool defined = rep != NULL;
+          bool active = (is_ifndef ? !defined : defined) && parent_active;
+          Cond *c = xmalloc(sizeof(Cond));
+          c->active = active; c->seen_true = active; c->next = cond_stack; cond_stack = c;
+          free(name);
+        }
+      } else if (strcmp(dir, "if") == 0) {
+        bool active = false;
+        if (!parent_active) active = false;
+        else {
+          const char *t = s;
+          while (*t && isspace((unsigned char)*t)) t++;
+          if (strncmp(t, "defined", 7) == 0) {
+            const char *p1 = strchr(t, '(');
+            const char *p2 = p1 ? strchr(p1+1, ')') : NULL;
+            if (p1 && p2) {
+              char *name = strndup(p1+1, p2 - (p1+1));
+              const char *rep = lookup_macro(name);
+              active = rep != NULL;
+              free(name);
+            } else active = false;
+          } else {
+            char *end;
+            long v = strtol(t, &end, 0);
+            active = (v != 0);
+          }
+        }
+        Cond *c = xmalloc(sizeof(Cond));
+        c->active = active && parent_active; c->seen_true = active && parent_active; c->next = cond_stack; cond_stack = c;
+      } else if (strcmp(dir, "elif") == 0) {
+        if (!cond_stack) fprintf(stderr, "unexpected #elif\n");
+        else {
+          Cond *c = cond_stack;
+          if (c->seen_true) c->active = false;
+          else {
+            bool condval = false;
+            if (!parent_active) condval = false;
+            else {
+              const char *t = s;
+              while (*t && isspace((unsigned char)*t)) t++;
+              if (strncmp(t, "defined", 7) == 0) {
+                const char *p1 = strchr(t, '(');
+                const char *p2 = p1 ? strchr(p1+1, ')') : NULL;
+                if (p1 && p2) {
+                  char *name = strndup(p1+1, p2 - (p1+1));
+                  const char *rep = lookup_macro(name);
+                  condval = rep != NULL;
+                  free(name);
+                }
+              } else {
+                char *end;
+                long v = strtol(t, &end, 0);
+                condval = (v != 0);
+              }
+            }
+            c->active = condval && parent_active;
+            if (c->active) c->seen_true = true;
+          }
+        }
+      } else if (strcmp(dir, "else") == 0) {
+        if (!cond_stack) fprintf(stderr, "unexpected #else\n");
+        else {
+          Cond *c = cond_stack;
+          if (c->seen_true) c->active = false;
+          else c->active = parent_active;
+          c->seen_true = c->seen_true || c->active;
+        }
+      } else if (strcmp(dir, "endif") == 0) {
+        if (!cond_stack) fprintf(stderr, "unexpected #endif\n");
+        else { Cond *c = cond_stack; cond_stack = c->next; free(c); }
+      } else {
+        if (parent_active) {
+          if (outi + 2 >= outcap) { outcap *= 2; out = xrealloc(out, outcap); }
+          out[outi++] = '\n';
+        }
+      }
+      free(dir);
+    } else {
+      if (parent_active) {
+        char *expanded = expand_macros_in_line(line);
+        size_t need = outi + strlen(expanded) + 2;
+        if (need >= outcap) { outcap = need * 2; out = xrealloc(out, outcap); }
+        memcpy(out + outi, expanded, strlen(expanded));
+        outi += strlen(expanded);
+        out[outi++] = '\n';
+        free(expanded);
+      } else {
+        if (outi + 2 >= outcap) { outcap *= 2; out = xrealloc(out, outcap); }
+        out[outi++] = '\n';
+      }
+    }
+    free(line);
+  }
+
+  while (cond_stack) { Cond *c = cond_stack; cond_stack = c->next; free(c); }
+  out[outi] = '\0';
+  return out;
+}
+
+static char *preprocess_file(const char *path) {
+  char *buf = read_file(path);
+  if (!buf) return NULL;
+  char *no_comments = strip_comments(buf);
+  free(buf);
+  char *dir = dir_of(path);
+  IncludeStack st;
+  st.path = xstrdup(path);
+  st.dir = xstrdup(dir);
+  st.next = incstack;
+  incstack = &st;
+  char *result = preprocess_buffer(no_comments, dir, path);
+  incstack = st.next;
+  free(st.path);
+  free(st.dir);
+  free(no_comments);
+  free(dir);
+  return result;
+}
+
+//
+// Tokenizer
+//
+
+typedef enum { TK_RESERVED, TK_IDENT, TK_NUM, TK_STR, TK_EOF } TokenKind;
+typedef struct Token Token;
+struct Token { TokenKind kind; Token *next; int val; char *str; int len; char *loc; };
+
+static Token *token;
+static char *user_input;
+
+static void error_at_tok(char *loc, char *fmt, ...) {
+  va_list ap; va_start(ap, fmt);
+  int pos = loc - user_input;
+  fprintf(stderr, "%s\n", user_input);
+  fprintf(stderr, "%*s", pos, "");
+  fprintf(stderr, "^ ");
+  vfprintf(stderr, fmt, ap);
+  fprintf(stderr, "\n");
+  exit(1);
+}
+
+static Token *new_token(TokenKind kind, Token *cur, char *str, int len, char *loc) {
+  Token *tok = xmalloc(sizeof(Token));
+  tok->kind = kind;
+  tok->str = str;
+  tok->len = len;
+  tok->loc = loc;
+  cur->next = tok;
+  return tok;
+}
+static bool startswith(const char *p, const char *q) { return memcmp(p, q, strlen(q)) == 0; }
+static bool is_ident1(char c) { return isalpha((unsigned char)c) || c == '_'; }
+static bool is_ident2(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+static Token *tokenize() {
+  char *p = user_input;
+  Token head; head.next = NULL;
+  Token *cur = &head;
+  while (*p) {
+    if (isspace((unsigned char)*p)) { p++; continue; }
+    if (startswith(p, "==") || startswith(p, "!=") || startswith(p, "<=") || startswith(p, ">=") || startswith(p, "->")) {
+      cur = new_token(TK_RESERVED, cur, p, 2, p); p += 2; continue;
+    }
+    if (strchr("+-*/()<>;=,{}[]&!~?:.%", *p)) { cur = new_token(TK_RESERVED, cur, p, 1, p); p++; continue; }
+    if (isdigit((unsigned char)*p)) {
+      char *q = p; int val = strtol(p, &p, 10); cur = new_token(TK_NUM, cur, q, p - q, q); cur->val = val; continue;
+    }
+    if (*p == '"') {
+      char *start = p; p++;
+      char *buf = xmalloc(1); size_t cap = 0, len = 0;
+      while (*p && *p != '"') {
+        if (*p == '\\') { p++; char esc = *p; char out = esc; if (esc == 'n') out = '\n'; else if (esc == 't') out = '\t'; else if (esc == 'r') out = '\r'; else if (esc == '\\') out = '\\'; else if (esc == '"') out = '"'; else out = esc; if (len + 1 >= cap) { cap = cap ? cap * 2 : 8; buf = xrealloc(buf, cap); } buf[len++] = out; p++; }
+        else { if (len + 1 >= cap) { cap = cap ? cap * 2 : 8; buf = xrealloc(buf, cap); } buf[len++] = *p++; }
+      }
+      if (*p != '"') error_at_tok(start, "unclosed string literal");
+      p++;
+      buf = xrealloc(buf, len + 1); buf[len] = '\0';
+      Token *tok = new_token(TK_STR, cur, NULL, 0, start); tok->str = buf; tok->len = len; cur = tok;
+      continue;
+    }
+    if (is_ident1(*p)) {
+      char *q = p++; while (is_ident2(*p)) p++;
+      int len = p - q;
+      TokenKind kind = TK_IDENT;
+      // keywords: int, return, if, else, while, for, sizeof, unsigned, char, short, long, struct
+      if (len == 3 && memcmp(q, "int", 3) == 0) kind = TK_RESERVED;
+      else if (len == 6 && memcmp(q, "return", 6) == 0) kind = TK_RESERVED;
+      else if (len == 2 && memcmp(q, "if", 2) == 0) kind = TK_RESERVED;
+      else if (len == 4 && memcmp(q, "else", 4) == 0) kind = TK_RESERVED;
+      else if (len == 5 && memcmp(q, "while", 5) == 0) kind = TK_RESERVED;
+      else if (len == 3 && memcmp(q, "for", 3) == 0) kind = TK_RESERVED;
+      else if (len == 6 && memcmp(q, "sizeof", 6) == 0) kind = TK_RESERVED;
+      else if (len == 8 && memcmp(q, "unsigned", 8) == 0) kind = TK_RESERVED;
+      else if (len == 4 && memcmp(q, "char", 4) == 0) kind = TK_RESERVED;
+      else if (len == 5 && memcmp(q, "short", 5) == 0) kind = TK_RESERVED;
+      else if (len == 4 && memcmp(q, "long", 4) == 0) kind = TK_RESERVED;
+      else if (len == 6 && memcmp(q, "struct", 6) == 0) kind = TK_RESERVED;
+      cur = new_token(kind, cur, q, len, q);
+      continue;
+    }
+    error_at_tok(p, "invalid token");
+  }
+  new_token(TK_EOF, cur, p, 0, p);
+  return head.next;
+}
+
+//
+// Types, structs, AST
+//
+
+typedef enum { TY_INT, TY_PTR, TY_STRUCT } TypeKind;
+typedef struct Type Type;
+typedef struct StructMember StructMember;
+typedef struct StructDef StructDef;
+
+struct StructMember {
+  char *name;
+  Type *ty;
+  int offset;
+};
+
+struct StructDef {
+  StructDef *next;
+  char *tag;
+  StructMember *members;
+  int members_len;
+  int size;
+  int align;
+};
+
+struct Type {
+  TypeKind kind;
+  Type *base; // for pointer
+  int size;
+  bool is_unsigned;
+  int rank; // 0:char,1:short,2:int,3:long
+  StructDef *sdef; // for struct
+};
+
+static StructDef *structs = NULL;
+
+static StructDef *find_struct(const char *tag) {
+  for (StructDef *s = structs; s; s = s->next) if (strcmp(s->tag, tag) == 0) return s;
+  return NULL;
+}
+
+static StructDef *new_struct_def(const char *tag) {
+  StructDef *s = xmalloc(sizeof(StructDef));
+  s->tag = xstrdup(tag);
+  s->members = NULL;
+  s->members_len = 0;
+  s->size = 0;
+  s->align = 1;
+  s->next = structs;
+  structs = s;
+  return s;
+}
+
+static Type *make_ptr(Type *base) {
+  Type *t = xmalloc(sizeof(Type));
+  t->kind = TY_PTR;
+  t->base = base;
+  t->size = 8;
+  t->is_unsigned = false;
+  t->rank = 4;
+  t->sdef = NULL;
+  return t;
+}
+
+static Type *int_type_cache[4][2]; // rank 0..3, unsigned 0/1
+
+static Type *get_int_type_by_rank(int rank, bool is_unsigned) {
+  if (rank < 0) rank = 2;
+  if (rank > 3) rank = 3;
+  if (!int_type_cache[rank][is_unsigned]) {
+    Type *t = xmalloc(sizeof(Type));
+    t->kind = TY_INT;
+    t->is_unsigned = is_unsigned;
+    t->rank = rank;
+    if (rank == 0) t->size = 1;
+    else if (rank == 1) t->size = 2;
+    else if (rank == 2) t->size = 4;
+    else t->size = 8;
+    t->base = NULL;
+    t->sdef = NULL;
+    int_type_cache[rank][is_unsigned] = t;
+  }
+  return int_type_cache[rank][is_unsigned];
+}
+
+static Type *struct_type(StructDef *sdef) {
+  Type *t = xmalloc(sizeof(Type));
+  t->kind = TY_STRUCT;
+  t->sdef = sdef;
+  t->size = sdef->size;
+  t->is_unsigned = false;
+  t->rank = 5;
+  t->base = NULL;
+  return t;
+}
+
+//
+// AST node kinds
+//
+typedef enum {
+  ND_ADD, ND_SUB, ND_MUL, ND_DIV,
+  ND_EQ, ND_NE, ND_LT, ND_LE,
+  ND_ASSIGN, ND_VAR, ND_NUM, ND_RETURN,
+  ND_IF, ND_WHILE, ND_FOR, ND_BLOCK,
+  ND_FUNCALL, ND_ADDR, ND_DEREF, ND_SIZEOF,
+  ND_EXPR_STMT, ND_NULL, ND_MEMBER, ND_MEMBER_REF
+} NodeKind;
+
+typedef struct Node Node;
+struct Node {
+  NodeKind kind;
+  Node *lhs;
+  Node *rhs;
+  Node *cond;
+  Node *then;
+  Node *els;
+  Node *init;
+  Node *inc;
+  Node **stmts;
+  int stmts_len;
+  int val;
+  char *name;
+  Type *ty;
+  int offset; // for local var
+  Node **args;
+  int args_len;
+  char *str;
+  // member-specific
+  char *member_name;
+  StructMember *member; // resolved member
+};
+
+static Node *new_node(NodeKind kind) { Node *n = xmalloc(sizeof(Node)); memset(n,0,sizeof(Node)); n->kind = kind; return n; }
+static Node *new_binary(NodeKind kind, Node *lhs, Node *rhs) { Node *n = new_node(kind); n->lhs = lhs; n->rhs = rhs; return n; }
+static Node *new_num(int val) { Node *n = new_node(ND_NUM); n->val = val; n->ty = get_int_type_by_rank(2, false); return n; }
+static Node *new_var_node(char *name) { Node *n = new_node(ND_VAR); n->name = xstrdup(name); n->ty = NULL; return n; }
+static Node *new_strlit(char *s) { Node *n = new_node(ND_NULL); n->kind = ND_NULL; n->str = s; return n; }
+
+//
+// Symbol table (locals)
+//
+typedef struct Var { struct Var *next; char *name; int offset; Type *ty; bool is_param; } Var;
+static Var *locals;
+
+static Var *find_var_by_name(const char *name) {
+  for (Var *v = locals; v; v = v->next) if (strcmp(v->name, name) == 0) return v;
+  return NULL;
+}
+static Var *push_var(const char *name, Type *ty, bool is_param) {
+  Var *v = xmalloc(sizeof(Var));
+  v->name = xstrdup(name);
+  v->ty = ty;
+  v->is_param = is_param;
+  v->next = locals;
+  locals = v;
+  return v;
+}
+
+//
+// Function symbol
+//
+typedef struct Function { struct Function *next; char *name; Node *body; int stack_size; int params_count; char **params; Type **param_types; } Function;
+static Function *functions;
+
+//
+// Parser forward
+//
+static Node *program();
+static Node *declaration();
+static Node *stmt();
+static Node *expr();
+static Node *assign();
+static Node *equality();
+static Node *relational();
+static Node *add();
+static Node *mul();
+static Node *unary();
+static Node *postfix();
+static Node *primary();
+static Node *compound_stmt();
+
+static bool consume(const char *op) {
+  if (token->kind != TK_RESERVED || strlen(op) != token->len || memcmp(token->str, op, token->len)) return false;
+  token = token->next; return true;
+}
+static void expect(const char *op) {
+  if (token->kind != TK_RESERVED || strlen(op) != token->len || memcmp(token->str, op, token->len)) error_at_tok(token->loc, "expected \"%s\"", (char*)op);
+  token = token->next;
+}
+static int expect_number() {
+  if (token->kind != TK_NUM) error_at_tok(token->loc, "expected a number");
+  int val = token->val; token = token->next; return val;
+}
+static char *expect_ident() {
+  if (token->kind != TK_IDENT) error_at_tok(token->loc, "expected an identifier");
+  char *s = strndup(token->str, token->len); token = token->next; return s;
+}
+static bool at_eof() { return token->kind == TK_EOF; }
+static bool is_keyword(const char *kw) {
+  if (token->kind != TK_RESERVED) return false;
+  if (strlen(kw) != token->len) return false;
+  return memcmp(token->str, kw, token->len) == 0;
+}
+
+//
+// Type parsing: supports optional 'unsigned' and one of char/short/int/long or 'struct tag' or 'struct { ... }'
+//
+static Type *last_parsed_type = NULL;
+
+static Type *parse_type_specifier() {
+  bool is_unsigned = false;
+  if (is_keyword("unsigned")) { token = token->next; is_unsigned = true; }
+  if (is_keyword("char")) { token = token->next; last_parsed_type = get_int_type_by_rank(0, is_unsigned); return last_parsed_type; }
+  if (is_keyword("short")) { token = token->next; last_parsed_type = get_int_type_by_rank(1, is_unsigned); return last_parsed_type; }
+  if (is_keyword("int")) { token = token->next; last_parsed_type = get_int_type_by_rank(2, is_unsigned); return last_parsed_type; }
+  if (is_keyword("long")) { token = token->next; last_parsed_type = get_int_type_by_rank(3, is_unsigned); return last_parsed_type; }
+  if (is_keyword("struct")) {
+    token = token->next;
+    // either "struct tag { ... }" or "struct tag" or "struct { ... }"
+    if (token->kind == TK_IDENT) {
+      char *tag = strndup(token->str, token->len);
+      token = token->next;
+      StructDef *sdef = find_struct(tag);
+      if (consume("{")) {
+        // define struct body
+        if (!sdef) sdef = new_struct_def(tag);
+        // parse members: (type ident;)+
+        while (!consume("}")) {
+          Type *mty = parse_type_specifier();
+          if (!mty) error_at_tok(token->loc, "expected member type");
+          char *mname = expect_ident();
+          expect(";");
+          // add member
+          sdef->members = xrealloc(sdef->members, sizeof(StructMember) * (sdef->members_len + 1));
+          StructMember *m = &sdef->members[sdef->members_len++];
+          m->name = xstrdup(mname);
+          m->ty = mty;
+          m->offset = 0;
+          free(mname);
+        }
+        // compute layout
+        int off = 0;
+        int maxalign = 1;
+        for (int i = 0; i < sdef->members_len; i++) {
+          StructMember *m = &sdef->members[i];
+          int align = m->ty->size;
+          if (align > maxalign) maxalign = align;
+          // align offset
+          if (off % align) off += align - (off % align);
+          m->offset = off;
+          off += m->ty->size;
+        }
+        if (off % maxalign) off += maxalign - (off % maxalign);
+        sdef->size = off;
+        sdef->align = maxalign;
+        last_parsed_type = struct_type(sdef);
+        free(tag);
+        return last_parsed_type;
+      } else {
+        // reference to existing struct tag
+        if (!sdef) {
+          // forward declaration: create empty struct def (size 0) so type exists
+          sdef = new_struct_def(tag);
+        }
+        last_parsed_type = struct_type(sdef);
+        free(tag);
+        return last_parsed_type;
+      }
+    } else if (consume("{")) {
+      // anonymous struct
+      StructDef *sdef = new_struct_def("__anon__");
+      while (!consume("}")) {
+        Type *mty = parse_type_specifier();
+        if (!mty) error_at_tok(token->loc, "expected member type");
+        char *mname = expect_ident();
+        expect(";");
+        sdef->members = xrealloc(sdef->members, sizeof(StructMember) * (sdef->members_len + 1));
+        StructMember *m = &sdef->members[sdef->members_len++];
+        m->name = xstrdup(mname);
+        m->ty = mty;
+        m->offset = 0;
+        free(mname);
+      }
+      int off = 0; int maxalign = 1;
+      for (int i = 0; i < sdef->members_len; i++) {
+        StructMember *m = &sdef->members[i];
+        int align = m->ty->size;
+        if (align > maxalign) maxalign = align;
+        if (off % align) off += align - (off % align);
+        m->offset = off;
+        off += m->ty->size;
+      }
+      if (off % maxalign) off += maxalign - (off % maxalign);
+      sdef->size = off; sdef->align = maxalign;
+      last_parsed_type = struct_type(sdef);
+      return last_parsed_type;
+    } else {
+      error_at_tok(token->loc, "expected struct tag or definition");
+    }
+  }
+  last_parsed_type = NULL;
+  return NULL;
+}
+
+//
+// Parser (uses last_parsed_type for declarations)
+//
+
+static Node *program() {
+  Node *head = new_node(ND_BLOCK);
+  head->stmts = NULL; head->stmts_len = 0;
+  while (!at_eof()) {
+    if (is_keyword("unsigned") || is_keyword("char") || is_keyword("short") || is_keyword("int") || is_keyword("long") || is_keyword("struct")) {
+      Type *ty = parse_type_specifier();
+      if (!ty) error_at_tok(token->loc, "expected type");
+      if (token->kind == TK_IDENT) {
+        char *name = strndup(token->str, token->len);
+        Token *save = token;
+        token = token->next;
+        if (consume("(")) {
+          Function *f = xmalloc(sizeof(Function)); memset(f,0,sizeof(Function));
+          f->name = name; f->params_count = 0; f->params = NULL; f->param_types = NULL;
+          while (!consume(")")) {
+            Type *pty = parse_type_specifier();
+            if (!pty) error_at_tok(token->loc, "expected parameter type");
+            if (token->kind == TK_IDENT) {
+              char *pname = strndup(token->str, token->len);
+              token = token->next;
+              f->params = xrealloc(f->params, sizeof(char*) * (f->params_count + 1));
+              f->param_types = xrealloc(f->param_types, sizeof(Type*) * (f->params_count + 1));
+              f->params[f->params_count] = pname;
+              f->param_types[f->params_count] = pty;
+              f->params_count++;
+            }
+            if (consume(",")) continue;
+          }
+          f->body = compound_stmt();
+          f->next = functions; functions = f;
+          continue;
+        } else {
+          token = save;
+          // declaration: last_parsed_type already set
+          Node *d = declaration();
+          head->stmts = xrealloc(head->stmts, sizeof(Node*) * (head->stmts_len + 1));
+          head->stmts[head->stmts_len++] = d;
+          continue;
+        }
+      } else {
+        error_at_tok(token->loc, "expected identifier after type");
+      }
+    }
+    Node *s = stmt();
+    head->stmts = xrealloc(head->stmts, sizeof(Node*) * (head->stmts_len + 1));
+    head->stmts[head->stmts_len++] = s;
+  }
+  return head;
+}
+
+static Node *declaration() {
+  char *name = expect_ident();
+  Type *ty = last_parsed_type ? last_parsed_type : get_int_type_by_rank(2, false);
+  push_var(name, ty, false);
+  Node *node = new_node(ND_EXPR_STMT);
+  if (consume("=")) {
+    Node *rhs = expr();
+    Node *lhs = new_var_node(name);
+    Node *assign = new_binary(ND_ASSIGN, lhs, rhs);
+    node->lhs = assign;
+  } else node->lhs = NULL;
+  expect(";");
+  return node;
+}
+
+static Node *compound_stmt() {
+  expect("{");
+  Node *node = new_node(ND_BLOCK);
+  node->stmts = NULL; node->stmts_len = 0;
+  while (!consume("}")) {
+    if (is_keyword("unsigned") || is_keyword("char") || is_keyword("short") || is_keyword("int") || is_keyword("long") || is_keyword("struct")) {
+      Type *ty = parse_type_specifier();
+      if (!ty) error_at_tok(token->loc, "expected type");
+      Node *d = declaration();
+      node->stmts = xrealloc(node->stmts, sizeof(Node*) * (node->stmts_len + 1));
+      node->stmts[node->stmts_len++] = d;
+    } else {
+      Node *s = stmt();
+      node->stmts = xrealloc(node->stmts, sizeof(Node*) * (node->stmts_len + 1));
+      node->stmts[node->stmts_len++] = s;
+    }
+  }
+  return node;
+}
+
+static Node *stmt() {
+  if (is_keyword("return")) { token = token->next; Node *n = new_node(ND_RETURN); n->lhs = expr(); expect(";"); return n; }
+  if (is_keyword("if")) {
+    token = token->next; expect("("); Node *cond = expr(); expect(")"); Node *then = stmt(); Node *els = NULL;
+    if (is_keyword("else")) { token = token->next; els = stmt(); }
+    Node *n = new_node(ND_IF); n->cond = cond; n->then = then; n->els = els; return n;
+  }
+  if (is_keyword("while")) { token = token->next; expect("("); Node *cond = expr(); expect(")"); Node *body = stmt(); Node *n = new_node(ND_WHILE); n->cond = cond; n->then = body; return n; }
+  if (is_keyword("for")) {
+    token = token->next; expect("("); Node *init = NULL;
+    if (!consume(";")) {
+      if (is_keyword("unsigned") || is_keyword("char") || is_keyword("short") || is_keyword("int") || is_keyword("long") || is_keyword("struct")) { Type *ty = parse_type_specifier(); init = declaration(); }
+      else { init = expr(); expect(";"); }
+    }
+    Node *cond = NULL; if (!consume(";")) { cond = expr(); expect(";"); }
+    Node *inc = NULL; if (!consume(")")) { inc = expr(); expect(")"); }
+    Node *body = stmt(); Node *n = new_node(ND_FOR); n->init = init; n->cond = cond; n->inc = inc; n->then = body; return n;
+  }
+  if (token->kind == TK_RESERVED && token->len == 1 && token->str[0] == '{') return compound_stmt();
+  Node *n = expr(); expect(";"); Node *es = new_node(ND_EXPR_STMT); es->lhs = n; return es;
+}
+
+static Node *expr() { return assign(); }
+
+static Node *assign() {
+  Node *node = equality();
+  if (consume("=")) { Node *rhs = assign(); node = new_binary(ND_ASSIGN, node, rhs); }
+  return node;
+}
+
+static Node *equality() {
+  Node *node = relational();
+  for (;;) { if (consume("==")) node = new_binary(ND_EQ, node, relational()); else if (consume("!=")) node = new_binary(ND_NE, node, relational()); else return node; }
+}
+
+static Node *relational() {
+  Node *node = add();
+  for (;;) {
+    if (consume("<")) node = new_binary(ND_LT, node, add());
+    else if (consume("<=")) node = new_binary(ND_LE, node, add());
+    else if (consume(">")) node = new_binary(ND_LT, add(), node);
+    else if (consume(">=")) node = new_binary(ND_LE, add(), node);
+    else return node;
+  }
+}
+
+static Node *add() {
+  Node *node = mul();
+  for (;;) { if (consume("+")) node = new_binary(ND_ADD, node, mul()); else if (consume("-")) node = new_binary(ND_SUB, node, mul()); else return node; }
+}
+
+static Node *mul() {
+  Node *node = unary();
+  for (;;) { if (consume("*")) node = new_binary(ND_MUL, node, unary()); else if (consume("/")) node = new_binary(ND_DIV, node, unary()); else return node; }
+}
+
+static Node *unary() {
+  if (consume("+")) return unary();
+  if (consume("-")) return new_binary(ND_SUB, new_num(0), unary());
+  if (consume("&")) { Node *n = new_node(ND_ADDR); n->lhs = unary(); return n; }
+  if (consume("*")) { Node *n = new_node(ND_DEREF); n->lhs = unary(); return n; }
+  if (is_keyword("sizeof")) { token = token->next; Node *n = new_node(ND_SIZEOF); n->lhs = unary(); return n; }
+  return postfix();
+}
+
+// postfix = primary ( "(" args? ")" | "[" expr "]" | "." ident | "->" ident )*
+static Node *postfix() {
+  Node *node = primary();
+  for (;;) {
+    if (consume("(")) {
+      Node *n = new_node(ND_FUNCALL);
+      n->name = node->name;
+      n->args = NULL; n->args_len = 0;
+      if (!consume(")")) {
+        while (1) {
+          Node *a = expr();
+          n->args = xrealloc(n->args, sizeof(Node*) * (n->args_len + 1));
+          n->args[n->args_len++] = a;
+          if (consume(")")) break;
+          expect(",");
+        }
+      }
+      node = n;
+      continue;
+    }
+    if (consume("[")) {
+      Node *idx = expr();
+      expect("]");
+      Node *addn = new_binary(ND_ADD, node, idx);
+      Node *deref = new_node(ND_DEREF);
+      deref->lhs = addn;
+      node = deref;
+      continue;
+    }
+    if (consume(".")) {
+      char *mname = expect_ident();
+      Node *n = new_node(ND_MEMBER);
+      n->lhs = node;
+      n->member_name = mname;
+      node = n;
+      continue;
+    }
+    if (consume("->")) {
+      char *mname = expect_ident();
+      Node *n = new_node(ND_MEMBER_REF);
+      n->lhs = node;
+      n->member_name = mname;
+      node = n;
+      continue;
+    }
+    break;
+  }
+  return node;
+}
+
+static Node *primary() {
+  if (consume("(")) { Node *n = expr(); expect(")"); return n; }
+  if (token->kind == TK_IDENT) {
+    char *name = strndup(token->str, token->len);
+    token = token->next;
+    Node *n = new_var_node(name);
+    n->name = name;
+    return n;
+  }
+  if (token->kind == TK_NUM) {
+    int val = token->val;
+    token = token->next;
+    return new_num(val);
+  }
+  if (token->kind == TK_STR) {
+    char *s = token->str;
+    token = token->next;
+    Node *n = new_strlit(s);
+    return n;
+  }
+  error_at_tok(token->loc, "expected an expression");
+  return NULL;
+}
+
+//
+// Semantic: collect locals and assign offsets
+//
+
+static void collect_locals_from_node(Node *node) {
+  if (!node) return;
+  switch (node->kind) {
+    case ND_BLOCK:
+      for (int i = 0; i < node->stmts_len; i++) collect_locals_from_node(node->stmts[i]);
+      break;
+    case ND_EXPR_STMT:
+      if (node->lhs) collect_locals_from_node(node->lhs);
+      break;
+    case ND_IF:
+      collect_locals_from_node(node->cond);
+      collect_locals_from_node(node->then);
+      collect_locals_from_node(node->els);
+      break;
+    case ND_WHILE:
+      collect_locals_from_node(node->cond);
+      collect_locals_from_node(node->then);
+      break;
+    case ND_FOR:
+      collect_locals_from_node(node->init);
+      collect_locals_from_node(node->cond);
+      collect_locals_from_node(node->inc);
+      collect_locals_from_node(node->then);
+      break;
+    case ND_RETURN:
+      collect_locals_from_node(node->lhs);
+      break;
+    case ND_ASSIGN:
+    case ND_ADD:
+    case ND_SUB:
+    case ND_MUL:
+    case ND_DIV:
+    case ND_EQ:
+    case ND_NE:
+    case ND_LT:
+    case ND_LE:
+      collect_locals_from_node(node->lhs);
+      collect_locals_from_node(node->rhs);
+      break;
+    case ND_DEREF:
+    case ND_ADDR:
+    case ND_SIZEOF:
+      collect_locals_from_node(node->lhs);
+      break;
+    case ND_FUNCALL:
+      for (int i = 0; i < node->args_len; i++) collect_locals_from_node(node->args[i]);
+      break;
+    case ND_MEMBER:
+    case ND_MEMBER_REF:
+      collect_locals_from_node(node->lhs);
+      break;
+    default:
+      break;
+  }
+}
+
+static void assign_lvar_offsets(Function *f) {
+  int offset = 0;
+  for (Var *v = locals; v; v = v->next) {
+    if (v->is_param) continue;
+    offset += 8;
+    v->offset = offset;
+  }
+  for (Var *v = locals; v; v = v->next) {
+    if (!v->is_param) continue;
+    offset += 8;
+    v->offset = offset;
+  }
+  f->stack_size = ((offset + 15) / 16) * 16;
+}
+
+//
+// Code generator
+//
+
+static FILE *outf;
+static int label_seq = 0;
+
+static void gen_lval(Node *node);
+
+static void load_from_address(Type *ty) {
+  if (!ty) { fprintf(outf, "  mov rax, [rax]\n  push rax\n"); return; }
+  if (ty->kind == TY_PTR) { fprintf(outf, "  mov rax, [rax]\n  push rax\n"); return; }
+  if (ty->kind == TY_STRUCT) { // load address pointer as value (struct value copy not implemented)
+    fprintf(outf, "  lea rax, [rax]\n  push rax\n");
+    return;
+  }
+  if (ty->size == 8) { fprintf(outf, "  mov rax, [rax]\n  push rax\n"); return; }
+  if (ty->size == 4) {
+    if (ty->is_unsigned) fprintf(outf, "  mov eax, [rax]\n");
+    else { fprintf(outf, "  mov eax, [rax]\n  movsxd rax, eax\n"); }
+    fprintf(outf, "  push rax\n"); return;
+  }
+  if (ty->size == 2) {
+    if (ty->is_unsigned) fprintf(outf, "  movzx rax, word ptr [rax]\n");
+    else fprintf(outf, "  movsx rax, word ptr [rax]\n");
+    fprintf(outf, "  push rax\n"); return;
+  }
+  if (ty->size == 1) {
+    if (ty->is_unsigned) fprintf(outf, "  movzx rax, byte ptr [rax]\n");
+    else fprintf(outf, "  movsx rax, byte ptr [rax]\n");
+    fprintf(outf, "  push rax\n"); return;
+  }
+  fprintf(outf, "  mov rax, [rax]\n  push rax\n");
+}
+
+static void store_to_address(Type *ty) {
+  if (!ty) { fprintf(outf, "  mov [rax], rdi\n"); return; }
+  if (ty->kind == TY_PTR || ty->size == 8) { fprintf(outf, "  mov [rax], rdi\n"); return; }
+  if (ty->size == 4) { fprintf(outf, "  mov dword ptr [rax], edi\n"); return; }
+  if (ty->size == 2) { fprintf(outf, "  mov word ptr [rax], di\n"); return; }
+  if (ty->size == 1) { fprintf(outf, "  mov byte ptr [rax], dil\n"); return; }
+  fprintf(outf, "  mov [rax], rdi\n");
+}
+
+static void gen(Node *node) {
+  if (!node) return;
+  switch (node->kind) {
+    case ND_NUM:
+      fprintf(outf, "  mov rax, %d\n  push rax\n", node->val);
+      node->ty = get_int_type_by_rank(2, false);
+      return;
+    case ND_NULL:
+      if (node->str) {
+        int id = register_string_literal(node->str);
+        fprintf(outf, "  lea rax, [rel .LC%d]\n  push rax\n", id);
+        node->ty = make_ptr(get_int_type_by_rank(2, false));
+        node->val = id;
+      }
+      return;
+    case ND_VAR: {
+      Var *v = find_var_by_name(node->name);
+      if (!v) { fprintf(stderr, "undefined variable %s\n", node->name); exit(1); }
+      fprintf(outf, "  lea rax, [rbp-%d]\n", v->offset);
+      load_from_address(v->ty);
+      node->ty = v->ty;
+      return;
+    }
+    case ND_ASSIGN: {
+      gen_lval(node->lhs);
+      gen(node->rhs);
+      fprintf(outf, "  pop rdi\n"); // value
+      fprintf(outf, "  pop rax\n"); // address
+      Type *lty = NULL;
+      if (node->lhs->kind == ND_VAR) {
+        Var *v = find_var_by_name(node->lhs->name);
+        if (!v) { fprintf(stderr, "undefined variable %s\n", node->lhs->name); exit(1); }
+        lty = v->ty;
+      } else if (node->lhs->kind == ND_DEREF) {
+        if (node->lhs->lhs && node->lhs->lhs->ty && node->lhs->lhs->ty->kind == TY_PTR) lty = node->lhs->lhs->ty->base;
+      }
+      if (!lty) lty = get_int_type_by_rank(2, false);
+      store_to_address(lty);
+      // push stored value (promoted)
+      if (lty->size == 8) fprintf(outf, "  push rdi\n");
+      else {
+        if (lty->size == 4) { if (lty->is_unsigned) fprintf(outf, "  mov eax, edi\n"); else fprintf(outf, "  mov eax, edi\n  movsxd rax, eax\n"); }
+        else if (lty->size == 2) { if (lty->is_unsigned) fprintf(outf, "  movzx rax, di\n"); else fprintf(outf, "  movsx rax, di\n"); }
+        else if (lty->size == 1) { if (lty->is_unsigned) fprintf(outf, "  movzx rax, dil\n"); else fprintf(outf, "  movsx rax, dil\n"); }
+        else fprintf(outf, "  mov rax, rdi\n");
+        fprintf(outf, "  push rax\n");
+      }
+      node->ty = lty;
+      return;
+    }
+    case ND_ADDR:
+      gen_lval(node->lhs);
+      node->ty = make_ptr(get_int_type_by_rank(2, false));
+      return;
+    case ND_DEREF:
+      gen(node->lhs);
+      fprintf(outf, "  pop rax\n");
+      if (node->lhs->ty && node->lhs->ty->kind == TY_PTR) {
+        load_from_address(node->lhs->ty->base);
+        node->ty = node->lhs->ty->base;
+      } else {
+        fprintf(outf, "  mov rax, [rax]\n  push rax\n");
+        node->ty = get_int_type_by_rank(2, false);
+      }
+      return;
+    case ND_SIZEOF:
+      if (node->lhs && node->lhs->ty) fprintf(outf, "  mov rax, %d\n  push rax\n", node->lhs->ty->size);
+      else fprintf(outf, "  mov rax, %d\n  push rax\n", get_int_type_by_rank(2, false)->size);
+      node->ty = get_int_type_by_rank(2, false);
+      return;
+    case ND_RETURN:
+      gen(node->lhs);
+      fprintf(outf, "  pop rax\n  mov rsp, rbp\n  pop rbp\n  ret\n");
+      return;
+    case ND_IF: {
+      int seq = label_seq++;
+      gen(node->cond);
+      fprintf(outf, "  pop rax\n  cmp rax, 0\n");
+      if (node->els) {
+        fprintf(outf, "  je .Lelse%d\n", seq);
+        gen(node->then);
+        fprintf(outf, "  jmp .Lend%d\n", seq);
+        fprintf(outf, ".Lelse%d:\n", seq);
+        gen(node->els);
+        fprintf(outf, ".Lend%d:\n", seq);
+      } else {
+        fprintf(outf, "  je .Lend%d\n", seq);
+        gen(node->then);
+        fprintf(outf, ".Lend%d:\n", seq);
+      }
+      return;
+    }
+    case ND_WHILE: {
+      int seq = label_seq++;
+      fprintf(outf, ".Lbegin%d:\n", seq);
+      gen(node->cond);
+      fprintf(outf, "  pop rax\n  cmp rax, 0\n  je .Lend%d\n", seq);
+      gen(node->then);
+      fprintf(outf, "  jmp .Lbegin%d\n", seq);
+      fprintf(outf, ".Lend%d:\n", seq);
+      return;
+    }
+    case ND_FOR: {
+      int seq = label_seq++;
+      if (node->init) gen(node->init);
+      fprintf(outf, ".Lbegin%d:\n", seq);
+      if (node->cond) { gen(node->cond); fprintf(outf, "  pop rax\n  cmp rax, 0\n  je .Lend%d\n", seq); }
+      gen(node->then);
+      if (node->inc) gen(node->inc);
+      fprintf(outf, "  jmp .Lbegin%d\n", seq);
+      fprintf(outf, ".Lend%d:\n", seq);
+      return;
+    }
+    case ND_BLOCK:
+      for (int i = 0; i < node->stmts_len; i++) gen(node->stmts[i]);
+      return;
+    case ND_EXPR_STMT:
+      if (node->lhs) gen(node->lhs);
+      fprintf(outf, "  pop rax\n");
+      return;
+    case ND_FUNCALL: {
+      const char *regs[] = {"rdi","rsi","rdx","rcx","r8","r9"};
+      for (int i = 0; i < node->args_len; i++) gen(node->args[i]);
+      for (int i = node->args_len - 1, r = 0; i >= 0 && r < 6; i--, r++) fprintf(outf, "  pop %s\n", regs[r]);
+      fprintf(outf, "  call %s\n  push rax\n", node->name);
+      node->ty = get_int_type_by_rank(2, false);
+      return;
+    }
+    case ND_MEMBER: {
+      // a.field  -> compute address of a, then add offset, then load value
+      gen_lval(node->lhs); // push address of object
+      fprintf(outf, "  pop rax\n");
+      // resolve member
+      Type *base_ty = node->lhs->ty;
+      if (!base_ty || base_ty->kind != TY_STRUCT) error_at_tok(node->lhs->name ? node->lhs->name : user_input, "not a struct in member access");
+      StructDef *sdef = base_ty->sdef;
+      StructMember *found = NULL;
+      for (int i = 0; i < sdef->members_len; i++) {
+        if (strcmp(sdef->members[i].name, node->member_name) == 0) { found = &sdef->members[i]; break; }
+      }
+      if (!found) error_at_tok(node->lhs->name ? node->lhs->name : user_input, "no such member %s", node->member_name);
+      fprintf(outf, "  add rax, %d\n", found->offset);
+      // load according to member type
+      load_from_address(found->ty);
+      node->ty = found->ty;
+      node->member = found;
+      return;
+    }
+    case ND_MEMBER_REF: {
+      // p->field  -> evaluate p, pop pointer, then add offset and load
+      gen(node->lhs);
+      fprintf(outf, "  pop rax\n"); // rax = pointer
+      Type *ptrty = node->lhs->ty;
+      if (!ptrty || ptrty->kind != TY_PTR || ptrty->base->kind != TY_STRUCT) error_at_tok(node->lhs->name ? node->lhs->name : user_input, "not a pointer to struct in -> access");
+      StructDef *sdef = ptrty->base->sdef;
+      StructMember *found = NULL;
+      for (int i = 0; i < sdef->members_len; i++) {
+        if (strcmp(sdef->members[i].name, node->member_name) == 0) { found = &sdef->members[i]; break; }
+      }
+      if (!found) error_at_tok(node->lhs->name ? node->lhs->name : user_input, "no such member %s", node->member_name);
+      fprintf(outf, "  add rax, %d\n", found->offset);
+      load_from_address(found->ty);
+      node->ty = found->ty;
+      node->member = found;
+      return;
+    }
+    case ND_ADD: case ND_SUB: case ND_MUL: case ND_DIV:
+    case ND_EQ: case ND_NE: case ND_LT: case ND_LE: {
+      gen(node->lhs);
+      gen(node->rhs);
+      fprintf(outf, "  pop rdi\n  pop rax\n");
+      // simple signedness: if either operand unsigned, treat as unsigned
+      bool is_unsigned = false;
+      if (node->lhs && node->lhs->ty && node->lhs->ty->is_unsigned) is_unsigned = true;
+      if (node->rhs && node->rhs->ty && node->rhs->ty->is_unsigned) is_unsigned = true;
+      switch (node->kind) {
+        case ND_ADD: fprintf(outf, "  add rax, rdi\n"); break;
+        case ND_SUB: fprintf(outf, "  sub rax, rdi\n"); break;
+        case ND_MUL: fprintf(outf, "  imul rax, rdi\n"); break;
+        case ND_DIV:
+          if (is_unsigned) { fprintf(outf, "  xor rdx, rdx\n  div rdi\n"); }
+          else { fprintf(outf, "  cqo\n  idiv rdi\n"); }
+          break;
+        case ND_EQ: fprintf(outf, "  cmp rax, rdi\n  sete al\n  movzb rax, al\n"); break;
+        case ND_NE: fprintf(outf, "  cmp rax, rdi\n  setne al\n  movzb rax, al\n"); break;
+        case ND_LT: fprintf(outf, "  cmp rax, rdi\n"); if (is_unsigned) fprintf(outf, "  setb al\n"); else fprintf(outf, "  setl al\n"); fprintf(outf, "  movzb rax, al\n"); break;
+        case ND_LE: fprintf(outf, "  cmp rax, rdi\n"); if (is_unsigned) fprintf(outf, "  setbe al\n"); else fprintf(outf, "  setle al\n"); fprintf(outf, "  movzb rax, al\n"); break;
+        default: break;
+      }
+      fprintf(outf, "  push rax\n");
+      node->ty = get_int_type_by_rank(2, false);
+      return;
+    }
+    default:
+      fprintf(stderr, "codegen: unknown node kind %d\n", node->kind);
+      exit(1);
+  }
+}
+
+static void gen_lval(Node *node) {
+  if (node->kind == ND_VAR) {
+    Var *v = find_var_by_name(node->name);
+    if (!v) error_at_tok(user_input, "undefined variable %s", node->name);
+    fprintf(outf, "  lea rax, [rbp-%d]\n  push rax\n", v->offset);
+    return;
+  }
+  if (node->kind == ND_MEMBER) {
+    // compute address of base, then add offset
+    gen_lval(node->lhs);
+    fprintf(outf, "  pop rax\n");
+    Type *base_ty = node->lhs->ty;
+    if (!base_ty || base_ty->kind != TY_STRUCT) error_at_tok(user_input, "not a struct in member lvalue");
+    StructDef *sdef = base_ty->sdef;
+    StructMember *found = NULL;
+    for (int i = 0; i < sdef->members_len; i++) if (strcmp(sdef->members[i].name, node->member_name) == 0) { found = &sdef->members[i]; break; }
+    if (!found) error_at_tok(user_input, "no such member %s", node->member_name);
+    fprintf(outf, "  add rax, %d\n  push rax\n", found->offset);
+    return;
+  }
+  if (node->kind == ND_MEMBER_REF) {
+    // p->m : evaluate p, pop pointer, add offset
+    gen(node->lhs);
+    fprintf(outf, "  pop rax\n");
+    Type *ptrty = node->lhs->ty;
+    if (!ptrty || ptrty->kind != TY_PTR || ptrty->base->kind != TY_STRUCT) error_at_tok(user_input, "not a pointer to struct in -> lvalue");
+    StructDef *sdef = ptrty->base->sdef;
+    StructMember *found = NULL;
+    for (int i = 0; i < sdef->members_len; i++) if (strcmp(sdef->members[i].name, node->member_name) == 0) { found = &sdef->members[i]; break; }
+    if (!found) error_at_tok(user_input, "no such member %s", node->member_name);
+    fprintf(outf, "  add rax, %d\n  push rax\n", found->offset);
+    return;
+  }
+  error_at_tok(user_input, "not an lvalue");
+}
+
+//
+// Helpers to collect string literals for emission
+//
+typedef struct StrNode { struct StrNode *next; int id; char *s; } StrNode;
+static StrNode *strs = NULL;
+static int str_seq = 0;
+int register_string_literal(const char *s) {
+  StrNode *n = xmalloc(sizeof(StrNode));
+  n->s = xstrdup(s);
+  n->id = ++str_seq;
+  n->next = strs;
+  strs = n;
+  return n->id;
+}
+
+//
+// Main / CLI
+//
+
+int main(int argc, char **argv) {
+  if (argc < 2) { fprintf(stderr, "Usage: %s <src.c> -o <outname>\n", argv[0]); return 1; }
+  char *src_path = NULL; char *out_name = NULL;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-o") == 0) { if (i + 1 >= argc) { fprintf(stderr, "-o requires an argument\n"); return 1; } out_name = argv[++i]; }
+    else { if (!src_path) src_path = argv[i]; }
+  }
+  if (!src_path) { fprintf(stderr, "no input file\n"); return 1; }
+  if (!out_name) out_name = "a.out";
+
+  char *pp = preprocess_file(src_path);
+  if (!pp) { fprintf(stderr, "preprocessing failed\n"); return 1; }
+
+  user_input = pp;
+  token = tokenize();
+  Node *prog = program();
+
+  size_t len = strlen(out_name) + 3;
+  char *asm_path = xmalloc(len + 1);
+  snprintf(asm_path, len + 1, "%s.s", out_name);
+  outf = fopen(asm_path, "w");
+  if (!outf) { perror("fopen"); return 1; }
+
+  fprintf(outf, ".intel_syntax noprefix\n");
+
+  for (Function *f = functions; f; f = f->next) {
+    locals = NULL;
+    /* push params as locals with their declared types */
+    for (int i = f->params_count - 1; i >= 0; i--) {
+      Type *pty = f->param_types ? f->param_types[i] : get_int_type_by_rank(2, false);
+      push_var(f->params[i], pty, true);
+    }
+
+    collect_locals_from_node(f->body);
+    assign_lvar_offsets(f);
+
+    fprintf(outf, ".global %s\n", f->name);
+    fprintf(outf, "%s:\n", f->name);
+    fprintf(outf, "  push rbp\n  mov rbp, rsp\n  sub rsp, %d\n", f->stack_size);
+
+    const char *regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    for (int i = 0; i < f->params_count && i < 6; i++) {
+      Var *v = find_var_by_name(f->params[i]);
+      if (!v) continue;
+      if (v->ty->size == 8) fprintf(outf, "  mov [rbp-%d], %s\n", v->offset, regs[i]);
+      else if (v->ty->size == 4) fprintf(outf, "  mov dword ptr [rbp-%d], %s\n", v->offset, regs[i]);
+      else if (v->ty->size == 2) fprintf(outf, "  mov word ptr [rbp-%d], %s\n", v->offset, regs[i]);
+      else if (v->ty->size == 1) fprintf(outf, "  mov byte ptr [rbp-%d], %s\n", v->offset, regs[i]);
+      else fprintf(outf, "  mov [rbp-%d], %s\n", v->offset, regs[i]);
+    }
+
+    gen(f->body);
+
+    fprintf(outf, "  mov rsp, rbp\n  pop rbp\n  ret\n");
+  }
+
+  if (!functions) {
+    locals = NULL;
+    collect_locals_from_node(prog);
+    Function tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    assign_lvar_offsets(&tmp);
+
+    fprintf(outf, ".global main\n");
+    fprintf(outf, "main:\n");
+    fprintf(outf, "  push rbp\n  mov rbp, rsp\n  sub rsp, %d\n", tmp.stack_size ? tmp.stack_size : 16);
+
+    gen(prog);
+
+    fprintf(outf, "  pop rax\n  mov rsp, rbp\n  pop rbp\n  ret\n");
+  }
+
+  if (strs) {
+    fprintf(outf, ".section .rodata\n");
+    for (StrNode *s = strs; s; s = s->next) {
+      fprintf(outf, ".LC%d:\n  .string \"", s->id);
+      for (char *p = s->s; *p; p++) {
+        char c = *p;
+        if (c == '\\') fprintf(outf, "\\\\");
+        else if (c == '\"') fprintf(outf, "\\\"");
+        else if (c == '\n') fprintf(outf, "\\n");
+        else if (c == '\t') fprintf(outf, "\\t");
+        else if ((unsigned char)c < 32 || (unsigned char)c >= 127) fprintf(outf, "\\x%02x", (unsigned char)c);
+        else fputc(c, outf);
+      }
+      fprintf(outf, "\"\n");
+    }
+  }
+
+  fclose(outf);
+  fprintf(stderr, "wrote %s\n", asm_path);
+  free(pp);
+  free(asm_path);
+  return 0;
+}
+

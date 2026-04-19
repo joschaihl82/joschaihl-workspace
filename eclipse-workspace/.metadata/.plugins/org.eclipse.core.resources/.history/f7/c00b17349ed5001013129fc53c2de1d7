@@ -1,0 +1,1304 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#define null NULL
+
+// ====================================================================
+// --- ELF STRUCTURES ---
+// ====================================================================
+
+enum {
+    max_buf_size = 1024,
+    null_section = 0,
+    text_section = 1,
+    shstrtab_section = 2,
+    symtab_section = 3,
+    strtab_section = 4
+};
+
+typedef struct {
+    unsigned char ident[16];
+    uint16_t type;
+    uint16_t machine;
+    uint32_t version;
+    uint64_t entry;
+    uint64_t phoff;
+    uint64_t shoff;
+    uint32_t flags;
+    uint16_t hsize;
+    uint16_t phsize;
+    uint16_t phnum;
+    uint16_t shsize;
+    uint16_t shnum;
+    uint16_t strndx;
+} elfhdr_t;
+
+typedef struct {
+    uint32_t name;
+    uint32_t type;
+    uint64_t flags;
+    uint64_t addr;
+    uint64_t offset;
+    uint64_t size;
+    uint32_t link;
+    uint32_t info;
+    uint64_t align;
+    uint64_t esize;
+} shdr_t;
+
+typedef struct {
+    uint32_t name;
+    uint8_t info;
+    uint8_t other;
+    uint16_t index;
+    uint64_t value;
+    uint64_t size;
+} sym_t;
+
+typedef struct {
+    shdr_t hdr;
+    size_t len;
+    unsigned char *data;
+} section_t;
+
+typedef struct {
+    elfhdr_t hdr;
+    section_t sec[5];
+} elf64_t;
+
+typedef struct {
+    size_t len;
+    char *buf;
+} strtab_t;
+
+// ====================================================================
+// --- LEXER STRUCTURES (Lexing Logic: next_token) ---
+// ====================================================================
+
+typedef enum {
+    tkn_eof,
+    tkn_num,
+    tkn_ident,
+    tkn_instr,
+    tkn_reg,
+    tkn_xmm_reg,
+    tkn_sym,
+} tokentype_t;
+
+typedef enum {
+    sym_colon,
+    sym_comma,
+    sym_comment,
+    sym_unknown,
+    sym_lparen, // ( for AT&T memory
+    sym_rparen, // ) for AT&T memory
+} symtype_t;
+
+typedef struct {
+    tokentype_t type;
+    void *data;
+} token_t;
+
+typedef struct {
+    char *buf;
+    size_t i;
+} lexer_t;
+
+// ====================================================================
+// --- PARSER STRUCTURES (Parsing Logic: next_instr) ---
+// ====================================================================
+
+typedef enum {
+    instr_nop,
+    instr_mov, instr_add, instr_sub, instr_and, instr_or,
+    instr_push, instr_pop, instr_inc, instr_dec,
+    instr_ret,
+    instr_syscall,
+    instr_call,
+    instr_jmp,
+    instr_label,
+    instr_global_label,
+    // sse instructions
+    instr_movaps, instr_movups, instr_addps, instr_subps, instr_mulps,
+    parser_eof,
+} instrtype_t;
+
+typedef struct {
+    instrtype_t type;
+    void *data;
+} instr_t;
+
+typedef enum {
+    op_reg,
+    op_xmm_reg,
+    op_label,
+    op_int,
+    op_mem,
+    op_unknown,
+    op_none
+} optype_t;
+
+typedef struct {
+    optype_t type;
+    void *data;
+} op_t;
+
+// for binary operations, op1 will be the internal destination, op2 will be the internal source
+typedef struct {
+    op_t *op1;
+    op_t *op2;
+} binary_op_t;
+
+typedef struct _symentry {
+    char *name;
+    size_t offset;
+    struct _symentry *next;
+} symentry_t;
+
+typedef struct {
+    symentry_t *syms;
+    size_t offset;
+} asm_t;
+
+// operand type matching for the instruction table
+typedef enum {
+    insn_op_match_r64,          // general purpose register (rax, rbx, ...)
+    insn_op_match_xmm,          // xmm register
+    insn_op_match_imm32,        // 32-bit immediate
+    insn_op_match_label,        // label for jmp/call
+    insn_op_match_r_m,          // register or memory operand (r/m field in modrm)
+    insn_op_match_r_m_gpr,      // gpr register or memory (for gpr instructions)
+    insn_op_match_none,         // no operand
+} insn_op_match_t;
+
+// instruction format flags/encoding steps
+enum {
+    enc_none,
+    enc_imm32,          // 4 byte immediate data
+    enc_rel32,          // 4 byte relative displacement (jmp/call)
+    enc_w_prefix,       // rex.w bit
+    enc_r_prefix,       // rex.r bit (from op2 reg field/source)
+    enc_b_prefix,       // rex.b bit (from op1 r/m field/destination)
+    enc_66_prefix,
+    enc_f2_prefix,
+    enc_f3_prefix,
+    enc_opcode,         // base opcode bytes
+    enc_modrm_reg_rr,   // modrm r/m field is op1(dst), reg field is op2(src)
+    enc_modrm_ext,      // modrm r/m field is op1(dst), reg field is modrm_ext (i-r, unary)
+    enc_pop_push_reg,   // 50+r / 58+r
+};
+
+// instruction table structure
+typedef struct {
+    instrtype_t type;
+    const char *name;
+    uint8_t opcodes[3];
+    size_t opcode_len;
+    uint8_t modrm_ext;           // modrm reg/op field if not a register
+    insn_op_match_t op1_match;   // expected type of op1 (internal destination)
+    insn_op_match_t op2_match;   // expected type of op2 (internal source)
+    uint8_t encoding_steps[8];   // ordered list of enc_ flags
+} insn_t;
+
+
+// ====================================================================
+// --- FORWARD DECLARATIONS ---
+// ====================================================================
+
+// elf functions
+elf64_t gen_elf64(void);
+size_t append_strtab(strtab_t *stab, const char *data);
+
+// lexer functions
+token_t next_token(lexer_t *lex);
+
+// parser functions
+int instr_off(asm_t *asmblr, instr_t *ins);
+void encode(asm_t *asmblr, instr_t *ins, unsigned char *buf);
+int is_binary_op(instrtype_t type);
+void free_op(op_t *op);
+void free_instr(instr_t *ins);
+instr_t next_instr(lexer_t *lex);
+const insn_t *lookup_insn_by_name(const char *name);
+const insn_t *lookup_insn_match(instrtype_t type, optype_t op1_type, optype_t op2_type);
+int regord(const char *reg, uint8_t *rex_b);
+
+// asm functions
+void assemble(elf64_t *elf, lexer_t *lex);
+void collect_syms(asm_t *asmblr, elf64_t *elf, lexer_t *lex);
+void encode_prog(asm_t *asmblr, elf64_t *elf, lexer_t *lex);
+void update_off(elf64_t *elf);
+void free_syms(symentry_t *syms);
+
+// main functions
+int read_file(const char *name, char **buf);
+int output(lexer_t *lex, const char *name);
+
+
+// ====================================================================
+// --- GLOBAL DATA (Instruction Table) ---
+// ====================================================================
+
+// this table is defined internally as (destination, source)
+const insn_t insn_table[] = {
+    // unary instructions
+    { instr_nop, "nop", { 0x90 }, 1, 0, insn_op_match_none, insn_op_match_none, { enc_opcode, enc_none } },
+    { instr_ret, "ret", { 0xc3 }, 1, 0, insn_op_match_none, insn_op_match_none, { enc_opcode, enc_none } },
+    { instr_syscall, "syscall", { 0x0f, 0x05 }, 2, 0, insn_op_match_none, insn_op_match_none, { enc_opcode, enc_none } },
+
+    // mov: mov r/m64, imm32 (0xc7 /0 + imm32). op1(dst)=r64, op2(src)=imm32
+    { instr_mov, "mov", { 0xc7 }, 1, 0, insn_op_match_r64, insn_op_match_imm32, { enc_w_prefix, enc_b_prefix, enc_opcode, enc_modrm_ext, enc_imm32, enc_none } },
+    // mov: mov r/m64, reg (0x89 /r). op1(dst)=r/m64, op2(src)=reg. (AT&T: mov %reg, %r/m)
+    { instr_mov, "mov", { 0x89 }, 1, 0, insn_op_match_r_m_gpr, insn_op_match_r64, { enc_w_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+
+    // add: add r/m, reg (0x01 /r). op1(dst)=r/m, op2(src)=reg. (AT&T: add %reg, %r/m)
+    { instr_add, "add", { 0x01 }, 1, 0, insn_op_match_r_m_gpr, insn_op_match_r64, { enc_w_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    // sub, and, or use the same encoding pattern with different opcodes
+    { instr_sub, "sub", { 0x29 }, 1, 0, insn_op_match_r_m_gpr, insn_op_match_r64, { enc_w_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    { instr_and, "and", { 0x21 }, 1, 0, insn_op_match_r_m_gpr, insn_op_match_r64, { enc_w_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    { instr_or, "or", { 0x09 }, 1, 0, insn_op_match_r_m_gpr, insn_op_match_r64, { enc_w_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+
+    // push r64 (50+r). op1=r64, op2=none
+    { instr_push, "push", { 0x50 }, 1, 0, insn_op_match_r64, insn_op_match_none, { enc_b_prefix, enc_pop_push_reg, enc_none } },
+    // pop r64 (58+r). op1=r64, op2=none
+    { instr_pop, "pop", { 0x58 }, 1, 0, insn_op_match_r64, insn_op_match_none, { enc_b_prefix, enc_pop_push_reg, enc_none } },
+
+    // inc r/m64 (ff /0) - unary op. modrm_ext is 0. op1=r64, op2=none
+    { instr_inc, "inc", { 0xff }, 1, 0, insn_op_match_r64, insn_op_match_none, { enc_w_prefix, enc_b_prefix, enc_opcode, enc_modrm_ext, enc_none } },
+    // dec r/m64 (ff /1) - unary op. modrm_ext is 1. op1=r64, op2=none
+    { instr_dec, "dec", { 0xff }, 1, 1, insn_op_match_r64, insn_op_match_none, { enc_w_prefix, enc_b_prefix, enc_opcode, enc_modrm_ext, enc_none } },
+
+    // control flow (label is target). op1=label, op2=none
+    { instr_call, "call", { 0xe8 }, 1, 0, insn_op_match_label, insn_op_match_none, { enc_opcode, enc_rel32, enc_none } }, // call rel32
+    { instr_jmp, "jmp", { 0xe9 }, 1, 0, insn_op_match_label, insn_op_match_none, { enc_opcode, enc_rel32, enc_none } },  // jmp rel32
+
+    // sse instructions (r-r forms). op1(dst)=xmm, op2(src)=xmm
+    // movaps xmm, xmm. using 0x28 (movaps xmm, xmm/m128), which is source-first in intel.
+    // we use the same 0x28 for internal (dst, src) by letting enc_modrm_reg_rr handle it, which is correct for 0x28.
+    { instr_movaps, "movaps", { 0x0f, 0x28 }, 2, 0, insn_op_match_xmm, insn_op_match_xmm, { enc_66_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    // movups xmm, xmm.
+    { instr_movups, "movups", { 0x0f, 0x10 }, 2, 0, insn_op_match_xmm, insn_op_match_xmm, { enc_f3_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    // addps xmm, xmm
+    { instr_addps, "addps", { 0x0f, 0x58 }, 2, 0, insn_op_match_xmm, insn_op_match_xmm, { enc_66_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    // subps xmm, xmm
+    { instr_subps, "subps", { 0x0f, 0x5c }, 2, 0, insn_op_match_xmm, insn_op_match_xmm, { enc_66_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+    // mulps xmm, xmm
+    { instr_mulps, "mulps", { 0x0f, 0x59 }, 2, 0, insn_op_match_xmm, insn_op_match_xmm, { enc_66_prefix, enc_r_prefix, enc_b_prefix, enc_opcode, enc_modrm_reg_rr, enc_none } },
+
+    // directives
+    { instr_label, "label", { 0 }, 0, 0, insn_op_match_none, insn_op_match_none, { enc_none } },
+    { instr_global_label, "global", { 0 }, 0, 0, insn_op_match_none, insn_op_match_none, { enc_none } }
+};
+
+const size_t insn_table_size = sizeof(insn_table) / sizeof(insn_t);
+
+
+// ====================================================================
+// --- ELF IMPLEMENTATION (from elf.c) ---
+// ====================================================================
+
+static elfhdr_t gen_elfhdr(void) {
+    return (elfhdr_t) {
+        .ident = {
+            0x7f, 'e', 'l', 'f', 0x02, 0x01, 0x01, 0x00,
+            0, 0, 0, 0, 0, 0, 0, 0
+        },
+        .type = 0x01, .machine = 0x3e, .version = 0x01, .entry = 0, .phoff = 0,
+        .shoff = sizeof(elfhdr_t), .flags = 0, .hsize = sizeof(elfhdr_t),
+        .phsize = 0, .phnum = 0, .shsize = sizeof(shdr_t), .shnum = 0, .strndx = 0,
+    };
+}
+
+static shdr_t gen_null_shdr(void) {
+    return (shdr_t) { .name = 0, .type = 0, .flags = 0, .addr = 0, .offset = 0, .size = 0, .link = 0, .info = 0, .align = 0, .esize = 0 };
+}
+
+static shdr_t gen_text_shdr(void) {
+    return (shdr_t) { .name = 0, .type = 0x01, .flags = 0x02 | 0x04, .addr = 0, .offset = 0, .size = 0, .link = 0, .info = 0, .align = 0x01, .esize = 0 };
+}
+
+static shdr_t gen_strtab_shdr(void) {
+    return (shdr_t) { .name = 0, .type = 0x03, .flags = 0, .addr = 0, .offset = 0, .size = 0, .link = 0, .info = 0, .align = 0x01, .esize = 0 };
+}
+
+static shdr_t gen_symtab_shdr(void) {
+    return (shdr_t) { .name = 0, .type = 0x02, .flags = 0, .addr = 0, .offset = 0, .size = 0, .link = 0, .info = 0, .align = 0x08, .esize = sizeof(sym_t) };
+}
+
+size_t append_strtab(strtab_t *stab, const char *data) {
+    size_t idx = stab->len;
+    size_t data_len = strlen(data);
+
+    if (stab->len + data_len + 1 > max_buf_size) {
+         fprintf(stderr, "error: string table buffer overflow\n");
+         exit(1);
+    }
+
+    strcpy(stab->buf + stab->len, data);
+    stab->len += data_len;
+    stab->buf[stab->len++] = '\0';
+
+    return idx;
+}
+
+elf64_t gen_elf64(void) {
+    elf64_t elf;
+    strtab_t shstrtab = { .len = 0, .buf = (char *)malloc(max_buf_size) };
+
+    if (!shstrtab.buf) {
+        fprintf(stderr, "error: out of memory for shstrtab\n");
+        exit(1);
+    }
+
+    elf.hdr = gen_elfhdr();
+    elf.hdr.shnum = 0x05;
+    elf.hdr.strndx = shstrtab_section;
+
+    elf.sec[null_section] = (section_t) { .hdr = gen_null_shdr(), .data = null, .len = 0};
+    elf.sec[text_section] = (section_t) {.hdr = gen_text_shdr(), .data = null, .len = 0 };
+    elf.sec[shstrtab_section] = (section_t) {.hdr = gen_strtab_shdr(), .data = (unsigned char *)shstrtab.buf, .len = 0 };
+    elf.sec[symtab_section] = (section_t) {.hdr = gen_symtab_shdr(), .data = null, .len = 0 };
+    elf.sec[strtab_section] = (section_t) {.hdr = gen_strtab_shdr(), .data = null, .len = 0 };
+
+    elf.sec[null_section].hdr.name = append_strtab(&shstrtab, "");
+    elf.sec[text_section].hdr.name = append_strtab(&shstrtab, ".text");
+    elf.sec[shstrtab_section].hdr.name = append_strtab(&shstrtab, ".shstrtab");
+    elf.sec[symtab_section].hdr.name = append_strtab(&shstrtab, ".symtab");
+    elf.sec[strtab_section].hdr.name = append_strtab(&shstrtab, ".strtab");
+
+    elf.sec[shstrtab_section].len = shstrtab.len;
+
+    elf.sec[symtab_section].hdr.link = strtab_section;
+
+    return elf;
+}
+
+
+// ====================================================================
+// --- LEXER IMPLEMENTATION (from lexer.c) ---
+// ====================================================================
+
+// these checks are simplified in the table-driven approach, but kept for token recognition
+static int is_reg_x64(const char *arg) {
+    // assumes arg is the stripped name (e.g., "rax")
+    if (strcmp(arg, "rax") == 0 || strcmp(arg, "rbx") == 0 || strcmp(arg, "rcx") == 0 ||
+        strcmp(arg, "rdx") == 0 || strcmp(arg, "rsi") == 0 || strcmp(arg, "rdi") == 0 ||
+        strcmp(arg, "rsp") == 0 || strcmp(arg, "rbp") == 0 ||
+        strcmp(arg, "r8") == 0  || strcmp(arg, "r9") == 0  || strcmp(arg, "r10") == 0 ||
+        strcmp(arg, "r11") == 0 || strcmp(arg, "r12") == 0 || strcmp(arg, "r13") == 0 ||
+        strcmp(arg, "r14") == 0 || strcmp(arg, "r15") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
+static int is_reg_xmm(const char *arg) {
+    // assumes arg is the stripped name (e.g., "xmm0")
+    if (arg[0] == 'x' && arg[1] == 'm' && arg[2] == 'm') {
+        int reg_num = atoi(arg + 3);
+        if (reg_num >= 0 && reg_num <= 15) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int is_space(char c) {
+    return c == ' ' || c == '\n' || c == '\t' || c == '\r';
+}
+
+static int is_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static int is_ident_char(char c) {
+    // standard chars for the *body* of an identifier
+    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_';
+}
+
+static void consume_whitespace(lexer_t *lex) {
+    while (lex->buf[lex->i] != '\0' && is_space(lex->buf[lex->i])) {
+        lex->i++;
+    }
+}
+
+static token_t consume_sym(lexer_t *lex) {
+    symtype_t *st = (symtype_t *)malloc(sizeof(symtype_t));
+    if (!st) {
+        fprintf(stderr, "error: out of memory for symtype\n");
+        exit(1);
+    }
+
+    switch (lex->buf[lex->i++]) {
+        case ',': *st = sym_comma; break;
+        case ':': *st = sym_colon; break;
+        case '(': *st = sym_lparen; break; // AT&T memory open
+        case ')': *st = sym_rparen; break; // AT&T memory close
+        case ';':
+            while (lex->buf[lex->i] != '\0' && lex->buf[lex->i] != '\n') {
+                lex->i++;
+            }
+            *st = sym_comment;
+            break;
+        default: *st = sym_unknown;
+    }
+
+    return (token_t){
+        .type = tkn_sym,
+        .data = st,
+    };
+}
+
+// handles registers (%rax) and labels/instructions (mov, mylabel, $label)
+static token_t consume_ident(lexer_t *lex) {
+    char *data;
+    size_t n = 0;
+    tokentype_t type = tkn_ident;
+    const insn_t *insn;
+
+    // track position to copy stripped name
+    size_t start_i = lex->i;
+    int has_prefix = 0;
+
+    // handle optional '%' or '$' prefix (AT&T registers and labels/immediates)
+    if (lex->buf[start_i] == '%' || lex->buf[start_i] == '$') {
+        has_prefix = 1;
+        start_i++;
+    }
+
+    // get length of identifier *without* the potential prefix
+    while (lex->buf[start_i + n] != '\0' && is_ident_char(lex->buf[start_i + n])) {
+        n++;
+    }
+
+    // if only a prefix or an invalid ident, let consume_sym handle it
+    if (n == 0) {
+        lex->i = start_i - has_prefix; // rewind to original position
+        return consume_sym(lex);
+    }
+
+    data = (char *)malloc(n + 1);
+    if (!data) {
+        fprintf(stderr, "error: out of memory for ident data\n");
+        exit(1);
+    }
+    data[n] = '\0';
+    strncpy(data, lex->buf + start_i, n); // copy only the non-prefixed name
+
+    lex->i = start_i + n; // update lexer position to end of token (after prefix)
+
+    // classification uses stripped name `data` ("rax", "mov", "my_label")
+    if ((insn = lookup_insn_by_name(data)) != null) {
+        type = tkn_instr;
+    } else if (is_reg_x64(data)) {
+        type = tkn_reg;
+    } else if (is_reg_xmm(data)) {
+        type = tkn_xmm_reg;
+    }
+
+    return (token_t){
+        .data = data,
+        .type = type,
+    };
+}
+
+// handles numbers (including AT&T '$' prefix for immediates)
+static token_t consume_num(lexer_t *lex) {
+    token_t tkn = { .type = tkn_eof, .data = null };
+    int num = 0;
+    size_t start_i = lex->i;
+    int sign = 1;
+
+    // handle AT&T immediate prefix
+    if (lex->buf[lex->i] == '$') {
+        lex->i++; // consume '$'
+        // if not followed by a digit or sign, rewind and let consume_ident handle it ($label)
+        if (!is_digit(lex->buf[lex->i]) && lex->buf[lex->i] != '-') {
+            lex->i = start_i;
+            return tkn;
+        }
+    }
+
+    // handle optional negative sign
+    if (lex->buf[lex->i] == '-') {
+        sign = -1;
+        lex->i++;
+    }
+
+    // actual number parsing
+    if (!is_digit(lex->buf[lex->i])) { // not a number after optional sign/prefix
+        lex->i = start_i; // rewind entirely
+        return tkn;
+    }
+
+    while (lex->buf[lex->i] != '\0' && is_digit(lex->buf[lex->i])) {
+        num = (num * 10) + (lex->buf[lex->i] - '0');
+        lex->i++;
+    }
+    num *= sign;
+
+    tkn.type = tkn_num;
+    tkn.data = (int *)malloc(sizeof(int));
+    if (!tkn.data) {
+        fprintf(stderr, "error: out of memory for num data\n");
+        exit(1);
+    }
+    *((int *)tkn.data) = num;
+
+    return tkn;
+}
+
+token_t next_token(lexer_t *lex) {
+    token_t tkn;
+
+    consume_whitespace(lex);
+
+    if (lex->buf[lex->i] == '\0') {
+        tkn.type = tkn_eof;
+        tkn.data = null;
+        return tkn;
+    }
+
+    // try to parse as an immediate number (handles '$' prefix) or a simple number
+    tkn = consume_num(lex);
+    if (tkn.type != tkn_eof) {
+        return tkn;
+    }
+
+    // try to parse as an ident/instr/reg (handles '%' or '$' prefix that isn't a number)
+    if (lex->buf[lex->i] == '%' || lex->buf[lex->i] == '$' || is_ident_char(lex->buf[lex->i])) {
+        tkn = consume_ident(lex);
+    } else {
+        tkn = consume_sym(lex);
+    }
+
+    // consume comment tokens until a non-comment or eof is reached
+    while (tkn.type == tkn_sym && *((symtype_t *)tkn.data) == sym_comment) {
+        if (tkn.data) free(tkn.data);
+        consume_whitespace(lex);
+        if (lex->buf[lex->i] == '\0') {
+            tkn.type = tkn_eof;
+            tkn.data = null;
+            return tkn;
+        }
+        tkn = consume_sym(lex);
+    }
+
+    return tkn;
+}
+
+
+// ====================================================================
+// --- PARSER IMPLEMENTATION (from parser.c) ---
+// ====================================================================
+
+const insn_t *lookup_insn_by_name(const char *name) {
+    for (size_t i = 0; i < insn_table_size; i++) {
+        if (strcmp(insn_table[i].name, name) == 0) {
+            return &insn_table[i];
+        }
+    }
+    return null;
+}
+
+static insn_op_match_t map_optype_to_match(optype_t type) {
+    switch (type) {
+        case op_reg: return insn_op_match_r64;
+        case op_xmm_reg: return insn_op_match_xmm;
+        case op_int: return insn_op_match_imm32;
+        case op_label: return insn_op_match_label;
+        case op_mem: return insn_op_match_r_m;
+        default: return insn_op_match_none;
+    }
+}
+
+const insn_t *lookup_insn_match(instrtype_t type, optype_t op1_type, optype_t op2_type) {
+    insn_op_match_t op1_match_run = map_optype_to_match(op1_type);
+    insn_op_match_t op2_match_run = map_optype_to_match(op2_type);
+
+    for (size_t i = 0; i < insn_table_size; i++) {
+        if (insn_table[i].type == type) {
+            insn_op_match_t op1_match_table = insn_table[i].op1_match;
+            insn_op_match_t op2_match_table = insn_table[i].op2_match;
+
+            // special case: r64 is a subset of r_m_gpr (register or memory for gpr instruction)
+            int match1 = (op1_match_run == op1_match_table);
+            if (op1_match_table == insn_op_match_r_m_gpr && (op1_match_run == insn_op_match_r64 || op1_match_run == insn_op_match_r_m)) {
+                match1 = 1;
+            }
+
+            int match2 = (op2_match_run == op2_match_table);
+            if (op2_match_table == insn_op_match_r_m_gpr && (op2_match_run == insn_op_match_r64 || op2_match_run == insn_op_match_r_m)) {
+                match2 = 1;
+            }
+
+            if (match1 && match2) {
+                return &insn_table[i];
+            }
+        }
+    }
+    return null;
+}
+
+void free_op(op_t *op) {
+    if (op == null) return;
+    if (op->data && (op->type == op_reg || op->type == op_xmm_reg || op->type == op_label || op->type == op_mem || op->type == op_int)) {
+        free(op->data);
+    }
+    free(op);
+}
+
+void free_instr(instr_t *ins) {
+    if (ins->type == parser_eof || ins->type == instr_nop || ins->data == null) {
+        return;
+    }
+
+    if (is_binary_op(ins->type)) {
+        binary_op_t *op = (binary_op_t *)ins->data;
+        // op1 is internal destination, op2 is internal source
+        free_op(op->op1);
+        free_op(op->op2);
+        free(op);
+    } else if (ins->type == instr_jmp || ins->type == instr_call ||
+               ins->type == instr_push || ins->type == instr_pop ||
+               ins->type == instr_inc || ins->type == instr_dec ||
+               ins->type == instr_global_label) {
+        op_t *op = (op_t *)ins->data;
+        free_op(op);
+    } else if (ins->type == instr_label) {
+        if (ins->data) free(ins->data); // data is the label name string
+    }
+}
+
+int is_binary_op(instrtype_t type) {
+    if (type == instr_mov || type == instr_add || type == instr_sub ||
+        type == instr_and || type == instr_or ||
+        type == instr_movaps || type == instr_movups ||
+        type == instr_addps || type == instr_subps || type == instr_mulps) {
+        return 1;
+    }
+    return 0;
+}
+
+// returns the 3-bit register index (0-7) and sets *rex_b to 1 if it's an extended register (r8-r15)
+int regord(const char *reg, uint8_t *rex_b) {
+    *rex_b = 0;
+
+    if (strcmp(reg, "rax") == 0 || strcmp(reg, "xmm0") == 0) return 0;
+    if (strcmp(reg, "rcx") == 0 || strcmp(reg, "xmm1") == 0) return 1;
+    if (strcmp(reg, "rdx") == 0 || strcmp(reg, "xmm2") == 0) return 2;
+    if (strcmp(reg, "rbx") == 0 || strcmp(reg, "xmm3") == 0) return 3;
+    if (strcmp(reg, "rsp") == 0 || strcmp(reg, "xmm4") == 0) return 4;
+    if (strcmp(reg, "rbp") == 0 || strcmp(reg, "xmm5") == 0) return 5;
+    if (strcmp(reg, "rsi") == 0 || strcmp(reg, "xmm6") == 0) return 6;
+    if (strcmp(reg, "rdi") == 0 || strcmp(reg, "xmm7") == 0) return 7;
+
+    if (strcmp(reg, "r8") == 0 || strcmp(reg, "xmm8") == 0) { *rex_b = 1; return 0; }
+    if (strcmp(reg, "r9") == 0 || strcmp(reg, "xmm9") == 0) { *rex_b = 1; return 1; }
+    if (strcmp(reg, "r10") == 0 || strcmp(reg, "xmm10") == 0) { *rex_b = 1; return 2; }
+    if (strcmp(reg, "r11") == 0 || strcmp(reg, "xmm11") == 0) { *rex_b = 1; return 3; }
+    if (strcmp(reg, "r12") == 0 || strcmp(reg, "xmm12") == 0) { *rex_b = 1; return 4; }
+    if (strcmp(reg, "r13") == 0 || strcmp(reg, "xmm13") == 0) { *rex_b = 1; return 5; }
+    if (strcmp(reg, "r14") == 0 || strcmp(reg, "xmm14") == 0) { *rex_b = 1; return 6; }
+    if (strcmp(reg, "r15") == 0 || strcmp(reg, "xmm15") == 0) { *rex_b = 1; return 7; }
+
+    return 0; // default/error case
+}
+
+size_t _offset(asm_t *asmblr, const char *label) {
+    size_t offset = 0;
+    symentry_t *s = asmblr->syms;
+    while (s != null) {
+        if (strcmp(s->name, label) == 0) {
+            offset = s->offset;
+            break;
+        }
+        s = s->next;
+    }
+    return offset;
+}
+
+op_t *parse_op(lexer_t *lex) {
+    token_t tkn = next_token(lex);
+
+    op_t *op = (op_t *)malloc(sizeof(op_t));
+    if (!op) { fprintf(stderr, "error: out of memory for op\n"); exit(1); }
+    op->data = tkn.data;
+    op->type = op_unknown;
+
+    switch (tkn.type) {
+        case tkn_num: op->type = op_int; break;
+        case tkn_ident: op->type = op_label; break;
+        case tkn_reg: op->type = op_reg; break;
+        case tkn_xmm_reg: op->type = op_xmm_reg; break;
+        case tkn_sym:
+            // at&t memory addressing (reg)
+            if (*((symtype_t *)tkn.data) == sym_lparen) { // (
+                op_t *reg_op = parse_op(lex);
+                token_t rparen = next_token(lex);
+
+                if (rparen.type == tkn_sym && *((symtype_t *)rparen.data) == sym_rparen && reg_op != null && reg_op->type == op_reg) { // )
+                    op->type = op_mem;
+                    op->data = reg_op->data; // store the register string data
+                    free(reg_op);
+                    free(tkn.data);
+                    free(rparen.data);
+                    break;
+                }
+                // error case cleanup
+                if (tkn.data) free(tkn.data);
+                if (rparen.data) free(rparen.data);
+                free_op(reg_op);
+                free(op);
+                op = null;
+                break;
+            }
+            if (tkn.data) free(tkn.data);
+            free(op);
+            op = null;
+            break;
+        default:
+            if (op->data) free(op->data);
+            free(op);
+            op = null;
+            break;
+    }
+
+    return op;
+}
+
+binary_op_t *parse_bin_op(lexer_t *lex) {
+    binary_op_t *bop = (binary_op_t *)malloc(sizeof(binary_op_t));
+    if (!bop) { fprintf(stderr, "error: out of memory for binary op\n"); exit(1); }
+
+    op_t *op_src = parse_op(lex); // at&t: first operand is source
+
+    token_t comma_tkn = next_token(lex);
+    if (comma_tkn.type != tkn_sym || *((symtype_t *)comma_tkn.data) != sym_comma) {
+         fprintf(stderr, "error: expected comma\n");
+         free_op(op_src);
+         if (comma_tkn.data) free(comma_tkn.data);
+         free(bop);
+         return null;
+    }
+    if (comma_tkn.data) free(comma_tkn.data);
+
+    op_t *op_dst = parse_op(lex); // at&t: second operand is destination
+
+    if (op_dst == null) {
+        fprintf(stderr, "error: expected second operand (destination)\n");
+        free_op(op_src);
+        free(bop);
+        return null;
+    }
+
+    // at&t to internal conversion: swap to (destination, source)
+    bop->op1 = op_dst; // internal destination (maps to r/m field)
+    bop->op2 = op_src; // internal source (maps to reg field or immediate)
+
+    return bop;
+}
+
+instr_t next_instr(lexer_t *lex) {
+    instr_t instr = { .type = instr_nop, .data = null };
+    token_t tkn;
+    const insn_t *insn;
+
+    tkn = next_token(lex);
+
+    switch (tkn.type) {
+        case tkn_eof:
+            instr.type = parser_eof;
+            break;
+
+        case tkn_instr: {
+            char *instr_str = (char *)tkn.data;
+            if ((insn = lookup_insn_by_name(instr_str)) != null) {
+                instr.type = insn->type;
+            } else {
+                fprintf(stderr, "error: unknown instruction '%s'\n", instr_str);
+                instr.type = parser_eof;
+            }
+            free(tkn.data);
+            break;
+        }
+
+        case tkn_ident: {
+            char *value = (char *)tkn.data;
+            token_t next_tkn = next_token(lex);
+
+            if (next_tkn.type == tkn_sym && *((symtype_t *)next_tkn.data) == sym_colon) {
+                instr.type = instr_label;
+                instr.data = value;
+                if (next_tkn.data) free(next_tkn.data);
+            } else if (strcmp(value, "global") == 0) {
+                 instr.type = instr_global_label;
+                 if (tkn.data) free(tkn.data); // free "global"
+                 break;
+            }
+            else {
+                fprintf(stderr, "error: unexpected token after identifier '%s'\n", value);
+                if (tkn.data) free(tkn.data);
+                if (next_tkn.data) free(next_tkn.data);
+                instr.type = parser_eof;
+            }
+            break;
+        }
+
+        case tkn_sym:
+            if (tkn.data) free(tkn.data);
+        default:
+             if (tkn.data) free(tkn.data);
+             break;
+    }
+
+    if (is_binary_op(instr.type)) {
+        instr.data = parse_bin_op(lex);
+        if (instr.data == null) instr.type = parser_eof;
+    } else if (instr.type == instr_jmp || instr.type == instr_call ||
+               instr.type == instr_push || instr.type == instr_pop ||
+               instr.type == instr_inc || instr.type == instr_dec ||
+               instr.type == instr_global_label) {
+        instr.data = parse_op(lex);
+        if (instr.data == null) instr.type = parser_eof;
+    }
+
+    return instr;
+}
+
+int instr_off(asm_t *asmblr, instr_t *ins) {
+    if (ins->type == parser_eof || ins->type == instr_label || ins->type == instr_global_label) return 0;
+
+    optype_t op1_type = op_none, op2_type = op_none;
+    op_t *op1 = null, *op2 = null;
+
+    if (is_binary_op(ins->type)) {
+        binary_op_t *op = (binary_op_t *)ins->data;
+        // op1 is internal destination, op2 is internal source
+        if (op) { op1 = op->op1; op2 = op->op2; op1_type = op1->type; op2_type = op2->type; }
+    } else if (ins.data != null) {
+        op1 = (op_t *)ins->data;
+        op1_type = op1->type;
+    }
+
+    const insn_t *insn = lookup_insn_match(ins->type, op1_type, op2_type);
+
+    if (insn == null) {
+        return 0; // unknown instruction variant
+    }
+
+    int size = 0;
+    uint8_t rex_r = 0, rex_b = 0; // to track if a rex prefix is needed
+
+    // pre-calculate rex info for modrm/push/pop steps
+    // op1 is r/m field (b), op2 is reg field (r)
+    if (op1_type == op_reg || op1_type == op_xmm_reg || op1_type == op_mem) {
+        regord((const char*)op1->data, &rex_b);
+    }
+    if (op2_type == op_reg || op2_type == op_xmm_reg) {
+        regord((const char*)op2->data, &rex_r);
+    }
+
+    for (int j = 0; insn->encoding_steps[j] != enc_none && j < 8; j++) {
+        switch (insn->encoding_steps[j]) {
+            case enc_66_prefix:
+            case enc_f2_prefix:
+            case enc_f3_prefix:
+                size++; break;
+            case enc_w_prefix:
+            case enc_r_prefix:
+            case enc_b_prefix:
+                // only count rex prefix once, if needed by any of its components
+                if ((insn->encoding_steps[j] == enc_w_prefix) ||
+                    (insn->encoding_steps[j] == enc_r_prefix && rex_r) ||
+                    (insn->encoding_steps[j] == enc_b_prefix && rex_b)) {
+                    // if this is the first rex component encountered in the steps,
+                    // we add 1 byte for the whole rex prefix.
+                    int is_first_rex_component = 1;
+                    for (int k = 0; k < j; k++) {
+                        if (insn->encoding_steps[k] == enc_w_prefix ||
+                            insn->encoding_steps[k] == enc_r_prefix ||
+                            insn->encoding_steps[k] == enc_b_prefix) {
+                            is_first_rex_component = 0;
+                            break;
+                        }
+                    }
+                    if (is_first_rex_component) size++;
+                }
+                break;
+            case enc_opcode:
+                size += insn->opcode_len; break;
+            case enc_modrm_reg_rr:
+            case enc_modrm_ext:
+                size++; break;
+            case enc_imm32:
+            case enc_rel32:
+                size += 4; break;
+            case enc_pop_push_reg:
+                size++; // 1 byte opcode (50+r / 58+r)
+                break;
+            default:
+                break;
+        }
+    }
+
+    return size;
+}
+
+void encode(asm_t *asmblr, instr_t *ins, unsigned char *buf) {
+    size_t start_offset = asmblr->offset;
+    unsigned char *current_buf = buf + start_offset;
+    int i = 0;
+
+    optype_t op1_type = op_none, op2_type = op_none;
+    op_t *op1 = null, *op2 = null;
+    uint8_t rex_r = 0, rex_b = 0;
+    uint8_t rex_prefix = 0;
+    int has_rex = 0;
+
+    if (is_binary_op(ins->type)) {
+        binary_op_t *op = (binary_op_t *)ins->data;
+        // op1 is internal destination, op2 is internal source
+        if (op) { op1 = op->op1; op2 = op->op2; op1_type = op1->type; op2_type = op2->type; }
+    } else if (ins.data != null) {
+        op1 = (op_t *)ins->data;
+        op1_type = op1->type;
+    }
+
+    const insn_t *insn = lookup_insn_match(ins->type, op1_type, op2_type);
+    if (insn == null) {
+        fprintf(stderr, "error: cannot encode instruction of type %d\n", ins->type);
+        return;
+    }
+
+    // pre-calculate rex info (op1 is r/m field (b), op2 is reg field (r))
+    if (op1 && (op1_type == op_reg || op1_type == op_xmm_reg || op1_type == op_mem)) {
+        regord((const char*)op1->data, &rex_b);
+    }
+    if (op2 && (op2_type == op_reg || op2_type == op_xmm_reg)) {
+        regord((const char*)op2->data, &rex_r);
+    }
+
+    for (int j = 0; insn->encoding_steps[j] != enc_none && j < 8; j++) {
+        switch (insn->encoding_steps[j]) {
+            case enc_66_prefix: current_buf[i++] = 0x66; break;
+            case enc_f2_prefix: current_buf[i++] = 0xf2; break;
+            case enc_f3_prefix: current_buf[i++] = 0xf3; break;
+
+            case enc_w_prefix: rex_prefix |= 0x08; has_rex = 1; break;
+            case enc_r_prefix: if (rex_r) { rex_prefix |= 0x04; has_rex = 1; } break;
+            case enc_b_prefix: if (rex_b) { rex_prefix |= 0x01; has_rex = 1; } break;
+
+            case enc_opcode:
+                // if rex prefix has been assembled, write it now before the opcode
+                if (has_rex) {
+                    current_buf[i++] = 0x40 | rex_prefix;
+                    has_rex = 0; // reset flag after writing
+                    rex_prefix = 0;
+                }
+                memcpy(current_buf + i, insn->opcodes, insn->opcode_len);
+                i += insn->opcode_len;
+                break;
+
+            case enc_modrm_reg_rr: {
+                // modrm byte (mod=11b for reg-reg, 0b11xxxxxx)
+                uint8_t reg_idx = regord((const char*)op2->data, &rex_r); // op2 is the reg field (source)
+                uint8_t rm_idx = regord((const char*)op1->data, &rex_b);  // op1 is the r/m field (destination)
+                uint8_t modrm = 0b11000000;
+                modrm |= (reg_idx << 3);
+                modrm |= rm_idx;
+                current_buf[i++] = modrm;
+                break;
+            }
+            case enc_modrm_ext: {
+                // modrm byte (mod=11b for reg-imm/unary ops)
+                uint8_t rm_idx = regord((const char*)op1->data, &rex_b); // op1 is the r/m field
+                uint8_t modrm = 0b11000000;
+                modrm |= (insn->modrm_ext << 3); // use table extension value for reg field
+                modrm |= rm_idx;
+                current_buf[i++] = modrm;
+                break;
+            }
+            case enc_imm32: {
+                int32_t imm32 = *(int *)op2->data;
+                memcpy(current_buf + i, &imm32, sizeof(int32_t));
+                i += sizeof(int32_t);
+                break;
+            }
+            case enc_rel32: {
+                size_t target_offset = _offset(asmblr, (const char *)op1->data);
+                // instruction length is always 5 (1 byte opcode + 4 byte imm32)
+                size_t instruction_len = 5;
+                size_t next_address = start_offset + instruction_len;
+                int32_t relative_offset = (int32_t)(target_offset - next_address);
+                memcpy(current_buf + i, &relative_offset, sizeof(int32_t));
+                i += sizeof(int32_t);
+                break;
+            }
+            case enc_pop_push_reg: {
+                // 50+r / 58+r
+                uint8_t reg_idx = regord((const char*)op1->data, &rex_b);
+                current_buf[i++] = insn->opcodes[0] + reg_idx;
+                break;
+            }
+
+            default:
+                break;
+        }
+    }
+
+    asmblr->offset = start_offset + i;
+}
+
+
+// ====================================================================
+// --- ASM IMPLEMENTATION (from asm.c) ---
+// ====================================================================
+
+#define max_prog_size 1024
+
+void assemble(elf64_t *elf, lexer_t *lex) {
+    asm_t asmblr = { .syms = null, .offset = 0 };
+
+    collect_syms(&asmblr, elf, lex);
+
+    // reset lexer to the start of the buffer for second pass
+    lex->i = 0;
+    encode_prog(&asmblr, elf, lex);
+
+    update_off(elf);
+    free_syms(asmblr.syms);
+}
+
+void encode_prog(asm_t *asmblr, elf64_t *elf, lexer_t *lex) {
+    instr_t ins;
+
+    elf->sec[text_section].data = (unsigned char *)malloc(max_prog_size);
+    if (!elf->sec[text_section].data) {
+        fprintf(stderr, "error: out of memory for text section\n");
+        exit(1);
+    }
+
+    do {
+        ins = next_instr(lex);
+
+        if (ins.type != instr_label && ins.type != instr_global_label && ins.type != parser_eof) {
+            encode(asmblr, &ins, (unsigned char *)elf->sec[text_section].data);
+        }
+
+        free_instr(&ins);
+    } while(ins.type != parser_eof);
+
+    elf->sec[text_section].len = asmblr->offset;
+}
+
+void update_off(elf64_t *elf) {
+    size_t offset = sizeof(elfhdr_t) + (sizeof(shdr_t) * 5);
+
+    for (int i = 1; i < 5; i++) {
+        size_t alignment = (i == symtab_section) ? 8 : 1;
+
+        if (offset % alignment != 0) {
+            offset += alignment - (offset % alignment);
+        }
+
+        elf->sec[i].hdr.size = elf->sec[i].len;
+        elf->sec[i].hdr.offset = offset;
+        offset += elf->sec[i].len;
+    }
+}
+
+void collect_syms(asm_t *asmblr, elf64_t *elf, lexer_t *lex) {
+    instr_t ins;
+    size_t offset = 0, num_syms = 0;
+    symentry_t *prev = null;
+
+    strtab_t symstab = { .len = 0, .buf = (char *)malloc(max_buf_size) };
+    if (!symstab.buf) {
+        fprintf(stderr, "error: out of memory for symtab string buffer\n");
+        exit(1);
+    }
+    // allocate enough space for max possible symbols (max_buf_size / smallest symbol size)
+    elf->sec[symtab_section].data = (unsigned char *)malloc(max_buf_size * 2 * sizeof(sym_t));
+    if (!elf->sec[symtab_section].data) {
+        fprintf(stderr, "error: out of memory for symtab data\n");
+        free(symstab.buf);
+        exit(1);
+    }
+
+    // 0. null symbol
+    sym_t null_sym = { 0 };
+    memcpy((sym_t *)elf->sec[symtab_section].data + num_syms, &null_sym, sizeof(sym_t));
+    num_syms++;
+
+    // 1. text section symbol
+    sym_t symtext = {
+        .name = append_strtab(&symstab, ".text"),
+        .info = 0x03, // section
+        .index = text_section,
+        .other = 0, .value = 0, .size = 0,
+    };
+    memcpy((sym_t *)elf->sec[symtab_section].data + num_syms, &symtext, sizeof(sym_t));
+    num_syms++;
+
+    do {
+        ins = next_instr(lex);
+        offset += instr_off(asmblr, &ins);
+
+        if (ins.type == instr_global_label) {
+            op_t *op = (op_t *)ins.data;
+            sym_t gsym = {
+                .name = append_strtab(&symstab, (const char *)op->data),
+                .value = offset,
+                .info = 0x10, // global
+                .index = text_section,
+                .size = 0,
+                .other = 0,
+            };
+            memcpy((sym_t *)elf->sec[symtab_section].data + num_syms, &gsym, sizeof(sym_t));
+            num_syms++;
+        }
+
+        if (ins.type == instr_label) {
+            symentry_t *next = (symentry_t *)malloc(sizeof(symentry_t));
+            if (!next) {
+                fprintf(stderr, "error: out of memory for symentry\n");
+                exit(1);
+            }
+            next->offset = offset;
+            next->name = (char *)ins.data;
+            next->next = null;
+
+            if (prev) {
+                prev->next = next;
+                prev = prev->next;
+            } else {
+                prev = next;
+                asmblr->syms = prev;
+            }
+            ins.data = null; // prevent free_instr from freeing the label name string
+        }
+
+        free_instr(&ins);
+    } while (ins.type != parser_eof);
+
+
+    elf->sec[symtab_section].hdr.info = num_syms - 1;
+    elf->sec[symtab_section].len = num_syms * sizeof(sym_t);
+    elf->sec[strtab_section].data = (unsigned char *)symstab.buf;
+    elf->sec[strtab_section].len = symstab.len;
+
+    // the lexer index is reset to 0 in assemble() for the second pass (encode_prog)
+}
+
+void free_syms(symentry_t *syms) {
+    symentry_t *current = syms;
+    while (current != null) {
+        symentry_t *next = current->next;
+        if (current->name) free(current->name);
+        free(current);
+        current = next;
+    }
+}
+
+
+// ====================================================================
+// --- MAIN IMPLEMENTATION (from main.c) ---
+// ====================================================================
+
+int read_file(const char *name, char **buf) {
+    FILE *f;
+    size_t len;
+
+    if ((f = fopen(name, "r")) == null) {
+        return 1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    *buf = (char *)malloc(len + 1);
+    if (!(*buf)) {
+        fclose(f);
+        fprintf(stderr, "error: out of memory for file buffer\n");
+        return 1;
+    }
+    fread(*buf, sizeof(char), len, f);
+    (*buf)[len] = '\0';
+
+    fclose(f);
+    return 0;
+}
+
+int output(lexer_t *lex, const char *name) {
+    FILE *f;
+
+    elf64_t elf = gen_elf64();
+    assemble(&elf, lex);
+
+    if ((f = fopen(name, "wb")) == null) {
+        return 1;
+    }
+
+    // elf header
+    fwrite(&elf.hdr, sizeof(elf.hdr), 1, f);
+
+    // section headers
+    for (int i = 0; i < 5; i++) {
+        fwrite(&elf.sec[i].hdr, sizeof(elf.sec[i].hdr), 1, f);
+    }
+
+    // section data
+    for (int i = 0; i < 5; i++) {
+        if (elf.sec[i].len > 0) {
+            // align file pointer to section offset
+            size_t current_pos = ftell(f);
+            if (current_pos < elf.sec[i].hdr.offset) {
+                size_t padding_size = elf.sec[i].hdr.offset - current_pos;
+                char *padding = (char *)calloc(1, padding_size);
+                if (padding) {
+                    fwrite(padding, 1, padding_size, f);
+                    free(padding);
+                } else {
+                    for (size_t j = 0; j < padding_size; j++) fputc(0, f);
+                }
+            }
+
+            fwrite(elf.sec[i].data, 1, elf.sec[i].len, f);
+            free(elf.sec[i].data);
+        }
+    }
+
+    // free the shstrtab buffer which was dynamically allocated in gen_elf64
+    if (elf.sec[shstrtab_section].data) free(elf.sec[shstrtab_section].data);
+
+    fclose(f);
+    return 0;
+}
+
+
+int main(int argc, char **argv) {
+
+    lexer_t lex = { .buf = null, .i = 0 };
+
+    if (argc != 3) {
+        printf("usage: ./dasm <input_filename> <output_filename>\n");
+        return 1;
+    }
+
+    if (read_file(argv[1], &lex.buf)) {
+        fprintf(stderr, "could not open the file '%s'\n", argv[1]);
+        return 1;
+    }
+
+    if (output(&lex, argv[2])) {
+        fprintf(stderr, "error during assembly output.\n");
+    }
+
+    if (lex.buf) free(lex.buf);
+    return 0;
+}

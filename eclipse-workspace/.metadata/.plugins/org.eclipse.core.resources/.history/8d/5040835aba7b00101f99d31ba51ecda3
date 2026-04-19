@@ -1,0 +1,430 @@
+#define _GNU_SOURCE
+#include <elf.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <libgen.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <dwarf.h>
+#include <elfutils/libdw.h>
+#include <elfutils/libdwfl.h>
+
+typedef struct {
+    uintptr_t addr;
+    long original_data;
+    int enabled;
+} Breakpoint;
+
+typedef struct {
+    Breakpoint *bps;
+    size_t count;
+    size_t capacity;
+} BreakpointList;
+
+typedef struct {
+    const char *filename;
+    int line;
+} SourceLocation;
+
+void bp_list_init(BreakpointList *list) {
+    list->bps = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+void bp_list_add(BreakpointList *list, uintptr_t addr) {
+    if (list->count == list->capacity) {
+        list->capacity = list->capacity ? list->capacity * 2 : 8;
+        list->bps = realloc(list->bps, list->capacity * sizeof(Breakpoint));
+        if (!list->bps) {
+            perror("realloc");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    list->bps[list->count].addr = addr;
+    list->bps[list->count].enabled = 0;
+    list->count++;
+}
+
+Breakpoint *bp_list_find(BreakpointList *list, uintptr_t addr) {
+    for (size_t i = 0; i < list->count; i++) {
+        if (list->bps[i].addr == addr) {
+            return &list->bps[i];
+        }
+    }
+    return NULL;
+}
+
+long read_memory(pid_t pid, uintptr_t addr) {
+    long data = ptrace(PTRACE_PEEKTEXT, pid, (void *)addr, NULL);
+    if (data == -1 && errno) {
+        perror("PTRACE_PEEKTEXT");
+        exit(EXIT_FAILURE);
+    }
+    return data;
+}
+
+void write_memory(pid_t pid, uintptr_t addr, long data) {
+    if (ptrace(PTRACE_POKETEXT, pid, (void *)addr, data) == -1) {
+        perror("PTRACE_POKETEXT");
+        exit(EXIT_FAILURE);
+    }
+}
+
+void enable_breakpoint(pid_t pid, Breakpoint *bp) {
+    if (bp->enabled) return;
+
+    long data = read_memory(pid, bp->addr);
+    bp->original_data = data;
+
+    long patched = (data & ~0xFF) | 0xCC;
+    write_memory(pid, bp->addr, patched);
+
+    bp->enabled = 1;
+    printf("Breakpoint set at 0x%lx\n", bp->addr);
+}
+
+void disable_breakpoint(pid_t pid, Breakpoint *bp) {
+    if (!bp->enabled) return;
+
+    write_memory(pid, bp->addr, bp->original_data);
+    bp->enabled = 0;
+}
+
+int wait_for_signal(pid_t pid) {
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        perror("waitpid");
+        exit(EXIT_FAILURE);
+    }
+    return status;
+}
+
+int find_addresses(Dwfl *dwfl, const SourceLocation *locations, size_t num_locations,
+                   uintptr_t **addresses, size_t *num_addresses) {
+    *addresses = NULL;
+    *num_addresses = 0;
+
+    size_t capacity = 0;
+    uintptr_t *found = NULL;
+    size_t found_count = 0;
+
+    Dwfl_Module *mod;
+    ptrdiff_t offset = 0;
+    while ((mod = dwfl_getmodules(dwfl, &offset, NULL, 0)) {
+        Dwarf_Addr bias;
+        Dwarf *dbg = dwfl_module_getdwarf(mod, &bias);
+        if (!dbg) continue;
+
+        Dwarf_Off cu_offset = 0;
+        size_t hdr_size;
+
+        while (dwarf_nextcu(dbg, cu_offset, &cu_offset, &hdr_size, NULL, NULL, NULL) == 0) {
+            Dwarf_Die cu_die;
+            if (dwarf_offdie(dbg, cu_offset + hdr_size, &cu_die) == NULL) continue;
+
+            Dwarf_Lines *lines;
+            size_t nlines;
+            if (dwarf_getsrclines(&cu_die, &lines, &nlines) != 0) continue;
+
+            for (size_t i = 0; i < nlines; i++) {
+                Dwarf_Line *line = dwarf_onesrcline(lines, i);
+                if (!line) continue;
+
+                const char *src_file;
+                int src_line;
+                Dwarf_Addr addr;
+
+                src_file = dwarf_linesrc(line, NULL, NULL);
+                dwarf_lineno(line, &src_line);
+                dwarf_lineaddr(line, &addr);
+
+                if (!src_file) continue;
+
+                for (size_t loc = 0; loc < num_locations; loc++) {
+                    if (strstr(src_file, locations[loc].filename) != NULL &&
+                        src_line == locations[loc].line) {
+
+                        if (found_count == capacity) {
+                            capacity = capacity ? capacity * 2 : 8;
+                            found = realloc(found, capacity * sizeof(uintptr_t));
+                            if (!found) {
+                                perror("realloc");
+                                exit(EXIT_FAILURE);
+                            }
+                        }
+                        found[found_count++] = addr + bias;
+                    }
+                }
+            }
+        }
+    }
+
+    *addresses = found;
+    *num_addresses = found_count;
+    return found_count > 0 ? 0 : -1;
+}
+
+Dwfl *init_dwarf(const char *executable) {
+    static Dwfl_Callbacks callbacks = {
+        .find_elf = dwfl_build_id_find_elf,
+        .find_debuginfo = dwfl_standard_find_debuginfo,
+        .section_address = dwfl_offline_section_address,
+    };
+
+    Dwfl *dwfl = dwfl_begin(&callbacks);
+    if (!dwfl) {
+        fprintf(stderr, "dwfl_begin failed: %s\n", dwfl_errmsg(-1));
+        return NULL;
+    }
+
+    int fd = open(executable, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        dwfl_end(dwfl);
+        return NULL;
+    }
+
+    Elf *elf = elf_begin(fd, ELF_C_READ, NULL);
+    if (!elf) {
+        fprintf(stderr, "elf_begin failed\n");
+        close(fd);
+        dwfl_end(dwfl);
+        return NULL;
+    }
+
+    if (dwfl_report_elf(dwfl, basename((char *)executable), executable, fd, 0) == NULL) {
+        fprintf(stderr, "dwfl_report_elf failed: %s\n", dwfl_errmsg(-1));
+        elf_end(elf);
+        close(fd);
+        dwfl_end(dwfl);
+        return NULL;
+    }
+
+    elf_end(elf);
+    close(fd);
+
+    if (dwfl_report_end(dwfl, NULL, NULL) != 0) {
+        fprintf(stderr, "dwfl_report_end failed: %s\n", dwfl_errmsg(-1));
+        dwfl_end(dwfl);
+        return NULL;
+    }
+
+    return dwfl;
+}
+
+void show_registers(pid_t pid) {
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+        perror("PTRACE_GETREGS");
+        return;
+    }
+
+    printf("Registers:\n"
+           "RAX: 0x%llx  RBX: 0x%llx  RCX: 0x%llx  RDX: 0x%llx\n"
+           "RSI: 0x%llx  RDI: 0x%llx  RBP: 0x%llx  RSP: 0x%llx\n"
+           "RIP: 0x%llx  FLAGS: 0x%llx\n",
+           (unsigned long long)regs.rax,
+           (unsigned long long)regs.rbx,
+           (unsigned long long)regs.rcx,
+           (unsigned long long)regs.rdx,
+           (unsigned long long)regs.rsi,
+           (unsigned long long)regs.rdi,
+           (unsigned long long)regs.rbp,
+           (unsigned long long)regs.rsp,
+           (unsigned long long)regs.rip,
+           (unsigned long long)regs.eflags);
+}
+
+void single_step(pid_t pid) {
+    if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) {
+        perror("PTRACE_SINGLESTEP");
+        return;
+    }
+    wait_for_signal(pid);
+}
+
+int main(int argc, char *argv[]) {
+    if (argc < 4) {
+        fprintf(stderr, "Usage: %s <executable> -b <file:line> [-b <file:line>...] [-- args]\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    const char *executable = argv[1];
+    BreakpointList bp_list;
+    bp_list_init(&bp_list);
+
+    SourceLocation *locations = NULL;
+    size_t num_locations = 0;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            char *sep = strchr(argv[i+1], ':');
+            if (!sep) {
+                fprintf(stderr, "Invalid breakpoint format: %s (expected file:line)\n", argv[i+1]);
+                return EXIT_FAILURE;
+            }
+
+            *sep = '\0';
+            int line = atoi(sep + 1);
+
+            locations = realloc(locations, (num_locations + 1) * sizeof(SourceLocation));
+            if (!locations) {
+                perror("realloc");
+                return EXIT_FAILURE;
+            }
+
+            locations[num_locations].filename = argv[i+1];
+            locations[num_locations].line = line;
+            num_locations++;
+            i++;
+        }
+    }
+
+    Dwfl *dwfl = init_dwarf(executable);
+    if (!dwfl) {
+        return EXIT_FAILURE;
+    }
+
+    uintptr_t *addresses;
+    size_t num_addresses;
+    if (find_addresses(dwfl, locations, num_locations, &addresses, &num_addresses) == -1) {
+        fprintf(stderr, "No matching addresses found for the specified breakpoints\n");
+        dwfl_end(dwfl);
+        return EXIT_FAILURE;
+    }
+
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return EXIT_FAILURE;
+    }
+
+    if (pid == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            perror("PTRACE_TRACEME");
+            exit(EXIT_FAILURE);
+        }
+
+        char **child_argv = malloc((argc + 1) * sizeof(char *));
+        if (!child_argv) {
+            perror("malloc");
+            exit(EXIT_FAILURE);
+        }
+
+        child_argv[0] = (char *)executable;
+        int child_argc = 1;
+
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--") == 0) {
+                for (int j = i + 1; j < argc; j++) {
+                    child_argv[child_argc++] = argv[j];
+                }
+                break;
+            }
+        }
+        child_argv[child_argc] = NULL;
+
+        execvp(executable, child_argv);
+        perror("execvp");
+        exit(EXIT_FAILURE);
+    } else {
+        int status = wait_for_signal(pid);
+        if (!WIFSTOPPED(status)) {
+            fprintf(stderr, "Child process not stopped\n");
+            return EXIT_FAILURE;
+        }
+
+        for (size_t i = 0; i < num_addresses; i++) {
+            bp_list_add(&bp_list, addresses[i]);
+            enable_breakpoint(pid, &bp_list.bps[bp_list.count - 1]);
+        }
+
+        printf("Debugger started. Commands: c (continue), s (step), r (registers), q (quit)\n");
+
+        while (1) {
+            printf("(dbg) ");
+            fflush(stdout);
+
+            char cmd[16];
+            if (!fgets(cmd, sizeof(cmd), stdin) break;
+
+            switch (cmd[0]) {
+                case 'c':
+                    if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
+                        perror("PTRACE_CONT");
+                        break;
+                    }
+                    status = wait_for_signal(pid);
+                    if (WIFEXITED(status)) {
+                        printf("Program exited with status %d\n", WEXITSTATUS(status));
+                        goto cleanup;
+                    }
+                    if (WIFSIGNALED(status)) {
+                        printf("Program terminated by signal %d\n", WTERMSIG(status));
+                        goto cleanup;
+                    }
+                    if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+                        struct user_regs_struct regs;
+                        if (ptrace(PTRACE_GETREGS, pid, NULL, &regs) == -1) {
+                            perror("PTRACE_GETREGS");
+                            break;
+                        }
+
+                        uintptr_t addr = (uintptr_t)regs.rip - 1;
+                        Breakpoint *bp = bp_list_find(&bp_list, addr);
+                        if (bp) {
+                            printf("Breakpoint hit at 0x%lx\n", addr);
+
+                            disable_breakpoint(pid, bp);
+
+                            regs.rip = addr;
+                            if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1) {
+                                perror("PTRACE_SETREGS");
+                                break;
+                            }
+
+                            single_step(pid);
+
+                            enable_breakpoint(pid, bp);
+                        }
+                    }
+                    break;
+
+                case 's':
+                    single_step(pid);
+                    show_registers(pid);
+                    break;
+
+                case 'r':
+                    show_registers(pid);
+                    break;
+
+                case 'q':
+                    goto cleanup;
+
+                default:
+                    printf("Unknown command\n");
+                    break;
+            }
+        }
+
+cleanup:
+        dwfl_end(dwfl);
+        free(addresses);
+        free(locations);
+        free(bp_list.bps);
+    }
+
+    return EXIT_SUCCESS;
+}

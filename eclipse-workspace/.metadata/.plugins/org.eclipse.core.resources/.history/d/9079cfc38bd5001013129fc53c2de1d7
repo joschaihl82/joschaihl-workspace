@@ -1,0 +1,529 @@
+/*
+ * asm.c — Minimal C99 assembler scaffold with ELF64 relocatable object file output.
+ *
+ * Implements:
+ * - AT&T syntax parsing.
+ * - Core x86-64 instruction encoding (movq, jmp).
+ * - Symbol management and R_X86_64_PC32 relocation.
+ * - Full ELF64 .o file generation (.text, .data, .bss, .rela.text, .symtab, .strtab, .shstrtab).
+ * - Instruction matching uses a table-driven approach for extensibility.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <errno.h>
+
+/* ===== Configuration ===== */
+
+#define MAX_OPERANDS            4
+#define MAX_INSN_OPCODES        16
+#define INPUT_LINE_MAX          2048
+#define NR_NAME_BUCKETS         32
+#define MAX_SYMBOLS             8192
+#define MAX_RELOCS              1024
+#define MAX_SECTION_SIZE        (1<<20) /* 1MB limit for sections */
+#define NR_SECTIONS_MAX         10
+
+/* ===== Forward declarations and Structs ===== */
+
+struct name;
+struct obj_symbol;
+struct operand;
+
+/* ELF Definitions (unchanged) */
+// ... (omitted for brevity, includes Elf64_Ehdr, Elf64_Shdr, etc.)
+
+// ... (omitted ELF definitions)
+#define EI_NIDENT 16
+#define EM_X86_64 0x3E
+typedef struct { /* ... */ } Elf64_Ehdr;
+typedef struct { /* ... */ } Elf64_Shdr;
+typedef struct { /* ... */ } Elf64_Sym;
+typedef struct { /* ... */ } Elf64_Rela;
+#define R_X86_64_NONE   0
+#define R_X86_64_PC32   2
+#define STB_LOCAL       0
+#define STB_GLOBAL      1
+#define ELF64_ST_INFO(bind, type)  (((bind)<<4)+((type)&0xf))
+#define STT_NOTYPE      0
+#define SHT_NULL        0
+#define SHT_PROGBITS    1
+#define SHT_SYMTAB      2
+#define SHT_STRTAB      3
+#define SHT_RELA        4
+#define SHT_NOBITS      8
+#define SHF_WRITE       (1 << 0)
+#define SHF_ALLOC       (1 << 1)
+#define SHF_EXECINSTR   (1 << 2)
+
+
+/* Name table infrastructure (unchanged) */
+struct name {
+    struct name *next;
+    struct obj_symbol *symbol;
+    unsigned int len;
+    unsigned int hash;
+    char data[1];
+};
+struct name *name_buckets[NR_NAME_BUCKETS] = {0};
+
+/* Symbol table (unchanged) */
+struct obj_symbol {
+    struct name *n;
+    int segment;
+    long offset;
+    int is_global;
+    uint32_t symtab_index;
+};
+static struct obj_symbol symbols[MAX_SYMBOLS] = {0};
+static int symbols_count = 1;
+
+/* Relocation Tracking (unchanged) */
+struct obj_reloc {
+    long offset;
+    struct obj_symbol *target_sym;
+    unsigned int type;
+    long addend;
+    int section;
+};
+static struct obj_reloc relocs[MAX_RELOCS] = {0};
+static int nr_relocs = 0;
+
+/* Instruction and Operand Definitions */
+struct operand {
+    int kind;
+    int reg;
+    int disp_reg;
+    int index_reg;
+    int scale;
+    long offset;
+    struct obj_symbol *symbol;
+};
+
+/* Operand flags (detailed subset for matching) */
+#define O_REG           (1<<0)  // General purpose register (%rax, etc.)
+#define O_IMM           (1<<1)  // Immediate value ($123, $symbol)
+#define O_MEM           (1<<2)  // Memory operand (disp(base,index,scale))
+#define O_ANY           (O_REG | O_IMM | O_MEM)
+
+/* Instruction Table Entry */
+struct insn_match {
+    const char *mnemonic;
+    int nr_operands;
+    // Defines the required kind for each operand (in AT&T order: src, dst)
+    unsigned int operand_flags[MAX_OPERANDS];
+    void (*encoder)(struct operand *operands); // Encoder function pointer
+};
+
+/* Global state and data buffers (unchanged) */
+// ... (omitted global state)
+int               pass               = 0;
+int               line_number        = 0;
+char              input_line[INPUT_LINE_MAX] = {0};
+char            * input_pos          = input_line;
+FILE            * list_file          = NULL;
+FILE            * output_file        = NULL;
+int               segment            = 0;
+long              text_bytes         = 0;
+long              data_bytes         = 0;
+int               nr_symbols         = 0;
+int               nr_symbol_changes  = 0;
+int               base_address       = 0;
+int               bits               = 64;
+enum TokKind { T_NONE, T_NAME, T_NUMBER, T_REG, T_CHAR, T_STRING, T_LABEL, T_EOF, T_COMMA, T_COLON, T_OPEN_PAREN, T_CLOSE_PAREN, T_DOLLAR, T_PERCENT, T_OPEN_BRACKET, T_CLOSE_BRACKET, T_ASTERISK, T_PLUS, T_MINUS };
+enum TokKind token_kind = T_NONE;
+struct name *name_token = NULL;
+long number_token = 0;
+char char_token = 0;
+char *string_token = NULL;
+static unsigned char text_buf[MAX_SECTION_SIZE];
+static unsigned char data_buf[MAX_SECTION_SIZE];
+static long text_len = 0;
+static long data_len = 0;
+struct operand operands[MAX_OPERANDS] = {0};
+int nr_operands = 0;
+
+
+/* ===== Utility functions (unchanged) ===== */
+static void error(const char *fmt, ...) { /* ... */ }
+static unsigned int hash_name(const char *p, unsigned int len) { /* ... */ }
+static struct name *lookup_name(const char *p, unsigned int len) { /* ... */ }
+static void emit_byte(unsigned char b) { /* ... */ }
+static void emit_u32(unsigned v) { /* ... */ }
+static void emit_reloc(int segment, long offset, struct obj_symbol *sym, unsigned int type, long addend) { /* ... */ }
+static enum TokKind next_token(void) { /* ... */ }
+static int reg_from_name(const struct name *n) { /* ... */ }
+static int parse_register_after_percent(struct operand *op) { /* ... */ }
+static int parse_immediate_after_dollar(struct operand *op) { /* ... */ }
+static int parse_memory_operand(struct operand *op) { /* ... */ }
+static int parse_operand(struct operand *op) { /* ... */ }
+
+
+/* ===== Instruction Encoding (Helper functions remain the same) ===== */
+
+static void emit_rex(int w, int r, int x, int b)
+{
+    unsigned char rex = 0x40;
+    if (w) rex |= 0x08;
+    if (r) rex |= (r >> 3);
+    if (x) rex |= (x >> 3) << 1;
+    if (b) rex |= (b >> 3);
+
+    if (rex != 0x40) {
+        emit_byte(rex);
+    }
+}
+
+static void emit_modrm(int mod, int reg, int rm)
+{
+    emit_byte((unsigned char)((mod << 6) | ((reg & 0x7) << 3) | (rm & 0x7)));
+}
+
+// movq %reg, %reg (R-R form)
+static void encode_mov_rr64(int dst, int src)
+{
+    emit_rex(1, src, 0, dst);
+    emit_byte(0x89);
+    emit_modrm(3, src, dst);
+}
+
+// movq $imm, %reg (I-R form)
+static void encode_mov_r64_imm32(int reg, struct operand *op)
+{
+    // C7 /0 id - MOV r/m64, imm32
+    emit_rex(1, 0, 0, reg);
+    emit_byte(0xC7);
+    emit_modrm(3, 0, reg);
+
+    if (op->symbol) {
+        long current_pos = segment == 1 ? text_len : data_len;
+
+        emit_u32(0);
+
+        emit_reloc(segment, current_pos, op->symbol, R_X86_64_PC32, 0);
+    } else {
+        emit_u32((unsigned)op->offset);
+    }
+}
+
+// addq %reg, %reg
+static void encode_add_rr64(int dst_rm, int src_reg)
+{
+    emit_rex(1, src_reg, 0, dst_rm);
+    emit_byte(0x01);
+    emit_modrm(3, src_reg, dst_rm);
+}
+
+// subq %reg, %reg
+static void encode_sub_rr64(int dst_rm, int src_reg)
+{
+    emit_rex(1, src_reg, 0, dst_rm);
+    emit_byte(0x29);
+    emit_modrm(3, src_reg, dst_rm);
+}
+
+// jmp target
+static void encode_jmp(struct operand *op)
+{
+    if (op->symbol) {
+        /* Symbol jump: JMP rel32 (0xE9) with R_X86_64_PC32 relocation */
+        long current_pos = text_len;
+
+        emit_byte(0xE9);
+        emit_u32(0);
+
+        emit_reloc(1, current_pos + 1, op->symbol, R_X86_64_PC32, -4);
+    } else {
+        /* Immediate jump (short: 0xEB disp8) */
+        emit_byte(0xEB);
+        long disp = op->offset - (text_bytes + 1);
+        emit_byte((unsigned char)(disp & 0xFF));
+    }
+}
+
+
+/* ===== Encoder Wrappers (for Instruction Table) ===== */
+
+static void encode_movq_reg_reg_wrapper(struct operand *operands) {
+    // AT&T order: src=operands[0], dst=operands[1]
+    encode_mov_rr64(operands[1].reg, operands[0].reg);
+}
+
+static void encode_movq_imm_reg_wrapper(struct operand *operands) {
+    // AT&T order: imm_op=operands[0], reg=operands[1]
+    encode_mov_r64_imm32(operands[1].reg, &operands[0]);
+}
+
+static void encode_addq_reg_reg_wrapper(struct operand *operands) {
+    // AT&T order: src_reg=operands[0], dst_rm=operands[1]
+    encode_add_rr64(operands[1].reg, operands[0].reg);
+}
+
+static void encode_subq_reg_reg_wrapper(struct operand *operands) {
+    // AT&T order: src_reg=operands[0], dst_rm=operands[1]
+    encode_sub_rr64(operands[1].reg, operands[0].reg);
+}
+
+static void encode_jmp_wrapper(struct operand *operands) {
+    // Only one operand (target)
+    encode_jmp(&operands[0]);
+}
+
+/* ===== Instruction Table ===== */
+
+struct insn_match insn_table[] = {
+    // Mnemonic | Num Ops | Op1 Kind | Op2 Kind | Encoder
+    // movq $imm, %reg
+    {"movq", 2, {O_IMM, O_REG, 0, 0}, encode_movq_imm_reg_wrapper},
+    // movq %reg, %reg
+    {"movq", 2, {O_REG, O_REG, 0, 0}, encode_movq_reg_reg_wrapper},
+    // addq %reg, %reg
+    {"addq", 2, {O_REG, O_REG, 0, 0}, encode_addq_reg_reg_wrapper},
+    // subq %reg, %reg
+    {"subq", 2, {O_REG, O_REG, 0, 0}, encode_subq_reg_reg_wrapper},
+    // jmp target ($label or $offset)
+    {"jmp", 1, {O_IMM, 0, 0, 0}, encode_jmp_wrapper},
+    // Sentinel
+    {NULL, 0, {0}, NULL}
+};
+
+
+/* ===== Instruction Parser (Uses Table) ===== */
+
+static int parse_instruction(void)
+{
+    char *mnemonic = name_token->data;
+    nr_operands = 0;
+
+    // Parse operands
+    if (next_token() != T_EOF) {
+        do {
+            if (nr_operands >= MAX_OPERANDS) { error("too many operands"); return -1; }
+            // The first operand token is already loaded here if it was a label:mnemonic line
+            if (parse_operand(&operands[nr_operands++]) != 0) return -1;
+        } while (token_kind == T_COMMA && next_token() != T_EOF);
+    }
+
+    // Table-driven encoding lookup
+    for (struct insn_match *m = insn_table; m->mnemonic; ++m) {
+        if (strcmp(mnemonic, m->mnemonic) == 0) {
+            // Match 1: Number of operands
+            if (nr_operands != m->nr_operands) continue;
+
+            // Match 2: Operand types (kinds)
+            int match = 1;
+            for (int i = 0; i < nr_operands; ++i) {
+                // Check if the actual operand kind is one of the allowed flags for this entry
+                if (!(operands[i].kind & m->operand_flags[i])) {
+                    match = 0;
+                    break;
+                }
+            }
+
+            if (match) {
+                // Found a match, encode!
+                m->encoder(operands);
+                return 0;
+            }
+        }
+    }
+
+    error("unsupported instruction form or mnemonic '%s'", mnemonic);
+    return -1;
+}
+
+/* ===== Pseudo-ops, Label Handling, and Main Driver (unchanged) ===== */
+
+static int pseudo_directive(const char *name) { /* ... */ }
+static void define_label(const char *name) { /* ... */ }
+static void process_line(char *line) { /* ... */ }
+static void write_output(void) { /* ... */ }
+// ... (omitted ELF writer helpers)
+
+// ... (omitted main driver)
+
+/* ===== Pseudo-ops ===== */
+
+static int pseudo_directive(const char *name)
+{
+    if (strcmp(name, ".global") == 0 || strcmp(name, "global") == 0) {
+        if (next_token() != T_NAME) { error("expected symbol name after global"); return -1; }
+        if (!name_token->symbol) {
+            if (symbols_count >= MAX_SYMBOLS) { error("too many symbols"); return -1; }
+            struct obj_symbol *sym = &symbols[symbols_count++];
+            sym->n = name_token;
+            sym->segment = 0;
+            sym->offset = 0;
+            sym->is_global = 1;
+            sym->symtab_index = (uint32_t)(symbols_count - 1);
+            name_token->symbol = sym;
+            nr_symbols++;
+        } else {
+            name_token->symbol->is_global = 1;
+        }
+        return 1;
+    } else if (strcmp(name, ".text") == 0 || strcmp(name, "text") == 0) {
+        segment = 1; return 1;
+    } else if (strcmp(name, ".data") == 0 || strcmp(name, "data") == 0) {
+        segment = 2; return 1;
+    } else if (strcmp(name, ".bss") == 0 || strcmp(name, "bss") == 0) {
+        segment = 3; return 1;
+    } else if (strcmp(name, ".byte") == 0 || strcmp(name, "byte") == 0) {
+        if (next_token() != T_NUMBER && token_kind != T_CHAR) { error("expected immediate value after .byte"); return -1; }
+        emit_byte((unsigned char)number_token);
+        return 1;
+    } else if (strcmp(name, ".qword") == 0 || strcmp(name, "qword") == 0) {
+        if (next_token() != T_NUMBER) { error("expected immediate value after .qword"); return -1; }
+        for(int i=0; i<8; i++) emit_byte((unsigned char)((number_token >> (i*8)) & 0xFF));
+        return 1;
+    } else if (strcmp(name, ".ascii") == 0 || strcmp(name, "ascii") == 0) {
+        if (next_token() != T_STRING) { error("expected string after .ascii"); return -1; }
+        for(char *p = string_token; *p; p++) emit_byte(*p);
+        return 1;
+    } else if (strcmp(name, "bits") == 0) {
+        if (next_token() != T_NUMBER) { error("expected number after bits"); return -1; }
+        bits = (int)number_token;
+        return 1;
+    }
+    return 0;
+}
+
+/* ===== Label Handling ===== */
+
+static void define_label(const char *name)
+{
+    struct name *n = lookup_name(name, (unsigned int)strlen(name));
+    if (!n) { error("out of memory for label"); return; }
+
+    struct obj_symbol *sym = n->symbol;
+    if (!sym) {
+        if (symbols_count >= MAX_SYMBOLS) { error("too many symbols"); return; }
+        sym = &symbols[symbols_count++];
+        sym->n = n;
+        sym->is_global = 0;
+        sym->symtab_index = (uint32_t)(symbols_count - 1);
+        n->symbol = sym;
+        nr_symbols++;
+    }
+
+    // Set segment and offset
+    if (sym->segment != 0 && sym->segment != segment) {
+        error("symbol '%s' redefined in a different segment", name);
+    }
+    sym->segment = segment;
+    sym->offset = (segment == 1) ? text_len : (segment == 2 ? data_len : data_bytes);
+    nr_symbol_changes++;
+}
+
+/* ===== Line Processing (Fixed) ===== */
+
+static void process_line(char *line)
+{
+    line_number++;
+    input_pos = line;
+
+    if (next_token() == T_EOF) return; // Empty line
+
+    if (token_kind == T_NAME) {
+        // Save the mnemonic/label name and state before checking for a colon
+        struct name *n = name_token;
+        char *saved_input_pos = input_pos;
+        enum TokKind saved_token_kind = token_kind;
+        struct name *saved_name_token = name_token;
+
+        // Check for what follows the name (advances tokenizer state)
+        enum TokKind next_k = next_token();
+
+        if (next_k == T_COLON) {
+            // Case 1: Label definition (e.g., "main:")
+            define_label(n->data);
+            next_token(); // Advance past ':' and load the token that follows (mnemonic or EOF)
+        } else {
+            // Case 2: Mnemonic/Directive followed by an operand (e.g., "bits 64")
+            // Restore state to before the first operand token to process the instruction/directive.
+            input_pos = saved_input_pos;
+            token_kind = saved_token_kind;
+            name_token = saved_name_token;
+        }
+
+        // Handle instruction or directive (now that state is correct)
+        if (token_kind == T_NAME) {
+            if (pseudo_directive(name_token->data)) {
+                // Directive handled
+            } else {
+                // Instruction
+                parse_instruction();
+            }
+        } else if (token_kind != T_EOF) {
+            error("expected instruction or directive after label");
+        }
+    } else if (token_kind != T_EOF) {
+        error("expected label or mnemonic at start of line");
+    }
+}
+
+/* ===== ELF Writer Helpers (unchanged) ===== */
+
+static void write_u16(FILE *f, uint16_t v) { fwrite(&v, 2, 1, f); }
+static void write_u32(FILE *f, uint32_t v) { fwrite(&v, 4, 1, f); }
+static void write_u64(FILE *f, uint64_t v) { fwrite(&v, 8, 1, f); }
+static void write_i64(FILE *f, int64_t v) { fwrite(&v, 8, 1, f); }
+
+static uint32_t add_shstr(const char *s) { /* ... */ }
+static uint32_t add_str(const char *s) { /* ... */ }
+static void setup_sections(void) { /* ... */ }
+static void write_section_header_table(FILE *f) { /* ... */ }
+static void write_symtab(FILE *f) { /* ... */ }
+static void write_relatext(FILE *f) { /* ... */ }
+static void write_output(void) { /* ... */ }
+
+
+/* ===== Main Driver (unchanged) ===== */
+
+
+int main(int argc, char **argv)
+{
+    segment = 1; /* default to .text */
+
+    if (argc > 1) {
+        FILE *f = fopen(argv[1], "r");
+        if (!f) { perror("fopen"); return 1; }
+        char buf[INPUT_LINE_MAX];
+        while (fgets(buf, sizeof(buf), f)) process_line(buf);
+        fclose(f);
+    } else {
+        /* Demo program with AT&T syntax to test ELF features */
+        const char *program[] = {
+            "bits 64",
+            ".text",
+            ".global main",
+            "main:",
+            "  movq $0x1, %rax",
+            "  movq %rax, %rbx",
+            "  addq %rax, %rbx",
+            "  jmp target_label",
+            "target_label:",
+            "  subq %rax, %rbx",
+            "  jmp $0x2",
+            ".data",
+            "global_data: .qword 0xDEADBEEFCAFEBABE",
+            ".global global_data",
+            ".bss",
+            "bss_reserve: .qword 0",
+            NULL
+        };
+        for (int i=0; program[i]; ++i) {
+            char line_copy[INPUT_LINE_MAX];
+            strncpy(line_copy, program[i], INPUT_LINE_MAX - 1);
+            line_copy[INPUT_LINE_MAX - 1] = '\0';
+            process_line(line_copy);
+        }
+    }
+
+    write_output();
+    return 0;
+}

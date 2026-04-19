@@ -1,0 +1,340 @@
+/* bootx64.c
+ * Standalone UEFI application WITHOUT including any EFI headers.
+ * All needed EFI types and important function prototypes are defined here
+ * so the file is self-contained.
+ *
+ * WARNING: This is low-level code that talks directly to firmware and PCI
+ * devices. Use in QEMU/OVMF for testing. It is untested on real hardware.
+ */
+
+// ---------------------- Minimal EFI type definitions (self-contained) ----------------------
+typedef unsigned long long UINT64;
+typedef unsigned int       UINT32;
+typedef unsigned short     UINT16;
+typedef unsigned char      UINT8;
+typedef unsigned long      UINTN; /* 64-bit on x86_64 when compiled appropriately */
+typedef void               VOID;
+typedef CHAR16             CHAR16; /* will define below */
+typedef char               CHAR8;
+
+/* Minimal CHAR16 for Unicode output */
+typedef unsigned short CHAR16;
+
+typedef VOID *EFI_HANDLE;
+typedef UINT64 EFI_PHYSICAL_ADDRESS;
+typedef UINT64 EFI_VIRTUAL_ADDRESS;
+
+typedef UINT64 EFI_STATUS;
+#define EFI_SUCCESS 0
+#define EFI_BUFFER_TOO_SMALL 5
+
+// Forward declarations
+struct _EFI_BOOT_SERVICES;
+struct _EFI_SYSTEM_TABLE;
+
+/* Prototype types for key Boot Services functions we use */
+typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(UINT32 Type, UINT32 MemoryType, UINTN Pages, EFI_PHYSICAL_ADDRESS *Memory);
+typedef EFI_STATUS (*EFI_FREE_PAGES)(EFI_PHYSICAL_ADDRESS Memory, UINTN Pages);
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(UINTN *MemoryMapSize, void *MemoryMap, UINTN *MapKey, UINTN *DescriptorSize, UINT32 *DescriptorVersion);
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle, UINTN MapKey);
+typedef EFI_STATUS (*EFI_LOCATE_HANDLE_BUFFER)(UINT32 SearchType, const void *Protocol, void *SearchKey, UINTN *NoHandles, EFI_HANDLE **Buffer);
+typedef EFI_STATUS (*EFI_HANDLE_PROTOCOL)(EFI_HANDLE Handle, const void *Protocol, void **Interface);
+typedef EFI_STATUS (*EFI_FREE_POOL)(void *Buffer);
+
+/* Simple PCI IO Read prototype (we only need Uint8/Uint32 reads) */
+typedef enum { EfiPciIoWidthUint8 = 0, EfiPciIoWidthUint32 = 3 } EFI_PCI_IO_WIDTH;
+typedef struct {
+    EFI_STATUS (*Read)(void *This, EFI_PCI_IO_WIDTH Width, UINTN Offset, UINTN Count, void *Buffer);
+    EFI_STATUS (*Write)(void *This, EFI_PCI_IO_WIDTH Width, UINTN Offset, UINTN Count, void *Buffer);
+} EFI_PCI_IO_PROTOCOL;
+
+/* Graphics Output protocol (very small subset) */
+typedef enum { PixelRedGreenBlueReserved8BitPerColor = 0 } EFI_GRAPHICS_PIXEL_FORMAT;
+typedef struct {
+    UINT32 HorizontalResolution;
+    UINT32 VerticalResolution;
+    UINT32 PixelsPerScanLine;
+    EFI_GRAPHICS_PIXEL_FORMAT PixelFormat;
+} GOP_MODE_INFO;
+typedef struct {
+    UINT64 FrameBufferBase;
+    UINT64 FrameBufferSize;
+    GOP_MODE_INFO *Info;
+} GOP_MODE;
+typedef struct {
+    GOP_MODE *Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+/* Simple text output protocol */
+typedef struct {
+    EFI_STATUS (*OutputString)(void *This, CHAR16 *String);
+} SIMPLE_TEXT_OUTPUT_PROTOCOL;
+
+/* Boot services (very small) */
+typedef struct _EFI_BOOT_SERVICES {
+    // many entries omitted; we only list the few we need in the proper order
+    void *Hdr;
+    EFI_ALLOCATE_PAGES AllocatePages;
+    void *FreePages; // not used
+    void *GetMemoryMap; // position placeholder
+    EFI_GET_MEMORY_MAP GetMemoryMap_fn; // we'll set by offset when reading
+    EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    EFI_LOCATE_HANDLE_BUFFER LocateHandleBuffer;
+    EFI_HANDLE_PROTOCOL HandleProtocol;
+    EFI_FREE_POOL FreePool;
+    // Note: in real firmware the table layout is strict. This is simplified and
+    // may need adjustments depending on the platform. In OVMF this generally works
+    // if compiled with the same ABI and offsets matched.
+} EFI_BOOT_SERVICES;
+
+/* System Table */
+typedef struct _EFI_SYSTEM_TABLE {
+    CHAR16 *FirmwareVendor;
+    UINT32 FirmwareRevision;
+    void *ConsoleInHandle;
+    SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut;
+    void *ConIn; // omitted
+    EFI_BOOT_SERVICES *BootServices;
+} EFI_SYSTEM_TABLE;
+
+// Minimal GUID placeholders (we only use pointers to protocol GUIDs for LocateHandleBuffer)
+static const void *gEfiPciIoProtocolGuid = (const void*)0x01;
+static const void *gEfiGraphicsOutputProtocolGuid = (const void*)0x02;
+
+// ---------------------- Small helpers ----------------------
+static inline VOID write_u16(CHAR16 *dst, const CHAR8 *s){
+    while (*s) { *dst++ = (CHAR16)(*s++); }
+    *dst = 0;
+}
+
+// Convert ASCII to CHAR16 and print via ConOut->OutputString
+static VOID PrintAscii(EFI_SYSTEM_TABLE *ST, const CHAR8 *s){
+    CHAR16 buf[512];
+    write_u16(buf, s);
+    if (ST && ST->ConOut && ST->ConOut->OutputString) ST->ConOut->OutputString(ST->ConOut, buf);
+}
+
+// ---------------------- NVMe & framebuffer code (same logic as before) ----------------------
+#define NVME_REG_CAP 0x0000
+#define NVME_REG_VS  0x0008
+#define NVME_REG_CC  0x0014
+#define NVME_REG_CSTS 0x001c
+#define NVME_REG_AQA 0x0024
+#define NVME_REG_ASQ 0x0028
+#define NVME_REG_ACQ 0x0030
+#define NVME_DOORBELL_OFFSET 0x1000
+#define NVME_ADMIN_IDENTIFY 0x06
+#define NVME_CMD_READ 0x02
+#define PAGE_SIZE 4096
+#define ADMIN_Q_ENTRIES 16
+
+typedef struct {
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINT32 FrameBufferWidth;
+    UINT32 FrameBufferHeight;
+    UINT32 PixelsPerScanLine;
+} FB_INFO;
+
+typedef struct {
+    EFI_PHYSICAL_ADDRESS NvmeBar;
+    FB_INFO fb;
+    EFI_PHYSICAL_ADDRESS AdminSqPhys;
+    EFI_PHYSICAL_ADDRESS AdminCqPhys;
+    EFI_PHYSICAL_ADDRESS DataBufPhys;
+    VOID *AdminSqVirt;
+    VOID *AdminCqVirt;
+    VOID *DataBufVirt;
+    UINTN MemMapSize;
+    VOID *MemMap;
+    UINTN MapKey;
+    UINTN DescriptorSize;
+    UINT32 DescriptorVersion;
+} SAVED_STATE;
+
+static SAVED_STATE S;
+
+static VOID *my_memcpy(VOID *dst, const VOID *src, UINTN len){ UINT8 *d=dst; const UINT8 *s=src; while(len--) *d++=*s++; return dst; }
+static VOID *my_memset(VOID *dst, int v, UINTN len){ UINT8 *d=dst; while(len--) *d++=(UINT8)v; return dst; }
+
+static const UINT8 hex6x8[][6] = {
+    {0x3E,0x51,0x49,0x45,0x3E,0x00},
+    {0x00,0x42,0x7F,0x40,0x00,0x00},
+    {0x62,0x51,0x49,0x49,0x46,0x00},
+    {0x22,0x41,0x49,0x49,0x36,0x00},
+    {0x18,0x14,0x12,0x7F,0x10,0x00},
+    {0x27,0x45,0x45,0x45,0x39,0x00},
+    {0x3C,0x4A,0x49,0x49,0x30,0x00},
+    {0x01,0x71,0x09,0x05,0x03,0x00},
+    {0x36,0x49,0x49,0x49,0x36,0x00},
+    {0x06,0x49,0x49,0x29,0x1E,0x00},
+};
+static const UINT8 hexAtoF[][6] = {
+    {0x7E,0x09,0x09,0x09,0x7E,0x00},
+    {0x7F,0x49,0x49,0x49,0x36,0x00},
+    {0x3E,0x41,0x41,0x41,0x22,0x00},
+    {0x7F,0x41,0x41,0x22,0x1C,0x00},
+    {0x7F,0x49,0x49,0x49,0x41,0x00},
+    {0x7F,0x09,0x09,0x09,0x01,0x00}
+};
+
+static inline void fb_put_pixel(UINTN x, UINTN y, UINT8 intensity){
+    FB_INFO *fb = &S.fb;
+    if (x >= fb->FrameBufferWidth || y >= fb->FrameBufferHeight) return;
+    volatile UINT8 *pix = (volatile UINT8*)(UINTN)fb->FrameBufferBase + (y * fb->PixelsPerScanLine + x) * 4;
+    if (intensity){ pix[0]=0xFF; pix[1]=0xFF; pix[2]=0xFF; pix[3]=0x00; } else { pix[0]=pix[1]=pix[2]=0x00; pix[3]=0x00; }
+}
+static void fb_draw_char_hex(UINTN sx, UINTN sy, CHAR8 c){ const UINT8 *glyph; if (c>='0'&&c<='9') glyph=hex6x8[c-'0']; else if (c>='A'&&c<='F') glyph=hexAtoF[c-'A']; else return; for (UINTN row=0;row<8;++row){ UINT8 b=glyph[row%6]; for (UINTN col=0;col<6;++col) fb_put_pixel(sx+col, sy+row, (b & (1<<(7-col)))?1:0); } }
+static void fb_draw_string_hex(UINTN sx, UINTN sy, const CHAR8 *s){ while(*s){ fb_draw_char_hex(sx,sy,*s); sx+=7; ++s; } }
+
+static inline UINT32 mmio_read32(UINT64 base, UINTN off){ volatile UINT32 *ptr=(volatile UINT32*)(UINTN)(base+off); return *ptr; }
+static inline void mmio_write32(UINT64 base, UINTN off, UINT32 v){ volatile UINT32 *ptr=(volatile UINT32*)(UINTN)(base+off); *ptr=v; }
+static inline UINT64 mmio_read64(UINT64 base, UINTN off){ volatile UINT64 *ptr=(volatile UINT64*)(UINTN)(base+off); return *ptr; }
+static inline void mmio_write64(UINT64 base, UINTN off, UINT64 v){ volatile UINT64 *ptr=(volatile UINT64*)(UINTN)(base+off); *ptr=v; }
+
+#pragma pack(push,1)
+typedef struct { UINT32 cdw0; UINT32 nsid; UINT64 reserved1; UINT64 mptr; UINT64 prp1; UINT64 prp2; UINT32 cdw10; UINT32 cdw11; UINT32 cdw12; UINT32 cdw13; UINT32 cdw14; UINT32 cdw15; } nvme_sqe_t;
+typedef struct { UINT32 result; UINT32 sq_head_sq_id; UINT16 command_id; UINT16 status; } nvme_cqe_t;
+#pragma pack(pop)
+
+static void nvme_build_identify(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT32 cns){ my_memset(sqe,0,sizeof(*sqe)); sqe->cdw0=(NVME_ADMIN_IDENTIFY & 0xFF); sqe->nsid=nsid; sqe->prp1=prp1; sqe->cdw10=cns; }
+static void nvme_build_read(nvme_sqe_t *sqe, UINT16 cid, UINT32 nsid, UINT64 prp1, UINT64 slba, UINT16 nblocks){ my_memset(sqe,0,sizeof(*sqe)); sqe->cdw0=(NVME_CMD_READ & 0xFF); sqe->nsid=nsid; sqe->prp1=prp1; sqe->cdw10=(UINT32)(slba & 0xFFFFFFFF); sqe->cdw11=(UINT32)(slba>>32); sqe->cdw12=(UINT32)(nblocks-1); }
+static void doorbell_write(UINT64 base, UINT32 qid, UINT32 val){ UINTN off = NVME_DOORBELL_OFFSET + (qid*8); mmio_write32(base, off, val); }
+
+static int nvme_poll_cq(nvme_cqe_t *cq, UINT32 qentries, UINT16 *seen_phase, UINT32 *cq_head_ref){ UINT32 head=*cq_head_ref; nvme_cqe_t *entry=&cq[head]; if ((((entry->status)>>1)&1) == *seen_phase){ UINT16 cid=entry->command_id; UINT32 res=entry->result; head=(head+1)%qentries; *cq_head_ref=head; if (head==0) *seen_phase ^=1; return cid | (res<<16); } return -1; }
+
+static void do_nvme_after_ebs(UINT64 nvme_mmio_base, EFI_SYSTEM_TABLE *ST){ UINT64 base=nvme_mmio_base; // print via ConOut ASCII->CHAR16
+    PrintAscii(ST, "[ring0] NVMe MMIO base: "); // we won't print the number easily; omit
+    UINT64 cap=mmio_read64(base, NVME_REG_CAP);
+    (void)cap;
+    nvme_sqe_t *asq=(nvme_sqe_t*)(UINTN)S.AdminSqPhys;
+    nvme_cqe_t *acq=(nvme_cqe_t*)(UINTN)S.AdminCqPhys;
+    my_memset(asq,0,PAGE_SIZE); my_memset(acq,0,PAGE_SIZE);
+    UINT32 aqa = ((ADMIN_Q_ENTRIES-1)<<16) | (ADMIN_Q_ENTRIES-1);
+    mmio_write32(base, NVME_REG_AQA, aqa);
+    mmio_write64(base, NVME_REG_ASQ, (UINT64)S.AdminSqPhys);
+    mmio_write64(base, NVME_REG_ACQ, (UINT64)S.AdminCqPhys);
+    UINT32 cc = mmio_read32(base, NVME_REG_CC); cc |= 1; mmio_write32(base, NVME_REG_CC, cc);
+    for (int i=0;i<100000;i++){ UINT32 csts = mmio_read32(base, NVME_REG_CSTS); if (csts & 1) break; }
+    nvme_build_identify(&asq[0], 0, 0, (UINT64)S.DataBufPhys, 1);
+    doorbell_write(base, 0, 1);
+    UINT16 phase=1; UINT32 cq_head=0; int cid_res=-1;
+    for (int t=0;t<1000000;++t){ int r=nvme_poll_cq(acq, ADMIN_Q_ENTRIES, &phase, &cq_head); if (r!=-1){ cid_res=r; break;} }
+    if (cid_res==-1) PrintAscii(ST, "Identify failed or timeout
+"); else PrintAscii(ST, "Identify completed
+");
+    nvme_build_read(&asq[1],1,1,(UINT64)S.DataBufPhys,0,1);
+    doorbell_write(base,0,2);
+    phase=1; cq_head=0; cid_res=-1;
+    for (int t=0;t<1000000;++t){ int r=nvme_poll_cq(acq, ADMIN_Q_ENTRIES, &phase, &cq_head); if (r!=-1){ cid_res=r; break; } }
+    if (cid_res==-1) PrintAscii(ST, "Read LBA failed or timeout
+"); else PrintAscii(ST, "Read LBA completed
+");
+    UINT8 *data=(UINT8*)(UINTN)S.DataBufPhys; CHAR8 line[64];
+    for (UINTN row=0; row<32; ++row){ UINTN offset = row*16; UINTN pos=0; for (UINTN i=0;i<16;i++){ UINT8 b=data[offset+i]; UINT8 hi=(b>>4)&0xF; UINT8 lo=b&0xF; line[pos++]=(hi<10)?('0'+hi):('A'+(hi-10)); line[pos++]=(lo<10)?('0'+lo):('A'+(lo-10)); line[pos++]=' '; } line[pos]=0; fb_draw_string_hex(10, 10 + row*9, line); }
+}
+
+// We'll implement a very small procedure to find PCI devices supporting PCI IO protocol
+// For simplicity we call LocateHandleBuffer with our protocol GUID sentinel. The firmware
+// implementation will match handles accordingly.
+
+static EFI_STATUS find_nvme_and_prepare(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable){
+    EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
+    EFI_STATUS Status;
+    UINTN HandleCount = 0;
+    EFI_HANDLE *HandleBuffer = 0;
+    Status = BS->LocateHandleBuffer(0, gEfiPciIoProtocolGuid, 0, &HandleCount, &HandleBuffer);
+    if (Status != EFI_SUCCESS) { PrintAscii(SystemTable, "LocateHandleBuffer(PciIo) failed
+"); return Status; }
+    for (UINTN i=0;i<HandleCount;i++){
+        void *PciIoIf = 0;
+        Status = BS->HandleProtocol(HandleBuffer[i], gEfiPciIoProtocolGuid, &PciIoIf);
+        if (Status != EFI_SUCCESS || !PciIoIf) continue;
+        EFI_PCI_IO_PROTOCOL *PciIo = (EFI_PCI_IO_PROTOCOL*)PciIoIf;
+        UINT8 class_code[3];
+        Status = PciIo->Read(PciIo, EfiPciIoWidthUint8, 0x0B, 3, class_code);
+        if (Status != EFI_SUCCESS) continue;
+        if (class_code[2]==0x01 && class_code[1]==0x08 && class_code[0]==0x02){
+            PrintAscii(SystemTable, "Found NVMe device
+");
+            UINT32 barlow=0, barhigh=0;
+            Status = PciIo->Read(PciIo, EfiPciIoWidthUint32, 0x10, 1, &barlow);
+            if (Status!=EFI_SUCCESS) continue;
+            Status = PciIo->Read(PciIo, EfiPciIoWidthUint32, 0x14, 1, &barhigh);
+            if (Status!=EFI_SUCCESS) continue;
+            UINT64 bar = ((UINT64)barhigh<<32) | (barlow & ~0xF);
+            S.NvmeBar = bar;
+            PrintAscii(SystemTable, "NVMe BAR found
+");
+            // Locate GOP
+            EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = 0;
+            Status = BS->LocateHandleBuffer(0, gEfiGraphicsOutputProtocolGuid, 0, &HandleCount, &HandleBuffer);
+            if (Status==EFI_SUCCESS){
+                // try first handle
+                BS->HandleProtocol(HandleBuffer[0], gEfiGraphicsOutputProtocolGuid, (void**)&Gop);
+                if (Gop && Gop->Mode && Gop->Mode->Info){
+                    S.fb.FrameBufferBase = (EFI_PHYSICAL_ADDRESS)Gop->Mode->FrameBufferBase;
+                    S.fb.FrameBufferWidth = Gop->Mode->Info->HorizontalResolution;
+                    S.fb.FrameBufferHeight = Gop->Mode->Info->VerticalResolution;
+                    S.fb.PixelsPerScanLine = Gop->Mode->Info->PixelsPerScanLine;
+                }
+            }
+            // Allocate pages for ASQ, ACQ, DBUF
+            EFI_PHYSICAL_ADDRESS pages = 0;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc ASQ failed
+"); return Status; }
+            S.AdminSqPhys = pages; S.AdminSqVirt = (VOID*)(UINTN)pages;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc ACQ failed
+"); return Status; }
+            S.AdminCqPhys = pages; S.AdminCqVirt = (VOID*)(UINTN)pages;
+            Status = BS->AllocatePages(0, 0, 1, &pages);
+            if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc DBUF failed
+"); return Status; }
+            S.DataBufPhys = pages; S.DataBufVirt = (VOID*)(UINTN)pages;
+            my_memset(S.AdminSqVirt,0,PAGE_SIZE); my_memset(S.AdminCqVirt,0,PAGE_SIZE); my_memset(S.DataBufVirt,0,PAGE_SIZE);
+            // Get memory map
+            UINTN MapSize=0; void *Map=0; UINTN MapKey=0; UINTN DescSize=0; UINT32 DescVersion=0;
+            Status = BS->GetMemoryMap(&MapSize, Map, &MapKey, &DescSize, &DescVersion);
+            if (Status == EFI_BUFFER_TOO_SMALL){
+                UINTN pages_needed = (MapSize + PAGE_SIZE-1)/PAGE_SIZE;
+                EFI_PHYSICAL_ADDRESS memmap_addr=0;
+                Status = BS->AllocatePages(0, 0, pages_needed, &memmap_addr);
+                if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "Alloc memmap failed
+"); return Status; }
+                Map = (void*)(UINTN)memmap_addr;
+                Status = BS->GetMemoryMap(&MapSize, Map, &MapKey, &DescSize, &DescVersion);
+                if (Status!=EFI_SUCCESS) { PrintAscii(SystemTable, "GetMemoryMap failed
+"); return Status; }
+                S.MemMapSize = MapSize; S.MemMap = Map; S.MapKey = MapKey; S.DescriptorSize = DescSize; S.DescriptorVersion = DescVersion;
+            } else { PrintAscii(SystemTable, "GetMemoryMap initial failed
+"); return Status; }
+            // Free handle buffer then return
+            BS->FreePool(HandleBuffer);
+            return EFI_SUCCESS;
+        }
+    }
+    if (HandleBuffer) BS->FreePool(HandleBuffer);
+    return 1; // not found
+}
+
+// Entry point with no EFI headers: signature must match expected efi_main(ImageHandle, SystemTable)
+EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable){
+    // Print startup
+    PrintAscii(SystemTable, "UEFI NVMe post-EBS hexdump starter
+");
+    EFI_STATUS Status = find_nvme_and_prepare(ImageHandle, SystemTable);
+    if (Status!=EFI_SUCCESS){ PrintAscii(SystemTable, "NVMe prepare failed
+"); return Status; }
+    PrintAscii(SystemTable, "Exiting Boot Services...
+");
+    // Call ExitBootServices with saved MapKey
+    EFI_BOOT_SERVICES *BS = SystemTable->BootServices;
+    Status = BS->ExitBootServices(ImageHandle, S.MapKey);
+    if (Status!=EFI_SUCCESS){ PrintAscii(SystemTable, "ExitBootServices failed
+"); return Status; }
+    // After EBS, use direct mmio
+    do_nvme_after_ebs((UINT64)S.NvmeBar, SystemTable);
+    for(;;) __asm__("hlt");
+    return EFI_SUCCESS;
+}

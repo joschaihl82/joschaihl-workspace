@@ -1,0 +1,374 @@
+// mini_dbg.c
+// A tiny, educational debugger that can set breakpoints by source file and line
+// on an ELF binary with DWARF debug info (Linux, x86_64).
+//
+// Features
+// - Launches a program under ptrace
+// - Resolves filename:line to code addresses using elfutils/libdwfl (DWARF)
+// - Sets software breakpoints (INT3, 0xCC)
+// - Handles SIGTRAP, restores instruction byte, single-steps, and re-arms breakpoints
+// - Minimal REPL: continue (c), step (s, single-step 1 insn), regs (r), quit (q)
+//
+// Limitations
+// - x86_64 only (adjust RIP by -1 on trap)
+// - No shared library relocation handling beyond basic DWFL reporting for the main file
+// - No symbolization UI; this is a compact demo, not a gdb replacement
+// - Requires elfutils: libdw, libdwfl
+//
+// Build (Debian/Ubuntu/Fedora/etc):
+//   gcc -Wall -Wextra -O2 mini_dbg.c -o mini-dbg \
+//       -ldw -lelf
+//
+// If libdwfl is split: you may also need -ldwfl on some distros
+//   gcc -Wall -Wextra -O2 mini_dbg.c -o mini-dbg -ldw -ldwfl -lelf
+//
+// Usage:
+//   ./mini-dbg -e ./a.out -b src/main.c:42 -b lib/foo.c:17 -- [args for program]
+//
+// Notes:
+//   * Paths match by suffix (basename or tail of path) to be friendlier.
+//   * You can specify multiple -b options.
+//
+// -----------------------------------------------------------------------------
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <libgen.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+// elfutils / DWARF
+#include <elfutils/libdwfl.h>
+
+// ---------------------- Utilities ----------------------
+static void die(const char *msg) {
+    perror(msg);
+    exit(1);
+}
+
+static int has_path_suffix(const char *path, const char *suffix) {
+    // Case-sensitive suffix match; compares end of path with suffix
+    size_t lp = strlen(path), ls = strlen(suffix);
+    if (ls > lp) return 0;
+    return strncmp(path + (lp - ls), suffix, ls) == 0;
+}
+
+static const char* base(const char *p) {
+    const char *slash = strrchr(p, '/');
+    return slash ? slash + 1 : p;
+}
+
+// ---------------------- Breakpoints ----------------------
+
+typedef struct Breakpoint {
+    uintptr_t addr;     // address where INT3 is placed
+    long saved_word;    // original machine word containing the replaced byte
+    int enabled;
+} Breakpoint;
+
+typedef struct BPList {
+    Breakpoint *items;
+    size_t n, cap;
+} BPList;
+
+static void bplist_init(BPList *l) { l->items = NULL; l->n = l->cap = 0; }
+
+static void bplist_push(BPList *l, Breakpoint bp) {
+    if (l->n == l->cap) {
+        l->cap = l->cap ? l->cap * 2 : 8;
+        l->items = (Breakpoint*)realloc(l->items, l->cap * sizeof(Breakpoint));
+        if (!l->items) die("realloc bplist");
+    }
+    l->items[l->n++] = bp;
+}
+
+static Breakpoint* bplist_find(BPList *l, uintptr_t addr) {
+    for (size_t i = 0; i < l->n; ++i) if (l->items[i].addr == addr) return &l->items[i];
+    return NULL;
+}
+
+// ---------------------- DWARF line->addr ----------------------
+
+typedef struct LineSpec { const char *file; int line; } LineSpec;
+
+typedef struct AddrList { uintptr_t *a; size_t n, cap; } AddrList;
+
+static void addrlist_add(AddrList *L, uintptr_t v) {
+    if (L->n == L->cap) {
+        L->cap = L->cap ? L->cap * 2 : 8;
+        L->a = (uintptr_t*)realloc(L->a, L->cap * sizeof(uintptr_t));
+        if (!L->a) die("realloc addrlist");
+    }
+    L->a[L->n++] = v;
+}
+
+static int resolve_lines_to_addrs(const char *exe, LineSpec *specs, size_t nspecs, AddrList *out) {
+    Dwfl_Callbacks cb = { 0 };
+    cb.find_elf = dwfl_build_id_find_elf;
+    cb.find_debuginfo = dwfl_standard_find_debuginfo;
+
+    Dwfl *dwfl = dwfl_begin(&cb);
+    if (!dwfl) { fprintf(stderr, "dwfl_begin failed: %s\n", dwfl_errmsg(-1)); return -1; }
+
+    int fd = open(exe, O_RDONLY);
+    if (fd < 0) die("open exe");
+
+    Dwfl_Module *mod = dwfl_report_elf(dwfl, exe, exe, fd);
+    if (!mod) { fprintf(stderr, "dwfl_report_elf failed: %s\n", dwfl_errmsg(-1)); return -1; }
+
+    if (dwfl_report_end(dwfl, NULL, NULL) != 0) {
+        fprintf(stderr, "dwfl_report_end: %s\n", dwfl_errmsg(-1));
+        return -1;
+    }
+
+    // For each source file in the module, get its lines and match specs.
+    // We'll iterate over all source files via dwfl_module_getsrc
+    Dwfl_Line *line = NULL;
+    while ((line = dwfl_module_getsrc(mod, line)) != NULL) {
+        const char *srcfile = dwfl_lineinfo(line, NULL, NULL, NULL, NULL, NULL, NULL);
+        if (!srcfile) continue;
+
+        for (size_t i = 0; i < nspecs; ++i) {
+            // Match by exact suffix or basename equality
+            if (has_path_suffix(srcfile, specs[i].file) || strcmp(base(srcfile), base(specs[i].file)) == 0) {
+                // Retrieve all lines for this file and scan for the wanted line number
+                Dwfl_Line **lines = NULL;
+                int n = dwfl_module_getsrc_file(mod, srcfile, &lines, 0);
+                if (n < 0) {
+                    fprintf(stderr, "getsrc_file(%s) failed: %s\n", srcfile, dwfl_errmsg(-1));
+                    continue;
+                }
+                for (int k = 0; k < n; ++k) {
+                    int lno = 0, col = 0;
+                    Dwarf_Addr addr = 0;
+                    (void) dwfl_lineinfo(lines[k], &addr, &lno, &col, NULL, NULL, NULL);
+                    if (lno == specs[i].line) {
+                        addrlist_add(out, (uintptr_t)addr);
+                    }
+                }
+                free(lines);
+            }
+        }
+    }
+
+    dwfl_end(dwfl);
+    return 0;
+}
+
+// ---------------------- ptrace helpers ----------------------
+
+static long read_word(pid_t pid, uintptr_t addr) {
+    errno = 0;
+    long data = ptrace(PTRACE_PEEKTEXT, pid, (void*)addr, 0);
+    if (errno) die("PTRACE_PEEKTEXT");
+    return data;
+}
+
+static void write_word(pid_t pid, uintptr_t addr, long data) {
+    if (ptrace(PTRACE_POKETEXT, pid, (void*)addr, (void*)data) != 0) die("PTRACE_POKETEXT");
+}
+
+static void set_breakpoint(pid_t pid, BPList *bps, uintptr_t addr) {
+    if (bplist_find(bps, addr)) return; // already
+    long orig = read_word(pid, addr);
+    long patched = (orig & ~0xFF) | 0xCC; // replace lowest byte with INT3
+    write_word(pid, addr, patched);
+    Breakpoint bp = { addr, orig, 1 };
+    bplist_push(bps, bp);
+    fprintf(stderr, "[+] breakpoint set at 0x%lx\n", (unsigned long)addr);
+}
+
+static void disable_breakpoint(pid_t pid, Breakpoint *bp) {
+    if (!bp->enabled) return;
+    write_word(pid, bp->addr, bp->saved_word);
+    bp->enabled = 0;
+}
+
+static void enable_breakpoint(pid_t pid, Breakpoint *bp) {
+    if (bp->enabled) return;
+    long orig = read_word(pid, bp->addr);
+    long patched = (orig & ~0xFF) | 0xCC;
+    write_word(pid, bp->addr, patched);
+    bp->enabled = 1;
+}
+
+static int wait_for_signal(pid_t pid) {
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) die("waitpid");
+    return status;
+}
+
+// ---------------------- REPL ----------------------
+
+static void print_regs(pid_t pid) {
+    struct user_regs_struct regs;
+    if (ptrace(PTRACE_GETREGS, pid, 0, &regs) != 0) die("GETREGS");
+#if defined(__x86_64__)
+    fprintf(stderr,
+        "RIP=0x%llx RSP=0x%llx RBP=0x%llx RAX=0x%llx RBX=0x%llx RCX=0x%llx RDX=0x%llx\n",
+        (unsigned long long)regs.rip, (unsigned long long)regs.rsp,
+        (unsigned long long)regs.rbp, (unsigned long long)regs.rax,
+        (unsigned long long)regs.rbx, (unsigned long long)regs.rcx,
+        (unsigned long long)regs.rdx);
+#else
+# error "This demo currently targets x86_64 only."
+#endif
+}
+
+static void single_step(pid_t pid) {
+    if (ptrace(PTRACE_SINGLESTEP, pid, 0, 0) != 0) die("SINGLESTEP");
+    wait_for_signal(pid);
+}
+
+// ---------------------- Main ----------------------
+
+static void usage(const char *argv0) {
+    fprintf(stderr,
+        "Usage: %s -e <exe> -b <file:line> [-b <file:line> ...] -- [program args]\n",
+        argv0);
+}
+
+int main(int argc, char **argv) {
+    const char *exe = NULL;
+
+    LineSpec *specs = NULL; size_t nspecs = 0, capspecs = 0;
+
+    int sep = -1; // index of "--"
+    for (int i = 1; i < argc; ++i) if (strcmp(argv[i], "--") == 0) { sep = i; break; }
+
+    int i = 1;
+    while (i < argc && (sep == -1 || i < sep)) {
+        if (strcmp(argv[i], "-e") == 0 && i + 1 < argc) { exe = argv[++i]; i++; }
+        else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            const char *s = argv[++i];
+            const char *colon = strrchr(s, ':');
+            if (!colon) { fprintf(stderr, "-b expects file:line, got '%s'\n", s); return 1; }
+            char *file = strndup(s, colon - s);
+            int line = atoi(colon + 1);
+            if (capspecs == nspecs) {
+                capspecs = capspecs ? capspecs * 2 : 4;
+                specs = (LineSpec*)realloc(specs, capspecs * sizeof(LineSpec));
+            }
+            specs[nspecs].file = file; specs[nspecs].line = line; nspecs++;
+            i++;
+        }
+        else { i++; }
+    }
+
+    if (!exe || nspecs == 0) { usage(argv[0]); return 1; }
+
+    // Resolve lines -> addresses
+    AddrList addrs = {0};
+    if (resolve_lines_to_addrs(exe, specs, nspecs, &addrs) != 0) {
+        fprintf(stderr, "Failed to resolve source lines to addresses.\n");
+        return 1;
+    }
+    if (addrs.n == 0) {
+        fprintf(stderr, "No addresses matched requested breakpoints.\n");
+        return 1;
+    }
+
+    fprintf(stderr, "[info] resolved %zu address(es) from %zu breakpoint spec(s)\n", addrs.n, nspecs);
+
+    // Fork/exec traced child
+    pid_t child = fork();
+    if (child < 0) die("fork");
+
+    if (child == 0) {
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) die("PTRACE_TRACEME");
+        raise(SIGSTOP); // allow parent to set breakpoints before exec
+
+        if (sep == -1) {
+            execl(exe, exe, (char*)NULL);
+            die("execl");
+        } else {
+            // Build argv for execv
+            char **child_argv = &argv[sep + 1];
+            if (child_argv[0] == NULL) { // no args given after --, just run exe
+                execl(exe, exe, (char*)NULL);
+                die("execl");
+            } else {
+                execv(exe, child_argv);
+                die("execv");
+            }
+        }
+        return 0;
+    }
+
+    // Parent: wait for child stop
+    int st = wait_for_signal(child);
+    if (!(WIFSTOPPED(st))) die("child did not stop");
+
+    // PTRACE_SETOPTIONS to get exec-stop, trap, etc.
+    if (ptrace(PTRACE_SETOPTIONS, child, 0, (void*)(PTRACE_O_EXITKILL)) != 0) die("SETOPTIONS");
+
+    // Set all breakpoints
+    BPList bps; bplist_init(&bps);
+    for (size_t k = 0; k < addrs.n; ++k) set_breakpoint(child, &bps, addrs.a[k]);
+
+    // Continue to first stop (will be SIGSTOP right after exec or first BRK)
+    if (ptrace(PTRACE_CONT, child, 0, 0) != 0) die("CONT");
+
+    // Simple REPL
+    char linebuf[128];
+    while (1) {
+        int status = wait_for_signal(child);
+        if (WIFEXITED(status)) { fprintf(stderr, "[child exited %d]\n", WEXITSTATUS(status)); break; }
+        if (WIFSIGNALED(status)) { fprintf(stderr, "[child signaled %d]\n", WTERMSIG(status)); break; }
+
+        if (WIFSTOPPED(status)) {
+            int sig = WSTOPSIG(status);
+            if (sig == SIGTRAP) {
+                // Check if we hit a breakpoint: RIP is after INT3, so adjust
+                struct user_regs_struct regs;
+                if (ptrace(PTRACE_GETREGS, child, 0, &regs) != 0) die("GETREGS");
+#if defined(__x86_64__)
+                uintptr_t rip = (uintptr_t)regs.rip;
+                uintptr_t bp_addr = rip - 1; // INT3 is 1 byte
+                Breakpoint *bp = bplist_find(&bps, bp_addr);
+                if (bp) {
+                    // Restore original byte and rewind RIP, then single-step and re-arm
+                    disable_breakpoint(child, bp);
+                    regs.rip = (unsigned long long)bp_addr;
+                    if (ptrace(PTRACE_SETREGS, child, 0, &regs) != 0) die("SETREGS");
+                    single_step(child);
+                    enable_breakpoint(child, bp);
+                }
+#else
+# error "x86_64 only"
+#endif
+            }
+        }
+
+        // Prompt
+        fprintf(stderr, "(mini-dbg) ");
+        if (!fgets(linebuf, sizeof linebuf, stdin)) break;
+        if (linebuf[0] == 'q') {
+            ptrace(PTRACE_DETACH, child, 0, 0);
+            break;
+        } else if (linebuf[0] == 'c') {
+            if (ptrace(PTRACE_CONT, child, 0, 0) != 0) die("CONT");
+            continue;
+        } else if (linebuf[0] == 's') {
+            single_step(child);
+            continue;
+        } else if (linebuf[0] == 'r') {
+            print_regs(child);
+            continue;
+        } else {
+            fprintf(stderr, "Commands: c(continue), s(step), r(regs), q(quit)\n");
+            if (ptrace(PTRACE_CONT, child, 0, 0) != 0) die("CONT");
+            continue;
+        }
+    }
+
+    return 0;
+}

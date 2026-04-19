@@ -1,0 +1,121 @@
+// test.c
+// Einfacher Test-Harness für emu.c
+// - zeichnet Gradient und animiertes Rechteck in den Emulator-Framebuffer
+// - zeigt das Ergebnis via SDL (emu.c's fb_present)
+// - kompiliere mit: make
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <time.h>
+#include <SDL2/SDL.h>
+
+/* Externe Funktionen aus emu.c (müssen in emu.c exportiert werden) */
+int x64emu_init_standalone(void);
+int fb_init_display(int width, int height);
+void fb_present(void);
+void fb_shutdown(void);
+void run_loop_optimized(void); /* optional, startet die emulation loop (blockierend) */
+
+/* Accessor-Funktionen, die in emu.c ergänzt werden müssen */
+extern uint8_t *emu_get_fb(void);
+extern int emu_get_fb_pitch(void);
+extern int emu_get_fb_width(void);
+extern int emu_get_fb_height(void);
+
+/* Simple helpers */
+static void draw_gradient(void) {
+    uint8_t *fb = emu_get_fb();
+    int pitch = emu_get_fb_pitch();
+    int w = emu_get_fb_width();
+    int h = emu_get_fb_height();
+    if (!fb) return;
+    for (int y = 0; y < h; ++y) {
+        uint32_t *row = (uint32_t*)(fb + y * pitch);
+        for (int x = 0; x < w; ++x) {
+            uint8_t r = (uint8_t)((x * 255) / (w - 1));
+            uint8_t g = (uint8_t)((y * 255) / (h - 1));
+            uint8_t b = (uint8_t)(( (x+y) * 255) / (w + h - 2));
+            uint32_t pixel = (0xFFu << 24) | (r << 16) | (g << 8) | b; // ARGB8888
+            row[x] = pixel;
+        }
+    }
+}
+
+static void draw_moving_rect(int frame) {
+    uint8_t *fb = emu_get_fb();
+    int pitch = emu_get_fb_pitch();
+    int w = emu_get_fb_width();
+    int h = emu_get_fb_height();
+    if (!fb) return;
+    int rw = w / 6;
+    int rh = h / 6;
+    int cx = (frame * 4) % (w + rw) - rw/2;
+    int cy = (frame * 2) % (h + rh) - rh/2;
+    for (int y = 0; y < h; ++y) {
+        uint32_t *row = (uint32_t*)(fb + y * pitch);
+        for (int x = 0; x < w; ++x) {
+            if (x >= cx && x < cx + rw && y >= cy && y < cy + rh) {
+                /* animated rectangle color */
+                row[x] = (0xFFu << 24) | (0x00 << 16) | (0xC0 << 8) | 0x40; // ARGB
+            } else {
+                /* slightly darken existing pixel */
+                uint32_t p = row[x];
+                uint8_t a = (p >> 24) & 0xFF;
+                uint8_t r = (p >> 16) & 0xFF;
+                uint8_t g = (p >> 8) & 0xFF;
+                uint8_t b = (p >> 0) & 0xFF;
+                r = (uint8_t)(r * 0.95);
+                g = (uint8_t)(g * 0.95);
+                b = (uint8_t)(b * 0.95);
+                row[x] = (a<<24) | (r<<16) | (g<<8) | b;
+            }
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    (void)argc; (void)argv;
+    const int WIDTH = 640;
+    const int HEIGHT = 480;
+
+    if (x64emu_init_standalone() != 0) {
+        fprintf(stderr, "Emulator init failed\n");
+        return 1;
+    }
+
+    if (fb_init_display(WIDTH, HEIGHT) != 0) {
+        fprintf(stderr, "Framebuffer init failed\n");
+        return 1;
+    }
+
+    /* initial gradient */
+    draw_gradient();
+    fb_present();
+
+    /* main loop: animate rectangle for a few seconds */
+    const int FPS = 60;
+    const int DURATION_SEC = 10;
+    const int FRAMES = FPS * DURATION_SEC;
+    struct timespec ts = {0, (long)(1e9 / FPS)};
+    for (int f = 0; f < FRAMES; ++f) {
+        draw_moving_rect(f);
+        fb_present();
+        nanosleep(&ts, NULL);
+        /* simple event pump so window stays responsive */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                f = FRAMES; break;
+            }
+        }
+    }
+
+    /* optional: run a short emulation burst (non-blocking example omitted) */
+    /* If you want to exercise the CPU run loop, you can call run_loop_optimized()
+       in a separate thread or modify run_loop_optimized to return after N instructions. */
+
+    fb_shutdown();
+    return 0;
+}

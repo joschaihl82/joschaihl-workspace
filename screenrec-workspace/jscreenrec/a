@@ -1,0 +1,32 @@
+screenrec.cpp: In member function ‘virtual void Recorder::run()’:
+screenrec.cpp:312:52: warning: ‘AVCodec::sample_fmts’ is deprecated [-Wdeprecated-declarations]
+  312 |         const enum AVSampleFormat *p = audioCodec->sample_fmts;
+      |                                                    ^~~~~~~~~~~
+In file included from /usr/include/x86_64-linux-gnu/libavformat/avformat.h:328,
+                 from screenrec.cpp:28:
+/usr/include/x86_64-linux-gnu/libavcodec/codec.h:219:32: note: declared here
+  219 |     const enum AVSampleFormat *sample_fmts; ///< @deprecated use avcodec_get_supported_config()
+      |                                ^~~~~~~~~~~
+screenrec.cpp:312:52: warning: ‘AVCodec::sample_fmts’ is deprecated [-Wdeprecated-declarations]
+  312 |         const enum AVSampleFormat *p = audioCodec->sample_fmts;
+      |                                                    ^~~~~~~~~~~
+/usr/include/x86_64-linux-gnu/libavcodec/codec.h:219:32: note: declared here
+  219 |     const enum AVSampleFormat *sample_fmts; ///< @deprecated use avcodec_get_supported_config()
+      |                                ^~~~~~~~~~~
+screenrec.cpp:312:52: warning: ‘AVCodec::sample_fmts’ is deprecated [-Wdeprecated-declarations]
+  312 |         const enum AVSampleFormat *p = audioCodec->sample_fmts;
+      |                                                    ^~~~~~~~~~~
+/usr/include/x86_64-linux-gnu/libavcodec/codec.h:219:32: note: declared here
+  219 |     const enum AVSampleFormat *sample_fmts; ///< @deprecated use avcodec_get_supported_config()
+      |                                ^~~~~~~~~~~
+screenrec.cpp:389:31: error: ‘av_get_default_channel_layout’ was not declared in this scope
+  389 |         uint64_t in_ch_mask = av_get_default_channel_layout(m_alsa->channels());
+      |                               ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+screenrec.cpp:390:32: error: ‘av_channel_layout_to_mask’ was not declared in this scope; did you mean ‘av_channel_layout_from_mask’?
+  390 |         uint64_t out_ch_mask = av_channel_layout_to_mask(&audio_enc_ctx->ch_layout);
+      |                                ^~~~~~~~~~~~~~~~~~~~~~~~~
+      |                                av_channel_layout_from_mask
+screenrec.cpp:453:19: warning: unused variable ‘targetFps’ [-Wunused-variable]
+  453 |         const int targetFps = 30;
+      |                   ^~~~~~~~~
+make: *** [Makefile:660: screenrec.o] Error 1

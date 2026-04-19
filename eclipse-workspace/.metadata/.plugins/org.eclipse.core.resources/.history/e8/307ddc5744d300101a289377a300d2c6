@@ -1,0 +1,1413 @@
+// xmpp.cpp
+// Expanded XMPP VoIP client scaffold (single-file)
+// - Qt6 + QXmpp + ALSA scaffold
+// - Connection, Registration, Contacts, Chat, Calls, AGC, Tones, Tray, Notifications
+// - Settings persistence, logging, mock mode, plugin host stubs
+// - Author: scaffold generator (expanded)
+// - License: Example / MIT-style (adapt as needed)
+
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QMainWindow>
+#include <QtWidgets/QWidget>
+#include <QtWidgets/QDialog>
+#include <QtWidgets/QPushButton>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QLabel>
+#include <QtWidgets/QVBoxLayout>
+#include <QtWidgets/QHBoxLayout>
+#include <QtWidgets/QFormLayout>
+#include <QtWidgets/QGroupBox>
+#include <QtWidgets/QListWidget>
+#include <QtWidgets/QListWidgetItem>
+#include <QtWidgets/QPlainTextEdit>
+#include <QtWidgets/QTextEdit>
+#include <QtWidgets/QComboBox>
+#include <QtWidgets/QCheckBox>
+#include <QtWidgets/QSpinBox>
+#include <QtWidgets/QSlider>
+#include <QtWidgets/QTabWidget>
+#include <QtWidgets/QStackedWidget>
+#include <QtWidgets/QSplitter>
+#include <QtWidgets/QToolBar>
+#include <QtWidgets/QStatusBar>
+#include <QtWidgets/QMenuBar>
+#include <QtWidgets/QMenu>
+//#include <QtWidgets/QAction>
+#include <QtWidgets/QSystemTrayIcon>
+#include <QtWidgets/QStyle>
+#include <QtWidgets/QFileDialog>
+#include <QtWidgets/QMessageBox>
+#include <QtWidgets/QInputDialog>
+#include <QtWidgets/QScrollArea>
+#include <QtWidgets/QFrame>
+#include <QtWidgets/QLabel>
+#include <QtCore/QTimer>
+#include <QtCore/QThread>
+#include <QtCore/QMutex>
+#include <QtCore/QMutexLocker>
+#include <QtCore/QSettings>
+#include <QtCore/QFile>
+#include <QtCore/QTextStream>
+#include <QtCore/QDateTime>
+#include <QtCore/QRandomGenerator>
+#include <QtCore/QCommandLineParser>
+#include <QtCore/QStandardPaths>
+#include <QtNetwork/QNetworkAccessManager>
+#include <QtNetwork/QNetworkReply>
+#include <QtMultimedia/QAudioDeviceInfo>
+#include <QtMultimedia/QAudioInput>
+#include <QtMultimedia/QAudioOutput>
+#include <QtMultimedia/QAudioFormat>
+
+#include <thread>
+#include <chrono>
+#include <cmath>
+#include <atomic>
+#include <memory>
+#include <vector>
+#include <map>
+#include <functional>
+#include <sstream>
+
+// QXmpp includes (adjust include path depending on your installation)
+#include <QXmppClient.h>
+#include <QXmppConfiguration.h>
+#include <QXmppRosterManager.h>
+#include <QXmppPresence.h>
+#include <QXmppLogger.h>
+#include <QXmppCallManager.h>
+#include <QXmppCall.h>
+#include <QXmppMessage.h>
+
+// ALSA (optional; used by AlsaAudioDevice)
+#include <alsa/asoundlib.h>
+
+// -----------------------------------------------------------------------------
+// Utility helpers
+// -----------------------------------------------------------------------------
+static QString nowString() {
+	return QDateTime::currentDateTime().toString(Qt::ISODate);
+}
+
+static QString appDataPath() {
+	return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+}
+
+static void ensureDirExists(const QString &path) {
+	QDir d(path);
+	if (!d.exists())
+		d.mkpath(".");
+}
+
+// Simple hex helper
+static QString toHex(const QByteArray &b) {
+	return QString(b.toHex());
+}
+
+// -----------------------------------------------------------------------------
+// Logger - logs to file and UI sink
+// -----------------------------------------------------------------------------
+class Logger: public QObject {
+Q_OBJECT
+public:
+	explicit Logger(QObject *parent = nullptr) :
+			QObject(parent) {
+		ensureDirExists(appDataPath());
+		QString logFile = appDataPath() + "/xmpp_voip.log";
+		m_file.setFileName(logFile);
+		m_file.open(QIODevice::Append | QIODevice::Text);
+	}
+	~Logger() override {
+		if (m_file.isOpen())
+			m_file.close();
+	}
+	void log(const QString &msg) {
+		QString line = QString("[%1] %2").arg(nowString(), msg);
+		emit newLog(line);
+		if (m_file.isOpen()) {
+			QTextStream ts(&m_file);
+			ts << line << "\n";
+			ts.flush();
+		}
+		qDebug().noquote() << line;
+	}
+signals:
+	void newLog(const QString &line);
+private:
+	QFile m_file;
+};
+
+// -----------------------------------------------------------------------------
+// SettingsManager - wrapper around QSettings for typed access
+// -----------------------------------------------------------------------------
+class SettingsManager {
+public:
+	SettingsManager() :
+			m_settings("ExampleOrg", "xmpp_voip_expanded") {
+	}
+	void setValue(const QString &k, const QVariant &v) {
+		m_settings.setValue(k, v);
+	}
+	QVariant value(const QString &k, const QVariant &def = QVariant()) {
+		return m_settings.value(k, def);
+	}
+	void sync() {
+		m_settings.sync();
+	}
+private:
+	QSettings m_settings;
+};
+
+// -----------------------------------------------------------------------------
+// ToneGenerator - generates PCM tone patterns (16-bit LE, 8000 Hz mono)
+// -----------------------------------------------------------------------------
+class ToneGenerator {
+public:
+	ToneGenerator(int sampleRate = 8000) :
+			m_sampleRate(sampleRate) {
+	}
+	QByteArray sineTone(int ms, double freq, double amplitude = 3000.0) {
+		int samples = (m_sampleRate * ms) / 1000;
+		QByteArray ba;
+		ba.resize(samples * 2);
+		qint16 *ptr = reinterpret_cast<qint16*>(ba.data());
+		for (int i = 0; i < samples; ++i) {
+			double t = static_cast<double>(i) / m_sampleRate;
+			double v = sin(2.0 * M_PI * freq * t) * amplitude;
+			ptr[i] = static_cast<qint16>(v);
+		}
+		return ba;
+	}
+	QByteArray silence(int ms) {
+		int samples = (m_sampleRate * ms) / 1000;
+		QByteArray ba;
+		ba.resize(samples * 2);
+		memset(ba.data(), 0, ba.size());
+		return ba;
+	}
+	// Composite patterns
+	QByteArray waitingPattern() {
+		// ringback: 1s tone 3s silence
+		QByteArray out;
+		out.append(sineTone(1000, 440.0, 4000.0));
+		out.append(silence(3000));
+		return out;
+	}
+	QByteArray busyPattern() {
+		// busy: 480Hz + 620Hz alternating 500ms
+		QByteArray out;
+		out.append(sineTone(500, 480.0, 3500.0));
+		out.append(sineTone(500, 620.0, 3500.0));
+		return out;
+	}
+	QByteArray wrongNumberPattern() {
+		QByteArray out;
+		out.append(sineTone(200, 600.0, 4000.0));
+		out.append(silence(100));
+		out.append(sineTone(200, 600.0, 4000.0));
+		return out;
+	}
+	QByteArray ringPattern() {
+		// short ring bursts
+		QByteArray out;
+		out.append(sineTone(200, 440.0, 4000.0));
+		out.append(silence(200));
+		out.append(sineTone(200, 440.0, 4000.0));
+		out.append(silence(2000));
+		return out;
+	}
+private:
+	int m_sampleRate;
+};
+
+// -----------------------------------------------------------------------------
+// AlsaAudioDevice - minimal ALSA wrapper (blocking) - optional use
+// -----------------------------------------------------------------------------
+class AlsaAudioDevice {
+public:
+	AlsaAudioDevice(const std::string &device = "default", unsigned int rate =
+			8000, unsigned int channels = 1) :
+			m_device(device), m_rate(rate), m_channels(channels), m_capture(
+					nullptr), m_playback(nullptr) {
+	}
+	~AlsaAudioDevice() {
+		close();
+	}
+	bool openCapture() {
+		int err;
+		if ((err = snd_pcm_open(&m_capture, m_device.c_str(),
+				SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+			qWarning() << "ALSA capture open error:" << snd_strerror(err);
+			return false;
+		}
+		snd_pcm_hw_params_t *params;
+		snd_pcm_hw_params_malloc(&params);
+		snd_pcm_hw_params_any(m_capture, params);
+		snd_pcm_hw_params_set_access(m_capture, params,
+				SND_PCM_ACCESS_RW_INTERLEAVED);
+		snd_pcm_hw_params_set_format(m_capture, params, SND_PCM_FORMAT_S16_LE);
+		snd_pcm_hw_params_set_channels(m_capture, params, m_channels);
+		unsigned int r = m_rate;
+		snd_pcm_hw_params_set_rate_near(m_capture, params, &r, 0);
+		snd_pcm_hw_params(m_capture, params);
+		snd_pcm_hw_params_free(params);
+		snd_pcm_prepare(m_capture);
+		return true;
+	}
+	bool openPlayback() {
+		int err;
+		if ((err = snd_pcm_open(&m_playback, m_device.c_str(),
+				SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+			qWarning() << "ALSA playback open error:" << snd_strerror(err);
+			return false;
+		}
+		snd_pcm_hw_params_t *params;
+		snd_pcm_hw_params_malloc(&params);
+		snd_pcm_hw_params_any(m_playback, params);
+		snd_pcm_hw_params_set_access(m_playback, params,
+				SND_PCM_ACCESS_RW_INTERLEAVED);
+		snd_pcm_hw_params_set_format(m_playback, params, SND_PCM_FORMAT_S16_LE);
+		snd_pcm_hw_params_set_channels(m_playback, params, m_channels);
+		unsigned int r = m_rate;
+		snd_pcm_hw_params_set_rate_near(m_playback, params, &r, 0);
+		snd_pcm_hw_params(m_playback, params);
+		snd_pcm_hw_params_free(params);
+		snd_pcm_prepare(m_playback);
+		return true;
+	}
+	void close() {
+		if (m_capture) {
+			snd_pcm_close(m_capture);
+			m_capture = nullptr;
+		}
+		if (m_playback) {
+			snd_pcm_close(m_playback);
+			m_playback = nullptr;
+		}
+	}
+	ssize_t read(void *buf, size_t bytes) {
+		if (!m_capture)
+			return -1;
+		snd_pcm_sframes_t frames = snd_pcm_readi(m_capture, buf, bytes / 2);
+		if (frames < 0)
+			frames = snd_pcm_recover(m_capture, frames, 0);
+		if (frames < 0)
+			return -1;
+		return frames * 2;
+	}
+	ssize_t write(const void *buf, size_t bytes) {
+		if (!m_playback)
+			return -1;
+		snd_pcm_sframes_t frames = snd_pcm_writei(m_playback, buf, bytes / 2);
+		if (frames < 0)
+			frames = snd_pcm_recover(m_playback, frames, 0);
+		if (frames < 0)
+			return -1;
+		return frames * 2;
+	}
+private:
+	std::string m_device;
+	unsigned int m_rate;
+	unsigned int m_channels;
+	snd_pcm_t *m_capture;
+	snd_pcm_t *m_playback;
+};
+
+// -----------------------------------------------------------------------------
+// AudioEngine - uses QtMultimedia for cross-platform audio capture/playback
+// includes simple AGC and device selection
+// -----------------------------------------------------------------------------
+class AudioEngine: public QObject {
+Q_OBJECT
+public:
+	AudioEngine(QObject *parent = nullptr) :
+			QObject(parent), m_input(nullptr), m_output(nullptr), m_inputDevice(
+					QAudioDeviceInfo::defaultInputDevice()), m_outputDevice(
+					QAudioDeviceInfo::defaultOutputDevice()), m_sampleRate(
+					8000), m_channels(1), m_agcEnabled(true), m_agcTargetRms(
+					1000.0), m_agcGain(1.0), m_agcAttack(0.02), m_agcRelease(
+					0.1), m_muted(false) {
+		// default format
+		m_format.setSampleRate(m_sampleRate);
+		m_format.setChannelCount(m_channels);
+		m_format.setSampleSize(16);
+		m_format.setCodec("audio/pcm");
+		m_format.setByteOrder(QAudioFormat::LittleEndian);
+		m_format.setSampleType(QAudioFormat::SignedInt);
+	}
+
+	~AudioEngine() override {
+		stop();
+	}
+
+	QStringList availableInputDevices() {
+		QStringList list;
+		for (const QAudioDeviceInfo &d : QAudioDeviceInfo::availableDevices(
+				QAudio::AudioInput)) {
+			list << d.deviceName();
+		}
+		return list;
+	}
+
+	QStringList availableOutputDevices() {
+		QStringList list;
+		for (const QAudioDeviceInfo &d : QAudioDeviceInfo::availableDevices(
+				QAudio::AudioOutput)) {
+			list << d.deviceName();
+		}
+		return list;
+	}
+
+	void setInputDeviceByName(const QString &name) {
+		for (const QAudioDeviceInfo &d : QAudioDeviceInfo::availableDevices(
+				QAudio::AudioInput)) {
+			if (d.deviceName() == name) {
+				m_inputDevice = d;
+				return;
+			}
+		}
+	}
+
+	void setOutputDeviceByName(const QString &name) {
+		for (const QAudioDeviceInfo &d : QAudioDeviceInfo::availableDevices(
+				QAudio::AudioOutput)) {
+			if (d.deviceName() == name) {
+				m_outputDevice = d;
+				return;
+			}
+		}
+	}
+
+	bool start() {
+		stop();
+		if (!m_inputDevice.isFormatSupported(m_format)) {
+			m_format = m_inputDevice.nearestFormat(m_format);
+		}
+		m_input = new QAudioInput(m_inputDevice, m_format, this);
+		m_output = new QAudioOutput(m_outputDevice, m_format, this);
+		m_inputBuffer = m_input->start();
+		m_outputBuffer = m_output->start();
+		connect(m_inputBuffer, &QIODevice::readyRead, this,
+				&AudioEngine::onInputReady);
+		return true;
+	}
+
+	void stop() {
+		if (m_input) {
+			m_input->stop();
+			delete m_input;
+			m_input = nullptr;
+		}
+		if (m_output) {
+			m_output->stop();
+			delete m_output;
+			m_output = nullptr;
+		}
+		if (m_inputBuffer) {
+			m_inputBuffer->close();
+			m_inputBuffer = nullptr;
+		}
+		if (m_outputBuffer) {
+			m_outputBuffer->close();
+			m_outputBuffer = nullptr;
+		}
+	}
+
+	void setAgcEnabled(bool on) {
+		m_agcEnabled = on;
+	}
+	void setAgcTargetRms(double v) {
+		m_agcTargetRms = v;
+	}
+	void setAgcAttack(double v) {
+		m_agcAttack = v;
+	}
+	void setAgcRelease(double v) {
+		m_agcRelease = v;
+	}
+	void setMuted(bool m) {
+		m_muted = m;
+	}
+
+	// send PCM to playback (expects 16-bit LE mono)
+	void playPcm(const QByteArray &pcm) {
+		if (!m_outputBuffer)
+			return;
+		if (m_muted)
+			return;
+		m_outputBuffer->write(pcm);
+	}
+
+signals:
+	void frameCaptured(const QByteArray &pcm);
+
+private slots:
+	void onInputReady() {
+		if (!m_inputBuffer)
+			return;
+		QByteArray data = m_inputBuffer->readAll();
+		if (data.isEmpty())
+			return;
+		// apply AGC if enabled
+		if (m_agcEnabled)
+			data = applyAgc(data);
+		emit frameCaptured(data);
+	}
+
+private:
+	QByteArray applyAgc(const QByteArray &pcm) {
+		if (pcm.isEmpty())
+			return pcm;
+		int samples = pcm.size() / 2;
+		const qint16 *in = reinterpret_cast<const qint16*>(pcm.constData());
+		QByteArray out;
+		out.resize(pcm.size());
+		qint16 *outPtr = reinterpret_cast<qint16*>(out.data());
+		double sum = 0.0;
+		for (int i = 0; i < samples; ++i) {
+			double s = static_cast<double>(in[i]);
+			sum += s * s;
+		}
+		double rms = (samples > 0) ? sqrt(sum / samples) : 0.0;
+		double desiredGain = 1.0;
+		if (rms > 1e-6)
+			desiredGain = m_agcTargetRms / rms;
+		if (desiredGain > 10.0)
+			desiredGain = 10.0;
+		if (desiredGain < 0.1)
+			desiredGain = 0.1;
+		if (desiredGain > m_agcGain) {
+			m_agcGain += (desiredGain - m_agcGain) * m_agcAttack;
+		} else {
+			m_agcGain += (desiredGain - m_agcGain) * m_agcRelease;
+		}
+		for (int i = 0; i < samples; ++i) {
+			double v = static_cast<double>(in[i]) * m_agcGain;
+			if (v > 32767.0)
+				v = 32767.0;
+			if (v < -32768.0)
+				v = -32768.0;
+			outPtr[i] = static_cast<qint16>(v);
+		}
+		return out;
+	}
+
+	QAudioDeviceInfo m_inputDevice;
+	QAudioDeviceInfo m_outputDevice;
+	QAudioFormat m_format;
+	int m_sampleRate;
+	int m_channels;
+	QAudioInput *m_input;
+	QAudioOutput *m_output;
+	QIODevice *m_inputBuffer;
+	QIODevice *m_outputBuffer;
+	bool m_agcEnabled;
+	double m_agcTargetRms;
+	double m_agcGain;
+	double m_agcAttack;
+	double m_agcRelease;
+	bool m_muted;
+};
+
+// -----------------------------------------------------------------------------
+// CallManager - manages call lifecycle, tones, and integrates AudioEngine
+// -----------------------------------------------------------------------------
+class CallManager: public QObject {
+Q_OBJECT
+public:
+	CallManager(AudioEngine *audio, Logger *logger, QObject *parent = nullptr) :
+			QObject(parent), m_audio(audio), m_logger(logger), m_active(false), m_tonePlaying(
+					false), m_toneGen(8000), m_mockRemote(false) {
+		if (m_audio)
+			connect(m_audio, &AudioEngine::frameCaptured, this,
+					&CallManager::onLocalFrame);
+	}
+
+	~CallManager() override {
+		stopCall();
+	}
+
+	void startCall(const QString &peerJid) {
+		if (m_active)
+			return;
+		m_peer = peerJid;
+		m_logger->log(QString("Starting call to %1").arg(peerJid));
+		if (m_audio)
+			m_audio->start();
+		m_active = true;
+		playRingback();
+		emit callStarted(peerJid);
+	}
+
+	void stopCall() {
+		if (!m_active)
+			return;
+		stopTone();
+		if (m_audio)
+			m_audio->stop();
+		m_logger->log(QString("Stopped call with %1").arg(m_peer));
+		emit callEnded(m_peer);
+		m_active = false;
+		m_peer.clear();
+	}
+
+	void hangup() {
+		stopCall();
+	}
+
+	void playRingback() {
+		stopTone();
+		m_tonePlaying = true;
+		// schedule repeating ringback
+		m_toneTimer = std::make_unique<QTimer>();
+		connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+			QByteArray p = m_toneGen.waitingPattern();
+			if (m_audio)
+				m_audio->playPcm(p);
+		});
+		// immediate play
+		if (m_audio)
+			m_audio->playPcm(m_toneGen.waitingPattern());
+		m_toneTimer->start(4000);
+	}
+
+	void playBusy() {
+		stopTone();
+		m_tonePlaying = true;
+		m_toneTimer = std::make_unique<QTimer>();
+		connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+			QByteArray p = m_toneGen.busyPattern();
+			if (m_audio)
+				m_audio->playPcm(p);
+		});
+		if (m_audio)
+			m_audio->playPcm(m_toneGen.busyPattern());
+		m_toneTimer->start(1000);
+	}
+
+	void playWrongNumber() {
+		stopTone();
+		m_tonePlaying = true;
+		QByteArray p = m_toneGen.wrongNumberPattern();
+		if (m_audio)
+			m_audio->playPcm(p);
+		QTimer::singleShot(1200, this, [this]() {
+			this->m_tonePlaying = false;
+		});
+	}
+
+	void playRing() {
+		stopTone();
+		m_tonePlaying = true;
+		m_toneTimer = std::make_unique<QTimer>();
+		connect(m_toneTimer.get(), &QTimer::timeout, this, [this]() {
+			QByteArray p = m_toneGen.ringPattern();
+			if (m_audio)
+				m_audio->playPcm(p);
+		});
+		if (m_audio)
+			m_audio->playPcm(m_toneGen.ringPattern());
+		m_toneTimer->start(2600);
+	}
+
+	void stopTone() {
+		m_tonePlaying = false;
+		if (m_toneTimer) {
+			m_toneTimer->stop();
+			m_toneTimer.reset();
+		}
+	}
+
+	void setMockRemote(bool on) {
+		m_mockRemote = on;
+	}
+
+signals:
+	void callStarted(const QString &jid);
+	void callEnded(const QString &jid);
+	void remoteFrame(const QByteArray &pcm);
+
+private slots:
+	void onLocalFrame(const QByteArray &pcm) {
+		// Called when audio engine captures a frame
+		if (!m_active)
+			return;
+		// In real implementation: encode and send via RTP
+		// For mock mode: loop back or simulate remote
+		if (m_mockRemote) {
+			// simulate network jitter and echo
+			QByteArray copy = pcm;
+			// small delay
+			QTimer::singleShot(50 + (QRandomGenerator::global()->bounded(50)),
+					this, [this, copy]() {
+						if (m_audio)
+							m_audio->playPcm(copy);
+						emit remoteFrame(copy);
+					});
+		} else {
+			// loopback locally if no remote
+			if (!m_tonePlaying && m_audio)
+				m_audio->playPcm(pcm);
+		}
+	}
+
+private:
+	AudioEngine *m_audio;
+	Logger *m_logger;
+	bool m_active;
+	QString m_peer;
+	bool m_tonePlaying;
+	std::unique_ptr<QTimer> m_toneTimer;
+	ToneGenerator m_toneGen;
+	bool m_mockRemote;
+};
+
+// -----------------------------------------------------------------------------
+// XmppController - manages QXmppClient, roster, messages, and integrates with UI
+// -----------------------------------------------------------------------------
+class XmppController: public QObject {
+Q_OBJECT
+public:
+	XmppController(Logger *logger, QObject *parent = nullptr) :
+			QObject(parent), m_logger(logger), m_client(new QXmppClient()), m_rosterMgr(
+					nullptr) {
+		connect(m_client.get(), &QXmppClient::connected, this,
+				&XmppController::onConnected);
+		connect(m_client.get(), &QXmppClient::disconnected, this,
+				&XmppController::onDisconnected);
+		connect(m_client.get(), &QXmppClient::error, this,
+				&XmppController::onError);
+		// message handling
+		connect(m_client.get(), &QXmppClient::messageReceived, this,
+				&XmppController::onMessageReceived);
+		// try to find roster extension
+		m_rosterMgr = m_client->findExtension<QXmppRosterManager>();
+		if (m_rosterMgr) {
+			connect(m_rosterMgr, &QXmppRosterManager::rosterReceived, this,
+					&XmppController::onRosterReceived);
+			connect(m_rosterMgr, &QXmppRosterManager::presenceChanged, this,
+					&XmppController::onPresenceChanged);
+		}
+	}
+
+	~XmppController() override {
+		if (m_client->isConnected())
+			m_client->disconnectFromServer();
+	}
+
+	void connectToServer(const QString &jid, const QString &password,
+			const QString &host = QString(), int port = 5222) {
+		QXmppConfiguration cfg;
+		cfg.setJid(jid);
+		cfg.setPassword(password);
+		if (!host.isEmpty())
+			cfg.setHost(host);
+		cfg.setPort(port);
+		m_logger->log(QString("Connecting to XMPP: %1").arg(jid));
+		m_client->connectToServer(cfg);
+	}
+
+	void disconnectFromServer() {
+		if (m_client->isConnected()) {
+			m_client->disconnectFromServer();
+			m_logger->log("Disconnecting from XMPP");
+		}
+	}
+
+	bool isConnected() const {
+		return m_client->isConnected();
+	}
+
+	QString currentJid() const {
+		return m_client->configuration().jid();
+	}
+
+	QStringList rosterJids() const {
+		// local copy if roster manager not available
+		QStringList out;
+		if (m_rosterMgr) {
+			// QXmppRosterManager API varies; try to use getRosterEntry if available
+			// Fallback: use stored list
+			// Many QXmpp versions provide getRosterEntry or roster() - keep simple
+		}
+		out = m_localRoster;
+		return out;
+	}
+
+	void addRosterItem(const QString &jid) {
+		if (!m_localRoster.contains(jid))
+			m_localRoster << jid;
+		if (m_rosterMgr)
+			m_rosterMgr->addItem(jid);
+		emit rosterUpdated();
+	}
+
+	void removeRosterItem(const QString &jid) {
+		m_localRoster.removeAll(jid);
+		if (m_rosterMgr)
+			m_rosterMgr->removeItem(jid);
+		emit rosterUpdated();
+	}
+
+	void sendMessage(const QString &to, const QString &body) {
+		QXmppMessage msg;
+		msg.setTo(to);
+		msg.setBody(body);
+		m_client->sendPacket(msg);
+		m_logger->log(QString("Sent message to %1: %2").arg(to, body));
+	}
+
+signals:
+	void connected();
+	void disconnected();
+	void rosterUpdated();
+	void presenceUpdated(const QString &jid, const QString &resource);
+	void messageReceived(const QString &from, const QString &body);
+
+private slots:
+	void onConnected() {
+		m_logger->log("XMPP connected");
+		emit connected();
+	}
+	void onDisconnected() {
+		m_logger->log("XMPP disconnected");
+		emit disconnected();
+	}
+	void onError(QXmppClient::Error err) {
+		Q_UNUSED(err);
+		m_logger->log("XMPP error occurred");
+	}
+	void onRosterReceived() {
+		m_logger->log("Roster received");
+		emit rosterUpdated();
+	}
+	void onPresenceChanged(const QString &jid, const QString &resource) {
+		m_logger->log(QString("Presence changed: %1 (%2)").arg(jid, resource));
+		emit presenceUpdated(jid, resource);
+	}
+	void onMessageReceived(const QXmppMessage &msg) {
+		QString from = msg.from();
+		QString body = msg.body();
+		m_logger->log(QString("Message received from %1: %2").arg(from, body));
+		emit messageReceived(from, body);
+	}
+
+private:
+	Logger *m_logger;
+	std::unique_ptr<QXmppClient> m_client;
+	QXmppRosterManager *m_rosterMgr;
+	QStringList m_localRoster;
+};
+
+// -----------------------------------------------------------------------------
+// UI Components: ChatWindow, ContactList, SettingsDialog, MainWindow
+// -----------------------------------------------------------------------------
+class ChatWindow: public QWidget {
+Q_OBJECT
+public:
+	ChatWindow(const QString &jid, XmppController *xmpp, Logger *logger,
+			QWidget *parent = nullptr) :
+			QWidget(parent), m_jid(jid), m_xmpp(xmpp), m_logger(logger) {
+		setWindowTitle(QString("Chat - %1").arg(jid));
+		auto *layout = new QVBoxLayout(this);
+		m_history = new QPlainTextEdit(this);
+		m_history->setReadOnly(true);
+		m_input = new QLineEdit(this);
+		auto *btnLayout = new QHBoxLayout();
+		m_sendBtn = new QPushButton("Send", this);
+		m_closeBtn = new QPushButton("Close", this);
+		btnLayout->addWidget(m_sendBtn);
+		btnLayout->addWidget(m_closeBtn);
+		layout->addWidget(m_history);
+		layout->addWidget(m_input);
+		layout->addLayout(btnLayout);
+		connect(m_sendBtn, &QPushButton::clicked, this, &ChatWindow::onSend);
+		connect(m_closeBtn, &QPushButton::clicked, this, &ChatWindow::close);
+		connect(m_input, &QLineEdit::returnPressed, this, &ChatWindow::onSend);
+		if (m_xmpp)
+			connect(m_xmpp, &XmppController::messageReceived, this,
+					&ChatWindow::onIncoming);
+	}
+	void appendLocal(const QString &text) {
+		m_history->appendPlainText(
+				QString("[%1] Me: %2").arg(nowString(), text));
+	}
+	void appendRemote(const QString &from, const QString &text) {
+		m_history->appendPlainText(
+				QString("[%1] %2: %3").arg(nowString(), from, text));
+	}
+private slots:
+	void onSend() {
+		QString text = m_input->text().trimmed();
+		if (text.isEmpty())
+			return;
+		if (m_xmpp)
+			m_xmpp->sendMessage(m_jid, text);
+		appendLocal(text);
+		m_input->clear();
+	}
+	void onIncoming(const QString &from, const QString &body) {
+		if (from == m_jid)
+			appendRemote(from, body);
+	}
+private:
+	QString m_jid;
+	XmppController *m_xmpp;
+	Logger *m_logger;
+	QPlainTextEdit *m_history;
+	QLineEdit *m_input;
+	QPushButton *m_sendBtn;
+	QPushButton *m_closeBtn;
+};
+
+class SettingsDialog: public QDialog {
+Q_OBJECT
+public:
+	SettingsDialog(SettingsManager *settings, AudioEngine *audio,
+			QWidget *parent = nullptr) :
+			QDialog(parent), m_settings(settings), m_audio(audio) {
+		setWindowTitle("Settings");
+		auto *layout = new QVBoxLayout(this);
+		auto *tabs = new QTabWidget(this);
+
+		// General tab
+		auto *general = new QWidget(this);
+		auto *gLayout = new QFormLayout(general);
+		m_autoStart = new QCheckBox("Auto-start on login", this);
+		m_autoConnect = new QCheckBox("Auto-connect on startup", this);
+		gLayout->addRow(m_autoStart);
+		gLayout->addRow(m_autoConnect);
+		tabs->addTab(general, "General");
+
+		// Audio tab
+		auto *audioTab = new QWidget(this);
+		auto *aLayout = new QFormLayout(audioTab);
+		m_inputDevice = new QComboBox(this);
+		m_outputDevice = new QComboBox(this);
+		for (const QString &d : m_audio->availableInputDevices())
+			m_inputDevice->addItem(d);
+		for (const QString &d : m_audio->availableOutputDevices())
+			m_outputDevice->addItem(d);
+		m_agcEnable = new QCheckBox("Enable AGC", this);
+		m_agcTarget = new QSpinBox(this);
+		m_agcTarget->setRange(100, 10000);
+		m_agcTarget->setValue(1000);
+		m_agcAttack = new QSlider(Qt::Horizontal, this);
+		m_agcAttack->setRange(1, 100);
+		m_agcAttack->setValue(2);
+		m_agcRelease = new QSlider(Qt::Horizontal, this);
+		m_agcRelease->setRange(1, 100);
+		m_agcRelease->setValue(10);
+		aLayout->addRow("Input device:", m_inputDevice);
+		aLayout->addRow("Output device:", m_outputDevice);
+		aLayout->addRow(m_agcEnable);
+		aLayout->addRow("AGC target RMS:", m_agcTarget);
+		aLayout->addRow("AGC attack:", m_agcAttack);
+		aLayout->addRow("AGC release:", m_agcRelease);
+		tabs->addTab(audioTab, "Audio");
+
+		// Advanced tab (diagnostics)
+		auto *adv = new QWidget(this);
+		auto *advLayout = new QVBoxLayout(adv);
+		m_diag = new QPlainTextEdit(this);
+		m_diag->setReadOnly(true);
+		advLayout->addWidget(m_diag);
+		tabs->addTab(adv, "Diagnostics");
+
+		layout->addWidget(tabs);
+		auto *btnLayout = new QHBoxLayout();
+		auto *ok = new QPushButton("OK", this);
+		auto *cancel = new QPushButton("Cancel", this);
+		btnLayout->addWidget(ok);
+		btnLayout->addWidget(cancel);
+		layout->addLayout(btnLayout);
+		connect(ok, &QPushButton::clicked, this, &SettingsDialog::onOk);
+		connect(cancel, &QPushButton::clicked, this, &SettingsDialog::reject);
+
+		// Load settings
+		load();
+	}
+	void load() {
+		m_autoStart->setChecked(m_settings->value("autoStart", false).toBool());
+		m_autoConnect->setChecked(
+				m_settings->value("autoConnect", false).toBool());
+		QString inDev = m_settings->value("inputDevice", "").toString();
+		QString outDev = m_settings->value("outputDevice", "").toString();
+		int idx = m_inputDevice->findText(inDev);
+		if (idx >= 0)
+			m_inputDevice->setCurrentIndex(idx);
+		idx = m_outputDevice->findText(outDev);
+		if (idx >= 0)
+			m_outputDevice->setCurrentIndex(idx);
+		m_agcEnable->setChecked(m_settings->value("agcEnabled", true).toBool());
+		m_agcTarget->setValue(m_settings->value("agcTarget", 1000).toInt());
+		m_agcAttack->setValue(m_settings->value("agcAttack", 2).toInt());
+		m_agcRelease->setValue(m_settings->value("agcRelease", 10).toInt());
+	}
+private slots:
+	void onOk() {
+		m_settings->setValue("autoStart", m_autoStart->isChecked());
+		m_settings->setValue("autoConnect", m_autoConnect->isChecked());
+		m_settings->setValue("inputDevice", m_inputDevice->currentText());
+		m_settings->setValue("outputDevice", m_outputDevice->currentText());
+		m_settings->setValue("agcEnabled", m_agcEnable->isChecked());
+		m_settings->setValue("agcTarget", m_agcTarget->value());
+		m_settings->setValue("agcAttack", m_agcAttack->value());
+		m_settings->setValue("agcRelease", m_agcRelease->value());
+		m_settings->sync();
+		accept();
+	}
+private:
+	SettingsManager *m_settings;
+	AudioEngine *m_audio;
+	QCheckBox *m_autoStart;
+	QCheckBox *m_autoConnect;
+	QComboBox *m_inputDevice;
+	QComboBox *m_outputDevice;
+	QCheckBox *m_agcEnable;
+	QSpinBox *m_agcTarget;
+	QSlider *m_agcAttack;
+	QSlider *m_agcRelease;
+	QPlainTextEdit *m_diag;
+};
+
+// -----------------------------------------------------------------------------
+// MainWindow - orchestrates UI, controllers, audio, calls, and settings
+// -----------------------------------------------------------------------------
+class MainWindow: public QMainWindow {
+Q_OBJECT
+public:
+	MainWindow(QWidget *parent = nullptr) :
+			QMainWindow(parent), m_logger(new Logger(this)), m_settings(), m_audio(
+					new AudioEngine(this)), m_xmpp(
+					new XmppController(m_logger, this)), m_callManager(
+					new CallManager(m_audio, m_logger, this)) {
+		setWindowTitle("XMPP VoIP Expanded");
+		resize(1200, 800);
+
+		// Central layout
+		auto *central = new QWidget(this);
+		auto *mainLayout = new QVBoxLayout(central);
+
+		// Top toolbar: connection controls
+		auto *connGroup = new QGroupBox("Connection", this);
+		auto *connLayout = new QFormLayout(connGroup);
+		m_jid = new QLineEdit(this);
+		m_password = new QLineEdit(this);
+		m_password->setEchoMode(QLineEdit::Password);
+		m_server = new QLineEdit(this);
+		m_port = new QLineEdit(this);
+		m_port->setText("5222");
+		connLayout->addRow("JID:", m_jid);
+		connLayout->addRow("Password:", m_password);
+		connLayout->addRow("Server (optional):", m_server);
+		connLayout->addRow("Port:", m_port);
+		auto *btnRow = new QHBoxLayout();
+		m_connectBtn = new QPushButton("Connect", this);
+		m_disconnectBtn = new QPushButton("Disconnect", this);
+		m_registerBtn = new QPushButton("Register", this);
+		m_settingsBtn = new QPushButton("Settings", this);
+		btnRow->addWidget(m_connectBtn);
+		btnRow->addWidget(m_disconnectBtn);
+		btnRow->addWidget(m_registerBtn);
+		btnRow->addWidget(m_settingsBtn);
+		connLayout->addRow(btnRow);
+		mainLayout->addWidget(connGroup);
+
+		// Splitter: left contacts, right chat/calls/log
+		auto *split = new QSplitter(Qt::Horizontal, central);
+
+		// Left: contacts and groups
+		auto *left = new QWidget(this);
+		auto *leftLayout = new QVBoxLayout(left);
+		auto *contactsGroup = new QGroupBox("Contacts", left);
+		auto *contactsLayout = new QVBoxLayout(contactsGroup);
+		m_contactsList = new QListWidget(this);
+		contactsLayout->addWidget(m_contactsList);
+		auto *contactBtns = new QHBoxLayout();
+		m_addContact = new QPushButton("+", this);
+		m_removeContact = new QPushButton("-", this);
+		m_callContact = new QPushButton("Call", this);
+		m_chatContact = new QPushButton("Chat", this);
+		contactBtns->addWidget(m_addContact);
+		contactBtns->addWidget(m_removeContact);
+		contactBtns->addWidget(m_callContact);
+		contactBtns->addWidget(m_chatContact);
+		contactsLayout->addLayout(contactBtns);
+		leftLayout->addWidget(contactsGroup);
+		split->addWidget(left);
+
+		// Right: stacked chat/call/log
+		auto *right = new QWidget(this);
+		auto *rightLayout = new QVBoxLayout(right);
+		m_tab = new QTabWidget(this);
+		// Chat tab
+		m_chatArea = new QWidget(this);
+		auto *chatLayout = new QVBoxLayout(m_chatArea);
+		m_chatStack = new QStackedWidget(this);
+		chatLayout->addWidget(m_chatStack);
+		m_tab->addTab(m_chatArea, "Chats");
+		// Calls tab
+		m_callsArea = new QWidget(this);
+		auto *callsLayout = new QVBoxLayout(m_callsArea);
+		m_callHistory = new QPlainTextEdit(this);
+		m_callHistory->setReadOnly(true);
+		callsLayout->addWidget(m_callHistory);
+		m_tab->addTab(m_callsArea, "Calls");
+		// Log tab
+		m_logArea = new QWidget(this);
+		auto *logLayout = new QVBoxLayout(m_logArea);
+		m_logView = new QPlainTextEdit(this);
+		m_logView->setReadOnly(true);
+		logLayout->addWidget(m_logView);
+		m_tab->addTab(m_logArea, "Activity");
+		rightLayout->addWidget(m_tab);
+		split->addWidget(right);
+
+		mainLayout->addWidget(split);
+		setCentralWidget(central);
+
+		// Status bar
+		statusBar()->showMessage("Ready");
+
+		// Tray icon
+		setupTray();
+
+		// Connect signals
+		connect(m_connectBtn, &QPushButton::clicked, this,
+				&MainWindow::onConnect);
+		connect(m_disconnectBtn, &QPushButton::clicked, this,
+				&MainWindow::onDisconnect);
+		connect(m_registerBtn, &QPushButton::clicked, this,
+				&MainWindow::onRegister);
+		connect(m_settingsBtn, &QPushButton::clicked, this,
+				&MainWindow::onSettings);
+		connect(m_addContact, &QPushButton::clicked, this,
+				&MainWindow::onAddContact);
+		connect(m_removeContact, &QPushButton::clicked, this,
+				&MainWindow::onRemoveContact);
+		connect(m_callContact, &QPushButton::clicked, this,
+				&MainWindow::onCallContact);
+		connect(m_chatContact, &QPushButton::clicked, this,
+				&MainWindow::onChatContact);
+
+		// Logger wiring
+		connect(m_logger, &Logger::newLog, this, &MainWindow::onNewLog);
+
+		// Xmpp wiring
+		connect(m_xmpp, &XmppController::connected, this,
+				&MainWindow::onXmppConnected);
+		connect(m_xmpp, &XmppController::disconnected, this,
+				&MainWindow::onXmppDisconnected);
+		connect(m_xmpp, &XmppController::rosterUpdated, this,
+				&MainWindow::onRosterUpdated);
+		connect(m_xmpp, &XmppController::messageReceived, this,
+				&MainWindow::onMessageReceived);
+
+		// Call wiring
+		connect(m_callManager, &CallManager::callStarted, this,
+				&MainWindow::onCallStarted);
+		connect(m_callManager, &CallManager::callEnded, this,
+				&MainWindow::onCallEnded);
+
+		// Load persisted settings
+		loadSettings();
+
+		// Self-test in mock mode if requested
+		if (m_settings.value("mockMode", false).toBool()) {
+			enterMockMode();
+		}
+	}
+
+	~MainWindow() override {
+		if (m_tray) {
+			m_tray->hide();
+			delete m_tray;
+			m_tray = nullptr;
+		}
+	}
+
+private slots:
+	void onConnect() {
+		QString jid = m_jid->text().trimmed();
+		QString pw = m_password->text();
+		QString server = m_server->text().trimmed();
+		int port = m_port->text().toInt();
+		if (jid.isEmpty() || pw.isEmpty()) {
+			QMessageBox::warning(this, "Missing",
+					"Please enter JID and password.");
+			return;
+		}
+		m_xmpp->connectToServer(jid, pw, server, port);
+		m_logger->log(QString("Connect requested: %1").arg(jid));
+		// persist credentials if auto-connect
+		if (m_settings.value("autoConnect", false).toBool()) {
+			m_settings.setValue("jid", jid);
+			m_settings.setValue("password", pw);
+			m_settings.setValue("server", server);
+			m_settings.sync();
+		}
+	}
+	void onDisconnect() {
+		m_xmpp->disconnectFromServer();
+	}
+	void onRegister() {
+		// show registration dialog
+		RegistrationWindow dlg(this);
+		dlg.exec();
+	}
+	void onSettings() {
+		SettingsDialog dlg(&m_settings, m_audio, this);
+		if (dlg.exec() == QDialog::Accepted) {
+			// apply settings
+			QString inDev = m_settings.value("inputDevice", "").toString();
+			QString outDev = m_settings.value("outputDevice", "").toString();
+			if (!inDev.isEmpty())
+				m_audio->setInputDeviceByName(inDev);
+			if (!outDev.isEmpty())
+				m_audio->setOutputDeviceByName(outDev);
+			m_audio->setAgcEnabled(
+					m_settings.value("agcEnabled", true).toBool());
+			m_audio->setAgcTargetRms(
+					m_settings.value("agcTarget", 1000).toDouble());
+			m_audio->setAgcAttack(
+					m_settings.value("agcAttack", 0.02).toDouble());
+			m_audio->setAgcRelease(
+					m_settings.value("agcRelease", 0.1).toDouble());
+			m_logger->log("Settings applied");
+		}
+	}
+	void onAddContact() {
+		bool ok = false;
+		QString jid = QInputDialog::getText(this, "Add Contact", "JID:",
+				QLineEdit::Normal, QString(), &ok);
+		if (ok && !jid.isEmpty()) {
+			m_xmpp->addRosterItem(jid);
+			refreshContacts();
+		}
+	}
+	void onRemoveContact() {
+		QListWidgetItem *it = m_contactsList->currentItem();
+		if (!it)
+			return;
+		QString jid = it->text();
+		m_xmpp->removeRosterItem(jid);
+		refreshContacts();
+	}
+	void onCallContact() {
+		QListWidgetItem *it = m_contactsList->currentItem();
+		if (!it)
+			return;
+		QString jid = it->text();
+		m_callManager->startCall(jid);
+	}
+	void onChatContact() {
+		QListWidgetItem *it = m_contactsList->currentItem();
+		if (!it)
+			return;
+		QString jid = it->text();
+		openChat(jid);
+	}
+	void onNewLog(const QString &line) {
+		m_logView->appendPlainText(line);
+	}
+	void onXmppConnected() {
+		statusBar()->showMessage("Connected");
+		m_logger->log("Connected to XMPP server");
+		refreshContacts();
+		showTrayMessage("Connected", "Connected to XMPP server");
+	}
+	void onXmppDisconnected() {
+		statusBar()->showMessage("Disconnected");
+		m_logger->log("Disconnected from XMPP server");
+		showTrayMessage("Disconnected", "Disconnected from XMPP server");
+	}
+	void onRosterUpdated() {
+		refreshContacts();
+	}
+	void onMessageReceived(const QString &from, const QString &body) {
+		m_logger->log(QString("Incoming message from %1: %2").arg(from, body));
+		if (!m_chatWindows.contains(from))
+			openChat(from);
+		ChatWindow *cw = qobject_cast<ChatWindow*>(m_chatWindows[from]);
+		if (cw)
+			cw->appendRemote(from, body);
+		showTrayMessage("New message", QString("From %1: %2").arg(from, body));
+	}
+	void onCallStarted(const QString &jid) {
+		m_callHistory->appendPlainText(
+				QString("[%1] Call started: %2").arg(nowString(), jid));
+		m_logger->log(QString("Call started with %1").arg(jid));
+	}
+	void onCallEnded(const QString &jid) {
+		m_callHistory->appendPlainText(
+				QString("[%1] Call ended: %2").arg(nowString(), jid));
+		m_logger->log(QString("Call ended with %1").arg(jid));
+	}
+
+private:
+	void refreshContacts() {
+		m_contactsList->clear();
+		QStringList jids = m_xmpp->rosterJids();
+		for (const QString &j : jids) {
+			m_contactsList->addItem(j);
+		}
+	}
+	void openChat(const QString &jid) {
+		if (m_chatWindows.contains(jid)) {
+			QWidget *w = m_chatWindows[jid];
+			m_chatStack->setCurrentWidget(w);
+			return;
+		}
+		ChatWindow *cw = new ChatWindow(jid, m_xmpp, m_logger, this);
+		m_chatWindows.insert(jid, cw);
+		m_chatStack->addWidget(cw);
+		m_chatStack->setCurrentWidget(cw);
+	}
+	void setupTray() {
+		if (!QSystemTrayIcon::isSystemTrayAvailable())
+			return;
+		m_tray = new QSystemTrayIcon(this);
+		m_tray->setIcon(style()->standardIcon(QStyle::SP_ComputerIcon));
+		QMenu *menu = new QMenu(this);
+		QAction *showAct = new QAction("Show", this);
+		QAction *quitAct = new QAction("Quit", this);
+		menu->addAction(showAct);
+		menu->addSeparator();
+		menu->addAction(quitAct);
+		m_tray->setContextMenu(menu);
+		connect(showAct, &QAction::triggered, this, &MainWindow::showNormal);
+		connect(quitAct, &QAction::triggered, qApp, &QApplication::quit);
+		connect(m_tray, &QSystemTrayIcon::activated, this,
+				&MainWindow::onTrayActivated);
+		m_tray->show();
+	}
+	```cpp
+	void onTrayActivated(QSystemTrayIcon::ActivationReason r) {
+		if (r == QSystemTrayIcon::Trigger) {
+			if (isVisible()) {
+				hide();
+			} else {
+				showNormal();
+				raise();
+				activateWindow();
+			}
+		} else if (r == QSystemTrayIcon::Context) {
+			// context menu handled by QSystemTrayIcon
+		}
+	}
+
+	void loadSettings() {
+		// Load basic settings and apply to audio/xmpp where appropriate
+		QString savedJid = m_settings.value("jid", "").toString();
+		QString savedPw = m_settings.value("password", "").toString();
+		QString savedServer = m_settings.value("server", "").toString();
+		bool autoConnect = m_settings.value("autoConnect", false).toBool();
+		if (!savedJid.isEmpty())
+			m_jid->setText(savedJid);
+		if (!savedPw.isEmpty())
+			m_password->setText(savedPw);
+		if (!savedServer.isEmpty())
+			m_server->setText(savedServer);
+		if (autoConnect && !savedJid.isEmpty() && !savedPw.isEmpty()) {
+			// Delay to allow UI to initialize
+			QTimer::singleShot(600, this,
+					[this, savedJid, savedPw, savedServer]() {
+						m_xmpp->connectToServer(savedJid, savedPw, savedServer,
+								m_port->text().toInt());
+					});
+		}
+
+		// Audio device settings
+		QString inDev = m_settings.value("inputDevice", "").toString();
+		QString outDev = m_settings.value("outputDevice", "").toString();
+		if (!inDev.isEmpty())
+			m_audio->setInputDeviceByName(inDev);
+		if (!outDev.isEmpty())
+			m_audio->setOutputDeviceByName(outDev);
+		m_audio->setAgcEnabled(m_settings.value("agcEnabled", true).toBool());
+		m_audio->setAgcTargetRms(
+				m_settings.value("agcTarget", 1000).toDouble());
+		m_audio->setAgcAttack(m_settings.value("agcAttack", 0.02).toDouble());
+		m_audio->setAgcRelease(m_settings.value("agcRelease", 0.1).toDouble());
+	}
+
+	void enterMockMode() {
+		// Populate mock roster and enable mock remote audio in call manager
+		m_logger->log(
+				"Entering mock mode: populating fake roster and enabling simulated remote audio");
+		QStringList mock = { "alice@example.org", "bob@example.org",
+				"carol@example.org" };
+		for (const QString &j : mock) {
+			m_xmpp->addRosterItem(j);
+		}
+		m_callManager->setMockRemote(true);
+		refreshContacts();
+	}
+
+	void showTrayMessage(const QString &title, const QString &text) {
+		if (m_tray) {
+			m_tray->showMessage(title, text, QSystemTrayIcon::Information,
+					3000);
+		}
+	}
+
+private:
+	// UI widgets and helpers
+	QLineEdit *m_jid;
+	QLineEdit *m_password;
+	QLineEdit *m_server;
+	QLineEdit *m_port;
+	QPushButton *m_connectBtn;
+	QPushButton *m_disconnectBtn;
+	QPushButton *m_registerBtn;
+	QPushButton *m_settingsBtn;
+
+	QListWidget *m_contactsList;
+	QPushButton *m_addContact;
+	QPushButton *m_removeContact;
+	QPushButton *m_callContact;
+	QPushButton *m_chatContact;
+
+	QTabWidget *m_tab;
+	QWidget *m_chatArea;
+	QWidget *m_callsArea;
+	QWidget *m_logArea;
+	QStackedWidget *m_chatStack;
+	QPlainTextEdit *m_callHistory;
+	QPlainTextEdit *m_logView;
+	QPlainTextEdit *m_callHistoryView;
+
+	QSystemTrayIcon *m_tray { nullptr };
+
+	// Core components
+	Logger *m_logger;
+	SettingsManager m_settings;
+	AudioEngine *m_audio;
+	XmppController *m_xmpp;
+	CallManager *m_callManager;
+
+	// State
+	QMap<QString, QWidget*> m_chatWindows;
+	QMap<QString, ChatWindow*> m_chatWindowObjects;
+};
+
+// -----------------------------------------------------------------------------
+// main
+// -----------------------------------------------------------------------------
+int main(int argc, char **argv) {
+	QApplication app(argc, argv);
+	QApplication::setApplicationName("xmpp_voip_expanded");
+	QApplication::setOrganizationName("ExampleOrg");
+
+	// Enable high DPI scaling for modern displays
+	QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+
+	MainWindow w;
+	w.show();
+
+	return app.exec();
+}
+
+#include "xmpp.moc"
+

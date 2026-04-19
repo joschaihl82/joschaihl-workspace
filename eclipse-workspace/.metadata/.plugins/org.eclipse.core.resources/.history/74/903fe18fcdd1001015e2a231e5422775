@@ -1,0 +1,17 @@
+CC = gcc
+CFLAGS = -O2 -fno-stack-protector -fshort-wchar -mno-red-zone -fno-pie -fPIC -Wall
+LD = ld
+LDFLAGS = -shared -Bsymbolic -e efi_main
+OBJCOPY = objcopy
+
+all: gop_demo.efi
+
+gop_demo.so: gop_demo_no_headers.c
+	$(CC) $(CFLAGS) -c gop_demo_no_headers.c -o gop_demo.o
+	$(LD) $(LDFLAGS) -o gop_demo.so gop_demo.o
+
+gop_demo.efi: gop_demo.so
+	$(OBJCOPY) -I elf64-x86-64 -O pei-x86-64 gop_demo.so gop_demo.efi
+
+clean:
+	rm -f *.o *.so *.efi

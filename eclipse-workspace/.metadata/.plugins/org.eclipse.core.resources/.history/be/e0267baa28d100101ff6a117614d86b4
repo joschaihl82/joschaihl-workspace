@@ -1,0 +1,48 @@
+# ============================================================================
+# makefile zur erstellung eines bare-metal x86-64 programms
+# voraussetzung: x86_64-elf-toolchain (gcc, ld) ist installiert
+# ============================================================================
+
+# cross-compiler einstellungen
+target_arch := x86_64-elf
+cc := $(target_arch)-gcc
+ld := $(target_arch)-ld
+objcopy := $(target_arch)-objcopy
+
+# quelle und ziel
+source := main.c
+object := main.o
+binary_elf := test_bios.elf
+binary_raw := test_bios.bin
+load_addr := 0x0
+
+# c-flags:
+# -ffreestanding: keine std-lib/os-abhängigkeiten
+# -mno-red-zone: verhindert die nutzung der red-zone (wichtig für isrs/kernel)
+# -mcmodel=large: erlaubt große code- und datensegmente
+cflags := -std=gnu99 -O2 -g -ffreestanding -mno-red-zone -mcmodel=large -I.
+
+# linker-flags:
+# -nostdlib: keine standard-c-bibliothek verlinken
+# -t -e start_bios: setzt den einstiegspunkt auf die funktion start_bios
+ldflags := -nostdlib -Ttext $(load_addr) -e start_bios
+
+.PHONY: all clean
+
+all: $(binary_raw)
+
+# 1. c-quelldatei zu objektdatei kompilieren
+$(object): $(source)
+	$(cc) $(cflags) -c $< -o $@
+
+# 2. objektdatei zu elf-binärdatei linken
+$(binary_elf): $(object)
+	$(ld) $(ldflags) $< -o $@
+
+# 3. elf-datei in rohe binärdatei konvertieren
+# -o binary: ausgabeformat ist raw binary (nur code/daten, keine header)
+$(binary_raw): $(binary_elf)
+	$(objcopy) -O binary $< $@
+
+clean:
+	rm -f $(object) $(binary_elf) $(binary_raw)

@@ -1,0 +1,47 @@
+/* link.ld - minimal GNU ld script for PE/COFF x86_64 EFI application
+ *
+ * Notes:
+ *  - OUTPUT_FORMAT(pe-x86-64) ensures PE/COFF output.
+ *  - ENTRY(efi_main) sets the entry point symbol expected by UEFI apps.
+ *  - The script places sections contiguously; adjust addresses if needed.
+ */
+
+OUTPUT_FORMAT(pe-x86-64)
+ENTRY(efi_main)
+
+/* Optional: set a preferred image base. 0x400000 is a common default. */
+PROVIDE(_ImageBase = 0x400000);
+
+SECTIONS
+{
+  /* start at a reasonable base; ld will relocate if necessary */
+  . = 0x100000;
+
+  .text : {
+    *(.text*)
+    *(.gnu.linkonce.t*)
+    *(.rodata*)
+    *(.rodata.*)
+  }
+
+  .rdata : {
+    *(.rdata*)
+  }
+
+  .data : {
+    *(.data*)
+    *(.data.*)
+  }
+
+  .bss : {
+    __bss_start = .;
+    *(.bss*)
+    *(COMMON)
+    __bss_end = .;
+  }
+
+  /DISCARD/ : {
+    *(.eh_frame*)
+    *(.comment)
+  }
+}
