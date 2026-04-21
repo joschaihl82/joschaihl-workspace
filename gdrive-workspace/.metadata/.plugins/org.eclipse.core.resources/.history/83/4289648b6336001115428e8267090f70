@@ -1,2 +1,0 @@
-set(__QT_DEPLOY_TARGET_DriveSyncQt6_FILE /home/joscha/gdrive-workspace/gdrive6/build/cmake.run.linux.x86_64.Local/DriveSyncQt6)
-set(__QT_DEPLOY_TARGET_DriveSyncQt6_TYPE EXECUTABLE)

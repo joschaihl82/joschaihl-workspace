@@ -1,8 +1,0 @@
-[
-{
-  "directory": "/home/joscha/gdrive-workspace/gdrive4/build/cmake.run.linux.x86_64.Local",
-  "command": "/usr/bin/g++ -I/home/joscha/gdrive-workspace/gdrive4/build/cmake.run.linux.x86_64.Local -O3 -DNDEBUG -o CMakeFiles/gdrive4.dir/gdrive4.cpp.o -c /home/joscha/gdrive-workspace/gdrive4/gdrive4.cpp",
-  "file": "/home/joscha/gdrive-workspace/gdrive4/gdrive4.cpp",
-  "output": "CMakeFiles/gdrive4.dir/gdrive4.cpp.o"
-}
-]

@@ -10,6 +10,7 @@
 		<item key="isRegEx" value="false"/>
 		<item key="selection" value="int size"/>
 		<list key="findhistory">
+			<item value="epoch"/>
 			<item value="rax"/>
 			<item value="interactive_first"/>
 			<item value="%%rdi"/>
@@ -24,7 +25,6 @@
 			<item value="100"/>
 			<item value="error("/>
 			<item value="va_start"/>
-			<item value="__builtin_va_start"/>
 		</list>
 		<list key="replacehistory">
 			<item value="%"/>
