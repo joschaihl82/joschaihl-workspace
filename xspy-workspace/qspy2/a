@@ -1,0 +1,15 @@
+qspy.cpp: In member function ‘QString AtspiManager::getAttributes(quintptr)’:
+qspy.cpp:273:55: error: cannot convert ‘GHashTable*’ {aka ‘_GHashTable*’} to ‘gchar*’ {aka ‘char*’} in initialization
+  273 |         gchar *attrs = atspi_accessible_get_attributes(acc, &err);
+      |                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~
+      |                                                       |
+      |                                                       GHashTable* {aka _GHashTable*}
+qspy.cpp: In member function ‘QString AtspiManager::detectWebControlType(quintptr)’:
+qspy.cpp:310:14: warning: unused variable ‘hasComponent’ [-Wunused-variable]
+  310 |         bool hasComponent = (atspi_accessible_get_component(acc) != nullptr);
+      |              ^~~~~~~~~~~~
+qspy.cpp: In member function ‘void MainWindow::updatePreviewForSelection()’:
+qspy.cpp:760:27: warning: unused variable ‘r’ [-Wunused-variable]
+  760 |                 AtspiRole r = atspi_accessible_get_role(cur, &e);
+      |                           ^
+make: *** [Makefile:1110: qspy.o] Fehler 1

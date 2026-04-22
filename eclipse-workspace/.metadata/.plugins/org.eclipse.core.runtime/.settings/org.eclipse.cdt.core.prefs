@@ -8,6 +8,17 @@ config/emailcrawl4/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Lo
 config/emailcrawl4/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
 config/emailcrawl4/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
 config/emailcrawl4/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/execlogger/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
+config/execlogger/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/execlogger/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/execlogger/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/execlogger/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchMode=run
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchTarget.id=Local
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.toolChain.id=gcc-x86_64-/usr/bin/gcc
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/cdt.toolChain.type=org.eclipse.cdt.build.gcc
+config/kexeclogger/org.eclipse.cdt.make.core.provider/make.run.linux.x86_64.Local/stdbuild.build.container=/kexeclogger/build/make.run.linux.x86_64.Local
 config/xmpp/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchMode=run
 config/xmpp/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.id=Local
 config/xmpp/org.eclipse.cdt.cmake.core.provider/cmake.run.linux.x86_64.Local/cdt.launchTarget.typeId=org.eclipse.launchbar.core.launchTargetType.local

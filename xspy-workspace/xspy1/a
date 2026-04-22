@@ -1,0 +1,21 @@
+xspy.cpp: In lambda function:
+xspy.cpp:596:25: error: no match for ‘operator&&’ (operand types are ‘generateQmlForWindow(Display*, Window, QWidget*)::<lambda()>’ and ‘bool’)
+  596 |             if(cancelCb && cancelCb()) break;
+      |                ~~~~~~~~ ^~ ~~~~~~~~~~
+      |                |                   |
+      |                |                   bool
+      |                generateQmlForWindow(Display*, Window, QWidget*)::<lambda()>
+xspy.cpp:596:25: note: there is 1 candidate
+  596 |             if(cancelCb && cancelCb()) break;
+      |                ~~~~~~~~~^~~~~~~~~~~~~
+xspy.cpp:596:25: note: candidate 1: ‘operator&&(bool, bool)’ (built-in)
+xspy.cpp:596:25: note: no known conversion for argument 1 from ‘generateQmlForWindow(Display*, Window, QWidget*)::<lambda()>’ to ‘bool’
+xspy.cpp: In function ‘QString generateQmlForWindow(Display*, Window, QWidget*)’:
+xspy.cpp:622:19: error: ‘generateQml’ was not declared in this scope
+  622 |     QString qml = generateQml(rootNode);
+      |                   ^~~~~~~~~~~
+xspy.cpp: At global scope:
+xspy.cpp:392:16: warning: ‘QString normalizeRole(const QString&)’ defined but not used [-Wunused-function]
+  392 | static QString normalizeRole(const QString &role){
+      |                ^~~~~~~~~~~~~
+make: *** [Makefile:1103: xspy.o] Fehler 1
